@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Latch · approve 1Password secret access from your phone</title>
+<meta name="description" content="Latch is a personal instrument for approving 1Password secret access from your phone. The daemon at rest cannot produce a single secret: tokens are ciphertext, the unwrap key lives on the phone, and every hop carries only sealed envelopes.">
+<link rel="stylesheet" href="latch.css">
+</head>
+<body>
+
+<!-- TODO: repo has no remote yet; point every href="#repo" at the GitHub URL once it exists -->
+<nav class="nav">
+  <div class="wrap">
+    <a class="brand" href="index.html">latch<span class="cursor">_</span></a>
+    <div class="nav-links">
+      <a class="opt" href="#how">How it works</a>
+      <a class="opt" href="#approval">Approvals</a>
+      <a class="opt" href="#transport">Transport</a>
+      <a href="trust.html">Trust model</a>
+      <a class="repo" href="#repo">Source</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero flush">
+  <div class="wrap">
+    <div class="hero-grid">
+      <div class="hero-copy">
+        <p class="kicker"><span class="dot"></span> Personal instrument · in development</p>
+        <h1>The daemon at rest <span class="accent">cannot</span> produce a single secret.</h1>
+        <p class="hero-sub">Latch moves the 1Password biometric prompt from your desk to your phone, without ever trusting the network in between.</p>
+        <div class="hero-cta">
+          <a class="btn btn-primary" href="trust.html">Read the trust model <span class="arrow">-&gt;</span></a>
+          <a class="btn btn-ghost" href="#repo">View the source</a>
+        </div>
+      </div>
+      <div class="hero-visual">
+        <div class="term">
+          <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="lbl">latch status</span></div>
+<pre><span class="t-co">latch</span> <span class="t-faint">·</span> <span class="t-ok">armed</span>
+
+  <span class="t-dim">daemon</span>      <span class="t-ok">●</span> running        <span class="t-dim">pid 4821 · 2d 14h</span>
+  <span class="t-dim">phone</span>       <span class="t-ok">●</span> Tom's iPhone   <span class="t-dim">direct · last seen 12s ago</span>
+  <span class="t-dim">shim</span>        <span class="t-ok">✓</span> on PATH        <span class="t-dim">~/.latch/bin/op</span>
+  <span class="t-dim">ssh-agent</span>   <span class="t-ok">✓</span> SSH_AUTH_SOCK  <span class="t-dim">3 keys served</span>
+
+  <span class="t-dim">accounts</span>
+    Rowm work     <span class="t-dim">2 vaults</span>   <span class="t-ok">token healthy</span>    <span class="t-dim">used 4m ago</span>
+    Personal      <span class="t-dim">1 vault</span>    <span class="t-brass">rotate in 6d</span>     <span class="t-dim">used 2d ago</span>
+
+  <span class="t-dim">today</span>       12 approved <span class="t-faint">·</span> 1 denied <span class="t-faint">·</span> 0 expired</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- the problem -->
+<section id="why">
+  <div class="wrap">
+    <div class="cols">
+      <div>
+        <h2>Away from the desk, everything behind a prompt stalls</h2>
+      </div>
+      <div class="prose">
+        <p>All of a project's dev secrets can live in one 1Password item. Every tool that reads them, and every SSH connection through the 1Password agent, raises a biometric prompt on the Mac.</p>
+        <p>Leave the desk and those prompts sit unanswered. Agents block, dev servers refuse to start, SSH hangs until you are physically back. Latch answers the prompt from your phone instead. Two properties keep that from being merely convenient and quietly terrifying.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- core property -->
+<section id="property">
+  <div class="wrap">
+    <div class="claim">
+      <span class="k">The property everything rests on</span>
+      <p><strong>Approving is not permission. It is the missing half of the cryptography.</strong> Service-account tokens sit encrypted under a key the Mac never holds. The unwrap key lives on the phone, sealed behind Face ID, and is delivered fresh inside each approval. A stolen daemon is a box of ciphertext.</p>
+      <p>The second property: no caching, ever. Each approved request performs a live 1Password read, so a rotated secret is correct on the very next call, and the vault stays locked on the Mac. Secret bytes stream from the <code>op</code> child process straight to the caller's file descriptor and never pass through the daemon's memory.</p>
+    </div>
+  </div>
+</section>
+
+<!-- the system -->
+<section id="system">
+  <div class="wrap">
+    <div class="sec-head">
+      <h2>Three parties, and a boundary each one cannot cross</h2>
+      <p>Your existing tools keep calling <code>op</code> exactly as before. A shim earlier in <code>PATH</code> routes those calls through the daemon; teammates without the shim get vanilla <code>op</code>, so nothing about the repo changes.</p>
+    </div>
+    <div class="topo">
+      <div class="topo-row">
+        <div class="node">
+          <h5>Your tools</h5>
+          <div class="sub">op shim · ssh-agent sock</div>
+          <ul>
+            <li>launcher, scripts, ssh, agents</li>
+            <li>falls back to real op when the daemon is down</li>
+            <li class="cant">retain any secret</li>
+          </ul>
+        </div>
+        <div class="link"><span class="arrow">-&gt;</span><span class="lbl">unix socket 0600<br>argv · cwd · stdin</span></div>
+        <div class="node hero-node">
+          <h5>Latch daemon</h5>
+          <div class="sub">Rust · launchd agent · Mac</div>
+          <ul>
+            <li>encrypted tokens + vault routing table</li>
+            <li>spawns op per request, pipes stdout to caller fd</li>
+            <li>sends its own content-free push</li>
+            <li class="cant">decrypt tokens without a live approval</li>
+            <li class="cant">read the secret bytes it brokers</li>
+          </ul>
+        </div>
+        <div class="link"><span class="arrow">&lt;-&gt;</span><span class="lbl">sealed + signed<br>pinned keys, E2E</span></div>
+        <div class="node">
+          <h5>Phone app</h5>
+          <div class="sub">Expo · hardware-held keys</div>
+          <ul>
+            <li>holds the unwrap key, biometric gated</li>
+            <li>approves, denies, locks down</li>
+            <li class="cant">see the token or any secret value</li>
+          </ul>
+        </div>
+      </div>
+      <div class="topo-foot">
+        <span class="chip"><span class="dot" style="background:var(--cobalt)"></span>daemon &rarr; <b>1Password</b> · one live op read per approved request</span>
+        <span class="chip"><span class="dot" style="background:var(--brass)"></span>daemon &rarr; <b>push</b> · "Approval requested", no content, straight from the Mac</span>
+        <span class="chip"><span class="dot" style="background:var(--ok)"></span><b>transport ladder</b> · LAN &rarr; your endpoint &rarr; blind relay</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- how it works: round trip -->
+<section id="how">
+  <div class="wrap-narrow">
+    <div class="sec-head">
+      <h2>A request, end to end</h2>
+      <p>The round trip a single <code>op</code> call makes, from an unchanged caller to a secret on stdout.</p>
+    </div>
+    <ol class="flow">
+      <li><span class="who">launcher &rarr; shim</span>A tool runs <code>op item get ".env" --vault "Engineering" --format json</code>. The shim forwards argv, cwd, and stdin over the local socket, byte-for-byte compatible with real <code>op</code>.</li>
+      <li><span class="who">daemon</span>Routes the vault to the right account, loads that account's <em>encrypted</em> token, computes a risk level, and queues a signed, sealed request for the phone. Fires the content-free push in parallel.</li>
+      <li><span class="who">phone</span>The push arrives and wakes a handler that reaches the Mac down the transport ladder, pulls the sealed request, and rewrites the notification on-device. Apple only ever carried "Approval requested".</li>
+      <li><span class="who">you</span>Glance: which account, which item, which fields, which process, from which directory, how long until it expires. Approve with a biometric, or deny with one tap.</li>
+      <li><span class="who">phone &rarr; daemon</span>On approve, the biometric unlocks the hardware key, the unwrap key is re-wrapped to this request's ephemeral key, and the signed response returns. Replay-proof: single-use id, monotonic counter, short window.</li>
+      <li><span class="who">daemon</span>Unwraps the key, decrypts the one token, spawns <code>op</code> with the token in the child's environment, and splices child stdout onto the caller's fd. Zeroes the key and token. Writes an audit entry of names and metadata, never values.</li>
+      <li><span class="who">launcher</span>Receives the item JSON exactly as if the Mac prompt had been clicked. On deny or timeout the shim exits 1 with a clear stderr line, which is what the caller's error path already expects.</li>
+    </ol>
+    <p class="mt-m muted" style="font-size:0.92rem;max-width:66ch">One dev session can fire dozens of <code>op</code> calls. Approving "for this session" turns an approval into a <strong>lease</strong>: the unwrapped token is held in RAM, scoped to the verified caller fingerprint, item, and request type, until its short TTL expires and it is zeroed. Lockdown, restart, or expiry kills a lease instantly. A lease reduces fatigue; it does not widen the boundary, which is why leases are triple-scoped, TTL-bound, and memory-only.</p>
+  </div>
+</section>
+
+<!-- the approval experience -->
+<section id="approval">
+  <div class="wrap">
+    <div class="sec-head">
+      <h2>Friction scales with risk. Deny never does.</h2>
+      <p>The daemon computes risk from vault sensitivity, process novelty, and target host. Risk changes exactly one thing: the shape of the approve control. Refusing is always a single calm tap.</p>
+    </div>
+    <div class="stage">
+      <div>
+        <div class="phone"><div class="screen">
+          <div class="sheet-grab"></div>
+          <div class="apr-head">
+            <span class="apr-acct">Rowm work</span>
+            <span class="gauge">
+              <svg width="52" height="52" viewBox="0 0 52 52" aria-hidden="true">
+                <circle cx="26" cy="26" r="22" fill="none" stroke="oklch(0.3 0.016 245)" stroke-width="3.5"/>
+                <circle cx="26" cy="26" r="22" fill="none" stroke="oklch(0.75 0.115 78)" stroke-width="3.5"
+                  stroke-linecap="round" stroke-dasharray="138.2" stroke-dashoffset="47"/>
+              </svg>
+              <span class="t">0:41</span>
+            </span>
+          </div>
+          <div class="apr-type"><span class="glyph">&#9143;</span> READ SECRET</div>
+          <div class="mock-well">
+            <div class="ref">op:// <span class="sep">/</span> Rowm <span class="sep">/</span> <b>AWS-prod</b> <span class="sep">/</span> access-key</div>
+          </div>
+          <div class="prov">
+            <div><span class="k">process</span><span class="v">zsh &rarr; agent &rarr; op read</span></div>
+            <div><span class="k">cwd</span><span class="v">~/Projects/rowm-api</span></div>
+            <div><span class="k">machine</span><span class="v">studio.local</span></div>
+            <div><span class="k">when</span><span class="v">just now</span></div>
+          </div>
+          <div class="risk-line">Production vault. First request from this process.</div>
+          <div class="slide"><span class="knob">&rsaquo;</span><span class="lbl">Slide to approve</span></div>
+          <div class="denybtn">Deny</div>
+        </div></div>
+        <p class="mock-cap">Design mockup of the approval sheet at elevated risk: a brass gauge counting to expiry, the item name leading the readout, provenance in mono, a slide instead of a tap.</p>
+      </div>
+      <div>
+        <div class="ladder mt-s">
+          <div class="rung"><span class="lv" style="color:var(--cobalt)">routine</span><span>Known process, dev vault</span><span class="act">tap to approve</span></div>
+          <div class="rung"><span class="lv" style="color:var(--brass)">elevated</span><span>Production vault, or a process seen for the first time, with one reason line</span><span class="act">slide to approve</span></div>
+          <div class="rung"><span class="lv" style="color:var(--deny)">critical</span><span>Signature to a production host, bulk reads</span><span class="act">hold to approve</span></div>
+        </div>
+        <div class="prose mt-m">
+          <p>Every approve additionally passes a hardware biometric: the secure element will not release the unwrap key without it, so a stolen unlocked phone still cannot approve. A long press on deny offers "deny and block this process for an hour". An SSH request swaps the readout for the key label, target host, and challenge fingerprint, the two things worth verifying.</p>
+          <p>Deny is framed as the easy, safe default, never an alarm. There is no fear copy anywhere in the product: no shields, no glowing locks, no "you are protected". It is your own tool talking to you.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- transport + relay -->
+<section id="transport">
+  <div class="wrap">
+    <div class="sec-head">
+      <h2>The transport was never the security layer</h2>
+      <p>Every message on every rung is the same sealed, signed envelope between keys pinned in person at pairing. The phone tries rungs in order; the daemon accepts any of them identically.</p>
+    </div>
+    <div class="ladder">
+      <div class="rung"><span class="lv" style="color:var(--cobalt)">1 · LAN</span><span>At home the app finds the daemon over Bonjour. Zero infrastructure, zero third parties.</span><span class="act">direct</span></div>
+      <div class="rung"><span class="lv" style="color:var(--cobalt)">2 · your endpoint</span><span>A DDNS name or IPv6 address with one forwarded port. Unauthenticated bytes drop on the first frame. Optional; CGNAT blocks it.</span><span class="act">direct</span></div>
+      <div class="rung"><span class="lv" style="color:var(--brass)">3 · blind relay</span><span>A ciphertext mailbox that stores and forwards opaque envelopes it can neither read, forge, nor replay. Self-host the Worker in your own account, or run the protocol-identical Bun server. The daemon connects outbound, so this rung needs no port forwarding.</span><span class="act">store &amp; forward</span></div>
+    </div>
+
+    <div class="cols mt-l">
+      <div>
+        <h3>What a malicious relay can do, exhaustively</h3>
+        <p class="muted mt-s" style="font-size:0.95rem">You cannot prove what a remote server runs, so the proof is client-side: the relay is given no role that requires trust. It does not even distribute keys, because pairing is out-of-band by QR, so there is no man-in-the-middle surface at all.</p>
+        <ul class="notes mt-s">
+          <li><b>Drop or delay traffic.</b> This is a denial of service, and Latch fails closed: no envelope, no secret.</li>
+          <li><b>Observe metadata.</b> A pairing-hash mailbox address, timing, and blob sizes. Self-host to keep even that at home.</li>
+        </ul>
+      </div>
+      <div>
+        <h3>What it can never do</h3>
+        <p class="muted mt-s" style="font-size:0.95rem">Its complete behaviour is enumerable, and every entry is neutralized in client code you can read and build.</p>
+        <ul class="notes mt-s">
+          <li>Read a request, or learn a secret name, account, or command.</li>
+          <li>Mint an approval, or replay or reorder a real one.</li>
+          <li>Learn who you are: no accounts, no email, no push token. Mailboxes are a hash of the two paired public keys, self-authenticating and squat-proof.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="claim mt-l">
+      <span class="k">Claim, code, test</span>
+      <p><strong>The powerlessness is demonstrated, not asserted.</strong> The repository ships a deliberately hostile relay that tampers, replays, forges, and stalls, alongside a client test suite that must reject every attack and fail closed, plus a map from each security claim to the code that enforces it and the test that exercises it. The protocol core and that suite live in <code>crates/proto</code> and run on every platform.</p>
+    </div>
+  </div>
+</section>
+
+<!-- platforms -->
+<section id="platforms">
+  <div class="wrap">
+    <div class="sec-head">
+      <h2>One machine, different skins</h2>
+      <p>Nothing in the core is Apple-specific. The crypto, pairing ceremony, leases, relay, and audit model run unchanged everywhere; each platform only supplies its own answer to five seams: keystore, biometric, push, service manager, and socket.</p>
+    </div>
+    <div class="platforms">
+      <div class="plat">
+        <div class="role">approver</div>
+        <div class="nm">iPhone</div>
+        <div class="ds">Expo app, SwiftUI primitives, Secure Enclave keys, Face ID.</div>
+        <div class="st st-dev">in development</div>
+      </div>
+      <div class="plat">
+        <div class="role">approver</div>
+        <div class="nm">Android</div>
+        <div class="ds">Same Expo codebase, Jetpack Compose, StrongBox, BiometricPrompt.</div>
+        <div class="st st-dev">planned · v2</div>
+      </div>
+      <div class="plat">
+        <div class="role">daemon host</div>
+        <div class="nm">macOS</div>
+        <div class="ds">launchd agent, Keychain, SwiftUI configurator and menubar with Touch ID.</div>
+        <div class="st st-dev">in development</div>
+      </div>
+      <div class="plat">
+        <div class="role">daemon host</div>
+        <div class="nm">Linux</div>
+        <div class="ds">systemd user service, libsecret or kernel keyring, phone-only approval.</div>
+        <div class="st st-dev">planned · v2</div>
+      </div>
+      <div class="plat">
+        <div class="role">daemon host</div>
+        <div class="nm">Windows</div>
+        <div class="ds">Windows Service, Credential Manager, Windows Hello, named-pipe agent.</div>
+        <div class="st st-dev">planned · v2</div>
+      </div>
+    </div>
+    <p class="mt-m muted" style="font-size:0.92rem;max-width:70ch">The daemon, CLI, and shim are <strong>one Rust binary</strong> cross-compiled to a standalone, statically linked target per desktop, so installing Latch is copying a file with no runtime to install. The shim is that same binary invoked through an <code>op</code> symlink. The phone is one Expo codebase where the UI layer renders SwiftUI on iOS and Jetpack Compose on Android. All five platforms are committed targets; the seam abstractions exist from the first version so the later ports are fills, not rewrites.</p>
+  </div>
+</section>
+
+<!-- terminal -->
+<section id="cli">
+  <div class="wrap">
+    <div class="sec-head">
+      <h2>The daemon speaks plainly</h2>
+      <p>The <code>latch</code> CLI carries the same restraint as the apps: aligned columns, one cobalt accent, semantic green, brass, and rust, no banners. It respects <code>NO_COLOR</code> and non-TTY output.</p>
+    </div>
+    <div class="term plain">
+      <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="lbl">latch logs -f</span></div>
+<pre><span class="t-faint">$</span> latch logs -f
+<span class="t-dim">14:02:11</span>  read  Engineering/.env <span class="t-faint">›</span> graphql-api  <span class="t-dim">claude · ~/Projects/rowm</span>  <span class="t-ok">✓ approved</span> <span class="t-dim">8.2s phone</span>
+<span class="t-dim">14:02:40</span>  ssh   github-deploy <span class="t-faint">→</span> git@github.com  <span class="t-dim">ssh · ~/Projects/rowm</span>    <span class="t-ok">✓ approved</span> <span class="t-dim">0.1s lease</span>
+<span class="t-dim">14:31:07</span>  read  AWS-prod/access-key           <span class="t-dim">zsh · ~/Projects/infra</span>   <span class="t-deny">✗ denied</span> <span class="t-dim">"not me"</span>
+<span class="t-dim">15:12:44</span>  read  Engineering/.env <span class="t-faint">›</span> admin-app    <span class="t-dim">claude · ~/Projects/rowm</span> <span class="t-brass">⠿ awaiting 0:52</span></pre>
+    </div>
+
+    <div class="tblwrap mt-m">
+      <table>
+        <tr><th class="mono">command</th><th>does</th></tr>
+        <tr><td class="mono">latch setup</td><td>first run: keys, encrypted store, shim install, service registration, pairing QR; ends by printing the status panel</td></tr>
+        <tr><td class="mono">latch pair</td><td>QR plus six-word fingerprint in the terminal, for re-pairing or a second device</td></tr>
+        <tr><td class="mono">latch account add · list · rotate · remove</td><td>service-account token lifecycle; tokens arrive via stdin, never argv</td></tr>
+        <tr><td class="mono">latch status · logs [-f]</td><td>the panels above; the audit log is append-only, names never values</td></tr>
+        <tr><td class="mono">latch lockdown [--clear]</td><td>seal or unseal; clearing needs a biometric</td></tr>
+        <tr><td class="mono">latch doctor</td><td>PATH shim check, socket health, token validity, vault table, clock skew</td></tr>
+      </table>
+    </div>
+
+    <div class="mt-l">
+      <h3>Getting it</h3>
+      <p class="muted mt-s" style="font-size:0.92rem;max-width:64ch">No builds are published yet. The protocol core is under construction in the open; once the daemon lands, first run is a single command that walks the pairing ceremony and prints the status panel.</p>
+      <div class="install mt-s">
+        <code><span class="p">$</span> latch setup</code>
+        <button class="copybtn" type="button" data-copy="latch setup">Copy</button>
+      </div>
+      <p class="mt-s"><span class="status-pill">daemon and phone app in development</span></p>
+    </div>
+  </div>
+</section>
+
+<!-- footer -->
+<footer class="foot">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div>
+        <span class="brand">latch<span class="cursor">_</span></span>
+        <p class="tag">A personal instrument for approving 1Password secret access from your phone. Built for one user; the team never knows it exists.</p>
+      </div>
+      <div class="foot-links">
+        <div class="foot-col">
+          <h5>Read</h5>
+          <a href="trust.html">Trust model</a>
+          <a href="#how">How it works</a>
+          <a href="#transport">Transport ladder</a>
+        </div>
+        <div class="foot-col">
+          <h5>Build</h5>
+          <a href="#repo">Source</a>
+          <!-- TODO: link to a hosted copy of docs/design/latch-design-brief.html if published -->
+          <a href="#repo">Design brief</a>
+          <a href="#platforms">Platforms</a>
+        </div>
+      </div>
+    </div>
+    <p class="foot-fine">No secret caching. No analytics. No accounts. Everything fails closed.</p>
+  </div>
+</footer>
+
+<script>
+  // Sole script on the page: copy the install command to the clipboard.
+  document.querySelectorAll(".copybtn").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var text = btn.getAttribute("data-copy") || "";
+      navigator.clipboard.writeText(text).then(function () {
+        var prev = btn.textContent;
+        btn.textContent = "Copied";
+        btn.classList.add("copied");
+        setTimeout(function () { btn.textContent = prev; btn.classList.remove("copied"); }, 1600);
+      }).catch(function () { btn.textContent = "Copy failed"; });
+    });
+  });
+</script>
+
+</body>
+</html>

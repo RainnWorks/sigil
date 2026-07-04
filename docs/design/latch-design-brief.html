@@ -266,7 +266,7 @@
     <span class="chip">personal tool, <b>not a product</b></span>
     <span class="chip">phone · <b>Expo: SwiftUI on iOS, Compose on Android</b></span>
     <span class="chip">Mac · <b>SwiftUI + Liquid Glass</b></span>
-    <span class="chip">daemon + CLI · <b>Bun · macOS, Linux, Windows</b></span>
+    <span class="chip">daemon + CLI + shim · <b>one Rust binary · macOS, Linux, Windows</b></span>
     <span class="chip">transport · <b>E2E · direct first, blind relay fallback</b></span>
   </div>
   <nav class="toc">
@@ -317,7 +317,7 @@
     <div class="link"><span class="arrow">→</span><span class="lbl">unix socket 0600<br>argv · cwd · stdin</span></div>
     <div class="node hero">
       <h5>Latch daemon</h5>
-      <div class="sub">Bun · launchd agent · Mac</div>
+      <div class="sub">Rust · launchd agent · Mac</div>
       <ul>
         <li>encrypted SA tokens + vault routing table</li>
         <li>spawns op per request, pipes stdout to caller fd</li>
@@ -465,7 +465,7 @@
 
 <h2 id="ports">Android, Windows, Linux: the same machine, different skins</h2>
 <div class="prose">
-  <p>Nothing in the core is Apple-specific. The crypto, envelopes, pairing ceremony, leases, relay, and audit model run unchanged everywhere; each platform only supplies its own answer to five seams. The daemon, CLI, and shim are one Bun codebase cross-compiled to standalone single-file binaries (<code>bun build --compile</code> targets macOS arm64 and x64, Linux arm64 and x64, and Windows x64), so installing Latch on any desktop is copying a binary, with no runtime to install. The phone app is one Expo codebase where <code>@expo/ui</code> renders SwiftUI on iOS and Jetpack Compose on Android.</p>
+  <p>Nothing in the core is Apple-specific. The crypto, envelopes, pairing ceremony, leases, relay, and audit model run unchanged everywhere; each platform only supplies its own answer to five seams. The daemon, CLI, and shim are one Rust codebase cross-compiled to standalone single-file binaries (<code>cargo build --release</code> targets macOS arm64 and x64, Linux arm64 and x64, and Windows x64; the whole desktop install is one binary around half a megabyte, no runtime to install). The phone app is one Expo codebase where <code>@expo/ui</code> renders SwiftUI on iOS and Jetpack Compose on Android.</p>
 </div>
 
 <h3>Daemon hosts</h3>
@@ -653,7 +653,7 @@
   <li><strong>Trust is proven client-side</strong>: the relay is anonymous (key-hash mailboxes, no accounts, no APNs token), holds no key-distribution role, and its powerlessness is demonstrated by a hostile-relay test suite shipped in the repo rather than asserted.</li>
   <li><strong>Leases over per-call approvals</strong>: caller identity is a daemon-verified fingerprint (code-signing chain + project root + scope), and a session approval holds the unwrapped token in RAM for the TTL. Identical requests coalesce behind one decision, so a burst costs one glance.</li>
   <li><strong>Shim exits like real op</strong> (code 1, clear stderr) so existing error handling in the monorepo works untouched; opt-in distinct exit codes.</li>
-  <li><strong>Stack</strong>: phone = one Expo codebase, @expo/ui rendering SwiftUI on iOS (with expo-glass-effect) and Jetpack Compose on Android; Mac = pure SwiftUI with Liquid Glass (Expo has no macOS target); Linux and Windows get CLI-first config with minimal trays; daemon, CLI, shim = one Bun codebase cross-compiled to standalone binaries for every desktop (no runtime to install; the Keychain ACL and Authenticode caller checks bind to these signed binaries).</li>
+  <li><strong>Stack</strong>: phone = one Expo codebase, @expo/ui rendering SwiftUI on iOS (with expo-glass-effect) and Jetpack Compose on Android; Mac = pure SwiftUI with Liquid Glass (Expo has no macOS target); Linux and Windows get CLI-first config with minimal trays; daemon, CLI, shim = one Rust codebase cross-compiled to standalone binaries for every desktop (~half a MB, no runtime to install; the Keychain ACL and Authenticode caller checks bind to these signed binaries). Bun survives only as the optional relay-server variant.</li>
   <li><strong>Portability by seams</strong>: keystore, biometric, push, service manager, and socket are the only platform-specific layers; crypto, pairing, leases, relay, and the proof suite are shared code everywhere.</li>
 </ul>
 
