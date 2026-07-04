@@ -45,6 +45,11 @@ uuid.workspace = true
 # runtime. Feature set kept to the listener plus signal handling.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
 
+# latch-softphone: the reference approver, used by the remote e2e integration
+# test to stand in for a paired phone. Dev-only; never linked into the daemon.
+[dev-dependencies]
+latch-softphone = { path = "../softphone" }
+
 # security-framework: macOS Keychain blob storage and the Secure Enclave seam.
 # macOS-only so Linux/Windows fills stay dependency-free.
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -22,6 +22,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::keystore::Keystore;
+use crate::secrets::Dek;
 
 /// Default wait for a local decision before failing closed.
 pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -46,6 +47,39 @@ impl Decision {
     }
 }
 
+/// The full result of an approval: the [`Decision`], plus the DEK when the
+/// approving factor *supplied* one.
+///
+/// This is the seam that lets the inert daemon serve a secret with no key at
+/// rest. The local approver (Touch ID / control socket) returns `dek: None`; the
+/// daemon then unwraps the DEK from its own keystore. The remote approver (the
+/// paired phone / softphone) returns `dek: Some(_)`: the phone holds the one DEK
+/// and delivers it, re-sealed to the daemon, per approval. Either way the DEK is
+/// used once and zeroized (`Dek` is `Zeroizing`).
+#[derive(Clone)]
+pub struct ApprovalOutcome {
+    pub decision: Decision,
+    pub dek: Option<Dek>,
+}
+
+impl ApprovalOutcome {
+    /// A decision with no DEK: the daemon unwraps its own key (local path).
+    pub fn local(decision: Decision) -> Self {
+        Self {
+            decision,
+            dek: None,
+        }
+    }
+
+    /// A grant that carries the phone-delivered DEK (remote path).
+    pub fn with_dek(decision: Decision, dek: Dek) -> Self {
+        Self {
+            decision,
+            dek: Some(dek),
+        }
+    }
+}
+
 /// What the approver is shown about a request. Names and provenance only; never
 /// a secret value.
 #[derive(Debug, Clone)]
@@ -62,9 +96,11 @@ pub struct ApprovalContext {
     pub cwd: String,
 }
 
-/// Resolves an approval request to a decision. Blocking; may time out to `Deny`.
+/// Resolves an approval request to an [`ApprovalOutcome`]. Blocking; may time
+/// out to a `Deny` outcome. Every failure path must fail closed (return a `Deny`
+/// outcome, never a grant).
 pub trait Approver: Send + Sync {
-    fn decide(&self, ctx: &ApprovalContext) -> Decision;
+    fn decide(&self, ctx: &ApprovalContext) -> ApprovalOutcome;
 }
 
 /// Registry of pending local approvals, keyed by request id. Shared between the
@@ -185,7 +221,17 @@ impl LocalApprover {
 }
 
 impl Approver for LocalApprover {
-    fn decide(&self, ctx: &ApprovalContext) -> Decision {
+    fn decide(&self, ctx: &ApprovalContext) -> ApprovalOutcome {
+        // The local approver never supplies a DEK; the daemon unwraps its own
+        // key from the keystore once the decision is a grant.
+        ApprovalOutcome::local(self.decide_local(ctx))
+    }
+}
+
+impl LocalApprover {
+    /// The local decision, without a DEK. Split out so [`Approver::decide`] just
+    /// wraps it in a DEK-less [`ApprovalOutcome`].
+    fn decide_local(&self, ctx: &ApprovalContext) -> Decision {
         // 1. Dev auto-approve switch.
         if let Some(d) = self.dev.decision() {
             return d;
@@ -221,9 +267,9 @@ impl Approver for LocalApprover {
     }
 }
 
-/// A slot behind which coalesced requests wait for one decision.
+/// A slot behind which coalesced requests wait for one outcome.
 struct Slot {
-    done: Mutex<Option<Decision>>,
+    done: Mutex<Option<ApprovalOutcome>>,
     cv: Condvar,
 }
 
@@ -245,8 +291,9 @@ impl ApprovalGate {
 
     /// Resolve `ctx`, coalescing behind any in-flight request with the same
     /// `key`. Exactly one caller (the leader) drives the approver; the rest
-    /// block on the shared slot and receive the same decision.
-    pub fn decide(&self, key: [u8; 32], ctx: &ApprovalContext) -> Decision {
+    /// block on the shared slot and receive a clone of the same outcome
+    /// (including the phone-delivered DEK, when present).
+    pub fn decide(&self, key: [u8; 32], ctx: &ApprovalContext) -> ApprovalOutcome {
         enum Role {
             Leader(Arc<Slot>),
             Follower(Arc<Slot>),
@@ -268,20 +315,20 @@ impl ApprovalGate {
 
         match role {
             Role::Leader(slot) => {
-                let decision = self.approver.decide(ctx);
+                let outcome = self.approver.decide(ctx);
                 // Publish, wake followers, and clear the in-flight entry so the
                 // next burst re-prompts.
                 self.inflight.lock().expect("gate poisoned").remove(&key);
-                *slot.done.lock().expect("slot poisoned") = Some(decision);
+                *slot.done.lock().expect("slot poisoned") = Some(outcome.clone());
                 slot.cv.notify_all();
-                decision
+                outcome
             }
             Role::Follower(slot) => {
                 let mut done = slot.done.lock().expect("slot poisoned");
                 while done.is_none() {
                     done = slot.cv.wait(done).expect("slot poisoned");
                 }
-                done.expect("decision published")
+                done.clone().expect("outcome published")
             }
         }
     }
@@ -310,10 +357,10 @@ mod tests {
         decision: Decision,
     }
     impl Approver for Counting {
-        fn decide(&self, _ctx: &ApprovalContext) -> Decision {
+        fn decide(&self, _ctx: &ApprovalContext) -> ApprovalOutcome {
             self.calls.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(40));
-            self.decision
+            ApprovalOutcome::local(self.decision)
         }
     }
 
@@ -326,7 +373,7 @@ mod tests {
         // The gate owns a thin forwarder to the shared Counting approver.
         struct Fwd(Arc<Counting>);
         impl Approver for Fwd {
-            fn decide(&self, c: &ApprovalContext) -> Decision {
+            fn decide(&self, c: &ApprovalContext) -> ApprovalOutcome {
                 self.0.decide(c)
             }
         }
@@ -338,6 +385,7 @@ mod tests {
             let gate = gate.clone();
             handles.push(std::thread::spawn(move || {
                 gate.decide(key, &ctx(&format!("id-{i}"), "read .env"))
+                    .decision
             }));
         }
         for h in handles {
@@ -358,13 +406,19 @@ mod tests {
         });
         struct Fwd(Arc<Counting>);
         impl Approver for Fwd {
-            fn decide(&self, c: &ApprovalContext) -> Decision {
+            fn decide(&self, c: &ApprovalContext) -> ApprovalOutcome {
                 self.0.decide(c)
             }
         }
         let gate = ApprovalGate::new(Box::new(Fwd(counting.clone())));
-        assert_eq!(gate.decide([1u8; 32], &ctx("a", "s1")), Decision::Deny);
-        assert_eq!(gate.decide([2u8; 32], &ctx("b", "s2")), Decision::Deny);
+        assert_eq!(
+            gate.decide([1u8; 32], &ctx("a", "s1")).decision,
+            Decision::Deny
+        );
+        assert_eq!(
+            gate.decide([2u8; 32], &ctx("b", "s2")).decision,
+            Decision::Deny
+        );
         assert_eq!(counting.calls.load(Ordering::SeqCst), 2);
     }
 
@@ -373,11 +427,14 @@ mod tests {
         let ks: Arc<dyn Keystore> = Arc::new(crate::keystore::MemoryKeystore::new());
         let approver = LocalApprover::new(ks.clone(), Arc::new(PendingRegistry::new()))
             .with_dev(DevMode::Approve);
-        assert_eq!(approver.decide(&ctx("x", "s")), Decision::Approve);
+        assert_eq!(approver.decide(&ctx("x", "s")).decision, Decision::Approve);
 
         let lease = LocalApprover::new(ks, Arc::new(PendingRegistry::new()))
             .with_dev(DevMode::Lease(Duration::from_secs(60)));
-        assert!(matches!(lease.decide(&ctx("x", "s")), Decision::Lease(_)));
+        assert!(matches!(
+            lease.decide(&ctx("x", "s")).decision,
+            Decision::Lease(_)
+        ));
     }
 
     #[test]
@@ -407,7 +464,7 @@ mod tests {
 
         let approver = Arc::new(approver);
         let a2 = approver.clone();
-        let handle = std::thread::spawn(move || a2.decide(&ctx("req-1", "read .env")));
+        let handle = std::thread::spawn(move || a2.decide(&ctx("req-1", "read .env")).decision);
 
         // Wait for the approver to register the pending id, then resolve it.
         let mut tries = 0;
@@ -427,6 +484,9 @@ mod tests {
         let approver = LocalApprover::new(ks, pending)
             .with_dev(DevMode::Off)
             .with_timeout(Duration::from_millis(30));
-        assert_eq!(approver.decide(&ctx("req-2", "read .env")), Decision::Deny);
+        assert_eq!(
+            approver.decide(&ctx("req-2", "read .env")).decision,
+            Decision::Deny
+        );
     }
 }

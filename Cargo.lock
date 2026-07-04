@@ -373,6 +373,7 @@ dependencies = [
  "base64",
  "blake2",
  "latch-proto",
+ "latch-softphone",
  "libc",
  "rand_core",
  "security-framework",
@@ -398,6 +399,17 @@ dependencies = [
  "thiserror",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "latch-softphone"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "latch-proto",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

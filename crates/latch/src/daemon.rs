@@ -292,24 +292,31 @@ fn fulfill(
         provenance: caller.provenance(),
         cwd: cwd.to_string(),
     };
-    let decision = core.gate.decide(gk, &ctx);
+    let outcome = core.gate.decide(gk, &ctx);
+    let decision = outcome.decision;
     if !decision.is_grant() {
         return fail_closed(stderr, "op: request denied\n");
     }
 
-    // Unwrap the DEK (biometric on macOS), decrypt the one token, and drop the
-    // DEK immediately. Both live in `Zeroizing`, wiped on drop.
-    let dek = match core
-        .keystore
-        .unwrap_dek(&format!("Approve {scope} for {account_label}"))
-    {
-        Ok(dek) => dek,
-        Err(e) => {
-            return fail_closed(
-                stderr,
-                &format!("op: latch could not unwrap the key: {e}\n"),
-            )
-        }
+    // The DEK either arrived with the approval (a paired phone delivered it,
+    // re-sealed to this daemon) or must be unwrapped from the local keystore
+    // (Touch ID on macOS). The remote path is the inert-daemon case: no key at
+    // rest. Decrypt the one token and drop the DEK immediately; both live in
+    // `Zeroizing`, wiped on drop.
+    let dek = match outcome.dek {
+        Some(dek) => dek,
+        None => match core
+            .keystore
+            .unwrap_dek(&format!("Approve {scope} for {account_label}"))
+        {
+            Ok(dek) => dek,
+            Err(e) => {
+                return fail_closed(
+                    stderr,
+                    &format!("op: latch could not unwrap the key: {e}\n"),
+                )
+            }
+        },
     };
     let token = match secrets::decrypt_token(&dek, &ciphertext) {
         Ok(t) => t,
@@ -655,6 +662,219 @@ mod tests {
             local::recv_reply(&mut client).unwrap(),
             Reply::Exit { code: 0 }
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- remote (phone) approval end-to-end -------------------------------
+    //
+    // The milestone: an approval satisfied by a PAIRED REMOTE approver (the
+    // softphone) over a transport, with NO key at rest in the daemon. A request
+    // flows shim -> daemon -> seal -> local transport -> softphone -> decision
+    // (+ DEK on approve) -> daemon decrypts the token -> fake op -> the secret
+    // reaches the caller's fd. Nothing here uses the local keystore's DEK; the
+    // daemon's keystore is a fresh MemoryKeystore with no DEK provisioned.
+
+    use crate::remote::RemoteApprover;
+    use latch_proto::identity::DeviceIdentity;
+    use latch_proto::pairing::{DaemonPairing, Dek as ProtoDek};
+    use latch_proto::{LocalRelay, PairingState};
+    use latch_softphone::{Pairing, Policy, Softphone};
+    use zeroize::Zeroizing;
+
+    const REMOTE_NOW: u64 = 1_720_000_000_000;
+
+    fn clone_device(id: &DeviceIdentity) -> DeviceIdentity {
+        DeviceIdentity {
+            signing: id.signing.clone(),
+            agreement: id.agreement.clone(),
+        }
+    }
+
+    /// Pair a softphone to a fresh daemon identity in-process and return the
+    /// pieces the daemon side needs: the daemon identity (for the approver), the
+    /// paired softphone (holding the DEK), and the raw 32-byte DEK (so the test
+    /// can seal the account token under the same key).
+    fn pair_softphone(policy: Policy) -> (DeviceIdentity, Softphone, [u8; 32]) {
+        let daemon_id = DeviceIdentity::generate();
+        let daemon_for_approver = clone_device(&daemon_id);
+        let (mut daemon, payload) =
+            DaemonPairing::mint(daemon_id, vec!["lan://latch.local:4823".into()], REMOTE_NOW);
+
+        let phone_id = DeviceIdentity::generate();
+        let (mut pairing, resp) =
+            Pairing::scan_payload(phone_id, payload, REMOTE_NOW + 1_000, policy).unwrap();
+        daemon.receive_response(&resp, REMOTE_NOW + 2_000).unwrap();
+        assert_eq!(daemon.sas_words().unwrap(), pairing.sas_words());
+        daemon.confirm().unwrap();
+        pairing.confirm().unwrap();
+
+        // The one DEK: delivered to the phone via pairing, and (below) used to
+        // seal the account token so the phone-returned key decrypts it.
+        let dek_bytes = *ProtoDek::generate().as_bytes();
+        let env = daemon
+            .deliver_dek(&ProtoDek::from_bytes(dek_bytes), 1)
+            .unwrap();
+        assert_eq!(daemon.state(), PairingState::DekDelivered);
+        let softphone = pairing.receive_dek(&env).unwrap();
+
+        (daemon_for_approver, softphone, dek_bytes)
+    }
+
+    /// Build an inert daemon core whose approval gate is a [`RemoteApprover`]
+    /// wired to `relay`, with the account token sealed under `dek_bytes`.
+    fn remote_core(
+        dir: &Path,
+        daemon_id: DeviceIdentity,
+        phone: latch_proto::PeerIdentity,
+        relay: LocalRelay,
+        dek_bytes: [u8; 32],
+        token: &str,
+        secret: &str,
+    ) -> Arc<Core> {
+        // The account store: token ciphertext sealed under the shared DEK. The
+        // daemon holds NO DEK of its own.
+        let sealing_dek: crate::secrets::Dek = Zeroizing::new(dek_bytes);
+        let mut accounts = AccountStore::default();
+        accounts
+            .add(
+                "Rowm",
+                &sealing_dek,
+                token.as_bytes(),
+                vec!["Engineering".into()],
+            )
+            .unwrap();
+
+        let approver = RemoteApprover::new(Arc::new(relay), daemon_id, phone)
+            .with_timeout(Duration::from_secs(3));
+        let pending = Arc::new(PendingRegistry::new());
+        Arc::new(Core {
+            keystore: Arc::new(MemoryKeystore::new()), // no DEK at rest
+            accounts: Mutex::new(accounts),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(approver)),
+            pending,
+            lockdown: AtomicBool::new(false),
+            proc_table: Box::new(EmptyTable),
+            op_path: Some(write_fake_op(dir, token, secret)),
+            lease_ttl: Duration::from_secs(60),
+        })
+    }
+
+    /// Run the softphone's serve loop on a background thread until the returned
+    /// flag is set. Returns the flag and the join handle.
+    fn spawn_approver(
+        softphone: Arc<Softphone>,
+        relay: LocalRelay,
+    ) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let handle = std::thread::spawn(move || {
+            softphone.serve(&relay, &stop, Duration::from_millis(25));
+        });
+        (shutdown, handle)
+    }
+
+    #[test]
+    fn remote_softphone_approval_delivers_secret_over_the_socket() {
+        let dir = tmpdir("remote-approve");
+        let relay = LocalRelay::new();
+        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Approve);
+        let phone_pub = softphone.phone_identity();
+        let mailbox = softphone.mailbox();
+
+        let core = remote_core(
+            &dir,
+            daemon_id,
+            phone_pub,
+            relay.clone(),
+            dek_bytes,
+            "remote-token-xyz",
+            "remote-secret-99",
+        );
+
+        let softphone = Arc::new(softphone);
+        let (shutdown, approver_thread) = spawn_approver(softphone.clone(), relay.clone());
+
+        // Drive a full op request over the socket, exactly like the shim would.
+        let (client, server) = UnixStream::pair().unwrap();
+        let (read_end, write_end) = pipe();
+        let (err_r, err_w) = pipe();
+        let argv = vec![
+            "op".into(),
+            "read".into(),
+            "op://Engineering/.env/password".into(),
+        ];
+        local::send_frame(
+            &client,
+            &Frame::Op {
+                argv,
+                cwd: String::new(),
+            },
+            &[write_end.as_raw_fd(), err_w.as_raw_fd()],
+        )
+        .unwrap();
+        drop(write_end);
+        drop(err_w);
+
+        let worker = std::thread::spawn(move || handle_conn(core, server));
+        worker.join().unwrap().unwrap();
+
+        // The secret reached the caller's stdout fd, and only via the phone's DEK.
+        assert_eq!(read_all(read_end), "remote-secret-99");
+        let mut client = client;
+        assert_eq!(
+            local::recv_reply(&mut client).unwrap(),
+            Reply::Exit { code: 0 }
+        );
+
+        // The phone->daemon queue is drained; nothing left buffered.
+        assert_eq!(
+            relay.depth(mailbox, latch_proto::Direction::ToDaemon),
+            0,
+            "the response was consumed by the daemon"
+        );
+        let _ = err_r;
+
+        shutdown.store(true, Ordering::SeqCst);
+        approver_thread.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remote_softphone_denial_fails_closed_with_no_secret() {
+        let dir = tmpdir("remote-deny");
+        let relay = LocalRelay::new();
+        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Deny);
+        let phone_pub = softphone.phone_identity();
+
+        let core = remote_core(
+            &dir,
+            daemon_id,
+            phone_pub,
+            relay.clone(),
+            dek_bytes,
+            "tok",
+            "should-never-appear",
+        );
+
+        let softphone = Arc::new(softphone);
+        let (shutdown, approver_thread) = spawn_approver(softphone.clone(), relay.clone());
+
+        let (read_end, write_end) = pipe();
+        let (err_r, err_w) = pipe();
+        let argv = vec![
+            "op".into(),
+            "read".into(),
+            "op://Engineering/.env/password".into(),
+        ];
+        let code = fulfill(&core, &argv, "", None, Some(write_end), Some(err_w));
+
+        assert_eq!(code, 1, "a remote denial must fail closed");
+        assert_eq!(read_all(read_end), "", "no secret on a denied request");
+        assert!(read_all(err_r).contains("denied"));
+
+        shutdown.store(true, Ordering::SeqCst);
+        approver_thread.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 

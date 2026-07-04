@@ -12,6 +12,8 @@ pub mod fingerprint;
 pub mod identity;
 pub mod pairing;
 pub mod replay;
+pub mod request;
+pub mod transport;
 
 pub use envelope::{Envelope, OpenError, SealError};
 pub use fingerprint::{fingerprint_words, mailbox_id};
@@ -22,6 +24,11 @@ pub use pairing::{
     PAIRING_SECRET_TTL_MS,
 };
 pub use replay::{ReplayError, ReplayGuard};
+pub use request::{
+    ApprovalRequest, ApprovalResponse, BlockDirective, Decision, InstallLease, Provenance,
+    RequestKind, RiskLevel, SecretRef, SshChallenge,
+};
+pub use transport::{Direction, LocalRelay, Transport, TransportError};
 
 /// Maximum allowed clock skew between sender and receiver, in milliseconds.
 pub const REPLAY_WINDOW_MS: u64 = 90_000;

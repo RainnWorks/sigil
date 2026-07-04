@@ -104,6 +104,13 @@ fn canonical_bytes(e: &Envelope) -> Vec<u8> {
 }
 
 impl Envelope {
+    /// The canonical byte string the signature covers: length-prefixed fields
+    /// in a fixed order, so no two distinct envelopes share a canonical form.
+    /// Exposed for the shared Rust<->TS test vectors, which pin this encoding.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        canonical_bytes(self)
+    }
+
     /// Seal `payload` for the pinned `recipient`, signed by `sender_signing`.
     ///
     /// A fresh ephemeral X25519 key is generated per envelope; the recipient
