@@ -47,6 +47,13 @@ uuid.workspace = true
 # tokio: async accept loop for the daemon only; the shim path never builds a
 # runtime. Feature set kept to the listener plus signal handling.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
+# latch-relay-client already provides the daemon WS transport; the softphone is
+# a dev-dep. The pairing rendezvous uses relay-client's raw Rendezvous client.
+# qrcode: render the pairing payload as a scannable QR in the terminal (unicode
+# half-blocks). default-features off drops the `image`/`svg` renderers and their
+# deps; only the pure `render::unicode` string renderer is used, so no image
+# stack enters the single binary.
+qrcode = { version = "0.14", default-features = false }
 
 # latch-softphone: the reference approver, used by the remote e2e integration
 # test to stand in for a paired phone. Dev-only; never linked into the daemon.

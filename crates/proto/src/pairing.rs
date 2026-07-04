@@ -114,6 +114,8 @@ impl PairingPayload {
 
 /// Domain separation for everything the pairing handshake hashes or MACs.
 const PAIRING_DOMAIN: &[u8] = b"latch.pairing.v1";
+/// Domain for the pairing rendezvous mailbox (message 1 and 3 transport).
+const RENDEZVOUS_DOMAIN: &[u8] = b"latch.pairing.rendezvous.v1";
 /// Label deriving the confirmation-MAC subkey from the pairing secret. Distinct
 /// label => distinct key => no key reuse across purposes.
 const SUBKEY_CONFIRM_LABEL: &[u8] = b"confirm-tag";
@@ -178,6 +180,27 @@ fn pairing_transcript(
     absorb(&mut h, &phone.verifying);
     absorb(&mut h, &phone.agreement);
     absorb(&mut h, nonce);
+    let digest = h.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..32]);
+    out
+}
+
+/// The bootstrap mailbox both parties route the pairing messages on, before the
+/// phone's key is pinned and the steady-state [`mailbox_id`](crate::mailbox_id)
+/// can be computed.
+///
+/// It is derived from the daemon's pinned identity and the one-time pairing
+/// secret, both carried in the QR, so only a party holding the scanned QR can
+/// compute it. The relay sees an opaque 32-byte id and learns nothing about the
+/// pairing. It is distinct from the steady-state mailbox (different domain), so
+/// pairing traffic and approval traffic never share a queue.
+pub fn rendezvous_mailbox(daemon: &PeerIdentity, secret: &PairingSecret) -> [u8; 32] {
+    let mut h = Blake2b512::new();
+    h.update(RENDEZVOUS_DOMAIN);
+    absorb(&mut h, &daemon.verifying);
+    absorb(&mut h, &daemon.agreement);
+    absorb(&mut h, secret.as_bytes());
     let digest = h.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest[..32]);

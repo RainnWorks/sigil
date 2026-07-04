@@ -15,9 +15,20 @@ pub mod keystore;
 pub mod keystore_macos;
 pub mod lease;
 pub mod local;
+pub mod pair;
+pub mod pairing_store;
 pub mod paths;
 pub mod provider;
 pub mod remote;
 pub mod secrets;
+pub mod service;
+pub mod setup;
 pub mod shim;
 pub mod style;
+
+/// A process-wide lock serializing tests that mutate global environment
+/// variables (`LATCH_HOME` in particular). Cargo runs a crate's tests in
+/// parallel threads of one process, so any test that sets a global env var must
+/// hold this for its duration or it will clobber (and be clobbered by) another.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

@@ -21,9 +21,13 @@
 
 mod daemon_ws;
 mod phone_http;
+mod rendezvous;
+mod rendezvous_ws;
 
 pub use daemon_ws::DaemonRelay;
 pub use phone_http::PhoneRelay;
+pub use rendezvous::Rendezvous;
+pub use rendezvous_ws::RendezvousWs;
 
 use latch_proto::envelope::Envelope;
 

@@ -3,9 +3,8 @@
 
 use std::io::Read;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 
-use latch_proto::{fingerprint_words, DeviceIdentity};
+use latch_proto::DeviceIdentity;
 use zeroize::Zeroizing;
 
 use crate::daemon;
@@ -25,7 +24,10 @@ pub fn run() -> i32 {
         "" | "status" => cmd_status(),
         "daemon" => cmd_daemon(&args[1..]),
         "doctor" => cmd_doctor(),
-        "pair" => cmd_pair(),
+        "setup" => cmd_setup(&args[1..]),
+        "pair" => cmd_pair(&args[1..]),
+        "unpair" => cmd_unpair(),
+        "start" | "stop" | "restart" => cmd_service(&args[0]),
         "account" => cmd_account(&args[1..]),
         "lease" => cmd_lease(&args[1..]),
         "lockdown" => cmd_lockdown(&args[1..]),
@@ -54,12 +56,16 @@ fn print_help() {
 
 usage: latch <command>
 
-  status            instrument panel: daemon, shim, op
+  status            instrument panel: daemon, shim, op, factor
+  setup             guided first run: shim, PATH, launchd, then pair
   daemon [--dev-insecure]  run the approval daemon (foreground). Without a
                     paired phone or a hardware biometric it fails closed;
                     --dev-insecure enables local self-approval for dev only.
-  doctor            diagnose shim ordering, socket, and op discovery
-  pair              show this device's identity and fingerprint words
+  doctor            diagnose shim drift, factor, relay, socket, and op
+  pair --relay <url>   pair a phone over the relay (renders a QR)
+  pair list         list paired devices
+  unpair            forget the paired phone
+  start|stop|restart   control the launchd daemon agent
   account add       add a service-account token (reads token from stdin)
   account list      list configured accounts and their vault routing
   lease list        list active session leases with countdowns
@@ -82,8 +88,7 @@ fn cmd_status() -> i32 {
     let s = Style::stdout();
     let up = daemon_up();
     let sock = local::socket_path();
-    let order = paths::path_order();
-    let shim_on_path = order.shim.is_some();
+    let shim = paths::ShimStatus::detect();
     let real_op = paths::find_real_op();
 
     let state = if up { s.ok("armed") } else { s.deny("down") };
@@ -102,18 +107,21 @@ fn cmd_status() -> i32 {
     };
     println!("  {}  {glyph} {}  {note}", s.dim("daemon"), pad(label, 13));
 
-    // shim
-    let (glyph, label, note) = if shim_on_path {
+    // shim (with drift detection)
+    let (glyph, label, note) = if shim.healthy() {
         let where_ = paths::shim_bin_dir()
             .map(|p| p.join("op").display().to_string())
             .unwrap_or_default();
         (s.ok("\u{2713}"), "on PATH", s.dim(&where_))
+    } else if let Some(issue) = shim.issue() {
+        let label = if shim.installed {
+            "drift"
+        } else {
+            "not installed"
+        };
+        (s.brass("\u{2717}"), label, s.brass(&issue))
     } else {
-        (
-            s.brass("\u{2717}"),
-            "not installed",
-            s.dim("run: latch shim install"),
-        )
+        (s.brass("\u{2717}"), "unknown", s.dim(""))
     };
     println!("  {}    {glyph} {}  {note}", s.dim("shim"), pad(label, 13));
 
@@ -140,6 +148,30 @@ fn cmd_status() -> i32 {
         )
     };
     println!("  {} {glyph} {}  {note}", s.dim("accounts"), pad(label, 13));
+
+    // factor: what the daemon would gate with (phone > biometric > fail closed).
+    let paired = crate::pairing_store::summary().ok().flatten();
+    let biometric = keystore::for_host().is_biometric();
+    let (glyph, label, note) = if let Some(p) = &paired {
+        (
+            s.ok("\u{25cf}"),
+            "paired phone",
+            s.dim(&format!("via {}", p.relay_url)),
+        )
+    } else if biometric {
+        (
+            s.ok("\u{25cf}"),
+            "biometric",
+            s.dim("hardware Touch ID (Secure Enclave)"),
+        )
+    } else {
+        (
+            s.brass("\u{2717}"),
+            "fail closed",
+            s.brass("no factor; run: latch pair"),
+        )
+    };
+    println!("  {}   {glyph} {}  {note}", s.dim("factor"), pad(label, 13));
 
     println!();
     println!(
@@ -380,37 +412,70 @@ fn cmd_doctor() -> i32 {
     println!("{}", s.cobalt("latch doctor"));
     println!();
 
-    let order = paths::path_order();
+    let shim = paths::ShimStatus::detect();
     let real_op = paths::find_real_op();
     let mut ok = true;
 
-    // 1. shim resolves before the real op.
-    let shim_first = match (order.shim, order.real_op) {
-        (Some(shim), Some(real)) => shim < real,
-        (Some(_), None) => true,
-        _ => false,
-    };
+    // 1. shim health (drift): installed, first on PATH, points at this binary.
     ok &= check(
         &s,
-        shim_first,
-        "shim resolves before real op",
-        match (order.shim, order.real_op) {
-            (None, _) => "shim not on PATH (run: latch shim install)",
-            (Some(shim), Some(real)) if shim >= real => "real op precedes the shim on PATH",
-            _ => "",
-        },
+        shim.healthy(),
+        "shim wins on PATH and is current",
+        &shim.issue().unwrap_or_default(),
     );
 
-    // 2. socket reachable.
+    // 2. daemon socket reachable.
     let up = daemon_up();
     ok &= check(
         &s,
         up,
         "daemon socket reachable",
-        if up { "" } else { "daemon not running" },
+        if up {
+            ""
+        } else {
+            "daemon not running (latch start)"
+        },
     );
 
-    // 3. real op found.
+    // 3. socket path fits sun_path (a too-long path binds a truncated name).
+    match crate::service::socket_path_fits() {
+        Ok(()) => {
+            ok &= check(&s, true, "socket path length ok", "");
+        }
+        Err(e) => {
+            ok &= check(&s, false, "socket path length ok", &e);
+        }
+    }
+
+    // 4. approving factor: paired phone > biometric > fail closed.
+    let paired = crate::pairing_store::summary().ok().flatten();
+    let biometric = keystore::for_host().is_biometric();
+    let (factor_ok, factor_hint) = match (&paired, biometric) {
+        (Some(_), _) => (true, "paired phone (sealed remote approval)".to_string()),
+        (None, true) => (true, "hardware biometric (Secure Enclave)".to_string()),
+        (None, false) => (
+            false,
+            "no factor: fails closed. Run `latch pair`, or start `--dev-insecure` for dev".into(),
+        ),
+    };
+    ok &= check(&s, factor_ok, "approving factor resolved", &factor_hint);
+
+    // 5. relay reachable, when a pairing names one.
+    if let Some(p) = &paired {
+        let reachable = relay_reachable(&p.relay_url);
+        ok &= check(
+            &s,
+            reachable,
+            "relay reachable",
+            if reachable {
+                ""
+            } else {
+                "cannot reach the paired relay (approvals will time out)"
+            },
+        );
+    }
+
+    // 6. a real op to run.
     ok &= check(
         &s,
         real_op.is_some(),
@@ -432,6 +497,40 @@ fn cmd_doctor() -> i32 {
     }
 }
 
+/// Best-effort relay reachability: parse `http(s)://host[:port]` and try a short
+/// TCP connect. Dependency-free (no HTTP client in this binary); a successful
+/// connect is enough to distinguish "relay down" from "relay up" for the doctor.
+fn relay_reachable(url: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    use std::time::Duration;
+
+    let (rest, default_port) = if let Some(r) = url.strip_prefix("https://") {
+        (r, 443u16)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (r, 80u16)
+    } else if let Some(r) = url.strip_prefix("wss://") {
+        (r, 443u16)
+    } else if let Some(r) = url.strip_prefix("ws://") {
+        (r, 80u16)
+    } else {
+        (url, 443u16)
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().unwrap_or(default_port)),
+        None => (authority, default_port),
+    };
+    let Ok(addrs) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    for addr in addrs {
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
 fn check(s: &Style, ok: bool, label: &str, hint: &str) -> bool {
     let glyph = if ok {
         s.ok("\u{2713}")
@@ -446,38 +545,281 @@ fn check(s: &Style, ok: bool, label: &str, hint: &str) -> bool {
     ok
 }
 
-fn cmd_pair() -> i32 {
-    let s = Style::stdout();
-    // v0 stub: mint a device identity and show the fingerprint ceremony format.
-    // The peer is a placeholder until real pairing transport lands in v1.
-    let device = DeviceIdentity::generate();
-    let placeholder_peer = DeviceIdentity::generate().peer_identity();
-    let words = fingerprint_words(&device.peer_identity(), &placeholder_peer);
+fn cmd_pair(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) == Some("list") {
+        return pair_list();
+    }
+    run_pairing(args)
+}
 
-    println!("{}", s.cobalt("latch pair"));
+/// `latch pair list` / `latch list-paired-devices`: show the persisted pairing.
+fn pair_list() -> i32 {
+    let s = Style::stdout();
+    match crate::pairing_store::summary() {
+        Ok(Some(p)) => {
+            println!("{}", s.cobalt("paired devices"));
+            println!();
+            let words = if p.sas_words.is_empty() {
+                s.dim("(no SAS on record)")
+            } else {
+                s.cobalt(&p.sas_words.join(&s.faint(" \u{00b7} ")))
+            };
+            println!("  {}  {}", s.dim("phone"), words);
+            println!("  {}  {}", s.dim("relay"), s.dim(&p.relay_url));
+            println!(
+                "  {}  {}",
+                s.dim("since"),
+                s.dim(&format_unix_ms(p.paired_at))
+            );
+            0
+        }
+        Ok(None) => {
+            println!(
+                "  {}",
+                s.dim("no paired phone; run: latch pair --relay <url>")
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("latch: reading pairing: {e}");
+            1
+        }
+    }
+}
+
+/// The real pairing ceremony: mint a QR, wait on the relay for the phone, verify,
+/// confirm SAS, deliver the DEK, and persist. `--relay <url>` or `$LATCH_RELAY_URL`.
+fn run_pairing(args: &[String]) -> i32 {
+    let s = Style::stdout();
+    let relay = flag_value(args, "--relay")
+        .map(str::to_string)
+        .or_else(|| std::env::var("LATCH_RELAY_URL").ok());
+    let Some(relay) = relay else {
+        eprintln!(
+            "usage: latch pair --relay <url>   (or set LATCH_RELAY_URL)\n\
+             \n\
+             The relay is the blind mailbox the Mac and phone meet on. Use your\n\
+             own (self-hosted) relay URL, e.g. https://relay.example."
+        );
+        return 2;
+    };
+    let auto_yes = has_flag(args, "--yes") || has_flag(args, "-y");
+
+    if crate::pairing_store::exists() {
+        println!(
+            "  {}",
+            s.brass(
+                "a phone is already paired; re-pairing will replace it (latch unpair to remove)"
+            )
+        );
+    }
+
+    let ks = keystore::for_host();
+    let daemon_identity = DeviceIdentity::generate();
+
+    let mut present_qr = |unicode: &str, b64: &str| {
+        println!("{}", s.cobalt("latch pair"));
+        println!();
+        println!(
+            "  {}",
+            s.dim("Scan this with the Latch approver on your phone:")
+        );
+        println!();
+        println!("{unicode}");
+        println!("  {}", s.faint("or paste this pairing code into the app:"));
+        println!("  {b64}");
+        println!();
+        println!("  {}", s.dim("Waiting for the phone to respond..."));
+    };
+    let mut confirm = |words: &[&'static str; 6]| -> bool {
+        println!();
+        println!(
+            "  {}",
+            s.dim("Confirm these six words match your phone's screen:")
+        );
+        println!("    {}", s.cobalt(&words.join(&s.faint(" \u{00b7} "))));
+        if auto_yes {
+            println!("  {}", s.faint("(--yes) confirmed"));
+            return true;
+        }
+        print!("  match? [y/N] ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return false;
+        }
+        matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    };
+    let mut make_channel = |mailbox: [u8; 32]| crate::pair::relay_channel(&relay, mailbox);
+
+    let opts = crate::pair::CeremonyOpts {
+        relay_url: relay.clone(),
+        response_timeout: std::time::Duration::from_secs(180),
+        flush_grace: std::time::Duration::from_millis(750),
+        now: &latch_proto::now_ms,
+        make_channel: &mut make_channel,
+        present_qr: &mut present_qr,
+        confirm_sas: &mut confirm,
+    };
+
+    let new_pairing = match crate::pair::run_ceremony(daemon_identity, opts) {
+        Ok(np) => np,
+        Err(e) => {
+            eprintln!("{} pairing failed: {e:#}", s.deny("\u{2717}"));
+            return 1;
+        }
+    };
+
+    if let Err(e) = crate::pairing_store::save(ks.as_ref(), &new_pairing) {
+        eprintln!(
+            "{} pairing succeeded but could not be saved: {e}",
+            s.deny("\u{2717}")
+        );
+        return 1;
+    }
+
     println!();
+    println!("{} phone paired and saved", s.ok("\u{2713}"));
     println!(
         "  {}",
-        s.dim("Generated a fresh device identity (private half stays in memory;")
+        s.dim("the daemon now gates every request on your phone")
     );
     println!(
         "  {}",
-        s.dim("v0 has no keystore, so it is not persisted).")
-    );
-    println!();
-    println!(
-        "  {}",
-        s.dim("Fingerprint — confirm these six words on both devices:")
-    );
-    println!();
-    let joined = words.join(&s.faint(" · "));
-    println!("    {}", s.cobalt(&joined));
-    println!();
-    println!(
-        "  {}",
-        s.faint("Transport (QR exchange, relay, key pinning) lands in v1.")
+        s.faint("restart the daemon to arm it: latch restart")
     );
     0
+}
+
+fn cmd_unpair() -> i32 {
+    let s = Style::stdout();
+    let ks = keystore::for_host();
+    match crate::pairing_store::remove(ks.as_ref()) {
+        Ok(true) => {
+            println!("{} phone unpaired", s.ok("\u{2713}"));
+            println!(
+                "  {}",
+                s.brass(
+                    "the daemon will fail closed until you pair again or provision a biometric"
+                )
+            );
+            println!("  {}", s.faint("restart to apply: latch restart"));
+            0
+        }
+        Ok(false) => {
+            println!("  {}", s.dim("no phone was paired"));
+            0
+        }
+        Err(e) => {
+            eprintln!("latch: unpair failed: {e}");
+            1
+        }
+    }
+}
+
+fn cmd_setup(args: &[String]) -> i32 {
+    let s = Style::stdout();
+    println!("{}", s.cobalt("latch setup"));
+    println!();
+
+    // 1. Keystore DEK. On macOS this needs the Secure Enclave (NEEDS
+    //    VERIFICATION); a dev keystore provisions immediately. A failure here is
+    //    not fatal to the rest of setup, so we report and continue.
+    let ks = keystore::for_host();
+    match ks.ensure_dek() {
+        Ok(()) => println!("  {} keystore ready", s.ok("\u{2713}")),
+        Err(e) => println!(
+            "  {} keystore: {}",
+            s.brass("\u{2717}"),
+            s.dim(&e.to_string())
+        ),
+    }
+
+    // 2. Install the shim.
+    match crate::setup::install_shim() {
+        Ok((link, target)) => {
+            println!("  {} shim installed", s.ok("\u{2713}"));
+            println!(
+                "    {} {} -> {}",
+                s.dim("link"),
+                link.display(),
+                target.display()
+            );
+        }
+        Err(e) => {
+            eprintln!("  {} shim install failed: {e}", s.deny("\u{2717}"));
+            return 1;
+        }
+    }
+
+    // 3. Put the shim on PATH for interactive shells.
+    match crate::setup::ensure_profile_path() {
+        Ok(true) => println!(
+            "  {} added ~/.latch/bin to your shell profile (open a new shell)",
+            s.ok("\u{2713}")
+        ),
+        Ok(false) => println!("  {} shell profile already has the shim", s.ok("\u{2713}")),
+        Err(e) => println!(
+            "  {} shell profile: {}",
+            s.brass("\u{2717}"),
+            s.dim(&e.to_string())
+        ),
+    }
+
+    // 4. launchd agent (RunAtLoad + KeepAlive) with a shim-first PATH for GUI
+    //    tools. Mac-runtime; a bootstrap failure still leaves the plist written.
+    match crate::setup::install_and_load_agent() {
+        Ok(plist) => {
+            println!("  {} launchd agent loaded", s.ok("\u{2713}"));
+            println!("    {} {}", s.dim("plist"), plist.display());
+        }
+        Err(e) => println!(
+            "  {} launchd: {} {}",
+            s.brass("\u{2717}"),
+            s.dim(&e.to_string()),
+            s.faint("(you can load it later with: latch start)")
+        ),
+    }
+
+    // 5. Pairing, if a relay was given; else point the way.
+    println!();
+    if flag_value(args, "--relay").is_some() || std::env::var_os("LATCH_RELAY_URL").is_some() {
+        return run_pairing(args);
+    }
+    println!("  {}", s.dim("last step: pair your phone"));
+    println!("    {}", s.cobalt("latch pair --relay <url>"));
+    println!();
+    cmd_status()
+}
+
+fn cmd_service(verb: &str) -> i32 {
+    let s = Style::stdout();
+    let result = match verb {
+        "start" => crate::service::install_plist()
+            .and_then(|p| crate::service::bootstrap(&p).map(|_| "started")),
+        "stop" => crate::service::bootout().map(|_| "stopped"),
+        "restart" => crate::service::kickstart().map(|_| "restarted"),
+        _ => unreachable!("dispatch guards the verb"),
+    };
+    match result {
+        Ok(word) => {
+            println!("{} daemon {word}", s.ok("\u{2713}"));
+            0
+        }
+        Err(e) => {
+            eprintln!("{} {verb} failed: {e:#}", s.deny("\u{2717}"));
+            1
+        }
+    }
+}
+
+/// Format a unix-ms timestamp as a compact local-agnostic UTC date-time.
+fn format_unix_ms(ms: u64) -> String {
+    // A dependency-free rendering: seconds since epoch as an ISO-ish string is
+    // overkill here; show the unix seconds so `pair list` stays informative
+    // without pulling `chrono`/`time` into the single binary.
+    let secs = ms / 1000;
+    format!("unix {secs}")
 }
 
 fn cmd_shim(sub: Option<&str>) -> i32 {
@@ -492,29 +834,13 @@ fn cmd_shim(sub: Option<&str>) -> i32 {
 
 fn shim_install() -> i32 {
     let s = Style::stdout();
-    let Some(bindir) = paths::shim_bin_dir() else {
-        eprintln!("latch: HOME is not set");
-        return 1;
-    };
-    let target = match std::env::current_exe().and_then(|p| p.canonicalize()) {
-        Ok(p) => p,
+    let (link, target) = match crate::setup::install_shim() {
+        Ok(pair) => pair,
         Err(e) => {
-            eprintln!("latch: cannot resolve own path: {e}");
+            eprintln!("latch: {e:#}");
             return 1;
         }
     };
-    if let Err(e) = std::fs::create_dir_all(&bindir) {
-        eprintln!("latch: cannot create {}: {e}", bindir.display());
-        return 1;
-    }
-    let link: PathBuf = bindir.join("op");
-    if link.exists() || link.symlink_metadata().is_ok() {
-        let _ = std::fs::remove_file(&link);
-    }
-    if let Err(e) = std::os::unix::fs::symlink(&target, &link) {
-        eprintln!("latch: cannot symlink {}: {e}", link.display());
-        return 1;
-    }
 
     println!("{} shim installed", s.ok("\u{2713}"));
     println!("  {} {}", s.dim("link"), link.display());
@@ -527,7 +853,10 @@ fn shim_install() -> i32 {
     println!();
     println!("    {}", s.cobalt("export PATH=\"$HOME/.latch/bin:$PATH\""));
     println!();
-    println!("  {}", s.faint("v0 does not edit your shell rc for you."));
+    println!(
+        "  {}",
+        s.faint("or run `latch setup`, which edits your profile and loads the daemon.")
+    );
     0
 }
 

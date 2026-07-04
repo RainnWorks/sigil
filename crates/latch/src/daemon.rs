@@ -40,9 +40,11 @@ use crate::factor::{self, Factor};
 use crate::keystore::{self, Keystore};
 use crate::lease::{self, LeaseStore, ProcessTable, SysProcessTable};
 use crate::local::{self, Frame, Reply};
+use crate::paths::ShimStatus;
 use crate::provider::{OpProvider, ProviderRun, SecretProvider};
 use crate::remote::RemoteApprover;
 use crate::secrets::{self, AccountStore};
+use crate::service;
 
 use latch_proto::identity::DeviceIdentity;
 use latch_proto::{mailbox_id, PeerIdentity};
@@ -70,9 +72,10 @@ pub struct Core {
 }
 
 /// A persisted daemon<->phone pairing: everything needed to reach the phone as
-/// the approving factor over the blind relay. `latch pair` will persist this
-/// (onboarding flow, task #11); until then [`load_remote_pairing`] finds none,
-/// so a daemon with no biometric fails closed unless started `--dev-insecure`.
+/// the approving factor over the blind relay. `latch pair` persists this (see
+/// [`crate::pairing_store`]) and [`load_remote_pairing`] reconstructs it, so a
+/// paired daemon auto-selects the phone factor; a daemon with neither a pairing
+/// nor a biometric fails closed unless started `--dev-insecure`.
 pub struct RemotePairingConfig {
     /// The relay base URL (`http(s)://host`) the daemon attaches to.
     pub relay_url: String,
@@ -89,11 +92,20 @@ impl RemotePairingConfig {
     }
 }
 
-/// Load a persisted phone pairing, if one exists. There is no on-disk pairing
-/// format yet (see [`RemotePairingConfig`]), so today this always returns `None`
-/// and the phone factor is unavailable in the shipping CLI.
-fn load_remote_pairing() -> Option<RemotePairingConfig> {
-    None
+/// Load a persisted phone pairing, if one exists, from `~/.latch/pairing.json`
+/// plus the daemon identity in `ks`. A present-but-unreadable pairing (corrupt
+/// file, missing keystore identity) is logged and treated as "no pairing" so the
+/// daemon still arms and fails closed rather than refusing to start; the fault
+/// surfaces in `latch doctor`. See [`crate::pairing_store`] for the on-disk
+/// format and why it stays inert at rest.
+fn load_remote_pairing(ks: &Arc<dyn Keystore>) -> Option<RemotePairingConfig> {
+    match crate::pairing_store::load(ks.as_ref()) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("latch daemon: ignoring an unreadable pairing config: {e}");
+            None
+        }
+    }
 }
 
 /// Build the approval gate for a resolved [`Factor`]. Only [`Factor::DevInsecure`]
@@ -141,7 +153,7 @@ impl Core {
         let accounts = AccountStore::load().context("loading account store")?;
         let pending = Arc::new(PendingRegistry::new());
 
-        let remote = load_remote_pairing();
+        let remote = load_remote_pairing(&keystore);
         let inputs = factor::ArmInputs {
             dev_insecure,
             phone_paired: remote.is_some(),
@@ -178,7 +190,16 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
 }
 
 async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
+    // Roll the launchd append-mode logs if they have grown large, before we add
+    // to them. Best-effort: never blocks arming.
+    service::rotate_logs(service::LOG_ROTATE_BYTES);
+
     let sock = local::socket_path();
+    // A truncated socket path means clients and the daemon bind different names
+    // and never meet; surface it loudly (the bind below would appear to succeed).
+    if let Err(e) = service::socket_path_fits() {
+        eprintln!("latch daemon: {e}");
+    }
     prepare_socket(&sock)?;
     let listener =
         UnixListener::bind(&sock).with_context(|| format!("binding {}", sock.display()))?;
@@ -202,6 +223,13 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
         sock.display(),
         core.factor.label()
     );
+
+    // Shim-drift check: if the `op` a shell resolves is no longer our shim (not
+    // installed, out-ordered on PATH, or pointing at a stale binary), requests
+    // would bypass the gate entirely. Warn loudly at every start.
+    if let Some(issue) = ShimStatus::detect().issue() {
+        eprintln!("latch daemon: shim drift: {issue}");
+    }
 
     loop {
         tokio::select! {
@@ -1256,6 +1284,280 @@ mod tests {
         assert!(read_all(err_r).contains("denied"));
         assert_eq!(core.leases.active(), 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- pairing persistence -> phone factor (task #11) --------------------
+
+    use crate::pairing_store::{self, NewPairing};
+
+    /// A private LATCH_HOME for one test, restored on drop. Isolates the
+    /// `pairing.json` location from the real `~/.latch` and other tests.
+    struct HomeGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<std::ffi::OsString>,
+        dir: PathBuf,
+    }
+    impl HomeGuard {
+        fn new(tag: &str) -> Self {
+            let lock = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let dir = std::env::temp_dir().join(format!(
+                "latch-daemon-home-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let prev = std::env::var_os("LATCH_HOME");
+            std::env::set_var("LATCH_HOME", &dir);
+            Self {
+                _lock: lock,
+                prev,
+                dir,
+            }
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("LATCH_HOME", v),
+                None => std::env::remove_var("LATCH_HOME"),
+            }
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    fn sas_of(
+        daemon: &latch_proto::PeerIdentity,
+        phone: &latch_proto::PeerIdentity,
+    ) -> [String; 6] {
+        let w = latch_proto::fingerprint_words(daemon, phone);
+        std::array::from_fn(|i| w[i].to_string())
+    }
+
+    #[test]
+    fn build_gate_selects_the_phone_approver_from_a_persisted_config() {
+        // The wiring the whole task turns on: a RemotePairingConfig (such as
+        // `load_remote_pairing` reconstructs) drives `build_gate` to the phone
+        // approver with no DEK at rest. No relay is dialed synchronously, so this
+        // needs no network.
+        let (daemon_id, softphone, _dek) = pair_softphone(Policy::Approve);
+        let cfg = RemotePairingConfig {
+            relay_url: "ws://127.0.0.1:1".into(),
+            daemon_identity: daemon_id,
+            phone: softphone.phone_identity(),
+        };
+        let ks: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let pending = Arc::new(PendingRegistry::new());
+        // Factor resolution: a present pairing means phone_paired -> Factor::Phone.
+        assert_eq!(
+            factor::resolve(&factor::ArmInputs {
+                dev_insecure: true,
+                phone_paired: true,
+                biometric: true,
+            }),
+            Factor::Phone
+        );
+        // And the gate builds the phone approver from the config.
+        let gate = build_gate(Factor::Phone, Some(cfg), &ks, &pending).unwrap();
+        let _ = gate; // constructed without a DEK at rest: inert.
+        assert!(!ks.has_dek());
+    }
+
+    #[test]
+    fn persisted_pairing_reloads_and_stays_inert_at_rest() {
+        let _home = HomeGuard::new("reload-inert");
+        // One keystore instance stands in for the login Keychain across save and
+        // load (both go through the same trait object here).
+        let ks: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+
+        let (daemon_id, softphone, _dek) = pair_softphone(Policy::Approve);
+        let daemon_pub = daemon_id.peer_identity();
+        let phone = softphone.phone_identity();
+        let np = NewPairing {
+            daemon_identity: daemon_id,
+            phone,
+            relay_url: "ws://127.0.0.1:1".into(),
+            sas_words: sas_of(&daemon_pub, &phone),
+            paired_at: REMOTE_NOW,
+        };
+        pairing_store::save(ks.as_ref(), &np).unwrap();
+
+        // Reload: the config reconstructs the daemon identity and pins the phone.
+        let cfg = pairing_store::load(ks.as_ref())
+            .unwrap()
+            .expect("a pairing was saved");
+        assert_eq!(cfg.daemon_identity.peer_identity(), daemon_pub);
+        assert_eq!(cfg.phone, phone);
+        assert_eq!(cfg.mailbox(), softphone.mailbox());
+
+        // Inert at rest: nothing persisted lets the daemon produce a DEK. The
+        // keystore holds only the daemon identity blob, never a DEK.
+        assert!(!ks.has_dek(), "no DEK is persisted by pairing");
+    }
+
+    #[test]
+    fn reloaded_pairing_serves_a_secret_over_the_real_relay() {
+        // The end-to-end proof of the critical path: persist a pairing, reload
+        // it from disk, and use the RELOADED daemon identity to satisfy a real
+        // op request via the phone over the real relay — with NO DEK at rest. The
+        // reloaded identity must still sign requests the phone verifies and open
+        // the phone's sealed response.
+        let Some((base, _server)) = obtain_relay() else {
+            eprintln!(
+                "SKIPPED reloaded_pairing_serves_a_secret_over_the_real_relay: no relay. \
+                 Install bun, or set LATCH_TEST_RELAY_URL."
+            );
+            return;
+        };
+        let _home = HomeGuard::new("reload-e2e");
+        let ks: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+
+        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Approve);
+        let daemon_pub = daemon_id.peer_identity();
+        let phone_pub = softphone.phone_identity();
+        let mailbox = softphone.mailbox();
+
+        // Persist, then reload the daemon identity from disk.
+        let np = NewPairing {
+            daemon_identity: daemon_id,
+            phone: phone_pub,
+            relay_url: base.clone(),
+            sas_words: sas_of(&daemon_pub, &phone_pub),
+            paired_at: REMOTE_NOW,
+        };
+        pairing_store::save(ks.as_ref(), &np).unwrap();
+        let cfg = pairing_store::load(ks.as_ref()).unwrap().expect("saved");
+        assert_eq!(cfg.mailbox(), mailbox);
+
+        // Daemon side: RemoteApprover over the real WS, keyed by the RELOADED
+        // identity. The account token is sealed under the phone-held DEK; the
+        // daemon holds none.
+        let dir = tmpdir("reload-relay");
+        let daemon_relay = DaemonRelay::connect(&base, mailbox).expect("daemon ws attach");
+        let core = remote_core(
+            &dir,
+            cfg.daemon_identity,
+            cfg.phone,
+            Arc::new(daemon_relay),
+            Duration::from_secs(10),
+            dek_bytes,
+            "reload-token-abc",
+            "reload-secret-88",
+        );
+        assert!(!core.keystore.has_dek(), "daemon holds no DEK at rest");
+
+        // Phone side over the real HTTPS transport.
+        let phone_relay = PhoneRelay::new(&base, mailbox)
+            .expect("phone transport")
+            .with_poll_interval(Duration::from_millis(50));
+        let softphone = Arc::new(softphone);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let phone_thread = {
+            let sp = softphone.clone();
+            std::thread::spawn(move || sp.serve(&phone_relay, &stop, Duration::from_millis(200)))
+        };
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let (read_end, write_end) = pipe();
+        let argv = vec![
+            "op".into(),
+            "read".into(),
+            "op://Engineering/.env/password".into(),
+        ];
+        local::send_frame(
+            &client,
+            &Frame::Op {
+                argv,
+                cwd: String::new(),
+            },
+            &[write_end.as_raw_fd()],
+        )
+        .unwrap();
+        drop(write_end);
+
+        let worker = std::thread::spawn(move || handle_conn(core, server));
+        worker.join().unwrap().unwrap();
+
+        assert_eq!(
+            read_all(read_end),
+            "reload-secret-88",
+            "the reloaded pairing served the secret over the relay"
+        );
+
+        shutdown.store(true, Ordering::SeqCst);
+        phone_thread.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn latch_pair_completes_the_ceremony_over_the_real_relay() {
+        // Drive the real `latch pair` ceremony end to end over the blind relay:
+        // the daemon side uses the raw WebSocket rendezvous (`RendezvousWs` via
+        // `pair::relay_channel`), the phone side uses the HTTP `Rendezvous`
+        // client, and they meet on the rendezvous mailbox. Proves the pairing
+        // transport, the message framing, and the QR round-trip against a real
+        // relay process.
+        let Some((base, _server)) = obtain_relay() else {
+            eprintln!(
+                "SKIPPED latch_pair_completes_the_ceremony_over_the_real_relay: no relay. \
+                 Install bun, or set LATCH_TEST_RELAY_URL."
+            );
+            return;
+        };
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use latch_proto::{now_ms, rendezvous_mailbox, Envelope, PairingPayload};
+        use latch_relay_client::Rendezvous;
+
+        let (qr_tx, qr_rx) = std::sync::mpsc::channel::<String>();
+
+        // The phone: scan the QR, POST its response to the rendezvous mailbox,
+        // then poll for the sealed DEK.
+        let base_phone = base.clone();
+        let phone = std::thread::spawn(move || {
+            let qr = qr_rx.recv().expect("daemon rendered a QR");
+            let payload = PairingPayload::from_qr_string(&qr).unwrap();
+            let mailbox = rendezvous_mailbox(&payload.daemon, &payload.secret);
+            let rv = Rendezvous::new(&base_phone, mailbox).unwrap();
+            let phone_id = DeviceIdentity::generate();
+            let (mut pairing, resp) =
+                Pairing::scan(phone_id, &qr, now_ms(), Policy::Approve).unwrap();
+            rv.submit(&URL_SAFE_NO_PAD.encode(serde_json::to_vec(&resp).unwrap()))
+                .unwrap();
+            pairing.confirm().unwrap();
+            let env_wire = rv
+                .wait(Duration::from_secs(10), Duration::from_millis(50))
+                .unwrap()
+                .expect("the daemon sealed the DEK back");
+            let env: Envelope = serde_json::from_str(&env_wire).unwrap();
+            let sp = pairing.receive_dek(&env).unwrap();
+            sp.phone_identity()
+        });
+
+        let daemon_id = DeviceIdentity::generate();
+        let daemon_pub = daemon_id.peer_identity();
+        let mut make_channel = |mailbox: [u8; 32]| crate::pair::relay_channel(&base, mailbox);
+        let mut present_qr = |_u: &str, b64: &str| qr_tx.send(b64.to_string()).unwrap();
+        let mut confirm = |_w: &[&'static str; 6]| true;
+        let opts = crate::pair::CeremonyOpts {
+            relay_url: base.clone(),
+            response_timeout: Duration::from_secs(15),
+            flush_grace: Duration::from_millis(750),
+            now: &now_ms,
+            make_channel: &mut make_channel,
+            present_qr: &mut present_qr,
+            confirm_sas: &mut confirm,
+        };
+        let np = crate::pair::run_ceremony(daemon_id, opts).expect("pairing over the relay");
+
+        let phone_pub = phone.join().unwrap();
+        assert_eq!(
+            np.phone, phone_pub,
+            "the daemon pinned the phone that responded"
+        );
+        assert_eq!(np.daemon_identity.peer_identity(), daemon_pub);
     }
 
     #[test]

@@ -317,6 +317,10 @@ mod tests {
 
     #[test]
     fn store_persists_ciphertext_only() {
+        // Serialize with the other LATCH_HOME-mutating tests (parallel by default).
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("latch-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("LATCH_HOME", &tmp);

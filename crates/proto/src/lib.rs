@@ -19,8 +19,8 @@ pub use envelope::{Envelope, OpenError, SealError};
 pub use fingerprint::{fingerprint_words, mailbox_id};
 pub use identity::{DeviceIdentity, PeerIdentity};
 pub use pairing::{
-    open_dek, seal_dek, verify_sas, DaemonPairing, Dek, HandshakeError, PairingError,
-    PairingPayload, PairingResponse, PairingSecret, PairingState, PhonePairing,
+    open_dek, rendezvous_mailbox, seal_dek, verify_sas, DaemonPairing, Dek, HandshakeError,
+    PairingError, PairingPayload, PairingResponse, PairingSecret, PairingState, PhonePairing,
     PAIRING_SECRET_TTL_MS,
 };
 pub use replay::{ReplayError, ReplayGuard};

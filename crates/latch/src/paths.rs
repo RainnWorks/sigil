@@ -1,11 +1,41 @@
-//! Filesystem discovery: the real `op`, the shim install location, and where
-//! the shim sits relative to `op` on `PATH`.
+//! Filesystem discovery: the real `op`, the shim install location, where the
+//! shim sits relative to `op` on `PATH`, and the `~/.latch` layout (config,
+//! logs, the launchd plist).
 
 use std::path::{Path, PathBuf};
 
+/// The Latch home directory: `$LATCH_HOME` when set (tests and alternate
+/// installs), else `~/.latch`. `None` only if neither `LATCH_HOME` nor `HOME`
+/// is set, which no real login shell allows.
+pub fn latch_home() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("LATCH_HOME") {
+        return Some(PathBuf::from(dir));
+    }
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".latch"))
+}
+
 /// `~/.latch/bin`, where `latch shim install` drops the `op` symlink.
 pub fn shim_bin_dir() -> Option<PathBuf> {
+    // Kept anchored to `~/.latch/bin` (not `latch_home()/bin`) so `LATCH_HOME`
+    // test overrides never move the PATH entry a real profile points at.
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".latch").join("bin"))
+}
+
+/// `<latch_home>/pairing.json`: the persisted phone-pairing config (public
+/// parts; the daemon identity lives in the keystore). See `pairing_store`.
+pub fn pairing_path() -> Option<PathBuf> {
+    latch_home().map(|h| h.join("pairing.json"))
+}
+
+/// `<latch_home>/logs`, where the launchd agent's stdout/stderr are rotated.
+pub fn logs_dir() -> Option<PathBuf> {
+    latch_home().map(|h| h.join("logs"))
+}
+
+/// The launchd LaunchAgent plist for the daemon.
+pub fn launch_agent_plist() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join("Library/LaunchAgents/co.rowm.latch.plist"))
 }
 
 /// True if `p` is a regular file with any execute bit set.
@@ -47,6 +77,125 @@ pub fn find_real_op() -> Option<PathBuf> {
     None
 }
 
+/// The health of the `op` shim install, as seen from the running binary.
+///
+/// The daemon and `latch doctor` read this to catch **shim drift**: the shim
+/// silently ceasing to be the `op` a shell resolves, which would route requests
+/// straight to the real `op` with no approval gate. Three drifts are caught: the
+/// link never installed / removed, another `op` winning on `PATH`, and the link
+/// pointing at a stale `latch` binary (e.g. after a rebuild to a new path).
+#[derive(Debug, Clone)]
+pub struct ShimStatus {
+    /// `~/.latch/bin/op` exists as a symlink.
+    pub installed: bool,
+    /// `~/.latch/bin` is present somewhere on `PATH`.
+    pub dir_on_path: bool,
+    /// The first `op` a `PATH` walk resolves lives in the shim dir (the shim
+    /// wins over any real `op`).
+    pub first_on_path: bool,
+    /// The shim link resolves to the currently running `latch` binary. `false`
+    /// means it points at a stale binary or is broken.
+    pub resolves_to_current: bool,
+    /// What `~/.latch/bin/op` canonicalises to, if it resolves.
+    pub link_target: Option<PathBuf>,
+    /// The first `op` on `PATH` that is not the shim, if any.
+    pub real_op: Option<PathBuf>,
+}
+
+impl ShimStatus {
+    /// Compute the shim health from the current process, `PATH`, and filesystem.
+    pub fn detect() -> Self {
+        Self::detect_with(
+            own_binary(),
+            shim_bin_dir(),
+            std::env::var_os("PATH").as_deref(),
+        )
+    }
+
+    /// The pure core of [`detect`](Self::detect): everything reads from the
+    /// three explicit inputs (the running binary, the shim dir, and `PATH`) plus
+    /// the filesystem, so tests can drive it with synthetic dirs and no
+    /// process-global env mutation.
+    pub fn detect_with(
+        own: Option<PathBuf>,
+        shim_dir: Option<PathBuf>,
+        path: Option<&std::ffi::OsStr>,
+    ) -> Self {
+        let link = shim_dir.as_ref().map(|d| d.join("op"));
+        let installed = link
+            .as_ref()
+            .map(|l| l.symlink_metadata().is_ok())
+            .unwrap_or(false);
+        let link_target = link.as_ref().and_then(|l| l.canonicalize().ok());
+        let resolves_to_current = matches!((&link_target, &own), (Some(t), Some(o)) if t == o);
+
+        let mut first_op_dir: Option<PathBuf> = None;
+        let mut real_op: Option<PathBuf> = None;
+        let mut dir_on_path = false;
+        if let Some(path) = path {
+            for dir in std::env::split_paths(path) {
+                let is_shim_dir = shim_dir.as_ref() == Some(&dir);
+                if is_shim_dir {
+                    dir_on_path = true;
+                }
+                let cand = dir.join("op");
+                if !is_executable(&cand) {
+                    continue;
+                }
+                if first_op_dir.is_none() {
+                    first_op_dir = Some(dir.clone());
+                }
+                if !is_shim_dir && real_op.is_none() {
+                    real_op = Some(cand);
+                }
+            }
+        }
+        let first_on_path = matches!((&first_op_dir, &shim_dir), (Some(f), Some(sd)) if f == sd);
+
+        ShimStatus {
+            installed,
+            dir_on_path,
+            first_on_path,
+            resolves_to_current,
+            link_target,
+            real_op,
+        }
+    }
+
+    /// True when the shim is installed, wins on `PATH`, and points at this
+    /// binary. Anything else is drift.
+    pub fn healthy(&self) -> bool {
+        self.installed && self.first_on_path && self.resolves_to_current
+    }
+
+    /// A one-line description of the first drift found, with the fix, or `None`
+    /// when healthy.
+    pub fn issue(&self) -> Option<String> {
+        if !self.installed {
+            return Some("shim not installed (run: latch setup, or latch shim install)".into());
+        }
+        if !self.first_on_path {
+            if !self.dir_on_path {
+                return Some(
+                    "~/.latch/bin is not on PATH (add it to your shell profile so the shim wins)"
+                        .into(),
+                );
+            }
+            return Some("a real op precedes the shim on PATH".into());
+        }
+        if !self.resolves_to_current {
+            return Some(match &self.link_target {
+                Some(t) => format!(
+                    "shim points at a stale binary ({}); re-run: latch shim install",
+                    t.display()
+                ),
+                None => "shim link is broken; re-run: latch shim install".into(),
+            });
+        }
+        None
+    }
+}
+
 /// Where on `PATH` the shim and the real `op` first appear, as indices.
 pub struct PathOrder {
     pub shim: Option<usize>,
@@ -81,4 +230,148 @@ pub fn path_order() -> PathOrder {
         }
     }
     order
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "latch-shim-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Write an executable stub `op` into `dir` and return the dir.
+    fn op_in(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join("op");
+        std::fs::write(&p, "#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir.to_path_buf()
+    }
+
+    fn path_of(dirs: &[&Path]) -> OsString {
+        std::env::join_paths(dirs.iter().map(|d| d.to_path_buf())).unwrap()
+    }
+
+    #[test]
+    fn healthy_when_shim_is_installed_first_and_points_at_current() {
+        let root = tmp("healthy");
+        let shim_dir = root.join("shimbin");
+        let real_dir = op_in(&root.join("realbin"));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+
+        // A stand-in "current binary" and the shim symlink pointing at it.
+        let current = root.join("latch-bin");
+        std::fs::write(&current, "#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let own = current.canonicalize().unwrap();
+        std::os::unix::fs::symlink(&own, shim_dir.join("op")).unwrap();
+
+        // Shim dir first, real op dir second.
+        let path = path_of(&[&shim_dir, &real_dir]);
+        let s = ShimStatus::detect_with(Some(own), Some(shim_dir), Some(&path));
+        assert!(s.installed);
+        assert!(s.first_on_path);
+        assert!(s.resolves_to_current);
+        assert!(s.healthy(), "issue: {:?}", s.issue());
+        assert!(s.issue().is_none());
+        assert!(
+            s.real_op.is_some(),
+            "the real op behind the shim is still found"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn drift_when_a_real_op_precedes_the_shim() {
+        let root = tmp("precede");
+        let shim_dir = root.join("shimbin");
+        let real_dir = op_in(&root.join("realbin"));
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let current = root.join("latch-bin");
+        std::fs::write(&current, "x").unwrap();
+        std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let own = current.canonicalize().unwrap();
+        std::os::unix::fs::symlink(&own, shim_dir.join("op")).unwrap();
+
+        // Real op dir FIRST: the shim no longer wins.
+        let path = path_of(&[&real_dir, &shim_dir]);
+        let s = ShimStatus::detect_with(Some(own), Some(shim_dir), Some(&path));
+        assert!(s.installed);
+        assert!(!s.first_on_path);
+        assert!(!s.healthy());
+        assert_eq!(
+            s.issue().as_deref(),
+            Some("a real op precedes the shim on PATH")
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn drift_when_the_link_points_at_a_stale_binary() {
+        let root = tmp("stale");
+        let shim_dir = root.join("shimbin");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+
+        // The shim points at an OLD binary; the daemon now runs a different one.
+        let old = root.join("latch-old");
+        std::fs::write(&old, "old").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(old.canonicalize().unwrap(), shim_dir.join("op")).unwrap();
+        let current = root.join("latch-new");
+        std::fs::write(&current, "new").unwrap();
+        let own = current.canonicalize().unwrap();
+
+        let path = path_of(&[&shim_dir]);
+        let s = ShimStatus::detect_with(Some(own), Some(shim_dir), Some(&path));
+        assert!(s.installed);
+        assert!(s.first_on_path, "shim is still first on PATH");
+        assert!(!s.resolves_to_current, "but it points at a stale binary");
+        assert!(!s.healthy());
+        assert!(s.issue().unwrap().contains("stale binary"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn not_installed_when_the_link_is_absent() {
+        let root = tmp("absent");
+        let shim_dir = root.join("shimbin");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let path = path_of(&[&shim_dir]);
+        let s = ShimStatus::detect_with(Some(root.join("latch")), Some(shim_dir), Some(&path));
+        assert!(!s.installed);
+        assert!(!s.healthy());
+        assert!(s.issue().unwrap().contains("not installed"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn dir_off_path_is_reported_distinctly() {
+        let root = tmp("offpath");
+        let shim_dir = root.join("shimbin");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let current = root.join("latch-bin");
+        std::fs::write(&current, "x").unwrap();
+        std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let own = current.canonicalize().unwrap();
+        std::os::unix::fs::symlink(&own, shim_dir.join("op")).unwrap();
+
+        // Installed, points at current, but the shim dir is NOT on PATH.
+        let other = op_in(&root.join("otherbin"));
+        let path = path_of(&[&other]);
+        let s = ShimStatus::detect_with(Some(own), Some(shim_dir), Some(&path));
+        assert!(s.installed);
+        assert!(!s.dir_on_path);
+        assert!(!s.first_on_path);
+        assert!(s.issue().unwrap().contains("not on PATH"));
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
