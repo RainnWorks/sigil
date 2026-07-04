@@ -1,0 +1,34 @@
+import { useRouter } from "expo-router";
+import { View } from "react-native";
+
+import { Sans } from "@/components/ui/text";
+import { ApprovalSheet } from "@/components/approval/approval-sheet";
+import { space } from "@/theme/tokens";
+import { useAppState } from "@/src/state/store";
+
+/**
+ * The approval sheet route, presented as a native form sheet with detents. Shows
+ * the first live request; falls back to the most recent one so its terminal
+ * state (approved / denied / expired / superseded) is still viewable.
+ */
+export default function ApprovalRoute() {
+  const router = useRouter();
+  const s = useAppState();
+
+  const pending =
+    s.pending.find((r) => r.state === "fresh" || r.state === "expiring") ?? s.pending[0];
+
+  if (!pending) {
+    return (
+      <View style={{ flex: 1, alignItems: "center", justifyContent: "center", padding: space.xl }}>
+        <Sans tone="muted">Nothing to approve.</Sans>
+      </View>
+    );
+  }
+
+  return (
+    <View style={{ flex: 1, paddingTop: space.lg }}>
+      <ApprovalSheet pending={pending} onDone={() => router.back()} />
+    </View>
+  );
+}

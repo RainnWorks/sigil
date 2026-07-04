@@ -1,14 +1,18 @@
 //! The `latch` subcommands. Hand-rolled dispatch: v0 has a handful of verbs
 //! with no flags worth a parser dependency.
 
+use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use latch_proto::{fingerprint_words, DeviceIdentity};
+use zeroize::Zeroizing;
 
 use crate::daemon;
-use crate::local;
+use crate::keystore;
+use crate::local::{self, Frame, Reply};
 use crate::paths;
+use crate::secrets::{self, AccountStore};
 use crate::style::Style;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -21,6 +25,11 @@ pub fn run() -> i32 {
         "daemon" => cmd_daemon(),
         "doctor" => cmd_doctor(),
         "pair" => cmd_pair(),
+        "account" => cmd_account(&args[1..]),
+        "lease" => cmd_lease(&args[1..]),
+        "lockdown" => cmd_lockdown(&args[1..]),
+        "approve" => cmd_approve(&args[1..]),
+        "deny" => cmd_deny(&args[1..]),
         "shim" => cmd_shim(args.get(1).map(String::as_str)),
         "version" | "--version" | "-V" => {
             println!("latch {VERSION}");
@@ -48,6 +57,13 @@ usage: latch <command>
   daemon            run the approval daemon (foreground)
   doctor            diagnose shim ordering, socket, and op discovery
   pair              show this device's identity and fingerprint words
+  account add       add a service-account token (reads token from stdin)
+  account list      list configured accounts and their vault routing
+  lease list        list active session leases with countdowns
+  lease revoke <p>  revoke leases whose grant-key hex starts with <p>
+  lockdown [--clear]  seal the daemon (deny + refuse) or unseal it
+  approve --local --id <id> [--lease]  approve a pending request at the Mac
+  deny --local --id <id>               deny a pending request at the Mac
   shim install      symlink ~/.latch/bin/op at this binary
   version           print version
   help              print this message"
@@ -105,12 +121,247 @@ fn cmd_status() -> i32 {
     };
     println!("  {}      {glyph} {}  {note}", s.dim("op"), pad(label, 13));
 
+    // accounts
+    let accounts = AccountStore::load().map(|s| s.accounts.len()).unwrap_or(0);
+    let (glyph, label, note) = if accounts > 0 {
+        (
+            s.ok("\u{2713}"),
+            "configured",
+            s.dim(&format!("{accounts} account(s)")),
+        )
+    } else {
+        (
+            s.brass("\u{2717}"),
+            "none",
+            s.dim("run: latch account add --token-stdin --label <name>"),
+        )
+    };
+    println!("  {} {glyph} {}  {note}", s.dim("accounts"), pad(label, 13));
+
     println!();
     println!(
         "  {}",
-        s.faint("v0: no approval gating yet; the daemon runs op directly")
+        s.faint("every op request is gated: lease, else a fresh approval; fails closed")
     );
     0
+}
+
+/// Connect to the daemon, send one control frame, and return its reply.
+fn send_control(frame: &Frame) -> std::io::Result<Reply> {
+    let mut stream = UnixStream::connect(local::socket_path())?;
+    local::send_frame(&stream, frame, &[])?;
+    local::recv_reply(&mut stream)
+}
+
+/// Print a control reply's lines and map its ok flag to an exit code.
+fn print_control(reply: std::io::Result<Reply>) -> i32 {
+    let s = Style::stdout();
+    match reply {
+        Ok(Reply::Control { ok, lines }) => {
+            for line in &lines {
+                let glyph = if ok {
+                    s.ok("\u{2713}")
+                } else {
+                    s.brass("\u{2717}")
+                };
+                println!("  {glyph} {line}");
+            }
+            i32::from(!ok)
+        }
+        Ok(other) => {
+            eprintln!("latch: unexpected reply: {other:?}");
+            1
+        }
+        Err(e) => {
+            eprintln!("latch: daemon unreachable ({e}); is it running?");
+            1
+        }
+    }
+}
+
+/// `--flag value` / `--flag=value` extractor over a small arg slice.
+fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let mut it = args.iter();
+    let eq = format!("{name}=");
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix(&eq) {
+            return Some(v);
+        }
+        if a == name {
+            return it.next().map(String::as_str);
+        }
+    }
+    None
+}
+
+fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
+}
+
+fn cmd_account(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("add") => account_add(&args[1..]),
+        Some("list") => account_list(),
+        _ => {
+            eprintln!("usage: latch account <add|list>");
+            2
+        }
+    }
+}
+
+fn account_add(args: &[String]) -> i32 {
+    let s = Style::stdout();
+    let Some(label) = flag_value(args, "--label").map(str::to_string) else {
+        eprintln!("usage: latch account add --token-stdin --label <name>");
+        return 2;
+    };
+    if !has_flag(args, "--token-stdin") {
+        eprintln!("latch: refusing to read a token from argv; pass --token-stdin");
+        return 2;
+    }
+
+    // Read the token from stdin into a wiped buffer; trim one trailing newline.
+    let mut token = Zeroizing::new(Vec::new());
+    if let Err(e) = std::io::stdin().read_to_end(&mut token) {
+        eprintln!("latch: reading token from stdin: {e}");
+        return 1;
+    }
+    while matches!(token.last(), Some(b'\n' | b'\r')) {
+        token.pop();
+    }
+    if token.is_empty() {
+        eprintln!("latch: empty token on stdin");
+        return 1;
+    }
+
+    // Unwrap the DEK (biometric on macOS) and encrypt the token under it.
+    let ks = keystore::for_host();
+    if let Err(e) = ks.ensure_dek() {
+        eprintln!("latch: provisioning the DEK: {e}");
+        return 1;
+    }
+    let dek = match ks.unwrap_dek(&format!("Add the {label} service-account token")) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("latch: unwrapping the DEK: {e}");
+            return 1;
+        }
+    };
+
+    // Probe the vaults this token can actually route (best effort).
+    let vaults = match paths::find_real_op() {
+        Some(op) => secrets::probe_vaults(&op, &token).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if vaults.is_empty() {
+        println!(
+            "  {} {}",
+            s.brass("\u{2717}"),
+            s.dim("no vaults visible to this token (service accounts cannot see built-in Personal/Shared vaults)")
+        );
+    }
+
+    let mut store = match AccountStore::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("latch: loading account store: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = store.add(&label, &dek, &token, vaults.clone()) {
+        eprintln!("latch: {e}");
+        return 1;
+    }
+    if let Err(e) = store.save() {
+        eprintln!("latch: saving account store: {e}");
+        return 1;
+    }
+
+    println!("{} account {} added", s.ok("\u{2713}"), s.cobalt(&label));
+    if !vaults.is_empty() {
+        println!("  {} {}", s.dim("vaults"), vaults.join(", "));
+    }
+    0
+}
+
+fn account_list() -> i32 {
+    let s = Style::stdout();
+    let store = match AccountStore::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("latch: loading account store: {e}");
+            return 1;
+        }
+    };
+    if store.accounts.is_empty() {
+        println!("  {}", s.dim("no accounts; run: latch account add"));
+        return 0;
+    }
+    println!("{}", s.cobalt("accounts"));
+    println!();
+    for a in &store.accounts {
+        let vaults = if a.vaults.is_empty() {
+            s.dim("no vaults probed")
+        } else {
+            s.dim(&a.vaults.join(", "))
+        };
+        println!("  {}  {}", pad(&a.label, 20), vaults);
+    }
+    0
+}
+
+fn cmd_lease(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("list") | None => {
+            let reply = send_control(&Frame::LeaseList);
+            // A lease list with no lines is not a failure; print a note.
+            if let Ok(Reply::Control { lines, .. }) = &reply {
+                if lines.is_empty() {
+                    println!("  {}", Style::stdout().dim("no active leases"));
+                    return 0;
+                }
+            }
+            print_control(reply)
+        }
+        Some("revoke") => {
+            let Some(prefix) = args.get(1) else {
+                eprintln!("usage: latch lease revoke <grant-hex-prefix>");
+                return 2;
+            };
+            print_control(send_control(&Frame::LeaseRevoke {
+                prefix: prefix.clone(),
+            }))
+        }
+        _ => {
+            eprintln!("usage: latch lease <list|revoke <prefix>>");
+            2
+        }
+    }
+}
+
+fn cmd_lockdown(args: &[String]) -> i32 {
+    print_control(send_control(&Frame::Lockdown {
+        clear: has_flag(args, "--clear"),
+    }))
+}
+
+fn cmd_approve(args: &[String]) -> i32 {
+    let Some(id) = flag_value(args, "--id").map(str::to_string) else {
+        eprintln!("usage: latch approve --local --id <id> [--lease]");
+        return 2;
+    };
+    print_control(send_control(&Frame::Approve {
+        id,
+        lease: has_flag(args, "--lease"),
+    }))
+}
+
+fn cmd_deny(args: &[String]) -> i32 {
+    let Some(id) = flag_value(args, "--id").map(str::to_string) else {
+        eprintln!("usage: latch deny --local --id <id>");
+        return 2;
+    };
+    print_control(send_control(&Frame::Deny { id }))
 }
 
 fn cmd_daemon() -> i32 {

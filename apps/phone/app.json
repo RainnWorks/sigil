@@ -1,0 +1,46 @@
+{
+  "expo": {
+    "name": "Latch",
+    "slug": "latch",
+    "scheme": "latch",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "co.rowm.latch",
+      "infoPlist": {
+        "NSFaceIDUsageDescription": "Latch uses Face ID to release the unwrap key that authorizes a secret. Denying never needs it.",
+        "NSCameraUsageDescription": "Latch uses the camera once, to scan the pairing QR shown on your Mac.",
+        "ITSAppUsesNonExemptEncryption": false,
+        "UIBackgroundModes": ["remote-notification"]
+      }
+    },
+    "android": {
+      "package": "co.rowm.latch",
+      "permissions": ["CAMERA", "USE_BIOMETRIC", "POST_NOTIFICATIONS"]
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      "expo-local-authentication",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Latch uses the camera once, to scan the pairing QR shown on your Mac."
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "iosDisplayInForeground": true
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    }
+  }
+}

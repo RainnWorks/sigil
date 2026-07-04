@@ -1,12 +1,19 @@
-//! The local unix-socket protocol between the `op` shim and the daemon.
+//! The local unix-socket protocol between the `op` shim, the `latch` CLI, and
+//! the daemon.
 //!
 //! This is deliberately *not* the end-to-end envelope layer: it is a trusted,
-//! same-machine, same-user channel. Its one non-obvious job is to honour the
-//! core invariant that secret bytes never pass through daemon memory. The shim
-//! hands the daemon its own stdout and stderr file descriptors over SCM_RIGHTS;
-//! the daemon wires the real `op` child straight onto those descriptors, so
-//! `op` writes secrets directly to the caller's terminal or pipe. The daemon
-//! only ever sees the request metadata and the final exit code, never output.
+//! same-machine, same-user channel (the socket is 0600). It carries two kinds
+//! of traffic, distinguished by a tagged [`Frame`]:
+//!
+//! * an **op request** from the shim, which also passes the caller's own
+//!   stdout/stderr file descriptors over SCM_RIGHTS, so the real `op` child
+//!   writes secrets straight to the caller's terminal or pipe and the daemon
+//!   never sees output; and
+//! * **control commands** from the CLI (local approve/deny, lockdown, lease
+//!   list/revoke), which carry no descriptors.
+//!
+//! The daemon replies with a [`Reply`]: an exit code to mirror for op requests,
+//! or a small status payload for control commands.
 
 use std::io::{self, Read, Write};
 use std::mem;
@@ -28,55 +35,73 @@ pub fn socket_path() -> PathBuf {
     base.join("latch").join("daemon.sock")
 }
 
-/// The shim's request: the original argv and the caller's working directory.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocalRequest {
-    pub argv: Vec<String>,
-    pub cwd: String,
+/// A request frame from a client. Tagged so op traffic and control commands
+/// share one socket unambiguously.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Frame {
+    /// An `op` invocation: the original argv and the caller's cwd. The caller's
+    /// stdout/stderr descriptors ride alongside as SCM_RIGHTS.
+    Op { argv: Vec<String>, cwd: String },
+    /// Resolve a pending local approval as approve; `lease` makes it a session
+    /// lease rather than a single shot.
+    Approve { id: String, lease: bool },
+    /// Resolve a pending local approval as deny.
+    Deny { id: String },
+    /// Seal (or, with `clear`, unseal) the daemon.
+    Lockdown { clear: bool },
+    /// List active leases.
+    LeaseList,
+    /// Revoke leases whose grant-key hex starts with `prefix`.
+    LeaseRevoke { prefix: String },
 }
 
-/// The daemon's terminal reply: the `op` exit code to mirror.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocalReply {
-    pub exit: i32,
+/// The daemon's reply.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Reply {
+    /// The `op` exit code to mirror.
+    Exit { code: i32 },
+    /// A control result: success flag plus display lines.
+    Control { ok: bool, lines: Vec<String> },
 }
 
 fn invalid_data<E: std::error::Error + Send + Sync + 'static>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
-/// Send the request line plus the caller's stdout/stderr descriptors.
-pub fn send_request(stream: &UnixStream, req: &LocalRequest, fds: &[RawFd]) -> io::Result<()> {
-    let mut line = serde_json::to_vec(req).map_err(invalid_data)?;
+/// Send a frame, optionally with descriptors (op requests pass stdout/stderr).
+pub fn send_frame(stream: &UnixStream, frame: &Frame, fds: &[RawFd]) -> io::Result<()> {
+    let mut line = serde_json::to_vec(frame).map_err(invalid_data)?;
     line.push(b'\n');
     send_with_fds(stream.as_raw_fd(), &line, fds)
 }
 
-/// Receive the request and the passed descriptors. Returns
+/// Receive a frame and any passed descriptors. Returns
 /// [`io::ErrorKind::UnexpectedEof`] if the peer connected then hung up without
 /// sending anything (e.g. a `status` probe), which the caller treats as a
 /// quiet no-op.
-pub fn recv_request(stream: &UnixStream) -> io::Result<(LocalRequest, Vec<OwnedFd>)> {
+pub fn recv_frame(stream: &UnixStream) -> io::Result<(Frame, Vec<OwnedFd>)> {
     let mut buf = vec![0u8; 64 * 1024];
     let (n, fds) = recv_with_fds(stream.as_raw_fd(), &mut buf, 2)?;
     if n == 0 {
         return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
     }
     let end = buf[..n].iter().position(|&b| b == b'\n').unwrap_or(n);
-    let req = serde_json::from_slice(&buf[..end]).map_err(invalid_data)?;
-    Ok((req, fds))
+    let frame = serde_json::from_slice(&buf[..end]).map_err(invalid_data)?;
+    Ok((frame, fds))
 }
 
-/// Write the terminal reply line.
-pub fn send_reply(stream: &mut UnixStream, reply: &LocalReply) -> io::Result<()> {
+/// Write the reply line.
+pub fn send_reply(stream: &mut UnixStream, reply: &Reply) -> io::Result<()> {
     let mut line = serde_json::to_vec(reply).map_err(invalid_data)?;
     line.push(b'\n');
     stream.write_all(&line)
 }
 
-/// Read the terminal reply line.
-pub fn recv_reply(stream: &mut UnixStream) -> io::Result<LocalReply> {
-    let mut buf = Vec::with_capacity(64);
+/// Read the reply line.
+pub fn recv_reply(stream: &mut UnixStream) -> io::Result<Reply> {
+    let mut buf = Vec::with_capacity(128);
     let mut byte = [0u8; 1];
     loop {
         let n = stream.read(&mut byte)?;
@@ -191,10 +216,10 @@ mod tests {
     use std::fs::File;
 
     #[test]
-    fn fd_passing_and_reply_roundtrip_over_a_socketpair() {
+    fn op_fd_passing_and_reply_roundtrip_over_a_socketpair() {
         // Pass a pipe's write end through the socket; reading the read end
         // proves the descriptor really crossed the process boundary intact.
-        let (mut shim, mut daemon) = UnixStream::pair().unwrap();
+        let (mut shim, daemon) = UnixStream::pair().unwrap();
         let mut pipe_fds = [0 as RawFd; 2];
         // SAFETY: standard pipe(2) with a 2-element array out-param.
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
@@ -202,16 +227,15 @@ mod tests {
         let read_end = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
         let write_end = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
 
-        let req = LocalRequest {
+        let frame = Frame::Op {
             argv: vec!["op".into(), "read".into()],
             cwd: "/work".into(),
         };
-        send_request(&shim, &req, &[write_end.as_raw_fd()]).unwrap();
+        send_frame(&shim, &frame, &[write_end.as_raw_fd()]).unwrap();
         drop(write_end);
 
-        let (got, mut fds) = recv_request(&daemon).unwrap();
-        assert_eq!(got.argv, req.argv);
-        assert_eq!(got.cwd, req.cwd);
+        let (got, mut fds) = recv_frame(&daemon).unwrap();
+        assert_eq!(got, frame);
         assert_eq!(fds.len(), 1);
 
         // The received fd is a live handle to the same pipe.
@@ -224,7 +248,30 @@ mod tests {
         assert_eq!(s, "hello\n");
 
         // Terminal reply mirrors the exit code back to the shim.
-        send_reply(&mut daemon, &LocalReply { exit: 3 }).unwrap();
-        assert_eq!(recv_reply(&mut shim).unwrap().exit, 3);
+        let mut daemon = daemon;
+        send_reply(&mut daemon, &Reply::Exit { code: 3 }).unwrap();
+        assert_eq!(recv_reply(&mut shim).unwrap(), Reply::Exit { code: 3 });
+    }
+
+    #[test]
+    fn control_frame_roundtrips_without_fds() {
+        let (client, daemon) = UnixStream::pair().unwrap();
+        let frame = Frame::Approve {
+            id: "req-1".into(),
+            lease: true,
+        };
+        send_frame(&client, &frame, &[]).unwrap();
+        let (got, fds) = recv_frame(&daemon).unwrap();
+        assert_eq!(got, frame);
+        assert!(fds.is_empty());
+
+        let mut daemon = daemon;
+        let reply = Reply::Control {
+            ok: true,
+            lines: vec!["approved".into()],
+        };
+        send_reply(&mut daemon, &reply).unwrap();
+        let mut client = client;
+        assert_eq!(recv_reply(&mut client).unwrap(), reply);
     }
 }

@@ -3,13 +3,7 @@
 //! Invoked as `op` (argv[0] file stem) it is the shim; invoked as anything else
 //! it is the `latch` CLI. The shim path is std-only and synchronous so its cold
 //! start stays near zero; only the `daemon` subcommand ever builds a runtime.
-
-mod cli;
-mod daemon;
-mod local;
-mod paths;
-mod shim;
-mod style;
+//! All the real machinery lives in the `latch` library crate.
 
 use std::path::Path;
 
@@ -21,8 +15,8 @@ fn main() {
         .unwrap_or("");
 
     if stem == "op" {
-        shim::run(); // never returns
+        latch::shim::run(); // never returns
     }
 
-    std::process::exit(cli::run());
+    std::process::exit(latch::cli::run());
 }

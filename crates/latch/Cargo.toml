@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "Latch daemon, op shim, and CLI as one multicall binary"
 
+# A library target holds all the modules so unit tests and the seam traits are
+# public API (a binary-only crate would flag every test-only helper as dead).
+[lib]
+name = "latch"
+path = "src/lib.rs"
+
 [[bin]]
 name = "latch"
 path = "src/main.rs"
@@ -15,9 +21,31 @@ serde.workspace = true
 serde_json.workspace = true
 # anyhow only at the binary edge, per house rules.
 anyhow.workspace = true
+# thiserror: typed errors for the keystore/secrets/lease library seams.
+thiserror.workspace = true
 # libc: SCM_RIGHTS fd passing (op stdout/stderr wired straight to the caller,
-# never through daemon memory) and unix socket/dir permission bits.
+# never through daemon memory), unix socket/dir permission bits, socket peer
+# pid (LOCAL_PEERPID), and kernel-side process ancestry (sysctl KERN_PROC).
 libc.workspace = true
+# zeroize: DEK and decrypted-token buffers are wiped on drop; audited per path.
+zeroize.workspace = true
+# aes-gcm 0.10: AES-256-GCM for service-account tokens at rest under the DEK.
+# Pinned to 0.10 so it shares aead 0.5 with crypto_box already in the tree.
+aes-gcm = "0.10"
+# rand_core: CSPRNG (OsRng) for DEK and nonce generation. Same crate/features
+# the proto identity keys already use.
+rand_core.workspace = true
+# blake2: grant-key derivation over the verified caller ancestry chain.
+blake2.workspace = true
+# base64: encode token ciphertext for the plaintext-safe JSON account store.
+base64.workspace = true
+# uuid v7: per-approval ids used to address a pending local approval.
+uuid.workspace = true
 # tokio: async accept loop for the daemon only; the shim path never builds a
 # runtime. Feature set kept to the listener plus signal handling.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
+
+# security-framework: macOS Keychain blob storage and the Secure Enclave seam.
+# macOS-only so Linux/Windows fills stay dependency-free.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "2"

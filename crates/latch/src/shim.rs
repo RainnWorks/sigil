@@ -14,7 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{self, Command};
 
-use crate::local::{self, LocalRequest};
+use crate::local::{self, Frame, Reply};
 use crate::paths;
 
 /// Entry point for shim mode. Never returns.
@@ -40,13 +40,21 @@ fn forward(mut stream: UnixStream) -> io::Result<i32> {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let req = LocalRequest { argv, cwd };
+    let frame = Frame::Op { argv, cwd };
 
     // Hand the daemon our real stdout and stderr; `op` writes straight to them.
     let out = io::stdout();
     let err = io::stderr();
-    local::send_request(&stream, &req, &[out.as_raw_fd(), err.as_raw_fd()])?;
-    Ok(local::recv_reply(&mut stream)?.exit)
+    local::send_frame(&stream, &frame, &[out.as_raw_fd(), err.as_raw_fd()])?;
+    match local::recv_reply(&mut stream)? {
+        Reply::Exit { code } => Ok(code),
+        // The daemon only ever answers an op frame with an exit code; anything
+        // else is a protocol fault, so fail closed rather than run op locally.
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected reply to op request: {other:?}"),
+        )),
+    }
 }
 
 fn exec_real_op() -> ! {

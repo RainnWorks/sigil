@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "latch-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-04",
+  // One Durable Object per mailbox, keyed by the 64-hex mailbox id.
+  "durable_objects": {
+    "bindings": [{ "name": "MAILBOX", "class_name": "Mailbox" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Mailbox"] }],
+  // Deliberately OFF. Request logs would record mailbox ids and timing, which is
+  // exactly the metadata this relay promises never to retain. See README.
+  "observability": { "enabled": false }
+}
