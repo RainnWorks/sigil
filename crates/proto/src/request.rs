@@ -230,8 +230,11 @@ impl ApprovalResponse {
     /// yields no key rather than a partial one).
     pub fn dek(&self) -> Option<Dek> {
         let b64 = self.wrapped_dek.as_ref()?;
-        let bytes = B64.decode(b64).ok()?;
-        let arr: [u8; 32] = bytes.try_into().ok()?;
+        // The decoded bytes are raw DEK material: hold them in a Zeroizing
+        // buffer so the plaintext key does not linger in a freed heap
+        // allocation after it is copied into the zeroize-on-drop `Dek`.
+        let bytes = zeroize::Zeroizing::new(B64.decode(b64).ok()?);
+        let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
         Some(Dek::from_bytes(arr))
     }
 }
