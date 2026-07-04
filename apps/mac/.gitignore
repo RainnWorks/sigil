@@ -1,0 +1,8 @@
+# Generated from project.yml by xcodegen; regenerate with `xcodegen generate`.
+Latch.xcodeproj/
+# Xcode build products and per-user state.
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.DS_Store
