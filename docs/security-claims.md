@@ -112,6 +112,20 @@ Reviewed at commit `3d005aa` (the first end-to-end remote-approval loop).
 | The mailbox id carries no identity and is order-independent | `fingerprint.rs::mailbox_id` | `fingerprint.rs::mailbox_is_order_independent`, `mailbox_differs_for_different_pairs`, `fingerprint_and_mailbox_are_domain_separated` |
 | The relay has no key-distribution role (pairing is out-of-band QR) | `pairing.rs` (keys travel optically) | design invariant; the whole `pairing_mitm.rs` suite proves trust does not rest on any network party |
 
+## 10. Pairing persistence stays inert at rest (the `latch pair` at-rest format)
+
+| Claim | Enforcing code | Proving test |
+|-------|----------------|--------------|
+| The persisted set is `{daemon private identity → keystore, phone PUBLIC identity, relay URL, SAS words}`; no DEK, no DEK envelope, no pairing secret is ever persisted | `pairing_store.rs::{save,PersistedPairing,NewPairing}` | `pairing_store.rs::config_file_is_0600_and_holds_no_dek` (asserts no `dek`/`secret`/`signing` substring), `daemon.rs::persisted_pairing_reloads_and_stays_inert_at_rest` (`has_dek()==false`) |
+| The daemon private identity is sealed into the keystore blob seam (Keychain on macOS), never the plaintext file | `pairing_store.rs::save` (`store_blob(DAEMON_IDENTITY_LABEL, …)`), `keystore_macos.rs::MacKeystore::store_blob` | `pairing_store.rs::save_then_load_reconstructs_the_config_and_pins_the_phone` |
+| The 64-byte identity serialization is `Zeroizing`, length-checked, and fails closed on a corrupt/truncated blob (no partial key) | `identity.rs::DeviceIdentity::{to_secret_bytes,from_secret_bytes}` (intermediates zeroized) | `identity.rs::secret_bytes_round_trip_preserves_the_public_identity`, `from_secret_bytes_rejects_a_wrong_length_blob` |
+| The public config file is 0600 and holds no key material | `pairing_store.rs::save` (`set_permissions 0o600`) | `pairing_store.rs::config_file_is_0600_and_holds_no_dek` |
+| An attacker with the whole disk cannot produce a secret: tokens are ciphertext under the DEK the daemon does not hold; the stolen state can only *ask* the phone, which requires a fresh hardware-gated approval | `pairing_store.rs` (no DEK persisted), `daemon.rs::fulfill` (DEK arrives per-approval), `remote.rs` | `daemon.rs::reloaded_pairing_serves_a_secret_over_the_real_relay` (reloaded identity serves a secret ONLY via the phone's sealed DEK, `has_dek()==false`) |
+| A half-broken pairing (config present, keystore identity gone) surfaces loudly instead of silently failing | `pairing_store.rs::load` (`MissingIdentity`/`CorruptIdentity`), `daemon.rs::load_remote_pairing` (logs, treats as no-pairing → fails closed) | `pairing_store.rs::config_present_but_identity_missing_is_a_loud_error` |
+| The bootstrap **rendezvous mailbox** is domain-separated and non-invertible: leaking it reveals nothing about the secret | `pairing.rs::rendezvous_mailbox` (`BLAKE2b(RENDEZVOUS_DOMAIN ‖ daemon.verifying ‖ daemon.agreement ‖ secret)`, distinct from `mailbox_id`/`fingerprint`/confirm-tag domains; secret is 256-bit CSPRNG so preimage-resistant) | reviewed by inspection (domain constants distinct; length-prefixed absorb is injective); **UNPROVEN** by a dedicated test — no negative test asserts domain separation of the rendezvous id |
+| Pairing message 1 (`PairingResponse`) travels the relay as MAC-authenticated plaintext carrying only public data (phone pubkey, nonce, tag); substitution is rejected | `pairing.rs::PairingResponse::verify`, `relay-client/src/rendezvous_ws.rs` (moves opaque strings only, no envelope/key handling) | the full `pairing_mitm.rs` suite (message 1 is exactly what it attacks) |
+| Persisting a pairing auto-selects the phone factor with no dev flag | `daemon.rs::{load_remote_pairing,build_gate}` (`Factor::Phone`) | `daemon.rs::build_gate_selects_the_phone_approver_from_a_persisted_config` |
+
 ---
 
 ## Residuals (honest limits)
@@ -198,3 +212,29 @@ These are real and deliberately surfaced, not defects hidden.
    parties exchange envelopes, and the sizes/timing of those envelopes. This is
    inherent to any store-and-forward transport and is the accepted trust surface
    (`docs/design/latch-design-brief.html`, Trust model).
+
+7. **The "inert at rest" claim is strong for cold-disk theft, weaker for live
+   same-UID compromise.** Cold-disk theft yields only `pairing.json` (public);
+   the daemon private identity is in the login Keychain, encrypted at rest, so a
+   powered-off disk/backup reveals no key material — the strong form of the
+   claim holds. But an attacker running live as Tom with the Keychain unlocked
+   can read the identity blob and then originate `ApprovalRequest`s to the phone
+   with **attacker-chosen provenance** (`process_chain`, `cwd`, `machine` are
+   filled by whoever builds the request; the daemon normally derives them from
+   kernel-verified ancestry, but a raw holder of the signing key writes them
+   directly). The phone's readout cannot then distinguish an attacker's request
+   from a legitimate one, so the last line of defense is the human declining a
+   request they did not initiate. This is inherent to holding a signing key, not
+   a defect; and a live same-UID attacker could already trigger a *real* request
+   through the shim. The DEK still never releases without a fresh hardware-gated
+   tap, so nothing is released automatically. Documented so the phone UX does not
+   over-trust the displayed provenance.
+
+8. **`pairing.md` doc drift (cosmetic).** The pairing design note states "the
+   pairing secret is used only to key the confirmation MAC and is then
+   destroyed." As of the rendezvous work the secret is *also* an input to
+   `rendezvous_mailbox` (a distinct one-way BLAKE2b over `domain ‖ daemon_pub ‖
+   secret`). This is a second, independent one-way use of a 256-bit CSPRNG value
+   — no key reuse across a shared construction, no oracle, non-invertible — so it
+   is not a weakness, but the sentence in `docs/design/pairing.md` should be
+   updated to name both uses. Flagged to the doc owner.
