@@ -1,8 +1,11 @@
 /**
- * The recessed readout well. For a secret it shows the op:// reference segmented
- * so the item name is brightest and the separators dim; for SSH it shows key
- * label, host, and challenge fingerprint, the two things worth verifying.
+ * The recessed readout well. For a secret read it shows each requested ref's
+ * display segments — the item name brightest, separators dim — rendered from
+ * the provider-agnostic SecretRef and never by parsing the opaque reference. For
+ * SSH it shows key label, host, and challenge fingerprint, the two things worth
+ * verifying.
  */
+import { Fragment } from "react";
 import { View } from "react-native";
 
 import { Mono } from "@/components/ui/text";
@@ -31,26 +34,40 @@ function Well({ children }: { children: React.ReactNode }) {
   );
 }
 
-export function SecretReadout({ secretRef }: { secretRef: SecretRef }) {
+function RefLine({ secretRef }: { secretRef: SecretRef }) {
   const p = useTheme();
   const segments = segmentSecretRef(secretRef);
   return (
+    <Mono size={17} selectable style={{ lineHeight: 26 }}>
+      {segments.map((s, i) => (
+        <Mono
+          key={i}
+          size={17}
+          weight={s.emphasis === "bright" ? "semibold" : "regular"}
+          style={{
+            color: s.emphasis === "bright" ? p.label : s.emphasis === "sep" ? p.faint : p.muted,
+          }}
+        >
+          {s.text}
+        </Mono>
+      ))}
+    </Mono>
+  );
+}
+
+/**
+ * A command may resolve several secrets; each gets its own hairline-separated
+ * line in the one well.
+ */
+export function SecretReadout({ secrets }: { secrets: SecretRef[] }) {
+  return (
     <Well>
-      <Mono size={17} selectable style={{ lineHeight: 26 }}>
-        {segments.map((s, i) => (
-          <Mono
-            key={i}
-            size={17}
-            weight={s.emphasis === "bright" ? "semibold" : "regular"}
-            style={{
-              color:
-                s.emphasis === "bright" ? p.label : s.emphasis === "sep" ? p.faint : p.muted,
-            }}
-          >
-            {s.text}
-          </Mono>
-        ))}
-      </Mono>
+      {secrets.map((ref, i) => (
+        <Fragment key={i}>
+          {i > 0 ? <Hairline /> : null}
+          <RefLine secretRef={ref} />
+        </Fragment>
+      ))}
     </Well>
   );
 }

@@ -18,6 +18,7 @@ import { useTheme } from "@/theme/colors";
 import { space } from "@/theme/tokens";
 import { faceGate } from "@/src/lib/biometric";
 import { hapticCommit } from "@/src/lib/haptics";
+import { requestSource } from "@/src/lib/format";
 import { type PendingRequest } from "@/src/domain/types";
 import { store, useSelector } from "@/src/state/store";
 import { ApproveControl } from "./approve-control";
@@ -82,7 +83,7 @@ export function ApprovalSheet({
         {/* account header + gauge */}
         <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
           <Mono size={14} tone="muted">
-            {request.accountLabel}
+            {requestSource(request)}
           </Mono>
           <TimeoutGauge
             expiresAt={request.expiresAt}
@@ -94,8 +95,8 @@ export function ApprovalSheet({
 
         <TypeBanner kind={request.kind} />
 
-        {request.kind === "read_secret" && request.secret ? (
-          <SecretReadout secretRef={request.secret} />
+        {request.secrets.length > 0 ? (
+          <SecretReadout secrets={request.secrets} />
         ) : request.ssh ? (
           <SshReadout ssh={request.ssh} />
         ) : null}

@@ -1,30 +1,52 @@
 /**
  * The approval request/response payloads: the plaintext that rides *inside* a
- * sealed envelope. crates/proto does not yet define these (envelope, pairing,
- * identity, fingerprint, and replay are landed; the request payload is still
- * being finalized on the rust-core side). This module is the phone's proposed
- * shape and MUST be reconciled when the Rust type lands. Keep it in this one
- * file so the reconciliation is a single diff.
+ * sealed envelope. This byte-matches crates/proto/src/request.rs (camelCase
+ * serde on the Rust side); keep the two in lockstep.
+ *
+ * **Provider-agnostic by design.** The daemon's core is generic: "run this
+ * command with the approved credential injected so the command resolves its own
+ * secrets." The *source* of secrets is a pluggable provider seam (1Password's
+ * `op` is provider #1; bitwarden, aws-vault, doppler, an env-file are later
+ * fills). This contract bakes in no provider semantics: `command` is the raw
+ * argv, `secrets` are opaque provider references with display-only readout data,
+ * and `kind` is a DISPLAY HINT ONLY (how to render), never a mechanism switch
+ * (how to fulfill).
  *
  * The phone never sees a service-account token or a resolved secret value. A
  * request carries only metadata to display; a response carries the decision and,
- * on approve, the DEK re-wrapped to this request's ephemeral key.
+ * on approve, the DEK the daemon needs to decrypt the one stored credential.
+ * The whole response is sealed in an envelope, so `wrappedDek` is the plain
+ * base64 of the raw 32-byte DEK, confidential by virtue of the enclosing seal.
  */
 
 /** Risk scales the approve control only. Deny is always one tap. */
 export type RiskLevel = "routine" | "elevated" | "critical";
 
-export type RequestKind = "read_secret" | "ssh_signature";
+/**
+ * How the approver should *render* a request. A DISPLAY HINT ONLY: it selects a
+ * layout, never how the daemon fulfills the request (that is the provider seam's
+ * job). Serializes snake_case to match the Rust enum.
+ */
+export type RequestKind = "secret_read" | "ssh_signature" | "resume" | "lockdown_clear";
 
-/** A secret read: the op:// reference, segmented for the readout well. */
+/**
+ * A provider-agnostic reference to one requested secret. `reference` is OPAQUE:
+ * only the daemon-side provider named by `provider` knows how to resolve it, and
+ * the approver never parses it. The readout well is rendered from `segments` and
+ * `label`, never from `reference`.
+ */
 export interface SecretRef {
-  /** 1Password account label, e.g. "Rowm work". */
-  account: string;
-  vault: string;
-  /** The item name; rendered brightest in the well. */
-  item: string;
-  /** Field within the item, e.g. "access-key". */
-  field: string;
+  /** The provider that resolves this reference, e.g. "1password", "aws-vault". */
+  provider: string;
+  /** The opaque reference the provider understands. Never parsed on the phone. */
+  reference: string;
+  /**
+   * Human-readable path segments for the readout well, most-general first
+   * (e.g. ["Engineering", ".env", "password"]). Display only.
+   */
+  segments: string[];
+  /** A short display label (e.g. the item name), rendered brightest. */
+  label: string;
 }
 
 /** An SSH signature: the two things worth verifying. */
@@ -37,7 +59,7 @@ export interface SshChallenge {
 
 /** Daemon-verified provenance. Rendered in SF Mono, hairline-separated. */
 export interface Provenance {
-  /** Resolved ancestor chain, e.g. ["zsh", "claude", "op read"]. */
+  /** Resolved ancestor chain, root-first, e.g. ["zsh", "claude", "op"]. */
   processChain: string[];
   cwd: string;
   machine: string;
@@ -48,11 +70,16 @@ export interface Provenance {
 export interface ApprovalRequest {
   /** Matches the enclosing envelope's request id. */
   requestId: string;
+  /** Display hint for the approver's layout. */
   kind: RequestKind;
-  accountLabel: string;
-  /** Present iff kind === "read_secret". */
-  secret?: SecretRef;
-  /** Present iff kind === "ssh_signature". */
+  /** The argv the shim intercepted, e.g. ["op", "read", "op://…"]. */
+  command: string[];
+  /**
+   * Provider-agnostic references to the secrets this command will resolve.
+   * Empty for kinds that read no secret (resume, lockdown_clear).
+   */
+  secrets: SecretRef[];
+  /** Present for "ssh_signature". */
   ssh?: SshChallenge;
   provenance: Provenance;
   risk: RiskLevel;
@@ -69,7 +96,10 @@ export type Decision = "approved" | "denied";
 export interface ApprovalResponse {
   requestId: string;
   decision: Decision;
-  /** On approve: the DEK re-wrapped to this request's ephemeral key, base64. */
+  /**
+   * On approve: standard-base64 of the raw 32-byte DEK. Absent on deny, so a
+   * denial cannot release a token. Confidential by virtue of the enclosing seal.
+   */
   wrappedDek?: string;
   /** On approve with "for this session": a lease grant, else null. */
   lease?: { grantKey: string; ttlMs: number } | null;

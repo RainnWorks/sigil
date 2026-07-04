@@ -7,6 +7,7 @@
 import { useSyncExternalStore } from "react";
 
 import { type ApprovalRequest, type Decision } from "@/src/protocol";
+import { requestSource, secretRefLabel } from "@/src/lib/format";
 import {
   type AppState,
   type HistoryEntry,
@@ -126,16 +127,16 @@ class Store {
   private record(p: PendingRequest, decision: Decision | "expired", note?: string): void {
     const r = p.request;
     const label =
-      r.kind === "read_secret" && r.secret
-        ? `${r.secret.vault}/${r.secret.item} › ${r.secret.field}`
+      r.secrets.length > 0
+        ? r.secrets.map(secretRefLabel).join(", ")
         : r.ssh
           ? `${r.ssh.keyLabel} → ${r.ssh.host}`
-          : r.accountLabel;
+          : requestSource(r);
     const entry: HistoryEntry = {
       id: r.requestId,
       kind: r.kind,
       label,
-      account: r.accountLabel,
+      account: requestSource(r),
       process: r.provenance.processChain[r.provenance.processChain.length - 1] ?? "",
       cwd: r.provenance.cwd,
       decision,
@@ -163,11 +164,11 @@ class Store {
  */
 function grantKey(r: ApprovalRequest): string {
   const scope =
-    r.kind === "read_secret" && r.secret
-      ? `${r.secret.vault}/${r.secret.item}/${r.secret.field}`
+    r.secrets.length > 0
+      ? r.secrets.map((s) => s.reference).join(",")
       : r.ssh
         ? `${r.ssh.keyLabel}@${r.ssh.host}`
-        : r.accountLabel;
+        : r.command.join(" ");
   return `${r.provenance.processChain.join(">")}|${r.provenance.cwd}|${scope}`;
 }
 

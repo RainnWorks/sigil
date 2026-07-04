@@ -1,8 +1,10 @@
 /**
- * Formatting for the content voice: relative time, mono clocks, and the op://
- * reference segmentation the readout well needs.
+ * Formatting for the content voice: relative time, mono clocks, and the
+ * secret-reference readout the well needs. Everything here works off a
+ * SecretRef's display-only `segments` / `label`; it never parses the opaque
+ * `reference`, which only the owning provider understands.
  */
-import { type SecretRef } from "@/src/protocol";
+import { type ApprovalRequest, type SecretRef } from "@/src/protocol";
 
 /** "just now", "12s ago", "4m ago", "2d ago" — the brief's terse register. */
 export function relativeTime(fromMs: number, nowMs: number = Date.now()): string {
@@ -32,21 +34,46 @@ export interface RefSegment {
 }
 
 /**
- * Segment an op:// reference for the well: leading "op://", then account / vault
- * / item / field with dim separators, the item name brightest.
+ * Segment a SecretRef for the well: its `segments`, most-general first, joined
+ * by dim separators, with the item (the segment equal to `label`) brightest. If
+ * no segment matches the label, the last — the most specific, meaningful
+ * segment — is brightened instead.
  */
 export function segmentSecretRef(ref: SecretRef): RefSegment[] {
-  const sep: RefSegment = { text: " / ", emphasis: "sep" };
-  return [
-    { text: "op://", emphasis: "sep" },
-    { text: ref.account, emphasis: "normal" },
-    sep,
-    { text: ref.vault, emphasis: "normal" },
-    sep,
-    { text: ref.item, emphasis: "bright" },
-    sep,
-    { text: ref.field, emphasis: "normal" },
-  ];
+  const out: RefSegment[] = [];
+  ref.segments.forEach((seg, i) => {
+    if (i > 0) out.push({ text: " / ", emphasis: "sep" });
+    out.push({ text: seg, emphasis: seg === ref.label ? "bright" : "normal" });
+  });
+  const last = out[out.length - 1];
+  if (last && !ref.segments.includes(ref.label)) {
+    last.emphasis = "bright";
+  }
+  return out;
+}
+
+/**
+ * A one-line label for a secret ref, e.g. "Engineering/.env › graphql-api":
+ * the leading segments joined by "/", then the most-specific segment after "›".
+ * Falls back to the label when there are no segments.
+ */
+export function secretRefLabel(ref: SecretRef): string {
+  const leaf = ref.segments[ref.segments.length - 1];
+  if (leaf === undefined) return ref.label;
+  const head = ref.segments.slice(0, -1).join("/");
+  return head ? `${head} › ${leaf}` : leaf;
+}
+
+/**
+ * The provider-agnostic "source" line for a request header: the first secret's
+ * provider (e.g. "1password"), or the command name for kinds that read no
+ * secret (ssh_signature, resume, lockdown_clear).
+ */
+export function requestSource(r: ApprovalRequest): string {
+  const first = r.secrets[0];
+  if (first) return first.provider;
+  if (r.ssh) return r.ssh.keyLabel;
+  return r.command[0] ?? "";
 }
 
 /** Render a resolved process chain as "zsh -> claude -> op read". */

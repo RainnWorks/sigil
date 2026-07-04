@@ -6,7 +6,7 @@ import { Mono, Sans } from "@/components/ui/text";
 import { Card, Hairline, SectionHeader, StatePill } from "@/components/ui/primitives";
 import { stateLabel, useTheme } from "@/theme/colors";
 import { radius, space } from "@/theme/tokens";
-import { relativeTime } from "@/src/lib/format";
+import { relativeTime, requestSource, secretRefLabel } from "@/src/lib/format";
 import { type PendingRequest } from "@/src/domain/types";
 import { useAppState } from "@/src/state/store";
 
@@ -120,11 +120,11 @@ function PendingRow({ pending, onPress }: { pending: PendingRequest; onPress: ()
   const p = useTheme();
   const r = pending.request;
   const label =
-    r.kind === "read_secret" && r.secret
-      ? `${r.secret.item} › ${r.secret.field}`
+    r.secrets.length > 0
+      ? r.secrets.map(secretRefLabel).join(", ")
       : r.ssh
         ? `${r.ssh.keyLabel} → ${r.ssh.host}`
-        : r.accountLabel;
+        : requestSource(r);
   return (
     <Pressable
       onPress={onPress}
@@ -136,7 +136,7 @@ function PendingRow({ pending, onPress }: { pending: PendingRequest; onPress: ()
           {label}
         </Mono>
         <Mono size={12} tone="muted">
-          {r.accountLabel} · {r.provenance.processChain[r.provenance.processChain.length - 1]}
+          {requestSource(r)} · {r.provenance.processChain[r.provenance.processChain.length - 1]}
         </Mono>
       </View>
       <Sf name="chevron.right" color={p.faint} size={14} />

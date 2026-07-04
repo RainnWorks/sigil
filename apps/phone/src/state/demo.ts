@@ -18,9 +18,16 @@ const now = Date.now();
 export function demoReadRequest(overrides: Partial<ApprovalRequest> = {}): ApprovalRequest {
   return {
     requestId: crypto.randomUUID(),
-    kind: "read_secret",
-    accountLabel: "Rowm work",
-    secret: { account: "Rowm", vault: "Production", item: "AWS-prod", field: "access-key" },
+    kind: "secret_read",
+    command: ["op", "read", "op://Production/AWS-prod/access-key"],
+    secrets: [
+      {
+        provider: "1password",
+        reference: "op://Production/AWS-prod/access-key",
+        segments: ["Production", "AWS-prod", "access-key"],
+        label: "AWS-prod",
+      },
+    ],
     provenance: {
       processChain: ["zsh", "claude", "op read"],
       cwd: "~/Projects/rowm-api",
@@ -39,8 +46,15 @@ export function demoReadRequest(overrides: Partial<ApprovalRequest> = {}): Appro
 export function demoRoutineRequest(): ApprovalRequest {
   return demoReadRequest({
     requestId: crypto.randomUUID(),
-    accountLabel: "Rowm work",
-    secret: { account: "Rowm", vault: "Engineering", item: ".env", field: "graphql-api" },
+    command: ["op", "read", "op://Engineering/.env/graphql-api"],
+    secrets: [
+      {
+        provider: "1password",
+        reference: "op://Engineering/.env/graphql-api",
+        segments: ["Engineering", ".env", "graphql-api"],
+        label: ".env",
+      },
+    ],
     risk: "routine",
     reason: undefined,
     provenance: {
@@ -57,7 +71,8 @@ export function demoSshRequest(): ApprovalRequest {
   return {
     requestId: crypto.randomUUID(),
     kind: "ssh_signature",
-    accountLabel: "Rowm work",
+    command: ["ssh", "git@github.com"],
+    secrets: [],
     ssh: {
       keyLabel: "github-deploy",
       host: "git@github.com",
@@ -101,7 +116,7 @@ export const demoLeases: Lease[] = [
 export const demoHistory: HistoryEntry[] = [
   {
     id: "h1",
-    kind: "read_secret",
+    kind: "secret_read",
     label: "Engineering/.env › graphql-api",
     account: "Rowm work",
     process: "claude",
@@ -123,7 +138,7 @@ export const demoHistory: HistoryEntry[] = [
   },
   {
     id: "h3",
-    kind: "read_secret",
+    kind: "secret_read",
     label: "AWS-prod › access-key",
     account: "Rowm work",
     process: "zsh",
@@ -135,7 +150,7 @@ export const demoHistory: HistoryEntry[] = [
   },
   {
     id: "h4",
-    kind: "read_secret",
+    kind: "secret_read",
     label: "Personal/router › password",
     account: "Personal",
     process: "zsh",
