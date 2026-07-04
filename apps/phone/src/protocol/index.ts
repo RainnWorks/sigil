@@ -11,5 +11,6 @@ export * from "./replay";
 export * from "./envelope";
 export * from "./wire";
 export * from "./pairing";
+export * from "./pairing-handshake";
 export * from "./requests";
 export { WORDS } from "./words";

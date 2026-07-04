@@ -7,38 +7,69 @@ import { Mono, Sans } from "@/components/ui/text";
 import { Card } from "@/components/ui/primitives";
 import { useTheme } from "@/theme/colors";
 import { radius, space } from "@/theme/tokens";
-import { currentCeremony, resetCeremony } from "@/src/session/pairing-flow";
+import {
+  awaitDekDelivery,
+  currentCeremony,
+  resetCeremony,
+  submitPairingResponse,
+} from "@/src/session/pairing-flow";
 
-type Phase = "handshaking" | "confirm" | "pairing" | "error";
+type Phase = "handshaking" | "confirm" | "delivering" | "error";
 
 /**
- * The fingerprint confirmation: both devices show the same six words derived
- * from the two pinned identities. Match pins the daemon and completes the
- * handshake; Don't match aborts, because a mismatch is the signature of a
- * man-in-the-middle on the QR channel.
+ * The fingerprint confirmation and the live rendezvous. On mount the phone sends
+ * its authenticated PairingResponse to the daemon (message 1) over the relay;
+ * both devices then show the same six words derived from the two pinned
+ * identities. "They match" waits for the daemon's sealed DEK (message 3), stores
+ * it, and completes. "Don't match" aborts, because a mismatch is the signature of
+ * a man-in-the-middle on the QR channel.
  */
 export default function ConfirmScreen() {
   const p = useTheme();
   const router = useRouter();
   const [phase, setPhase] = useState<Phase>("handshaking");
   const [words, setWords] = useState<string[]>([]);
+  const [error, setError] = useState<string>("");
 
   useEffect(() => {
-    const c = currentCeremony();
-    if (!c?.confirmWords) {
-      setPhase("error");
-      return;
-    }
-    setWords(c.confirmWords);
-    // Brief "handshaking" beat before asking for the human check.
-    const t = setTimeout(() => setPhase("confirm"), 700);
-    return () => clearTimeout(t);
+    let alive = true;
+    (async () => {
+      const c = currentCeremony();
+      if (!c?.confirmWords) {
+        if (alive) {
+          setError("Pairing lost its place. Start again from the Mac's QR code.");
+          setPhase("error");
+        }
+        return;
+      }
+      if (alive) setWords(c.confirmWords);
+      try {
+        // Message 1: prove possession of the one-time secret and let the daemon
+        // pin this phone, so its screen can show the matching words.
+        await submitPairingResponse();
+        if (alive) setPhase("confirm");
+      } catch (e) {
+        if (alive) {
+          setError(e instanceof Error ? e.message : "Could not reach the Mac over the relay.");
+          setPhase("error");
+        }
+      }
+    })();
+    return () => {
+      alive = false;
+    };
   }, []);
 
-  function onMatch(): void {
-    setPhase("pairing");
-    // On device: complete the sealed handshake with the daemon over the ladder.
-    setTimeout(() => router.replace({ pathname: "/pairing/done", params: { ok: "1" } }), 900);
+  async function onMatch(): Promise<void> {
+    setPhase("delivering");
+    try {
+      // Message 3: the daemon seals the DEK once its human confirms too.
+      await awaitDekDelivery();
+      router.replace({ pathname: "/pairing/done", params: { ok: "1" } });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "The Mac did not deliver the key.");
+      setPhase("error");
+    }
   }
 
   function onMismatch(): void {
@@ -50,9 +81,9 @@ export default function ConfirmScreen() {
     return (
       <View style={{ flex: 1, padding: space.xl, justifyContent: "center", gap: space.md }}>
         <Sans size={18} weight="semibold" tone="deny">
-          Pairing lost its place
+          Pairing did not complete
         </Sans>
-        <Sans tone="muted">Start again from the Mac&apos;s QR code.</Sans>
+        <Sans tone="muted">{error}</Sans>
       </View>
     );
   }
@@ -60,7 +91,7 @@ export default function ConfirmScreen() {
   return (
     <View style={{ flex: 1, padding: space.xl, gap: space.xl, justifyContent: "center" }}>
       <View style={{ alignItems: "center", gap: space.sm }}>
-        {phase === "handshaking" || phase === "pairing" ? (
+        {phase === "handshaking" || phase === "delivering" ? (
           <Sf name="dot.radiowaves.left.and.right" color={p.cobalt} size={36} />
         ) : (
           <Sf name="checkmark.shield" color={p.cobalt} size={36} />
@@ -68,8 +99,8 @@ export default function ConfirmScreen() {
         <Sans size={20} weight="semibold" style={{ textAlign: "center" }}>
           {phase === "handshaking"
             ? "Handshaking…"
-            : phase === "pairing"
-              ? "Pairing…"
+            : phase === "delivering"
+              ? "Delivering the key…"
               : "Do both screens match?"}
         </Sans>
         <Sans size={15} tone="muted" style={{ textAlign: "center", maxWidth: 320 }}>

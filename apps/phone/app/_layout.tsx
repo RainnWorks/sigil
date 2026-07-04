@@ -8,6 +8,7 @@ import { StatusBar } from "expo-status-bar";
 
 import { paletteFor } from "@/theme/tokens";
 import { store } from "@/src/state/store";
+import { armLiveSession } from "@/src/session/controller";
 import { demoReadRequest, demoRoutineRequest, demoSshRequest } from "@/src/state/demo";
 
 /**
@@ -20,6 +21,11 @@ export default function RootLayout() {
   const p = paletteFor(scheme);
 
   useEffect(() => {
+    // If this phone has a stored pairing, arm the real relay session: it starts
+    // polling for sealed requests and dispatches decisions over the transport.
+    // Fails closed to a no-op when unpaired, so the dev/demo path is unaffected.
+    void armLiveSession();
+
     // Dev seed so the approval sheet and its states are reachable with no daemon.
     // The mock transport exercises the same requests through real crypto; this
     // is the pure-UI path. Remove for production.

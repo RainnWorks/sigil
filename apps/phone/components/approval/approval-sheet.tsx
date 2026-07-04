@@ -17,6 +17,7 @@ import { Mono } from "@/components/ui/text";
 import { useTheme } from "@/theme/colors";
 import { space } from "@/theme/tokens";
 import { faceGate } from "@/src/lib/biometric";
+import { isArmed, liveApprove, liveDeny } from "@/src/session/controller";
 import { hapticCommit } from "@/src/lib/haptics";
 import { requestSource } from "@/src/lib/format";
 import { type PendingRequest } from "@/src/domain/types";
@@ -51,28 +52,45 @@ export function ApprovalSheet({
     setBusy(true);
     setGateNote(null);
     // The biometric is mandatory and non-negotiable; the settings toggle never
-    // removes it. On device this unlocks the enclave key that re-wraps the DEK.
-    const gate = await faceGate("Approve secret release");
-    if (!gate.ok) {
-      setBusy(false);
-      setGateNote(gate.reason === "cancelled" ? null : "Face ID did not pass. Nothing was approved.");
-      return;
+    // removes it. When a live pairing is armed, reading the DEK from the
+    // biometric-tier keystore IS that gate (it seals the wrappedDek back to the
+    // daemon over the relay); when unpaired (dev/demo), faceGate stands in.
+    if (isArmed()) {
+      const outcome = await liveApprove(request);
+      if (outcome !== "sent") {
+        setBusy(false);
+        setGateNote(
+          outcome === "refused"
+            ? "Face ID did not pass. Nothing was approved."
+            : "Could not reach your Mac. Nothing was approved.",
+        );
+        return;
+      }
+    } else {
+      const gate = await faceGate("Approve secret release");
+      if (!gate.ok) {
+        setBusy(false);
+        setGateNote(
+          gate.reason === "cancelled" ? null : "Face ID did not pass. Nothing was approved.",
+        );
+        return;
+      }
     }
     await hapticCommit("approved");
-    // On device: session.respond(request, "approved", { wrappedDek }) seals the
-    // re-wrapped DEK back to the daemon. Here the store records the decision.
     store.decide(request.requestId, "approved");
     onDone();
   }
 
   async function handleDeny(): Promise<void> {
     await hapticCommit("denied");
+    if (isArmed()) await liveDeny(request);
     store.decide(request.requestId, "denied");
     onDone();
   }
 
   async function handleDenyAndBlock(): Promise<void> {
     await hapticCommit("denied");
+    if (isArmed()) await liveDeny(request);
     store.decide(request.requestId, "denied", `blocked ${process} 1h`);
     onDone();
   }

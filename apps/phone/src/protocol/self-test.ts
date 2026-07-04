@@ -5,11 +5,12 @@
  * cross-language guarantee comes from verify-vectors.ts; this proves the JS
  * side is coherent with itself and every branch is reachable.
  */
-import { bytesEqual } from "./bytes";
+import { bytesEqual, toHex } from "./bytes";
 import { EnvelopeOpenError, open, seal } from "./envelope";
 import { fingerprintWords, mailboxId } from "./fingerprint";
-import { generateDeviceIdentity, peerIdentity, signingSecretKey } from "./identity";
-import { pairingFromQrString, pairingToQrString } from "./pairing";
+import { generateDeviceIdentity, type PeerIdentity, peerIdentity, signingSecretKey } from "./identity";
+import { type PairingPayload, pairingFromQrString, pairingToQrString } from "./pairing";
+import { buildPairingResponseWithNonce, rendezvousMailbox } from "./pairing-handshake";
 import { ReplayGuard } from "./replay";
 import { loadSodiumForTests } from "./sodium-node";
 
@@ -141,6 +142,36 @@ async function main(): Promise<void> {
       back.endpoints.length === 2,
     "pairing QR round trip",
   );
+
+  // 9. Pairing handshake parity: the rendezvous mailbox and the confirmation tag
+  // over fixed inputs must equal the values the Rust proto produces. These two
+  // hex constants were produced by crates/proto (rendezvous_mailbox for the
+  // mailbox; the tag was accepted by the real DaemonPairing::verify), via the
+  // read-only parity harness. If either drifts, the phone can no longer pair with
+  // a real daemon. Pattern helper mirrors the harness's fixed key material.
+  const pattern = (mul: number, add: number): Uint8Array => {
+    const out = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) out[i] = (i * mul + add) & 0xff;
+    return out;
+  };
+  const pairDaemon: PeerIdentity = { verifying: pattern(7, 1), agreement: pattern(3, 5) };
+  const pairSecret = pattern(5, 9);
+  const pairPhone: PeerIdentity = { verifying: pattern(11, 2), agreement: pattern(13, 4) };
+  const pairNonce = pattern(17, 6);
+  const pairPayload: PairingPayload = {
+    daemon: pairDaemon,
+    endpoints: ["https://relay.latch.test"],
+    secret: pairSecret,
+    createdAt: 1_720_000_000_000,
+  };
+  const EXPECTED_MAILBOX = "f8f5836f143eed1bfb3b6cc3639f904452a3b2284f0e04f28f2b997a4f9de42e";
+  const EXPECTED_TAG = "9fcaa8fc71458a31ef409b4096ea57fd12031cd5b1c4790e3f25b83fcf9a8129";
+  ok(
+    toHex(rendezvousMailbox(sodium, pairDaemon, pairSecret)) === EXPECTED_MAILBOX,
+    "rendezvous mailbox matches proto (rust vector)",
+  );
+  const pairResp = buildPairingResponseWithNonce(sodium, pairPayload, pairPhone, pairNonce);
+  ok(toHex(pairResp.tag) === EXPECTED_TAG, "pairing confirmation tag matches proto (rust-verified)");
 
   console.log(failures === 0 ? "\nprotocol self-test: all green" : `\nprotocol self-test: ${failures} FAILED`);
   process.exit(failures === 0 ? 0 : 1);

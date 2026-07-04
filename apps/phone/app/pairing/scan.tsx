@@ -6,7 +6,7 @@ import { Pressable, View } from "react-native";
 import { Sans } from "@/components/ui/text";
 import { useTheme } from "@/theme/colors";
 import { radius, space } from "@/theme/tokens";
-import { acceptScan } from "@/src/session/pairing-flow";
+import { acceptScan, PairingExpiredError } from "@/src/session/pairing-flow";
 
 /**
  * QR scan: the camera reads the daemon's pairing QR (a base64url PairingPayload).
@@ -56,9 +56,13 @@ export default function ScanScreen() {
     try {
       await acceptScan(data);
       router.replace("/pairing/confirm");
-    } catch {
+    } catch (e) {
       handled.current = false;
-      setError("That QR is not a Latch pairing code.");
+      setError(
+        e instanceof PairingExpiredError
+          ? "That QR has expired. Generate a fresh one on your Mac."
+          : "That QR is not a Latch pairing code.",
+      );
     }
   }
 

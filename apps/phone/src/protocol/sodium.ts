@@ -53,7 +53,14 @@ export interface Sodium {
     publicKey: Uint8Array,
   ): boolean;
 
-  crypto_generichash(hashLength: number, message: Uint8Array): Uint8Array;
+  /**
+   * BLAKE2b. Unkeyed when `key` is omitted (fingerprint, mailbox id, pairing
+   * transcript); keyed when `key` is given, which is a first-class PRF and is
+   * how crates/proto's pairing handshake derives its subkey and confirmation
+   * MAC (the Rust `Blake2bMac`). Both bindings accept the optional key with an
+   * identical signature.
+   */
+  crypto_generichash(hashLength: number, message: Uint8Array, key?: Uint8Array | null): Uint8Array;
 
   readonly crypto_box_NONCEBYTES: number;
   readonly crypto_box_PUBLICKEYBYTES: number;
