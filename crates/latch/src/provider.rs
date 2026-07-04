@@ -8,26 +8,56 @@
 //! (phone / softphone) are provider-blind: they carry opaque references and a
 //! display hint, never provider mechanics.
 //!
-//! ## The invariant that shapes this seam
+//! ## The invariant that shapes the trait shape
 //!
-//! Secret VALUES never enter daemon memory (brief invariant #2). So a provider
-//! does **not** `fetch(refs) -> secret bytes` into the daemon. Instead it injects
-//! a CREDENTIAL (for `op`, the service-account token) into the child's
-//! environment, and the child streams the resolved secrets straight to the
-//! caller's fd. That is why the trait below splits into:
+//! Secret VALUES never enter daemon memory (brief invariant #2). So [`run`] is
+//! deliberately **not** `fetch(refs) -> secret bytes`: a signature that returned
+//! resolved secrets would pull them into the daemon and break the invariant.
+//! Instead a provider injects a CREDENTIAL (for `op`, the service-account token,
+//! itself a credential and not a resolved secret) into the child's environment
+//! and the child streams its resolved secrets straight to the caller's fds. So
+//! `run` fetches *and delivers* the secrets — to the caller, never returning them
+//! here — and reports only the child exit code. This is the honest realization
+//! of "fetch the secrets"; see the report accompanying this change.
 //!
-//! * [`SecretProvider::kind`] / [`SecretProvider::describe`] — build the
-//!   provider-agnostic display for the approval screen (implemented now); and
-//! * `prepare_env` / `probe` — inject the credential and enumerate what it can
-//!   serve. **NEEDS-BUILD** as a general trait method: today the daemon's spawn
-//!   path ([`crate::daemon`] `spawn_op`) is the `op` provider's inject step,
-//!   hard-coding `OP_SERVICE_ACCOUNT_TOKEN`, and [`crate::secrets::probe_vaults`]
-//!   is its probe. When provider #2 lands, lift those two into this trait
-//!   (`prepare_env(&self, dek) -> Vec<(String, String)>` and
-//!   `probe(&self, dek) -> Vec<String>`) so the daemon spawn path stops naming
-//!   `op`. The env-injection contract must keep secret values out of daemon RAM.
+//! [`run`]: SecretProvider::run
+
+use std::os::fd::OwnedFd;
+use std::os::unix::process::ExitStatusExt;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 use latch_proto::{RequestKind, SecretRef};
+
+use crate::paths;
+use crate::secrets::{self, Token};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderError {
+    /// The provider's backing tool could not be found.
+    #[error("provider tool not found")]
+    NoTool,
+    /// Probing what the credential can serve failed.
+    #[error("probe failed: {0}")]
+    Probe(String),
+}
+
+/// One command to run with a provider's credential injected. The secret VALUES
+/// stream from the child to `stdout`/`stderr` (the caller's own fds passed over
+/// the socket), so they never enter daemon memory.
+pub struct ProviderRun<'a> {
+    /// The argv the shim intercepted (argv[0] is the tool name, e.g. `op`).
+    pub command: &'a [String],
+    /// The caller's working directory, or empty to inherit the daemon's.
+    pub cwd: &'a str,
+    /// The decrypted credential to inject (for `op`, the SA token). A credential,
+    /// not a resolved secret.
+    pub credential: &'a Token,
+    /// The caller's stdout, wired straight to the child.
+    pub stdout: Option<OwnedFd>,
+    /// The caller's stderr, wired straight to the child.
+    pub stderr: Option<OwnedFd>,
+}
 
 /// A pluggable source of secrets. See the module docs for the memory invariant
 /// that shapes it.
@@ -42,17 +72,49 @@ pub trait SecretProvider: Send + Sync {
     /// [`SecretRef`]s for the approval screen. This is where the provider's own
     /// reference syntax is parsed; the approver never does this.
     fn describe(&self, command: &[String]) -> Vec<SecretRef>;
+
+    /// Run the command with the credential injected, streaming resolved secrets
+    /// straight to the caller's fds. Returns the child exit code. Secret VALUES
+    /// never return here (invariant #2). Fails closed to a non-zero code.
+    fn run(&self, run: ProviderRun) -> i32;
+
+    /// Enumerate what `credential` can serve (for `latch account add` setup).
+    fn probe(&self, credential: &[u8]) -> Result<Vec<String>, ProviderError>;
 }
 
 /// Provider #1: 1Password via `op` and a service-account token.
 ///
 /// It understands `op://…` references and injects the token so the `op` child
-/// resolves and streams the secret itself (never through the daemon).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct OpProvider;
+/// resolves and streams the secret itself (never through the daemon). The
+/// read-single-field vs get-whole-item distinction is an `op` implementation
+/// detail carried in the intercepted argv (`op read` vs `op item get`) and the
+/// ref's `segments` (a field-level ref has a trailing field segment); it is
+/// never a protocol [`RequestKind`].
+#[derive(Debug, Default, Clone)]
+pub struct OpProvider {
+    /// Explicit `op` binary; falls back to PATH discovery when `None`. Tests
+    /// point this at a fake `op`.
+    op_path: Option<PathBuf>,
+}
 
 impl OpProvider {
     pub const ID: &'static str = "1password";
+
+    /// Discover `op` on PATH at run time.
+    pub fn new() -> Self {
+        Self { op_path: None }
+    }
+
+    /// Use a fixed `op` binary (tests point this at a fake `op`).
+    pub fn with_binary(op_path: PathBuf) -> Self {
+        Self {
+            op_path: Some(op_path),
+        }
+    }
+
+    fn resolve(&self) -> Option<PathBuf> {
+        self.op_path.clone().or_else(paths::find_real_op)
+    }
 }
 
 impl SecretProvider for OpProvider {
@@ -68,6 +130,52 @@ impl SecretProvider for OpProvider {
 
     fn describe(&self, command: &[String]) -> Vec<SecretRef> {
         command.iter().filter_map(|arg| op_reference(arg)).collect()
+    }
+
+    fn run(&self, run: ProviderRun) -> i32 {
+        let Some(real) = self.resolve() else {
+            eprintln!("latch daemon: no real `op` found on PATH");
+            return 127;
+        };
+
+        let mut cmd = Command::new(&real);
+        cmd.args(run.command.iter().skip(1));
+        if !run.cwd.is_empty() {
+            cmd.current_dir(run.cwd);
+        }
+        // The service-account token is the only way `op` authenticates here. It
+        // is ASCII; a non-UTF-8 token is a corrupt store and fails closed.
+        match std::str::from_utf8(run.credential) {
+            Ok(s) => {
+                cmd.env("OP_SERVICE_ACCOUNT_TOKEN", s);
+            }
+            Err(_) => {
+                eprintln!("latch daemon: token is not valid UTF-8");
+                return 1;
+            }
+        }
+        if let Some(fd) = run.stdout {
+            cmd.stdout(Stdio::from(fd));
+        }
+        if let Some(fd) = run.stderr {
+            cmd.stderr(Stdio::from(fd));
+        }
+
+        match cmd.status() {
+            Ok(s) => s
+                .code()
+                .or_else(|| s.signal().map(|sig| 128 + sig))
+                .unwrap_or(1),
+            Err(e) => {
+                eprintln!("latch daemon: spawning op failed: {e}");
+                127
+            }
+        }
+    }
+
+    fn probe(&self, credential: &[u8]) -> Result<Vec<String>, ProviderError> {
+        let op = self.resolve().ok_or(ProviderError::NoTool)?;
+        secrets::probe_vaults(&op, credential).map_err(|e| ProviderError::Probe(e.to_string()))
     }
 }
 
@@ -112,7 +220,7 @@ mod tests {
 
     #[test]
     fn describe_extracts_op_references_only() {
-        let p = OpProvider;
+        let p = OpProvider::new();
         let refs = p.describe(&[
             "op".into(),
             "read".into(),
@@ -128,7 +236,7 @@ mod tests {
 
     #[test]
     fn describe_is_empty_without_a_reference() {
-        assert!(OpProvider
+        assert!(OpProvider::new()
             .describe(&["op".into(), "vault".into(), "list".into()])
             .is_empty());
     }
@@ -136,8 +244,49 @@ mod tests {
     #[test]
     fn kind_is_a_display_hint() {
         assert_eq!(
-            OpProvider.kind(&["op".into(), "read".into()]),
+            OpProvider::new().kind(&["op".into(), "read".into()]),
             RequestKind::SecretRead
         );
+    }
+
+    #[test]
+    fn run_streams_child_output_to_the_caller_fd() {
+        use std::io::Read;
+        use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+        use std::os::unix::fs::PermissionsExt;
+
+        // A fake `op` that echoes its token env so we can prove injection.
+        let dir = std::env::temp_dir().join(format!("latch-prov-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let op = dir.join("op");
+        std::fs::write(
+            &op,
+            "#!/bin/sh\nprintf 'tok=%s' \"$OP_SERVICE_ACCOUNT_TOKEN\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut fds = [0 as RawFd; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_end, write_end) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+
+        let provider = OpProvider::with_binary(op);
+        let credential: Token = zeroize::Zeroizing::new(b"secret-token".to_vec());
+        let code = provider.run(ProviderRun {
+            command: &["op".into(), "read".into()],
+            cwd: "",
+            credential: &credential,
+            stdout: Some(write_end),
+            stderr: None,
+        });
+        assert_eq!(code, 0);
+
+        let mut out = String::new();
+        std::fs::File::from(read_end)
+            .read_to_string(&mut out)
+            .unwrap();
+        assert_eq!(out, "tok=secret-token");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

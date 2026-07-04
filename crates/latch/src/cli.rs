@@ -12,7 +12,8 @@ use crate::daemon;
 use crate::keystore;
 use crate::local::{self, Frame, Reply};
 use crate::paths;
-use crate::secrets::{self, AccountStore};
+use crate::provider::{OpProvider, SecretProvider};
+use crate::secrets::AccountStore;
 use crate::style::Style;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -248,11 +249,9 @@ fn account_add(args: &[String]) -> i32 {
         }
     };
 
-    // Probe the vaults this token can actually route (best effort).
-    let vaults = match paths::find_real_op() {
-        Some(op) => secrets::probe_vaults(&op, &token).unwrap_or_default(),
-        None => Vec::new(),
-    };
+    // Probe the vaults this token can actually route (best effort), through the
+    // provider seam rather than calling `op` directly.
+    let vaults = OpProvider::new().probe(&token).unwrap_or_default();
     if vaults.is_empty() {
         println!(
             "  {} {}",

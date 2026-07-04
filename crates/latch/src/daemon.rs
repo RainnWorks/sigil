@@ -24,9 +24,7 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -38,8 +36,7 @@ use crate::approve::{ApprovalContext, ApprovalGate, Decision, LocalApprover, Pen
 use crate::keystore::{self, Keystore};
 use crate::lease::{self, LeaseStore, ProcessTable, SysProcessTable};
 use crate::local::{self, Frame, Reply};
-use crate::paths;
-use crate::provider::{OpProvider, SecretProvider};
+use crate::provider::{OpProvider, ProviderRun, SecretProvider};
 use crate::secrets::{self, AccountStore};
 
 /// Default session-lease TTL granted by an "approve for this session" decision.
@@ -54,11 +51,10 @@ pub struct Core {
     pending: Arc<PendingRegistry>,
     lockdown: AtomicBool,
     proc_table: Box<dyn ProcessTable + Send + Sync>,
-    /// The secret provider that describes requests and (via the spawn path)
-    /// injects the credential. 1Password is provider #1; the seam is generic.
+    /// The secret provider: it describes requests, injects the credential, and
+    /// runs the command streaming secrets to the caller. 1Password is provider
+    /// #1; the seam is generic and owns its own tool discovery.
     provider: Box<dyn SecretProvider>,
-    /// Test override for the `op` binary; production discovers it on PATH.
-    op_path: Option<PathBuf>,
     lease_ttl: Duration,
 }
 
@@ -78,8 +74,7 @@ impl Core {
             pending,
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(SysProcessTable),
-            provider: Box::new(OpProvider),
-            op_path: None,
+            provider: Box::new(OpProvider::new()),
             lease_ttl: DEFAULT_LEASE_TTL,
         })
     }
@@ -286,7 +281,13 @@ fn fulfill(
 
     // A live lease short-circuits the approval.
     if let Some(token) = core.leases.token_for(&gk, &account_label, &scope) {
-        return spawn_op(core, argv, cwd, &token, stdout, stderr);
+        return core.provider.run(ProviderRun {
+            command: argv,
+            cwd,
+            credential: &token,
+            stdout,
+            stderr,
+        });
     }
 
     // The provider describes the request in provider-agnostic terms; the
@@ -339,65 +340,18 @@ fn fulfill(
             .grant(gk, &account_label, &scope, token.clone(), ttl);
     }
 
-    let code = spawn_op(core, argv, cwd, &token, stdout, stderr);
+    // Run through the provider: it injects the credential and streams the
+    // resolved secrets straight to the caller's fds. The daemon never holds a
+    // secret value; it holds only the credential (token), zeroized below.
+    let code = core.provider.run(ProviderRun {
+        command: argv,
+        cwd,
+        credential: &token,
+        stdout,
+        stderr,
+    });
     drop(token); // zeroized here; the child holds its own copy in its env
     code
-}
-
-/// Spawn the real `op` with the token in its env and its stdout/stderr wired to
-/// the caller's descriptors. Secret bytes flow child -> caller fd, never here.
-fn spawn_op(
-    core: &Core,
-    argv: &[String],
-    cwd: &str,
-    token: &secrets::Token,
-    stdout: Option<OwnedFd>,
-    stderr: Option<OwnedFd>,
-) -> i32 {
-    let real = match &core.op_path {
-        Some(p) => p.clone(),
-        None => match paths::find_real_op() {
-            Some(p) => p,
-            None => {
-                eprintln!("latch daemon: no real `op` found on PATH");
-                return 127;
-            }
-        },
-    };
-
-    let mut cmd = Command::new(&real);
-    cmd.args(argv.iter().skip(1));
-    if !cwd.is_empty() {
-        cmd.current_dir(cwd);
-    }
-    // The service-account token is the only way `op` authenticates here. It is
-    // ASCII; a non-UTF-8 token is a corrupt store and fails closed.
-    match std::str::from_utf8(token) {
-        Ok(s) => {
-            cmd.env("OP_SERVICE_ACCOUNT_TOKEN", s);
-        }
-        Err(_) => {
-            eprintln!("latch daemon: token is not valid UTF-8");
-            return 1;
-        }
-    }
-    if let Some(fd) = stdout {
-        cmd.stdout(Stdio::from(fd));
-    }
-    if let Some(fd) = stderr {
-        cmd.stderr(Stdio::from(fd));
-    }
-
-    match cmd.status() {
-        Ok(s) => s
-            .code()
-            .or_else(|| s.signal().map(|sig| 128 + sig))
-            .unwrap_or(1),
-        Err(e) => {
-            eprintln!("latch daemon: spawning op failed: {e}");
-            127
-        }
-    }
 }
 
 /// Write a fail-closed message to the caller's stderr fd (if present) and
@@ -445,6 +399,7 @@ mod tests {
     use crate::keystore::MemoryKeystore;
     use std::io::Read;
     use std::os::fd::{FromRawFd, RawFd};
+    use std::path::PathBuf;
 
     /// A process table that resolves nothing, so the ancestry walk returns an
     /// empty chain instantly (the real table would hash every ancestor's
@@ -505,8 +460,7 @@ mod tests {
             pending: pending.clone(),
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
-            provider: Box::new(OpProvider),
-            op_path: Some(write_fake_op(dir, token, secret)),
+            provider: Box::new(OpProvider::with_binary(write_fake_op(dir, token, secret))),
             lease_ttl: Duration::from_secs(60),
         };
         (Arc::new(core), pending)
@@ -766,8 +720,7 @@ mod tests {
             pending,
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
-            provider: Box::new(OpProvider),
-            op_path: Some(write_fake_op(dir, token, secret)),
+            provider: Box::new(OpProvider::with_binary(write_fake_op(dir, token, secret))),
             lease_ttl: Duration::from_secs(60),
         })
     }
