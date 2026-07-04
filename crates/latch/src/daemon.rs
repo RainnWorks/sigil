@@ -39,6 +39,7 @@ use crate::keystore::{self, Keystore};
 use crate::lease::{self, LeaseStore, ProcessTable, SysProcessTable};
 use crate::local::{self, Frame, Reply};
 use crate::paths;
+use crate::provider::{OpProvider, SecretProvider};
 use crate::secrets::{self, AccountStore};
 
 /// Default session-lease TTL granted by an "approve for this session" decision.
@@ -53,6 +54,9 @@ pub struct Core {
     pending: Arc<PendingRegistry>,
     lockdown: AtomicBool,
     proc_table: Box<dyn ProcessTable + Send + Sync>,
+    /// The secret provider that describes requests and (via the spawn path)
+    /// injects the credential. 1Password is provider #1; the seam is generic.
+    provider: Box<dyn SecretProvider>,
     /// Test override for the `op` binary; production discovers it on PATH.
     op_path: Option<PathBuf>,
     lease_ttl: Duration,
@@ -74,6 +78,7 @@ impl Core {
             pending,
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(SysProcessTable),
+            provider: Box::new(OpProvider),
             op_path: None,
             lease_ttl: DEFAULT_LEASE_TTL,
         })
@@ -284,6 +289,8 @@ fn fulfill(
         return spawn_op(core, argv, cwd, &token, stdout, stderr);
     }
 
+    // The provider describes the request in provider-agnostic terms; the
+    // approver never sees op semantics.
     let ctx = ApprovalContext {
         id: uuid::Uuid::now_v7().to_string(),
         account: account_label.clone(),
@@ -291,6 +298,9 @@ fn fulfill(
         grant_hex: lease::hex32(&gk),
         provenance: caller.provenance(),
         cwd: cwd.to_string(),
+        command: argv.to_vec(),
+        secret_refs: core.provider.describe(argv),
+        kind: core.provider.kind(argv),
     };
     let outcome = core.gate.decide(gk, &ctx);
     let decision = outcome.decision;
@@ -495,6 +505,7 @@ mod tests {
             pending: pending.clone(),
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
+            provider: Box::new(OpProvider),
             op_path: Some(write_fake_op(dir, token, secret)),
             lease_ttl: Duration::from_secs(60),
         };
@@ -755,6 +766,7 @@ mod tests {
             pending,
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
+            provider: Box::new(OpProvider),
             op_path: Some(write_fake_op(dir, token, secret)),
             lease_ttl: Duration::from_secs(60),
         })

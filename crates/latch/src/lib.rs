@@ -15,6 +15,7 @@ pub mod keystore_macos;
 pub mod lease;
 pub mod local;
 pub mod paths;
+pub mod provider;
 pub mod remote;
 pub mod secrets;
 pub mod shim;

@@ -324,14 +324,18 @@ mod tests {
         use latch_proto::{Provenance, RiskLevel, SecretRef};
         ApprovalRequest {
             request_id: id.to_string(),
-            kind: RequestKind::OpRead,
-            account_label: "Rowm".into(),
-            secret: Some(SecretRef {
-                account: "Rowm".into(),
-                vault: "Engineering".into(),
-                item: ".env".into(),
-                field: "password".into(),
-            }),
+            kind: RequestKind::SecretRead,
+            command: vec![
+                "op".into(),
+                "read".into(),
+                "op://Engineering/.env/password".into(),
+            ],
+            secrets: vec![SecretRef {
+                provider: "1password".into(),
+                reference: "op://Engineering/.env/password".into(),
+                segments: vec!["Engineering".into(), ".env".into(), "password".into()],
+                label: ".env".into(),
+            }],
             ssh: None,
             provenance: Provenance {
                 process_chain: vec!["zsh".into(), "op".into()],
@@ -400,12 +404,13 @@ mod tests {
 
     #[test]
     fn rule_policy_denies_production_and_approves_others() {
+        // Provider-blind rule: it reads only the generic display segments, with
+        // no knowledge of what "vault" or "op://" means.
         let policy = Policy::rule(|req| {
             let prod = req
-                .secret
-                .as_ref()
-                .map(|s| s.vault.contains("Production"))
-                .unwrap_or(false);
+                .secrets
+                .iter()
+                .any(|s| s.segments.iter().any(|seg| seg.contains("Production")));
             if prod {
                 PolicyDecision::Deny
             } else {
@@ -415,7 +420,7 @@ mod tests {
         let (_d, _id, phone, _dek) = paired(policy);
 
         let mut prod = sample_request("prod");
-        prod.secret.as_mut().unwrap().vault = "Production".into();
+        prod.secrets[0].segments[0] = "Production".into();
         assert_eq!(phone.policy.decide(&prod), PolicyDecision::Deny);
 
         let dev = sample_request("dev");

@@ -173,14 +173,18 @@ fn cmd_demo(args: &[String]) -> anyhow::Result<()> {
     let mailbox = phone.mailbox();
     let request = ApprovalRequest {
         request_id: "demo-req-1".into(),
-        kind: RequestKind::OpRead,
-        account_label: "Rowm".into(),
-        secret: Some(SecretRef {
-            account: "Rowm".into(),
-            vault: "Engineering".into(),
-            item: ".env".into(),
-            field: "password".into(),
-        }),
+        kind: RequestKind::SecretRead,
+        command: vec![
+            "op".into(),
+            "read".into(),
+            "op://Engineering/.env/password".into(),
+        ],
+        secrets: vec![SecretRef {
+            provider: "1password".into(),
+            reference: "op://Engineering/.env/password".into(),
+            segments: vec!["Engineering".into(), ".env".into(), "password".into()],
+            label: ".env".into(),
+        }],
         ssh: None,
         provenance: Provenance {
             process_chain: vec!["zsh".into(), "claude".into(), "op".into()],

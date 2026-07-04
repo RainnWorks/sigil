@@ -87,13 +87,22 @@ pub struct ApprovalContext {
     /// uuidv7, the address for a local approve/deny round trip.
     pub id: String,
     pub account: String,
-    /// The op scope, e.g. `item get .env --vault Engineering`.
+    /// The scope string used for lease bookkeeping and local display, e.g.
+    /// `read op://Engineering/.env`. Internal; the remote request carries the
+    /// generic [`command`](Self::command)/[`secret_refs`](Self::secret_refs).
     pub scope: String,
     /// Grant-key hex, for correlating with `latch lease list`.
     pub grant_hex: String,
     /// Human process chain, e.g. `zsh → claude → op`.
     pub provenance: String,
     pub cwd: String,
+    /// The argv the shim intercepted. Carried verbatim into the remote request.
+    pub command: Vec<String>,
+    /// Provider-agnostic references the daemon's provider derived from the
+    /// command, for the approver's readout. Empty for non-secret requests.
+    pub secret_refs: Vec<latch_proto::SecretRef>,
+    /// The display hint the provider assigned (how the approver should render).
+    pub kind: latch_proto::RequestKind,
 }
 
 /// Resolves an approval request to an [`ApprovalOutcome`]. Blocking; may time
@@ -347,6 +356,9 @@ mod tests {
             grant_hex: "deadbeef".into(),
             provenance: "zsh \u{2192} op".into(),
             cwd: "/p".into(),
+            command: vec!["op".into(), "read".into()],
+            secret_refs: Vec::new(),
+            kind: latch_proto::RequestKind::SecretRead,
         }
     }
 

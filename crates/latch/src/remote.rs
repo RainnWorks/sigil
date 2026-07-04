@@ -30,7 +30,7 @@ use latch_proto::identity::DeviceIdentity;
 use latch_proto::ReplayGuard;
 use latch_proto::{
     mailbox_id, now_ms, ApprovalRequest, ApprovalResponse, Decision as ProtoDecision, Direction,
-    PeerIdentity, Provenance, RequestKind, RiskLevel, SecretRef, Transport,
+    PeerIdentity, Provenance, RiskLevel, Transport,
 };
 
 use crate::approve::{ApprovalContext, ApprovalOutcome, Approver, Decision};
@@ -88,7 +88,9 @@ impl RemoteApprover {
         self.pairing_id
     }
 
-    /// Build the request from the daemon-verified context.
+    /// Build the request from the daemon-verified context. Provider-blind: the
+    /// command, secret refs, and display hint were prepared by the daemon's
+    /// provider; this just packages them with the caller provenance.
     fn build_request(&self, ctx: &ApprovalContext) -> ApprovalRequest {
         let now = now_ms();
         let process_chain = ctx
@@ -100,9 +102,9 @@ impl RemoteApprover {
         let timeout_ms = self.timeout.as_millis() as u64;
         ApprovalRequest {
             request_id: ctx.id.clone(),
-            kind: classify(&ctx.scope),
-            account_label: ctx.account.clone(),
-            secret: parse_secret_ref(&ctx.scope, &ctx.account),
+            kind: ctx.kind,
+            command: ctx.command.clone(),
+            secrets: ctx.secret_refs.clone(),
             ssh: None,
             provenance: Provenance {
                 process_chain,
@@ -176,60 +178,6 @@ impl Approver for RemoteApprover {
     }
 }
 
-/// Classify an op scope into a [`RequestKind`]. Best-effort from the verb.
-fn classify(scope: &str) -> RequestKind {
-    let s = scope.trim_start();
-    if s.starts_with("item get") || s.starts_with("item ") {
-        RequestKind::OpItemGet
-    } else {
-        // `read`, and anything else op-shaped, maps to a single-field read.
-        RequestKind::OpRead
-    }
-}
-
-/// Pull the `op://…` reference out of a scope into a [`SecretRef`] for display.
-///
-/// 1Password references are `op://<vault>/<item>/<field>` (optionally
-/// `op://<account>/<vault>/<item>[/<section>]/<field>`). We parse loosely from
-/// the right and fall back to the routed account label; this is display metadata
-/// only (the token is never in scope here), so a partial parse is acceptable.
-fn parse_secret_ref(scope: &str, account: &str) -> Option<SecretRef> {
-    let start = scope.find("op://")?;
-    let rest = &scope[start + "op://".len()..];
-    // Stop at whitespace: the reference is one argv token.
-    let reference = rest.split_whitespace().next().unwrap_or(rest);
-    let parts: Vec<&str> = reference.split('/').filter(|p| !p.is_empty()).collect();
-    let n = parts.len();
-    let (account, vault, item, field) = match n {
-        0 | 1 => return None,
-        2 => (
-            account.to_string(),
-            parts[0].into(),
-            parts[1].into(),
-            String::new(),
-        ),
-        3 => (
-            account.to_string(),
-            parts[0].into(),
-            parts[1].into(),
-            parts[2].into(),
-        ),
-        // op://account/vault/item[/section]/field: account first, field last.
-        _ => (
-            parts[0].into(),
-            parts[1].into(),
-            parts[2].into(),
-            parts[n - 1].into(),
-        ),
-    };
-    Some(SecretRef {
-        account,
-        vault,
-        item,
-        field,
-    })
-}
-
 /// Best-effort machine name for the approval screen. Reads `$HOST`/`$HOSTNAME`,
 /// falling back to a constant so the field is never empty.
 fn hostname() -> String {
@@ -241,38 +189,43 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approve::ApprovalContext;
+    use latch_proto::{RequestKind, SecretRef};
 
     #[test]
-    fn classify_reads_the_verb() {
-        assert_eq!(
-            classify("read op://Engineering/.env/pw"),
-            RequestKind::OpRead
-        );
-        assert_eq!(
-            classify("item get .env --vault Engineering"),
-            RequestKind::OpItemGet
-        );
-    }
+    fn build_request_is_provider_blind() {
+        // The approver copies the provider-prepared fields verbatim; it contains
+        // no op-specific parsing.
+        let transport = std::sync::Arc::new(latch_proto::LocalRelay::new());
+        let daemon = DeviceIdentity::generate();
+        let phone = DeviceIdentity::generate().peer_identity();
+        let approver = RemoteApprover::new(transport, daemon, phone);
 
-    #[test]
-    fn parse_three_part_reference() {
-        let r = parse_secret_ref("read op://Engineering/.env/password", "Rowm").unwrap();
-        assert_eq!(r.account, "Rowm");
-        assert_eq!(r.vault, "Engineering");
-        assert_eq!(r.item, ".env");
-        assert_eq!(r.field, "password");
-    }
-
-    #[test]
-    fn parse_two_part_reference_has_empty_field() {
-        let r = parse_secret_ref("read op://Engineering/.env", "Rowm").unwrap();
-        assert_eq!(r.vault, "Engineering");
-        assert_eq!(r.item, ".env");
-        assert_eq!(r.field, "");
-    }
-
-    #[test]
-    fn no_reference_is_none() {
-        assert!(parse_secret_ref("vault list", "Rowm").is_none());
+        let ctx = ApprovalContext {
+            id: "req-1".into(),
+            account: "Rowm".into(),
+            scope: "read op://Engineering/.env/password".into(),
+            grant_hex: "dead".into(),
+            provenance: "zsh \u{2192} op".into(),
+            cwd: "/p".into(),
+            command: vec![
+                "op".into(),
+                "read".into(),
+                "op://Engineering/.env/password".into(),
+            ],
+            secret_refs: vec![SecretRef {
+                provider: "1password".into(),
+                reference: "op://Engineering/.env/password".into(),
+                segments: vec!["Engineering".into(), ".env".into(), "password".into()],
+                label: ".env".into(),
+            }],
+            kind: RequestKind::SecretRead,
+        };
+        let req = approver.build_request(&ctx);
+        assert_eq!(req.request_id, "req-1");
+        assert_eq!(req.kind, RequestKind::SecretRead);
+        assert_eq!(req.command, ctx.command);
+        assert_eq!(req.secrets, ctx.secret_refs);
+        assert_eq!(req.provenance.process_chain, vec!["zsh", "op"]);
     }
 }
