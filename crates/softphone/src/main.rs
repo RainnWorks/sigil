@@ -7,8 +7,11 @@
 //!   base64url line the daemon verifies) to stdout and the six SAS words to
 //!   stderr. This is the phone-to-Mac message of the handshake; completing the
 //!   pairing (SAS confirm + DEK delivery) needs the daemon on a shared
-//!   transport, which today is the in-process `LocalRelay` — so cross-process
-//!   pairing waits on the network relay transport (a second `Transport` impl).
+//!   transport. The network transport now exists (`latch-relay-client`'s
+//!   `PhoneRelay`/`DaemonRelay`, exercised end to end by the daemon's
+//!   `remote_approval_over_the_real_relay_delivers_the_secret` test); what
+//!   remains for a fully cross-process `pair` is persisting the pinned keys on
+//!   each side (onboarding flow, task #11).
 //!
 //! * `demo [--policy approve|deny|lease]`
 //!   Run the entire remote loop in one process against an in-memory relay: mint

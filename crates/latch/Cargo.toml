@@ -17,6 +17,9 @@ path = "src/main.rs"
 
 [dependencies]
 latch-proto = { path = "../proto" }
+# latch-relay-client: the daemon's outbound-WebSocket Transport to the blind
+# relay, wired behind the phone approving factor at arm time.
+latch-relay-client = { path = "../relay-client" }
 serde.workspace = true
 serde_json.workspace = true
 # anyhow only at the binary edge, per house rules.

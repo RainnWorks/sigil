@@ -23,7 +23,7 @@ pub fn run() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str).unwrap_or("") {
         "" | "status" => cmd_status(),
-        "daemon" => cmd_daemon(),
+        "daemon" => cmd_daemon(&args[1..]),
         "doctor" => cmd_doctor(),
         "pair" => cmd_pair(),
         "account" => cmd_account(&args[1..]),
@@ -55,7 +55,9 @@ fn print_help() {
 usage: latch <command>
 
   status            instrument panel: daemon, shim, op
-  daemon            run the approval daemon (foreground)
+  daemon [--dev-insecure]  run the approval daemon (foreground). Without a
+                    paired phone or a hardware biometric it fails closed;
+                    --dev-insecure enables local self-approval for dev only.
   doctor            diagnose shim ordering, socket, and op discovery
   pair              show this device's identity and fingerprint words
   account add       add a service-account token (reads token from stdin)
@@ -363,8 +365,8 @@ fn cmd_deny(args: &[String]) -> i32 {
     print_control(send_control(&Frame::Deny { id }))
 }
 
-fn cmd_daemon() -> i32 {
-    match daemon::run() {
+fn cmd_daemon(args: &[String]) -> i32 {
+    match daemon::run(args) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("latch daemon: {e:#}");

@@ -1,16 +1,24 @@
 //! The approval gate: nothing is fulfilled without a fresh out-of-band decision.
 //!
-//! The phone approver lands later; the interim approving factor here is local.
-//! [`LocalApprover`] resolves a decision one of three ways, in order:
+//! The real shipping factor is the paired phone ([`crate::remote::RemoteApprover`]);
+//! this module is the local factor. [`LocalApprover`] resolves a decision in
+//! order:
 //!
-//! * `LATCH_DEV_AUTOAPPROVE` set — headless auto-approve, for the gated-loop
-//!   tests and dev. `=lease` makes it a session lease; anything else a
-//!   single-shot approve. This is a dev switch, never a shipping path.
+//! * `LATCH_DEV_AUTOAPPROVE` — headless auto-approve for the gated-loop tests
+//!   and dev. Only functions when the daemon enabled it via `with_dev`, which
+//!   happens **only** under `--dev-insecure` (see [`crate::factor`]).
 //! * a live Mac Secure Enclave DEK envelope — prompt Touch ID to unwrap it
-//!   (NEEDS-VERIFICATION; see [`crate::keystore_macos`]).
-//! * otherwise — register the request as pending and block until a
-//!   `latch approve --local --id <id>` (or `deny`) arrives over the control
-//!   socket, or the timeout fires and it fails closed as a deny.
+//!   (NEEDS-VERIFICATION; see [`crate::keystore_macos`]). A successful unwrap is
+//!   the biometric approving factor.
+//! * the control socket — register the request as pending and block until a
+//!   `latch approve --local --id <id>` (or `deny`) arrives, or the timeout fails
+//!   closed. This path is same-UID forgeable (`docs/security-claims.md`
+//!   residual #1), so it is gated behind `with_control_socket`, enabled **only**
+//!   under `--dev-insecure`. Without it, an unresolved local decision fails
+//!   closed at once instead of offering a self-approvable gate.
+//!
+//! A daemon with no real factor and no `--dev-insecure` runs a [`NullApprover`]
+//! that denies everything, so it is never silently self-approvable.
 //!
 //! [`ApprovalGate`] wraps an approver with request coalescing: identical
 //! in-flight requests (same grant key + scope) wait behind one decision, so a
@@ -196,22 +204,34 @@ impl DevMode {
     }
 }
 
-/// The interim local approver (see module docs).
+/// The local approver: biometric unwrap, and — only when explicitly enabled —
+/// the dev auto-approve switch and the control-socket park.
+///
+/// Both the dev switch and the control socket default to **off**. They are the
+/// same-UID-forgeable paths from `docs/security-claims.md` residual #1, so the
+/// daemon turns them on only under [`Factor::DevInsecure`](crate::factor::Factor);
+/// with a biometric factor the unwrap is the sole gate and an unresolved
+/// decision fails closed rather than parking on the socket.
 pub struct LocalApprover {
     keystore: Arc<dyn Keystore>,
     pending: Arc<PendingRegistry>,
     timeout: Duration,
     dev: DevMode,
+    /// When false, an unresolved local decision fails closed instead of parking
+    /// on the control socket. Only `--dev-insecure` sets it true.
+    allow_control_socket: bool,
 }
 
 impl LocalApprover {
-    /// Build an approver, reading the dev auto-approve switch once from the env.
+    /// Build an approver with the forgeable paths off: no dev auto-approve and no
+    /// control-socket fallback. The caller opts into either explicitly.
     pub fn new(keystore: Arc<dyn Keystore>, pending: Arc<PendingRegistry>) -> Self {
         Self {
             keystore,
             pending,
             timeout: DEFAULT_APPROVAL_TIMEOUT,
-            dev: DevMode::from_env(),
+            dev: DevMode::Off,
+            allow_control_socket: false,
         }
     }
 
@@ -221,11 +241,34 @@ impl LocalApprover {
         self
     }
 
-    /// Set the dev auto-approve mode explicitly (tests, and the daemon when it
-    /// resolves the switch itself).
+    /// Set the dev auto-approve mode explicitly. Only wired under
+    /// `--dev-insecure`; never in a shipping factor.
     pub fn with_dev(mut self, dev: DevMode) -> Self {
         self.dev = dev;
         self
+    }
+
+    /// Enable the control-socket park (`latch approve|deny --local`). Only wired
+    /// under `--dev-insecure`; off means an unresolved decision fails closed.
+    pub fn with_control_socket(mut self, allow: bool) -> Self {
+        self.allow_control_socket = allow;
+        self
+    }
+}
+
+/// An approver with no real factor: it denies every request, fail closed. Wired
+/// under [`Factor::NoFactor`](crate::factor::Factor) so a daemon with no paired
+/// phone and no biometric refuses to serve rather than being self-approvable.
+pub struct NullApprover;
+
+impl Approver for NullApprover {
+    fn decide(&self, ctx: &ApprovalContext) -> ApprovalOutcome {
+        eprintln!(
+            "latch daemon: no approving factor (no paired phone, no hardware biometric); \
+             refusing '{}' for {}. Pair a phone, or start with --dev-insecure for local dev.",
+            ctx.scope, ctx.account
+        );
+        ApprovalOutcome::local(Decision::Deny)
     }
 }
 
@@ -264,7 +307,13 @@ impl LocalApprover {
             }
         }
 
-        // 3. Park until `latch approve|deny --local --id <ctx.id>` or timeout.
+        // 3. Park until `latch approve|deny --local --id <ctx.id>` or timeout —
+        //    but ONLY under --dev-insecure. The control socket is same-UID
+        //    forgeable (residual #1), so without it the daemon fails closed here
+        //    rather than offering a self-approvable gate.
+        if !self.allow_control_socket {
+            return Decision::Deny;
+        }
         eprintln!(
             "latch daemon: approval required · {} · {}\n            approve: latch approve --local --id {}\n            deny:    latch deny --local --id {}",
             ctx.account, ctx.scope, ctx.id, ctx.id
@@ -472,6 +521,7 @@ mod tests {
         let ks: Arc<dyn Keystore> = Arc::new(crate::keystore::MemoryKeystore::new());
         let approver = LocalApprover::new(ks, pending.clone())
             .with_dev(DevMode::Off)
+            .with_control_socket(true)
             .with_timeout(Duration::from_secs(2));
 
         let approver = Arc::new(approver);
@@ -495,10 +545,37 @@ mod tests {
         let ks: Arc<dyn Keystore> = Arc::new(crate::keystore::MemoryKeystore::new());
         let approver = LocalApprover::new(ks, pending)
             .with_dev(DevMode::Off)
+            .with_control_socket(true)
             .with_timeout(Duration::from_millis(30));
         assert_eq!(
             approver.decide(&ctx("req-2", "read .env")).decision,
             Decision::Deny
         );
+    }
+
+    #[test]
+    fn without_control_socket_an_unresolved_decision_fails_closed_at_once() {
+        // The shipping default: no dev switch, no control socket. A local
+        // decision that no biometric can satisfy must deny immediately, never
+        // park on the same-UID-forgeable control socket (residual #1).
+        let pending = Arc::new(PendingRegistry::new());
+        let ks: Arc<dyn Keystore> = Arc::new(crate::keystore::MemoryKeystore::new());
+        let approver =
+            LocalApprover::new(ks, pending.clone()).with_timeout(Duration::from_secs(30));
+        let start = std::time::Instant::now();
+        assert_eq!(
+            approver.decide(&ctx("req-x", "read .env")).decision,
+            Decision::Deny
+        );
+        // It denied on the spot, not after the 30s timeout, and never parked.
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(pending.pending_ids().is_empty());
+    }
+
+    #[test]
+    fn null_approver_denies_every_request() {
+        let outcome = NullApprover.decide(&ctx("req-n", "read .env"));
+        assert_eq!(outcome.decision, Decision::Deny);
+        assert!(outcome.dek.is_none());
     }
 }

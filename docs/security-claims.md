@@ -107,8 +107,8 @@ Reviewed at commit `3d005aa` (the first end-to-end remote-approval loop).
 
 | Claim | Enforcing code | Proving test |
 |-------|----------------|--------------|
-| The relay never sees plaintext (opaque envelopes only) | `envelope.rs::Envelope`, `transport.rs` (carries opaque envelopes) | `hostile_relay.rs::relay_cannot_read_the_payload` |
-| The relay cannot forge, tamper, replay, reorder, backdate, or drop-to-effect | `envelope.rs::open`, `replay.rs` | the full `hostile_relay.rs` suite (14 attacks) |
+| The relay never sees plaintext (opaque envelopes only) | `envelope.rs::Envelope`, `transport.rs` (carries opaque envelopes); the real network transport carries the same opaque `serde_json` envelope string (`relay-client/src/lib.rs::wire`, daemon-side WS `DaemonRelay`, phone-side HTTPS `PhoneRelay`) | `hostile_relay.rs::relay_cannot_read_the_payload`; end to end over the **real** Bun relay by `daemon.rs::remote_approval_over_the_real_relay_delivers_the_secret` |
+| The relay cannot forge, tamper, replay, reorder, backdate, or drop-to-effect | `envelope.rs::open`, `replay.rs` (unchanged whichever transport carries the bytes) | the full `hostile_relay.rs` suite (14 attacks) |
 | The mailbox id carries no identity and is order-independent | `fingerprint.rs::mailbox_id` | `fingerprint.rs::mailbox_is_order_independent`, `mailbox_differs_for_different_pairs`, `fingerprint_and_mailbox_are_domain_separated` |
 | The relay has no key-distribution role (pairing is out-of-band QR) | `pairing.rs` (keys travel optically) | design invariant; the whole `pairing_mitm.rs` suite proves trust does not rest on any network party |
 
@@ -118,23 +118,44 @@ Reviewed at commit `3d005aa` (the first end-to-end remote-approval loop).
 
 These are real and deliberately surfaced, not defects hidden.
 
-1. **The local control-socket approver is not an adversarial gate.** When the
-   daemon runs the `LocalApprover` (today's `Core::for_host`) and no biometric
-   is provisioned, an approval is granted by whoever sends
-   `Frame::Approve { id }` on the 0600 unix socket
-   (`daemon.rs::handle_conn` → `PendingRegistry::resolve`). The socket is
-   same-UID-only, and the request `id` is a uuidv7 that is **never returned to
-   the requesting client** (only printed to the daemon's stderr in
-   `approve.rs::LocalApprover::decide_local`). So the gate's strength in this
-   configuration reduces to the secrecy of that id: a same-UID attacker who can
-   read the daemon's log/stderr can self-approve its own pending request. Since
-   a compromised same-UID agent (a rogue `claude`/`op`) is exactly the adversary
-   Latch exists to stop, **the control-socket path must not ship as the sole
-   gate.** The shipping gate is the phone (`RemoteApprover`), where a same-UID
-   peer cannot forge the phone's sealed, signed response, or the Secure Enclave
-   biometric. Severity: **Medium-High in the local-only config; N/A once the
-   phone/biometric gate is wired.** No test asserts this is *safe* because it is
-   not; it is an interim path.
+1. **The local control-socket approver is not an adversarial gate — now gated
+   behind an explicit arm-time factor policy (MITIGATED).** The control socket
+   is same-UID-forgeable: an approval is granted by whoever sends
+   `Frame::Approve { id }` on the 0600 unix socket, and the request `id` is only
+   printed to the daemon's stderr, so a same-UID attacker who can read it can
+   self-approve. A compromised same-UID agent (a rogue `claude`/`op`) is exactly
+   the adversary Latch exists to stop, so this path must never be the sole gate.
+
+   The mitigation, added with the network transport: at arm time the daemon
+   resolves an explicit **approving factor** (`factor.rs::resolve`,
+   `daemon.rs::build_gate`), in order:
+   - a **paired phone** reachable over a `Transport` (`RemoteApprover`) — the
+     sealed, signed `ApprovalResponse` a same-UID peer cannot forge;
+   - a **verified hardware biometric** (`Keystore::is_biometric()` true) — the
+     Secure Enclave unwrap is the gate;
+   - otherwise **fail closed**: a `NullApprover` denies every gated request,
+     **unless** started with `--dev-insecure` / `LATCH_DEV_INSECURE=1`.
+
+   Only under `--dev-insecure` are `LATCH_DEV_AUTOAPPROVE` (`with_dev`) and the
+   control-socket park (`with_control_socket`) wired at all, and that mode prints
+   a loud multi-line stderr warning naming the same-UID risk on every start
+   (`factor.rs::warn_dev_insecure`). A normal `latch daemon` with no phone and no
+   biometric is **not** silently self-approvable: it runs the `NullApprover` and
+   refuses. With a biometric factor, an unresolved local decision fails closed
+   rather than parking on the socket (`approve.rs::LocalApprover::decide_local`
+   returns `Deny` when `allow_control_socket` is false).
+
+   Proving tests: `daemon.rs::no_factor_daemon_fails_closed_on_a_gated_request`
+   (no factor + no dev flag denies, delivers no secret),
+   `approve.rs::without_control_socket_an_unresolved_decision_fails_closed_at_once`
+   and `null_approver_denies_every_request`, the `factor.rs::tests` suite
+   (`resolve` precedence: phone > biometric > dev-insecure > fail-closed, and the
+   warning names the same-UID risk), and the phone factor proven end to end over
+   the real relay by
+   `daemon.rs::remote_approval_over_the_real_relay_delivers_the_secret` and
+   in-process by `remote_softphone_approval_delivers_secret_over_the_socket`
+   (both with no dev flag set). Severity: **Medium-High reduced to a documented
+   dev-only mode that fails closed by default and is loudly labelled.**
 
 2. **Secure Enclave biometric unwrap and kernel peer/ancestry are unproven on
    hardware.** `keystore_macos.rs::{ensure_dek,unwrap_dek}`, `lease.rs::peer_pid`,

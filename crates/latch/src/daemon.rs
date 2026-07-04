@@ -32,12 +32,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use tokio::net::UnixListener;
 
-use crate::approve::{ApprovalContext, ApprovalGate, Decision, LocalApprover, PendingRegistry};
+use crate::approve::{
+    ApprovalContext, ApprovalGate, Approver, Decision, DevMode, LocalApprover, NullApprover,
+    PendingRegistry,
+};
+use crate::factor::{self, Factor};
 use crate::keystore::{self, Keystore};
 use crate::lease::{self, LeaseStore, ProcessTable, SysProcessTable};
 use crate::local::{self, Frame, Reply};
 use crate::provider::{OpProvider, ProviderRun, SecretProvider};
+use crate::remote::RemoteApprover;
 use crate::secrets::{self, AccountStore};
+
+use latch_proto::identity::DeviceIdentity;
+use latch_proto::{mailbox_id, PeerIdentity};
+use latch_relay_client::DaemonRelay;
 
 /// Default session-lease TTL granted by an "approve for this session" decision.
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
@@ -56,33 +65,111 @@ pub struct Core {
     /// #1; the seam is generic and owns its own tool discovery.
     provider: Box<dyn SecretProvider>,
     lease_ttl: Duration,
+    /// The approving factor resolved at arm time (residual #1 mitigation).
+    factor: Factor,
+}
+
+/// A persisted daemon<->phone pairing: everything needed to reach the phone as
+/// the approving factor over the blind relay. `latch pair` will persist this
+/// (onboarding flow, task #11); until then [`load_remote_pairing`] finds none,
+/// so a daemon with no biometric fails closed unless started `--dev-insecure`.
+pub struct RemotePairingConfig {
+    /// The relay base URL (`http(s)://host`) the daemon attaches to.
+    pub relay_url: String,
+    /// The daemon's own pinned identity (signs requests, opens responses).
+    pub daemon_identity: DeviceIdentity,
+    /// The pinned phone identity the daemon seals to and verifies.
+    pub phone: PeerIdentity,
+}
+
+impl RemotePairingConfig {
+    /// The shared mailbox both parties route on, derived from the pinned keys.
+    pub fn mailbox(&self) -> [u8; 32] {
+        mailbox_id(&self.daemon_identity.peer_identity(), &self.phone)
+    }
+}
+
+/// Load a persisted phone pairing, if one exists. There is no on-disk pairing
+/// format yet (see [`RemotePairingConfig`]), so today this always returns `None`
+/// and the phone factor is unavailable in the shipping CLI.
+fn load_remote_pairing() -> Option<RemotePairingConfig> {
+    None
+}
+
+/// Build the approval gate for a resolved [`Factor`]. Only [`Factor::DevInsecure`]
+/// enables the dev switch and the control socket; [`Factor::NoFactor`] denies
+/// every request; the real factors are the phone (sealed remote approval) and
+/// the hardware biometric.
+fn build_gate(
+    factor: Factor,
+    remote: Option<RemotePairingConfig>,
+    keystore: &Arc<dyn Keystore>,
+    pending: &Arc<PendingRegistry>,
+) -> anyhow::Result<ApprovalGate> {
+    let approver: Box<dyn Approver> = match factor {
+        Factor::Phone => {
+            let cfg = remote.expect("phone factor implies a pairing config");
+            let relay = DaemonRelay::connect(&cfg.relay_url, cfg.mailbox())
+                .map_err(|e| anyhow::anyhow!("attaching to relay {}: {e}", cfg.relay_url))?;
+            Box::new(RemoteApprover::new(
+                Arc::new(relay),
+                cfg.daemon_identity,
+                cfg.phone,
+            ))
+        }
+        // The biometric unwrap is the only gate; an unresolved decision fails
+        // closed (no control socket, no dev switch).
+        Factor::Biometric => Box::new(LocalApprover::new(keystore.clone(), pending.clone())),
+        // The one place the forgeable dev paths are wired.
+        Factor::DevInsecure => Box::new(
+            LocalApprover::new(keystore.clone(), pending.clone())
+                .with_dev(DevMode::from_env())
+                .with_control_socket(true),
+        ),
+        Factor::NoFactor => Box::new(NullApprover),
+    };
+    Ok(ApprovalGate::new(approver))
 }
 
 impl Core {
-    /// Build the production core: the host keystore, the on-disk account store,
-    /// and a local approver reading the dev switch once from the env.
-    pub fn for_host() -> anyhow::Result<Self> {
+    /// Build the production core, resolving the approving factor from the host
+    /// (a paired phone, then a hardware biometric) and `dev_insecure`. With no
+    /// real factor and no `--dev-insecure`, the factor is [`Factor::NoFactor`]
+    /// and every gated request fails closed.
+    pub fn for_host(dev_insecure: bool) -> anyhow::Result<Self> {
         let keystore = keystore::for_host();
         let accounts = AccountStore::load().context("loading account store")?;
         let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone());
+
+        let remote = load_remote_pairing();
+        let inputs = factor::ArmInputs {
+            dev_insecure,
+            phone_paired: remote.is_some(),
+            biometric: keystore.is_biometric(),
+        };
+        let factor = factor::resolve(&inputs);
+        let gate = build_gate(factor, remote, &keystore, &pending)?;
+
         Ok(Self {
             keystore,
             accounts: Mutex::new(accounts),
             leases: LeaseStore::new(),
-            gate: ApprovalGate::new(Box::new(approver)),
+            gate,
             pending,
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(SysProcessTable),
             provider: Box::new(OpProvider::new()),
             lease_ttl: DEFAULT_LEASE_TTL,
+            factor,
         })
     }
 }
 
 /// Build a runtime and serve until interrupted. Blocks the calling thread.
-pub fn run() -> anyhow::Result<()> {
-    let core = Arc::new(Core::for_host()?);
+/// `args` are the `latch daemon` arguments (e.g. `--dev-insecure`).
+pub fn run(args: &[String]) -> anyhow::Result<()> {
+    let dev_insecure = factor::dev_insecure_requested(args);
+    let core = Arc::new(Core::for_host(dev_insecure)?);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
         .build()
@@ -99,6 +186,11 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
     fs::set_permissions(&sock, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod {}", sock.display()))?;
 
+    // Under the insecure dev path, print the loud warning on every start.
+    if core.factor == Factor::DevInsecure {
+        factor::warn_dev_insecure();
+    }
+
     let accounts = core
         .accounts
         .lock()
@@ -106,8 +198,9 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
         .accounts
         .len();
     eprintln!(
-        "latch daemon: armed on {} · {accounts} account(s) · gating active",
-        sock.display()
+        "latch daemon: armed on {} · {accounts} account(s) · factor: {}",
+        sock.display(),
+        core.factor.label()
     );
 
     loop {
@@ -449,8 +542,11 @@ mod tests {
         drop(dek);
 
         let pending = Arc::new(PendingRegistry::new());
+        // These tests exercise the dev-insecure configuration, so the dev switch
+        // and the control-socket park are both enabled.
         let approver = LocalApprover::new(keystore.clone(), pending.clone())
             .with_dev(dev)
+            .with_control_socket(true)
             .with_timeout(timeout);
         let core = Core {
             keystore,
@@ -462,6 +558,7 @@ mod tests {
             proc_table: Box::new(EmptyTable),
             provider: Box::new(OpProvider::with_binary(write_fake_op(dir, token, secret))),
             lease_ttl: Duration::from_secs(60),
+            factor: Factor::DevInsecure,
         };
         (Arc::new(core), pending)
     }
@@ -643,6 +740,7 @@ mod tests {
     use latch_proto::identity::DeviceIdentity;
     use latch_proto::pairing::{DaemonPairing, Dek as ProtoDek};
     use latch_proto::{LocalRelay, PairingState};
+    use latch_relay_client::{DaemonRelay, PhoneRelay};
     use latch_softphone::{Pairing, Policy, Softphone};
     use zeroize::Zeroizing;
 
@@ -686,12 +784,15 @@ mod tests {
     }
 
     /// Build an inert daemon core whose approval gate is a [`RemoteApprover`]
-    /// wired to `relay`, with the account token sealed under `dek_bytes`.
+    /// wired to `transport` (any [`Transport`]: the in-process [`LocalRelay`] or
+    /// the real [`DaemonRelay`]), with the account token sealed under `dek_bytes`.
+    #[allow(clippy::too_many_arguments)] // a test helper; each arg is a distinct fixture
     fn remote_core(
         dir: &Path,
         daemon_id: DeviceIdentity,
         phone: latch_proto::PeerIdentity,
-        relay: LocalRelay,
+        transport: Arc<dyn latch_proto::Transport>,
+        timeout: Duration,
         dek_bytes: [u8; 32],
         token: &str,
         secret: &str,
@@ -709,8 +810,7 @@ mod tests {
             )
             .unwrap();
 
-        let approver = RemoteApprover::new(Arc::new(relay), daemon_id, phone)
-            .with_timeout(Duration::from_secs(3));
+        let approver = RemoteApprover::new(transport, daemon_id, phone).with_timeout(timeout);
         let pending = Arc::new(PendingRegistry::new());
         Arc::new(Core {
             keystore: Arc::new(MemoryKeystore::new()), // no DEK at rest
@@ -722,6 +822,7 @@ mod tests {
             proc_table: Box::new(EmptyTable),
             provider: Box::new(OpProvider::with_binary(write_fake_op(dir, token, secret))),
             lease_ttl: Duration::from_secs(60),
+            factor: Factor::Phone,
         })
     }
 
@@ -751,7 +852,8 @@ mod tests {
             &dir,
             daemon_id,
             phone_pub,
-            relay.clone(),
+            Arc::new(relay.clone()),
+            Duration::from_secs(3),
             dek_bytes,
             "remote-token-xyz",
             "remote-secret-99",
@@ -816,7 +918,8 @@ mod tests {
             &dir,
             daemon_id,
             phone_pub,
-            relay.clone(),
+            Arc::new(relay.clone()),
+            Duration::from_secs(3),
             dek_bytes,
             "tok",
             "should-never-appear",
@@ -840,6 +943,318 @@ mod tests {
 
         shutdown.store(true, Ordering::SeqCst);
         approver_thread.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remote_pairing_config_derives_the_shared_mailbox() {
+        // The persisted phone-factor config must derive the exact mailbox both
+        // devices route on, so `build_gate(Factor::Phone, ..)` attaches to the
+        // right relay queue. This also constructs the config type end to end.
+        let (daemon_id, softphone, _dek) = pair_softphone(Policy::Approve);
+        let cfg = RemotePairingConfig {
+            relay_url: "https://relay.example".into(),
+            daemon_identity: daemon_id,
+            phone: softphone.phone_identity(),
+        };
+        assert_eq!(cfg.mailbox(), softphone.mailbox());
+    }
+
+    // --- the FULL cross-process loop over the REAL relay -------------------
+    //
+    // Same milestone as `remote_softphone_approval_delivers_secret_over_the_socket`,
+    // but the envelopes traverse the real blind relay (the Bun server) over real
+    // HTTP + WebSocket instead of the in-process LocalRelay: the daemon attaches
+    // outbound over a WebSocket (`DaemonRelay`) and the softphone polls over HTTPS
+    // (`PhoneRelay`). Pairing is done in-process (out-of-band by design); only
+    // the post-pairing approval round trip is carried by the relay.
+
+    /// A spawned Bun relay process, killed on drop.
+    struct RelayServer(std::process::Child);
+    impl Drop for RelayServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A free loopback TCP port (bind :0, read the port, release it).
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// Locate the `bun` binary: `$BUN_PATH`, then `PATH`, then `~/.bun/bin/bun`.
+    fn which_bun() -> Option<PathBuf> {
+        if let Some(p) = std::env::var_os("BUN_PATH") {
+            return Some(PathBuf::from(p));
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path) {
+                let cand = dir.join("bun");
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+        let home = std::env::var_os("HOME")?;
+        let cand = Path::new(&home).join(".bun/bin/bun");
+        cand.is_file().then_some(cand)
+    }
+
+    /// Spawn the Bun relay on a specific loopback `port` and wait for it to
+    /// accept connections. Returns `None` if `bun` or the server script is
+    /// missing, or the port never came up.
+    fn bun_relay_on(port: u16) -> Option<RelayServer> {
+        let bun = which_bun()?;
+        let server = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../relay/bun/server.ts");
+        if !server.exists() {
+            return None;
+        }
+        let child = std::process::Command::new(bun)
+            .arg("run")
+            .arg(&server)
+            .env("PORT", port.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let guard = RelayServer(child);
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return Some(guard);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+
+    /// Resolve a relay base URL for the e2e test. Prefers `$LATCH_TEST_RELAY_URL`
+    /// (an already-running relay); otherwise spawns the Bun relay if `bun` is
+    /// available. Returns `None` to soft-skip when no relay can be obtained.
+    fn obtain_relay() -> Option<(String, Option<RelayServer>)> {
+        if let Ok(url) = std::env::var("LATCH_TEST_RELAY_URL") {
+            return Some((url, None));
+        }
+        let port = free_port();
+        let guard = bun_relay_on(port)?;
+        Some((format!("http://127.0.0.1:{port}"), Some(guard)))
+    }
+
+    #[test]
+    fn remote_approval_over_the_real_relay_delivers_the_secret() {
+        let Some((base, _server)) = obtain_relay() else {
+            eprintln!(
+                "SKIPPED remote_approval_over_the_real_relay_delivers_the_secret: no relay. \
+                 Install bun, or start one and set LATCH_TEST_RELAY_URL, e.g.\n  \
+                 PORT=8787 bun run relay/bun/server.ts   (then LATCH_TEST_RELAY_URL=http://127.0.0.1:8787)"
+            );
+            return;
+        };
+
+        let dir = tmpdir("real-relay");
+        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Approve);
+        let phone_pub = softphone.phone_identity();
+        let mailbox = softphone.mailbox();
+
+        // The phone-factor config the daemon would load derives the same mailbox.
+        let cfg = RemotePairingConfig {
+            relay_url: base.clone(),
+            daemon_identity: clone_device(&daemon_id),
+            phone: phone_pub,
+        };
+        assert_eq!(cfg.mailbox(), mailbox);
+
+        // Daemon side: RemoteApprover over a real outbound WebSocket. No dev flag,
+        // no biometric: the paired phone is the real approving factor.
+        let daemon_relay = DaemonRelay::connect(&base, mailbox).expect("daemon ws attach");
+        let core = remote_core(
+            &dir,
+            daemon_id,
+            phone_pub,
+            Arc::new(daemon_relay),
+            Duration::from_secs(10),
+            dek_bytes,
+            "real-token-abc",
+            "real-secret-77",
+        );
+        // The inert-daemon invariant: no DEK at rest; it arrives per-approval.
+        assert!(!core.keystore.has_dek(), "daemon holds no DEK at rest");
+
+        // Phone side: the softphone serves over the real HTTPS transport.
+        let phone_relay = PhoneRelay::new(&base, mailbox)
+            .expect("phone transport")
+            .with_poll_interval(Duration::from_millis(50));
+        let softphone = Arc::new(softphone);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let phone_thread = {
+            let sp = softphone.clone();
+            std::thread::spawn(move || sp.serve(&phone_relay, &stop, Duration::from_millis(200)))
+        };
+
+        // Drive one op request over the socket, exactly like the shim would.
+        let (client, server) = UnixStream::pair().unwrap();
+        let (read_end, write_end) = pipe();
+        let (err_r, err_w) = pipe();
+        let argv = vec![
+            "op".into(),
+            "read".into(),
+            "op://Engineering/.env/password".into(),
+        ];
+        local::send_frame(
+            &client,
+            &Frame::Op {
+                argv,
+                cwd: String::new(),
+            },
+            &[write_end.as_raw_fd(), err_w.as_raw_fd()],
+        )
+        .unwrap();
+        drop(write_end);
+        drop(err_w);
+
+        let worker = std::thread::spawn(move || handle_conn(core, server));
+        worker.join().unwrap().unwrap();
+
+        // The secret reached the caller's stdout fd, carried end to end by the
+        // real relay and unsealed only via the phone-delivered DEK.
+        assert_eq!(
+            read_all(read_end),
+            "real-secret-77",
+            "the secret arrived over the real relay"
+        );
+        let mut client = client;
+        assert_eq!(
+            local::recv_reply(&mut client).unwrap(),
+            Reply::Exit { code: 0 }
+        );
+        let _ = err_r;
+
+        shutdown.store(true, Ordering::SeqCst);
+        phone_thread.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn daemon_relay_resumes_after_the_relay_is_bounced() {
+        // Reconnect/resume: attach the daemon, drop the relay out from under it,
+        // bring a fresh relay up on the same port, and prove the approval loop
+        // still completes. The DaemonRelay pump redials with backoff and the
+        // outbound request buffered across the outage is flushed on reattach.
+        // Only runnable when we control the relay process (spawn path).
+        if std::env::var("LATCH_TEST_RELAY_URL").is_ok() {
+            eprintln!("SKIPPED daemon_relay_resumes_after_the_relay_is_bounced: needs a bounceable relay (unset LATCH_TEST_RELAY_URL)");
+            return;
+        }
+        let port = free_port();
+        let Some(server1) = bun_relay_on(port) else {
+            eprintln!("SKIPPED daemon_relay_resumes_after_the_relay_is_bounced: bun not available");
+            return;
+        };
+        let base = format!("http://127.0.0.1:{port}");
+
+        let dir = tmpdir("relay-bounce");
+        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Approve);
+        let phone_pub = softphone.phone_identity();
+        let mailbox = softphone.mailbox();
+
+        // Attach the daemon and let the WebSocket establish.
+        let daemon_relay = DaemonRelay::connect(&base, mailbox).expect("daemon ws attach");
+        std::thread::sleep(Duration::from_millis(400));
+
+        // Bounce the relay: drop the old process, start a fresh one on the port.
+        drop(server1);
+        std::thread::sleep(Duration::from_millis(200));
+        let _server2 = bun_relay_on(port).expect("relay restart on the same port");
+
+        // Generous timeout to absorb reconnect backoff.
+        let core = remote_core(
+            &dir,
+            daemon_id,
+            phone_pub,
+            Arc::new(daemon_relay),
+            Duration::from_secs(20),
+            dek_bytes,
+            "bounce-token",
+            "bounce-secret-55",
+        );
+
+        let phone_relay = PhoneRelay::new(&base, mailbox)
+            .expect("phone transport")
+            .with_poll_interval(Duration::from_millis(50));
+        let softphone = Arc::new(softphone);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let phone_thread = {
+            let sp = softphone.clone();
+            std::thread::spawn(move || sp.serve(&phone_relay, &stop, Duration::from_millis(200)))
+        };
+
+        let (read_end, write_end) = pipe();
+        let argv = vec![
+            "op".into(),
+            "read".into(),
+            "op://Engineering/.env/password".into(),
+        ];
+        let code = fulfill(&core, &argv, "", None, Some(write_end), None);
+
+        assert_eq!(code, 0, "the loop must complete after a relay bounce");
+        assert_eq!(read_all(read_end), "bounce-secret-55");
+
+        shutdown.store(true, Ordering::SeqCst);
+        phone_thread.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Build a core armed with the given `factor` and gate, holding one account
+    /// whose token decrypts to `token`. Used to exercise the arm-time factor
+    /// policy (residual #1) directly.
+    fn factor_core(dir: &Path, token: &str, secret: &str, factor: Factor) -> Arc<Core> {
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::with_dek());
+        let dek = keystore.unwrap_dek("seed").unwrap();
+        let mut accounts = AccountStore::default();
+        accounts
+            .add("Rowm", &dek, token.as_bytes(), vec!["Engineering".into()])
+            .unwrap();
+        drop(dek);
+        let pending = Arc::new(PendingRegistry::new());
+        let gate = build_gate(factor, None, &keystore, &pending).unwrap();
+        Arc::new(Core {
+            keystore,
+            accounts: Mutex::new(accounts),
+            leases: LeaseStore::new(),
+            gate,
+            pending,
+            lockdown: AtomicBool::new(false),
+            proc_table: Box::new(EmptyTable),
+            provider: Box::new(OpProvider::with_binary(write_fake_op(dir, token, secret))),
+            lease_ttl: Duration::from_secs(60),
+            factor,
+        })
+    }
+
+    #[test]
+    fn no_factor_daemon_fails_closed_on_a_gated_request() {
+        // The residual-#1 mitigation: no paired phone, no biometric, and no
+        // --dev-insecure resolves to Factor::NoFactor. A gated request must be
+        // refused, never silently self-approved over the control socket.
+        let dir = tmpdir("no-factor");
+        let core = factor_core(&dir, "tok", "should-never-appear", Factor::NoFactor);
+        assert_eq!(core.factor, Factor::NoFactor);
+
+        let (read_end, write_end) = pipe();
+        let (err_r, err_w) = pipe();
+        let argv = vec!["op".into(), "read".into(), "op://Engineering/x".into()];
+        let code = fulfill(&core, &argv, "/p", None, Some(write_end), Some(err_w));
+
+        assert_eq!(code, 1, "a daemon with no factor must fail closed");
+        assert_eq!(read_all(read_end), "", "no secret without a real factor");
+        assert!(read_all(err_r).contains("denied"));
+        assert_eq!(core.leases.active(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

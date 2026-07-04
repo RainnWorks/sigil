@@ -9,6 +9,7 @@
 pub mod approve;
 pub mod cli;
 pub mod daemon;
+pub mod factor;
 pub mod keystore;
 #[cfg(target_os = "macos")]
 pub mod keystore_macos;
