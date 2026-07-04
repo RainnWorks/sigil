@@ -40,11 +40,14 @@ use crate::factor::{self, Factor};
 use crate::keystore::{self, Keystore};
 use crate::lease::{self, LeaseStore, ProcessTable, SysProcessTable};
 use crate::local::{self, Frame, Reply};
-use crate::paths::ShimStatus;
+use crate::paths::{self, ShimStatus};
 use crate::provider::{OpProvider, ProviderRun, SecretProvider};
 use crate::remote::RemoteApprover;
 use crate::secrets::{self, AccountStore};
 use crate::service;
+use crate::sshagent::{self, ServedIdentity, SignRequest, SshBackend};
+
+use latch_proto::SshChallenge;
 
 use latch_proto::identity::DeviceIdentity;
 use latch_proto::{mailbox_id, PeerIdentity};
@@ -69,6 +72,13 @@ pub struct Core {
     lease_ttl: Duration,
     /// The approving factor resolved at arm time (residual #1 mitigation).
     factor: Factor,
+    /// SSH identities this daemon serves on the agent socket, resolved from
+    /// `~/.latch/ssh-keys.json` at arm time. Empty means the agent advertises
+    /// no keys (and `ssh-add -l` shows none).
+    ssh_keys: Vec<sshagent::ServedIdentity>,
+    /// The `op` binary the SSH sign path shells out to for the per-signature key
+    /// fetch. `None` uses PATH discovery; tests point it at a fake `op`.
+    ssh_op_path: Option<std::path::PathBuf>,
 }
 
 /// A persisted daemon<->phone pairing: everything needed to reach the phone as
@@ -162,6 +172,16 @@ impl Core {
         let factor = factor::resolve(&inputs);
         let gate = build_gate(factor, remote, &keystore, &pending)?;
 
+        // Load the served SSH identities from ~/.latch/ssh-keys.json. A bad
+        // config is logged and treated as "no keys" so the daemon still arms.
+        let ssh_keys = match sshagent::SshKeyConfig::load() {
+            Ok(cfg) => cfg.served_identities(),
+            Err(e) => {
+                eprintln!("latch daemon: ignoring an unreadable ssh-keys config: {e}");
+                Vec::new()
+            }
+        };
+
         Ok(Self {
             keystore,
             accounts: Mutex::new(accounts),
@@ -173,7 +193,107 @@ impl Core {
             provider: Box::new(OpProvider::new()),
             lease_ttl: DEFAULT_LEASE_TTL,
             factor,
+            ssh_keys,
+            ssh_op_path: None,
         })
+    }
+}
+
+/// The lease/coalesce scope for one SSH signature. The data-to-sign fingerprint
+/// is part of it so the approval gate's grant-key coalescing treats different
+/// challenges as different requests (each signature is its own approval); only a
+/// byte-identical re-sign shares a scope.
+fn ssh_sign_scope(label: &str, data_fingerprint: &str) -> String {
+    format!("ssh-sign {label} {data_fingerprint}")
+}
+
+/// The vault segment of an `op://<vault>/<item>/<field>` reference, for account
+/// routing on the SSH sign path.
+fn vault_of_ref(reference: &str) -> Option<String> {
+    reference
+        .strip_prefix("op://")?
+        .split('/')
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+impl SshBackend for Core {
+    fn identities(&self) -> Vec<ServedIdentity> {
+        self.ssh_keys.clone()
+    }
+
+    /// Gate one SSH signature on the phone and, on approval, fetch the key and
+    /// sign. This is the same approval path as an `op` secret, with two
+    /// differences the security review must weigh (see `sshagent` module docs):
+    /// every signature is gated (no lease short-circuit in v1), and the private
+    /// key is briefly in daemon RAM for the one signature.
+    fn approve_and_sign(&self, req: SignRequest<'_>) -> Option<Vec<u8>> {
+        if self.lockdown.load(Ordering::SeqCst) {
+            eprintln!("latch daemon: ssh sign refused; latch is locked down");
+            return None;
+        }
+
+        // Route the account for the key's vault; clone what we need before the
+        // (possibly long) approval wait so the store lock is released.
+        let vault = vault_of_ref(&req.id.key_ref);
+        let (account_label, ciphertext) = {
+            let store = self.accounts.lock().expect("accounts poisoned");
+            let acct = store.route(vault.as_deref()).ok()?;
+            (acct.label.clone(), acct.ciphertext().ok()?)
+        };
+
+        // The approval screen shows a hash of the data to sign, never raw bytes.
+        let data_fingerprint = sshagent::sha256_fingerprint(req.data);
+        // The data fingerprint is folded into the scope so the gate's grant-key
+        // coalescing can never let two DIFFERENT challenges share one approval: a
+        // signature is a distinct auth event over distinct data, and the human
+        // approved *this* data's hash. Only a byte-identical re-sign (which is
+        // deterministic, so the same signature) may coalesce.
+        let scope = ssh_sign_scope(&req.id.label, &data_fingerprint);
+        let caller = lease::walk_ancestry(self.proc_table.as_ref(), req.caller_pid.unwrap_or(-1));
+        let gk = lease::grant_key(&caller, "", &scope);
+
+        let challenge = SshChallenge {
+            key_label: req.id.label.clone(),
+            host: req.host.host.clone(),
+            fingerprint: data_fingerprint,
+        };
+        let ctx = ApprovalContext {
+            id: uuid::Uuid::now_v7().to_string(),
+            account: account_label.clone(),
+            scope: scope.clone(),
+            grant_hex: lease::hex32(&gk),
+            provenance: caller.provenance(),
+            cwd: String::new(),
+            command: vec!["ssh-sign".to_string(), req.id.label.clone()],
+            secret_refs: Vec::new(),
+            kind: latch_proto::RequestKind::SshSignature,
+            ssh: Some(challenge),
+        };
+
+        let outcome = self.gate.decide(gk, &ctx);
+        if !outcome.decision.is_grant() {
+            return None;
+        }
+
+        // Unwrap the DEK (phone-delivered on approve, else from the keystore),
+        // decrypt the one token, and drop the DEK at once.
+        let dek = match outcome.dek {
+            Some(dek) => dek,
+            None => self
+                .keystore
+                .unwrap_dek(&format!("Sign with {} for {account_label}", req.id.label))
+                .ok()?,
+        };
+        let token = secrets::decrypt_token(&dek, &ciphertext).ok()?;
+        drop(dek);
+
+        // Fetch the private key per-signature and sign; the key lives only inside
+        // fetch_and_sign, in a Zeroizing buffer wiped when it returns.
+        let op = self.ssh_op_path.clone().or_else(paths::find_real_op)?;
+        let sig = sshagent::fetch_and_sign(&op, &token, &req.id.key_ref, req.data);
+        drop(token); // zeroized here
+        sig
     }
 }
 
@@ -207,6 +327,15 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
     fs::set_permissions(&sock, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod {}", sock.display()))?;
 
+    // The SSH agent socket, beside the daemon socket. A user points
+    // SSH_AUTH_SOCK at it; `ssh`/`git` then transparently gate on the phone.
+    let ssh_sock = sshagent::socket_path();
+    prepare_socket(&ssh_sock)?;
+    let ssh_listener =
+        UnixListener::bind(&ssh_sock).with_context(|| format!("binding {}", ssh_sock.display()))?;
+    fs::set_permissions(&ssh_sock, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod {}", ssh_sock.display()))?;
+
     // Under the insecure dev path, print the loud warning on every start.
     if core.factor == Factor::DevInsecure {
         factor::warn_dev_insecure();
@@ -222,6 +351,12 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
         "latch daemon: armed on {} · {accounts} account(s) · factor: {}",
         sock.display(),
         core.factor.label()
+    );
+    eprintln!(
+        "latch daemon: ssh-agent on {} · {} key(s) served · export SSH_AUTH_SOCK={}",
+        ssh_sock.display(),
+        core.ssh_keys.len(),
+        ssh_sock.display()
     );
 
     // Shim-drift check: if the `op` a shell resolves is no longer our shim (not
@@ -252,10 +387,25 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
                     }
                 });
             }
+            accepted = ssh_listener.accept() => {
+                let (stream, _) = accepted.context("ssh accept")?;
+                let std_stream = stream.into_std().context("ssh into_std")?;
+                std_stream.set_nonblocking(false).context("ssh set_nonblocking")?;
+                let core = core.clone();
+                // An SSH connection is also blocking (per-signature fetch, spawn,
+                // approval wait); serve it on the blocking pool with the Core as
+                // the agent backend.
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = sshagent::handle_connection(core.as_ref(), std_stream) {
+                        eprintln!("latch daemon: ssh connection error: {e}");
+                    }
+                });
+            }
         }
     }
 
     let _ = fs::remove_file(&sock);
+    let _ = fs::remove_file(&ssh_sock);
     Ok(())
 }
 
@@ -423,6 +573,7 @@ fn fulfill(
         command: argv.to_vec(),
         secret_refs: core.provider.describe(argv),
         kind: core.provider.kind(argv),
+        ssh: None,
     };
     let outcome = core.gate.decide(gk, &ctx);
     let decision = outcome.decision;
@@ -587,6 +738,8 @@ mod tests {
             provider: Box::new(OpProvider::with_binary(write_fake_op(dir, token, secret))),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
+            ssh_keys: Vec::new(),
+            ssh_op_path: None,
         };
         (Arc::new(core), pending)
     }
@@ -851,6 +1004,8 @@ mod tests {
             provider: Box::new(OpProvider::with_binary(write_fake_op(dir, token, secret))),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::Phone,
+            ssh_keys: Vec::new(),
+            ssh_op_path: None,
         })
     }
 
@@ -1262,6 +1417,8 @@ mod tests {
             provider: Box::new(OpProvider::with_binary(write_fake_op(dir, token, secret))),
             lease_ttl: Duration::from_secs(60),
             factor,
+            ssh_keys: Vec::new(),
+            ssh_op_path: None,
         })
     }
 
@@ -1558,6 +1715,33 @@ mod tests {
             "the daemon pinned the phone that responded"
         );
         assert_eq!(np.daemon_identity.peer_identity(), daemon_pub);
+    }
+
+    #[test]
+    fn vault_of_ref_extracts_the_vault_segment() {
+        assert_eq!(
+            vault_of_ref("op://Engineering/GitHub/private key").as_deref(),
+            Some("Engineering")
+        );
+        assert_eq!(vault_of_ref("not-a-ref"), None);
+    }
+
+    #[test]
+    fn different_ssh_challenges_do_not_share_a_grant_key() {
+        // The coalescing-safety invariant: a signature over different data must
+        // derive a different grant key, so the approval gate can never let one
+        // challenge ride another challenge's approval. Same caller, same key
+        // label, different data fingerprints -> different scope -> different gk.
+        let caller = lease::walk_ancestry(&EmptyTable, -1);
+        let fp_a = crate::sshagent::sha256_fingerprint(b"challenge-A");
+        let fp_b = crate::sshagent::sha256_fingerprint(b"challenge-B");
+        assert_ne!(fp_a, fp_b);
+        let gk_a = lease::grant_key(&caller, "", &ssh_sign_scope("GitHub", &fp_a));
+        let gk_b = lease::grant_key(&caller, "", &ssh_sign_scope("GitHub", &fp_b));
+        assert_ne!(gk_a, gk_b, "different data must not coalesce");
+        // A byte-identical re-sign IS allowed to coalesce (deterministic, same sig).
+        let gk_a2 = lease::grant_key(&caller, "", &ssh_sign_scope("GitHub", &fp_a));
+        assert_eq!(gk_a, gk_a2);
     }
 
     #[test]

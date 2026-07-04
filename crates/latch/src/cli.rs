@@ -33,6 +33,8 @@ pub fn run() -> i32 {
         "lockdown" => cmd_lockdown(&args[1..]),
         "approve" => cmd_approve(&args[1..]),
         "deny" => cmd_deny(&args[1..]),
+        "ssh" => cmd_ssh(&args[1..]),
+        "sshagent" => cmd_sshagent(),
         "shim" => cmd_shim(args.get(1).map(String::as_str)),
         "version" | "--version" | "-V" => {
             println!("latch {VERSION}");
@@ -73,6 +75,10 @@ usage: latch <command>
   lockdown [--clear]  seal the daemon (deny + refuse) or unseal it
   approve --local --id <id> [--lease]  approve a pending request at the Mac
   deny --local --id <id>               deny a pending request at the Mac
+  ssh add           serve a 1Password SSH key (--vault --item --pubkey-file)
+  ssh list          list the SSH keys the agent serves
+  ssh remove <item> stop serving an SSH key
+  sshagent          print the SSH_AUTH_SOCK to point ssh/git at Latch
   shim install      symlink ~/.latch/bin/op at this binary
   version           print version
   help              print this message"
@@ -172,6 +178,27 @@ fn cmd_status() -> i32 {
         )
     };
     println!("  {}   {glyph} {}  {note}", s.dim("factor"), pad(label, 13));
+
+    // ssh agent: how many keys it would serve.
+    let ssh_count = crate::sshagent::SshKeyConfig::load()
+        .map(|c| c.keys.len())
+        .unwrap_or(0);
+    let (glyph, label, note) = if ssh_count > 0 {
+        (
+            s.ok("\u{25cf}"),
+            "serving",
+            s.dim(&format!(
+                "{ssh_count} key(s) · point SSH_AUTH_SOCK: latch sshagent"
+            )),
+        )
+    } else {
+        (
+            s.dim("\u{25cb}"),
+            "no keys",
+            s.dim("add one: latch ssh add --vault <V> --item <I> --pubkey-file <p>"),
+        )
+    };
+    println!("  {}     {glyph} {}  {note}", s.dim("ssh"), pad(label, 13));
 
     println!();
     println!(
@@ -485,6 +512,22 @@ fn cmd_doctor() -> i32 {
         } else {
             "no `op` on PATH"
         },
+    );
+
+    // 7. ssh-agent: report the socket to point SSH_AUTH_SOCK at and the served
+    //    key count. Informational (not a pass/fail gate): serving zero keys is a
+    //    valid state until Tom adds one.
+    let ssh_sock = crate::sshagent::socket_path();
+    let ssh_count = crate::sshagent::SshKeyConfig::load()
+        .map(|c| c.keys.len())
+        .unwrap_or(0);
+    println!(
+        "  {} ssh-agent socket  {}",
+        s.ok("\u{2713}"),
+        s.dim(&format!(
+            "— {ssh_count} key(s); export SSH_AUTH_SOCK={}",
+            ssh_sock.display()
+        ))
     );
 
     println!();
@@ -820,6 +863,207 @@ fn format_unix_ms(ms: u64) -> String {
     // without pulling `chrono`/`time` into the single binary.
     let secs = ms / 1000;
     format!("unix {secs}")
+}
+
+fn cmd_ssh(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("add") => ssh_add(&args[1..]),
+        Some("list") | None => ssh_list(),
+        Some("remove") | Some("rm") => ssh_remove(args.get(1).map(String::as_str)),
+        _ => {
+            eprintln!("usage: latch ssh <add|list|remove>");
+            2
+        }
+    }
+}
+
+/// `latch ssh add --vault <V> --item <I> [--field <f>] [--comment <c>]
+/// (--pubkey-file <path> | --pubkey-stdin)`: register a 1Password SSH key for the
+/// agent to serve. Only the public key (not secret) is provided here; the private
+/// key is fetched per-signature. v1 accepts ed25519 only.
+fn ssh_add(args: &[String]) -> i32 {
+    let s = Style::stdout();
+    let (Some(vault), Some(item)) = (
+        flag_value(args, "--vault").map(str::to_string),
+        flag_value(args, "--item").map(str::to_string),
+    ) else {
+        eprintln!(
+            "usage: latch ssh add --vault <V> --item <I> [--field <f>] [--comment <c>] \
+             (--pubkey-file <path> | --pubkey-stdin)"
+        );
+        return 2;
+    };
+    let field = flag_value(args, "--field")
+        .unwrap_or("private key")
+        .to_string();
+    let comment = flag_value(args, "--comment").unwrap_or("").to_string();
+
+    // The public key line comes from a file or stdin (never secret).
+    let public_key = if let Some(path) = flag_value(args, "--pubkey-file") {
+        match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("latch: reading {path}: {e}");
+                return 1;
+            }
+        }
+    } else if has_flag(args, "--pubkey-stdin") {
+        let mut buf = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+            eprintln!("latch: reading public key from stdin: {e}");
+            return 1;
+        }
+        buf
+    } else {
+        eprintln!("latch: provide the public key with --pubkey-file <path> or --pubkey-stdin");
+        return 2;
+    };
+    let public_key = public_key.trim().to_string();
+
+    let entry = crate::sshagent::SshKeyEntry {
+        public_key,
+        vault: vault.clone(),
+        item: item.clone(),
+        field,
+        comment,
+    };
+    // Validate before persisting: it must parse as an ed25519 public key.
+    let Some(id) = crate::sshagent::resolve_identity(&entry) else {
+        eprintln!(
+            "{} not a usable ed25519 public key (v1 serves ed25519 only)",
+            s.deny("\u{2717}")
+        );
+        return 1;
+    };
+
+    let mut cfg = match crate::sshagent::SshKeyConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("latch: loading ssh-keys config: {e}");
+            return 1;
+        }
+    };
+    if cfg.keys.iter().any(|k| k.vault == vault && k.item == item) {
+        eprintln!("latch: op://{vault}/{item} is already served (remove it first to replace)");
+        return 1;
+    }
+    cfg.keys.push(entry);
+    if let Err(e) = cfg.save() {
+        eprintln!("latch: saving ssh-keys config: {e}");
+        return 1;
+    }
+
+    println!("{} serving {}", s.ok("\u{2713}"), s.cobalt(&id.label));
+    println!("  {}  {}", s.dim("key"), s.dim(&id.fingerprint));
+    println!("  {}  {}", s.dim("ref"), s.dim(&id.key_ref));
+    println!(
+        "  {}",
+        s.faint("restart the daemon to serve it: latch restart")
+    );
+    0
+}
+
+fn ssh_list() -> i32 {
+    let s = Style::stdout();
+    let cfg = match crate::sshagent::SshKeyConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("latch: loading ssh-keys config: {e}");
+            return 1;
+        }
+    };
+    if cfg.keys.is_empty() {
+        println!(
+            "  {}",
+            s.dim("no SSH keys served; add one: latch ssh add --vault <V> --item <I> --pubkey-file <p>")
+        );
+        return 0;
+    }
+    println!("{}", s.cobalt("ssh keys served"));
+    println!();
+    for e in &cfg.keys {
+        match crate::sshagent::resolve_identity(e) {
+            Some(id) => {
+                println!("  {}  {}", pad(&id.label, 18), s.dim(&id.fingerprint));
+                println!(
+                    "  {}  {}",
+                    pad("", 18),
+                    s.faint(&format!("op://{}/{} · {}", e.vault, e.item, id.comment))
+                );
+            }
+            None => println!(
+                "  {}  {}",
+                pad(&e.item, 18),
+                s.brass("unusable (not an ed25519 public key)")
+            ),
+        }
+    }
+    0
+}
+
+fn ssh_remove(item: Option<&str>) -> i32 {
+    let s = Style::stdout();
+    let Some(item) = item else {
+        eprintln!("usage: latch ssh remove <item>");
+        return 2;
+    };
+    let mut cfg = match crate::sshagent::SshKeyConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("latch: loading ssh-keys config: {e}");
+            return 1;
+        }
+    };
+    let before = cfg.keys.len();
+    cfg.keys.retain(|k| k.item != item);
+    if cfg.keys.len() == before {
+        println!("  {}", s.dim(&format!("no served key named {item}")));
+        return 0;
+    }
+    if let Err(e) = cfg.save() {
+        eprintln!("latch: saving ssh-keys config: {e}");
+        return 1;
+    }
+    println!("{} stopped serving {}", s.ok("\u{2713}"), s.cobalt(item));
+    println!(
+        "  {}",
+        s.faint("restart the daemon to apply: latch restart")
+    );
+    0
+}
+
+/// `latch sshagent`: print the SSH_AUTH_SOCK a user points `ssh`/`git` at, plus
+/// the served-key count and a guidance line.
+fn cmd_sshagent() -> i32 {
+    let s = Style::stdout();
+    let sock = crate::sshagent::socket_path();
+    let count = crate::sshagent::SshKeyConfig::load()
+        .map(|c| c.keys.len())
+        .unwrap_or(0);
+    println!("{}", s.cobalt("latch ssh-agent"));
+    println!();
+    println!(
+        "  {}  {}",
+        s.dim("socket"),
+        s.dim(&sock.display().to_string())
+    );
+    println!("  {}  {}", s.dim("keys"), s.dim(&format!("{count} served")));
+    println!();
+    println!(
+        "  {}",
+        s.dim("Point ssh and git at Latch by exporting this in your shell profile:")
+    );
+    println!();
+    println!(
+        "    {}",
+        s.cobalt(&format!("export SSH_AUTH_SOCK=\"{}\"", sock.display()))
+    );
+    println!();
+    println!(
+        "  {}",
+        s.faint("then `ssh-add -l` lists your served keys and `git push` asks your phone.")
+    );
+    0
 }
 
 fn cmd_shim(sub: Option<&str>) -> i32 {

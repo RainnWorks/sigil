@@ -111,6 +111,10 @@ pub struct ApprovalContext {
     pub secret_refs: Vec<latch_proto::SecretRef>,
     /// The display hint the provider assigned (how the approver should render).
     pub kind: latch_proto::RequestKind,
+    /// Present for an `ssh_signature` request: the key label, derived
+    /// destination, and data-to-sign fingerprint the approver renders. `None`
+    /// for secret reads and control requests.
+    pub ssh: Option<latch_proto::SshChallenge>,
 }
 
 /// Resolves an approval request to an [`ApprovalOutcome`]. Blocking; may time
@@ -408,6 +412,7 @@ mod tests {
             command: vec!["op".into(), "read".into()],
             secret_refs: Vec::new(),
             kind: latch_proto::RequestKind::SecretRead,
+            ssh: None,
         }
     }
 

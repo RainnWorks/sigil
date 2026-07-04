@@ -105,7 +105,7 @@ impl RemoteApprover {
             kind: ctx.kind,
             command: ctx.command.clone(),
             secrets: ctx.secret_refs.clone(),
-            ssh: None,
+            ssh: ctx.ssh.clone(),
             provenance: Provenance {
                 process_chain,
                 cwd: ctx.cwd.clone(),
@@ -220,6 +220,7 @@ mod tests {
                 label: ".env".into(),
             }],
             kind: RequestKind::SecretRead,
+            ssh: None,
         };
         let req = approver.build_request(&ctx);
         assert_eq!(req.request_id, "req-1");

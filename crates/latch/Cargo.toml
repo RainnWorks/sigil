@@ -54,11 +54,27 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sig
 # deps; only the pure `render::unicode` string renderer is used, so no image
 # stack enters the single binary.
 qrcode = { version = "0.14", default-features = false }
+# ssh-key 0.6: decode the `-----BEGIN OPENSSH PRIVATE KEY-----` body the service
+# account hands us, emit the public-key wire blob for IDENTITIES_ANSWER, and sign
+# via ed25519-dalek (already vendored; ssh-key delegates to it). ed25519-only in
+# v1, so no rsa/ecdsa/dsa features. `alloc` enables from_openssh + the Signer impl.
+ssh-key = { version = "0.6.7", default-features = false, features = ["ed25519", "alloc"] }
+# signature 2: the `Signer` trait ssh-key's PrivateKey implements; same crate and
+# version ssh-key pulls, brought in-scope to call `.try_sign` on the fetched key.
+signature = "2"
+# sha2 0.10: SHA-256 fingerprints of the host key and the data-to-sign for the
+# approval screen (matches `ssh-keygen -l`). Already in-tree transitively via
+# ssh-key; taken as a direct dep so the agent can hash arbitrary sign-data.
+sha2 = "0.10"
 
 # latch-softphone: the reference approver, used by the remote e2e integration
 # test to stand in for a paired phone. Dev-only; never linked into the daemon.
 [dev-dependencies]
 latch-softphone = { path = "../softphone" }
+# ed25519-dalek: cryptographically verify the agent's SSH signatures in tests
+# (raw ed25519 over the challenge), against the served public key. Already in the
+# tree via ssh-key/proto; a dev-dep so it never adds to the shipped binary.
+ed25519-dalek = { workspace = true }
 
 # security-framework: macOS Keychain blob storage and the Secure Enclave seam.
 # macOS-only so Linux/Windows fills stay dependency-free.

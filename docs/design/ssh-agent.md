@@ -317,7 +317,125 @@ retired.
 
 ---
 
+## Implementation addendum (built 2026-07-04)
+
+The v1 agent is built at `crates/latch/src/sshagent.rs`, wired into the daemon
+(`crates/latch/src/daemon.rs`) and the CLI (`crates/latch/src/cli.rs`). The design
+above held on every point; this records the pins, what changed since early 2026,
+and the state of the NEEDS-VERIFICATION list after the build.
+
+### Pinned crates and what changed since early 2026
+
+Re-checked live on crates.io on 2026-07-04:
+
+- **`ssh-key = 0.6.7`**, `default-features = false, features = ["ed25519", "alloc"]`.
+  0.6.7 is the current *stable*; **0.7.0 exists only as release candidates**
+  (`0.7.0-rc.11`) so we stay on 0.6.7. API used, all confirmed against
+  docs.rs/0.6.7: `PrivateKey::from_openssh`, `PrivateKey::public_key`,
+  `PublicKey::to_bytes` (the wire blob for `IDENTITIES_ANSWER`),
+  `PublicKey::from_openssh` / `from_bytes`, `PublicKey::fingerprint(HashAlg::Sha256)`,
+  `impl Signer<Signature> for PrivateKey` (`try_sign`), and `Signature::algorithm()`
+  / `as_bytes()`. It pulls **`ed25519-dalek ^2`** (matches the workspace pin; the
+  already-vendored signing primitive — no new curve impl enters the tree), plus
+  `ssh-encoding 0.2`, `ssh-cipher 0.2`, `sha2 0.10`, `signature 2`, `subtle 2`,
+  `pem-rfc7468 0.7`. We do **not** depend on `ssh-encoding` directly (0.3.0 is now
+  stable, but the SSH `string`/`u32` helpers are hand-rolled, per house style).
+- **`signature = "2"`** — direct dep to bring the `Signer` trait into scope (same
+  version ssh-key uses; no duplicate).
+- **`sha2 = "0.10"`** — SHA-256 of the data-to-sign for the approval screen, and
+  the host-key fingerprint fallback (already in-tree via ssh-key).
+- **`ed25519-dalek`** as a **dev-dependency only**, to cryptographically verify the
+  agent's signatures in tests.
+- **`ed25519-dalek 3.0.0`** is in RC (`3.0.0-rc.1`); the workspace stays on 2.x, so
+  no action. Nothing else material changed since early 2026.
+
+RFC 9987 message numbers re-confirmed against the published RFC: FAILURE=5,
+SUCCESS=6, REQUEST_IDENTITIES=11, IDENTITIES_ANSWER=12, SIGN_REQUEST=13,
+SIGN_RESPONSE=14, EXTENSION=27 (EXTENSION_FAILURE=28, EXTENSION_RESPONSE=29 added
+by 9987 but unused here). RSA flags `RSA_SHA2_256=0x02` / `512=0x04` matter only for
+RSA and are read-and-ignored for ed25519. `session-bind@openssh.com` shape confirmed
+from OpenSSH `PROTOCOL.agent`: `byte 27, string name, string hostkey, string
+session-id, string signature, bool is_forwarding` — we capture the hostkey only.
+
+### What was built and gated (all green: `cargo test && clippy -D warnings && fmt --check`)
+
+- Hand-rolled length-prefixed `Reader`/`Writer`; exactly `REQUEST_IDENTITIES ->
+  IDENTITIES_ANSWER` and `SIGN_REQUEST -> SIGN_RESPONSE`; `session-bind` accepted +
+  recorded; everything else (add/remove/lock/unlock/other extensions) refused with
+  `SSH_AGENT_FAILURE`. ed25519-only: non-ed25519 config entries are dropped, never
+  advertised.
+- Custody = fetch-per-signature: on an approved `SIGN_REQUEST` the daemon routes the
+  account, gates on the phone (same sealed envelope path as an `op` secret, via
+  `RequestKind::SshSignature` + the `ApprovalRequest.ssh` `SshChallenge`), unwraps
+  the DEK, decrypts the token, then `op read "…/private key?ssh-format=openssh"` into
+  a `Zeroizing` buffer, decodes, signs, and wipes. **Every signature is gated — v1
+  uses no lease short-circuit for SSH** (the safest default; leases can be added
+  later). The approval screen shows key label + derived destination + a
+  `SHA256:` hash of the data-to-sign, never raw bytes.
+- Host derivation: best-effort from the `session-bind` host key via
+  `~/.ssh/known_hosts` reverse lookup (skips hashed `|1|…` entries, strips
+  `@cert-authority`/`@revoked` markers, normalises `[host]:port`); falls back to the
+  host-key `SHA256:` fingerprint. No hostname is ever fabricated.
+- CLI/wiring: the daemon binds a second socket (`$TMPDIR/latch/ssh-agent.sock`,
+  0600, `LATCH_SSH_SOCK` override); `latch ssh add|list|remove` manage
+  `~/.latch/ssh-keys.json` (public key + op coordinates only — inert at rest);
+  `latch sshagent` prints the `SSH_AUTH_SOCK` export; `latch status` shows the served
+  key count; `latch doctor` reports the agent socket + `SSH_AUTH_SOCK` guidance.
+
+### Verification status update
+
+- **NEEDS-VERIFICATION #2 (known_hosts reverse lookup) — CLOSED (unit-tested).** The
+  lookup is exercised against synthetic known_hosts including a plain match, an
+  absent-key fingerprint fallback, a hashed-entry skip, and a `@cert-authority`
+  `[host]:port` line. The *live* `github.com` match during a real `git push` is still
+  worth a one-time confirm (see the residual list below), but the parsing logic the
+  earlier note worried about is now covered.
+- **op read round-trip — RE-VERIFIED live 2026-07-04.** A throwaway ed25519 SSH Key
+  item created in `Engineering`, read with `?ssh-format=openssh`, decoded, signed,
+  and the signature verified against the item's real public key by the ignored test
+  `fetch_and_sign_live_op`; item deleted (vault clean).
+- **Real client — VERIFIED.** `ssh-add -l` (OpenSSH_10.2p1) against both the
+  in-process listener and the **running `latch daemon` binary** listed the served key
+  with the exact `SHA256:` fingerprint.
+- **NEEDS-VERIFICATION #3 (ed25519-only) — still a prerequisite.** There remain
+  **zero** SSH Key items in any SA-visible vault, so before v1 serves anything Tom
+  must create his GitHub key as an `SSH Key` item in a shared vault (e.g.
+  `Engineering`) — a service account cannot see Personal.
+
+### Residual security posture (unchanged from §4, restated honestly)
+
+The v1 trade stands: for one signature the **private key is in daemon RAM** (it
+cannot stream like an `op` secret, because the daemon does the signing), and because
+the SA token can read the *whole* key, a daemon compromise at the moment of an
+approved request leaks **durable signing power**, not one signature — strictly worse
+than the secret case. Mitigations in code: `Zeroizing` buffer, no disk, no logging,
+held for one signature. This is the reason v2 moves keys into the Secure Enclave and
+retires the fetch path. Routed to security-reviewer with the build.
+
+### Still NEEDS VERIFICATION (requires Tom + a live session)
+
+1. **Full sign against GitHub.** `fetch_and_sign_live_op` proves the fetch/decode/
+   sign/verify path against the live SA, and `ssh-add -l` proves identity serving,
+   but an actual `git push` / `ssh -T git@github.com` that produces an approved
+   signature GitHub accepts needs (a) Tom's real GitHub key as an SSH Key item in a
+   shared vault, (b) a running paired daemon, and (c) a phone tap. Confirm with:
+   ```sh
+   latch ssh add --vault Engineering --item GitHub --pubkey-file ~/.ssh/id_ed25519.pub
+   latch restart
+   export SSH_AUTH_SOCK="$(python3 - <<'PY'
+import os; print(os.path.join(os.environ.get("TMPDIR","/tmp"),"latch","ssh-agent.sock"))
+PY
+)"
+   ssh -T git@github.com   # then approve on the phone
+   ```
+2. **Live `session-bind` host key matches the `github.com` known_hosts line.** The
+   parsing is unit-tested; the live wire format during a real `git push` is the last
+   mile. Confirm by logging the captured hostkey and diffing against the `github.com`
+   entry in `~/.ssh/known_hosts`.
+
+---
+
 *Grounding: RFC 9987 (SSH agent protocol), OpenSSH `PROTOCOL.agent`
 (`session-bind@openssh.com`, `restrict-destination-v00@openssh.com`), 1Password CLI
-`op read` `?ssh-format=openssh`, and live tests against the Rowm service account on
-2026-07-04.*
+`op read` `?ssh-format=openssh`, ssh-key 0.6.7 docs.rs, and live tests against the
+Rowm service account on 2026-07-04.*

@@ -24,6 +24,7 @@ pub mod secrets;
 pub mod service;
 pub mod setup;
 pub mod shim;
+pub mod sshagent;
 pub mod style;
 
 /// A process-wide lock serializing tests that mutate global environment
