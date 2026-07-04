@@ -1,0 +1,23 @@
+[package]
+name = "latch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Latch daemon, op shim, and CLI as one multicall binary"
+
+[[bin]]
+name = "latch"
+path = "src/main.rs"
+
+[dependencies]
+latch-proto = { path = "../proto" }
+serde.workspace = true
+serde_json.workspace = true
+# anyhow only at the binary edge, per house rules.
+anyhow.workspace = true
+# libc: SCM_RIGHTS fd passing (op stdout/stderr wired straight to the caller,
+# never through daemon memory) and unix socket/dir permission bits.
+libc.workspace = true
+# tokio: async accept loop for the daemon only; the shim path never builds a
+# runtime. Feature set kept to the listener plus signal handling.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }

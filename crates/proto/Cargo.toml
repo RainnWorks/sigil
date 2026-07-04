@@ -1,0 +1,18 @@
+[package]
+name = "latch-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Latch protocol core: sealed/signed envelopes, pairing, fingerprints"
+
+[dependencies]
+crypto_box.workspace = true
+ed25519-dalek.workspace = true
+rand_core.workspace = true
+zeroize.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+blake2.workspace = true
+base64.workspace = true
