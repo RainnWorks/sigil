@@ -10,6 +10,9 @@ Paths are relative to the repo root. Test names are the `#[test]` fn names;
 run any with `cargo test <name>`.
 
 Reviewed at commit `3d005aa` (the first end-to-end remote-approval loop).
+Extended at commit `ee49ee3` (any-CLI generalization: provider registry, the
+`env-file` direct-injection provider, the pluggable SSH signer, and the
+CLI-only pairing persistence) — sections 11–13 and residuals 9–11 below.
 
 ---
 
@@ -126,6 +129,67 @@ Reviewed at commit `3d005aa` (the first end-to-end remote-approval loop).
 | Pairing message 1 (`PairingResponse`) travels the relay as MAC-authenticated plaintext carrying only public data (phone pubkey, nonce, tag); substitution is rejected | `pairing.rs::PairingResponse::verify`, `relay-client/src/rendezvous_ws.rs` (moves opaque strings only, no envelope/key handling) | the full `pairing_mitm.rs` suite (message 1 is exactly what it attacks) |
 | Persisting a pairing auto-selects the phone factor with no dev flag | `daemon.rs::{load_remote_pairing,build_gate}` (`Factor::Phone`) | `daemon.rs::build_gate_selects_the_phone_approver_from_a_persisted_config` |
 
+## 11. The provider seam (any-CLI generalization, `ee49ee3`)
+
+The daemon core became provider-agnostic: a command's config names a provider,
+and the daemon dispatches the gated run to it. Two injection shapes ship, and
+the security boundary between them is stated honestly, not blurred.
+
+| Claim | Enforcing code | Proving test |
+|-------|----------------|--------------|
+| An **unconfigured** command is refused, never run ungated; the caller gets the exact `latch config add` hint | `daemon.rs::fulfill` (`commands.resolve` → `None` → `fail_closed`), `command.rs::CommandStore::resolve` (only `op` resolves by default) | `daemon.rs::unconfigured_command_is_refused_with_a_config_hint`, `command.rs::an_unconfigured_command_does_not_resolve` |
+| A config entry naming an **unknown provider** fails closed, never runs | `daemon.rs::fulfill` (`providers.get` → `None` → `fail_closed`) | reviewed by inspection (the `unknown provider` branch); exercised structurally by `provider.rs::registry_dispatches_by_id_and_lists_defaults` |
+| The env-file **source path comes only from the CLI-side config (0600), never from the caller's argv**, so a caller cannot redirect env-file at an arbitrary file (`/etc/shadow`, a co-worker's `.env`) | `daemon.rs::fulfill` (`source = cfg.source`, argv is never consulted for the source), `command.rs` (config is a CLI-only mutation surface) | reviewed by inspection; the config-store add/get/remove path is `command.rs::add_get_remove_round_trip_and_reject_duplicates` |
+| A command that **shadows a reserved verb** fails toward the built-in verb (safe), never toward ungated execution; the escape hatch is `latch run -- <cmd>` | `cli.rs::main` dispatch + `is_reserved_verb`, `shim.rs::dispatch` (the daemon's `fulfill` is the sole injection chokepoint) | `cli.rs::reserved_verbs_take_precedence_over_command_dispatch` |
+| Argv is passed to the child as **separate argv entries, never a shell string** (no shell-injection surface); the real binary is resolved via PATH skipping the shim | `provider.rs::{OpProvider,EnvFileProvider}::run` (`Command::new(real).args(...)`), `paths::{find_real,find_real_op}` | `daemon.rs::env_file_command_runs_gated_and_injects_env`, `provider.rs::run_streams_op_child_output_to_the_caller_fd` |
+| A **down daemon** makes the shim exec the bare tool with **no injected secret** (fail-safe: nothing is released); a protocol error while the daemon is **up** fails closed (exit 70), never runs ungated | `shim.rs::dispatch` (`Ok`→exit code; `forward` error→exit 70; only a *down* socket → `exec_real`), `shim.rs::exec_real` (no env injected) | reviewed by inspection (the module contract; no negative test asserts the exec fallback injects nothing) — **UNPROVEN** by a dedicated test |
+
+## 12. The `env-file` direct-injection provider (invariant #2, honestly relaxed)
+
+`env-file` is the reference provider that proves the seam is not op-shaped. It is
+the **one** path where resolved secret VALUES (not a credential) transit daemon
+RAM, and the doc is explicit about the exact residual that buys.
+
+| Claim | Enforcing code | Proving test |
+|-------|----------------|--------------|
+| `describe()` names the source **without reading it**, so no secret value enters daemon memory before the decision | `provider.rs::EnvFileProvider::describe` (uses `Path::file_name` only, never `read`) | reviewed by inspection; `provider.rs::env_file_parses_pairs_and_strips_quotes_and_comments` covers the parser that runs only at `run()` time |
+| The file is read into a `Zeroizing` buffer and every value lands in a `Zeroizing` string; both are wiped when the map drops at end of `run()` | `provider.rs::{EnvFileProvider::run,parse_env_file}` (`Zeroizing::new(bytes)`, `Zeroizing<Vec<(String, Zeroizing<String>)>>`) | `provider.rs::env_file_provider_injects_the_vars_into_the_child` (values reach the child), parser by `env_file_parses_pairs_and_strips_quotes_and_comments` |
+| **Leasing is disabled for env-file**: a lease would hold resolved values in RAM across a TTL, so a direct-injection provider is gated on **every** run — even when the decision grants a session lease | `daemon.rs::fulfill` (the lease short-circuit and the `grant` are both inside `if needs_account` / `if let Some(ciphertext)`, and `EnvFileProvider::needs_account()==false`) | `daemon.rs::env_file_lease_decision_grants_no_lease` (Lease decision → runs once, `leases.active()==0`), `env_file_command_runs_gated_and_injects_env` (`active()==0`) |
+| `needs_account()==false` correctly gates that env-file **never** routes an account, unwraps the DEK, or touches leasing | `provider.rs::EnvFileProvider::needs_account`, `daemon.rs::fulfill` (all account/DEK/lease work guarded by `needs_account`) | `provider.rs::op_provider_needs_an_account_and_env_file_does_not`, `daemon.rs::env_file_command_runs_gated_and_injects_env` |
+| No value is ever logged: every env-file error line names the **path / io error only** | `provider.rs::EnvFileProvider::run` (all `eprintln!` carry `run.source` or `command[0]`, never a value) | reviewed by inspection (no negative-logging assertion) — **UNPROVEN** by test |
+| The parser cannot panic on hostile input (lossy UTF-8, no split, short quotes) | `provider.rs::parse_env_file` (`from_utf8_lossy`, `split_once` guard, `len() >= 2` quote guard) | `provider.rs::env_file_parses_pairs_and_strips_quotes_and_comments` |
+
+See **residual 9** for the two un-wiped copies this shape unavoidably leaves (the
+`Command` env map and the child's `/proc/<pid>/environ`).
+
+## 13. The pluggable SSH signer (invariant #5, per-signature custody)
+
+The daemon holds `Vec<Box<dyn SshSigner>>`; after the phone gate it routes the
+signature to the signer that owns the key. Two signers ship (`OpSshSigner`,
+`FileSshSigner`); the gate is applied by the Core **before** `sign()` is called.
+
+| Claim | Enforcing code | Proving test |
+|-------|----------------|--------------|
+| **No signer can sign without the gate having passed**: `Core::approve_and_sign` runs `gate.decide` and returns `None` on any non-grant *before* calling `signer.sign` | `daemon.rs::Core::approve_and_sign` (`if !outcome.decision.is_grant() { return None }` precedes the `signer.sign` call); the `ssh_signers` field is private, so `sign()` has no other daemon caller | `daemon.rs::ssh_file_signer_denied_gate_yields_no_signature` (denied gate → `None`, signer never reached), `sshagent.rs::a_denied_sign_request_yields_failure_and_no_signature` |
+| The **data-to-sign hash is bound into the approval**: the scope folds in `sha256(data)`, so the gate's grant-key coalescing can never let one challenge ride another's approval; only a byte-identical re-sign coalesces | `daemon.rs::{ssh_sign_scope,approve_and_sign}` (`scope = "ssh-sign {label} {sha256(data)}"`, `gk = grant_key(caller,"",scope)`) | `daemon.rs::different_ssh_challenges_do_not_share_a_grant_key` |
+| The human approves the **hash of exactly the bytes signed**: the phone shows `sha256(data)`; the signer signs the same `data` verbatim | `sshagent.rs::sign` (`data` passed through), `daemon.rs::approve_and_sign` (`fingerprint = sha256_fingerprint(req.data)`, `signer.sign(req.id, req.data, ...)`) | `sshagent.rs::sign_request_produces_a_signature_that_verifies`, `fetch_and_sign_reads_the_key_and_signs_a_verifiable_signature` |
+| **Every SSH signature is gated** (no lease short-circuit in v1): the sign path never consults `leases` | `daemon.rs::approve_and_sign` (no `token_for`/`grant` call anywhere in the path) | reviewed by inspection; contrasted with the leased op path in `fulfill` |
+| A **wrong / missing / non-ed25519 / passphrase-encrypted key fails closed** to no signature (both signers) | `sshagent.rs::{FileSshSigner::sign` (`find(...)?`, `fs::read(...).ok()?`), `OpSshSigner::sign` (`credential?`), `sign_openssh_ed25519` (ed25519-only, `from_openssh(...).ok()?`)}` | `sshagent.rs::{fetch_and_sign_fails_closed_when_the_token_is_wrong,op_signer_fetches_and_signs_and_requires_a_credential (no-credential branch),sign_request_for_an_unknown_key_is_refused}` |
+| Both signers hold key material in a `Zeroizing` buffer for the **one** signature and wipe it; the key never reaches the SSH client | `sshagent.rs::{op_read_openssh_key` (stdout→`Zeroizing`, stderr `null`), `FileSshSigner::sign` (`Zeroizing::new(fs::read)`), `sign_openssh_ed25519` (`ssh_key::PrivateKey` zeroizes on drop)}` | `sshagent.rs::{fetch_and_sign_reads_the_key_and_signs_a_verifiable_signature,file_signer_signs_from_a_local_key_and_needs_no_account}`, `daemon.rs::ssh_file_signer_signs_when_gated` |
+| The `OpSshSigner` **whole-key-in-RAM-for-one-signature** residual is unchanged but isolated to that signer; `FileSshSigner` matches the same custody discipline | `sshagent.rs` module docs §"Custody (v1)", `OpSshSigner::sign` → `fetch_and_sign` | design residual (see `docs/design/ssh-agent.md` §4); exercised by the fetch/file sign tests above |
+| The `session-bind` host is **advisory context, attacker-nameable, never a boundary**; the load-bearing fields are the key label + data hash | `sshagent.rs::derive_host` (doc + honest fingerprint fallback; the host signature is not verified) | `sshagent.rs::{unknown_host_key_falls_back_to_a_fingerprint_not_a_fake_name,no_session_bind_yields_an_honest_unbound_marker}` |
+| The `ssh-keys.json` store holds **only public material + op coordinates**, never key bytes (inert like the account catalogue), and is 0600 | `sshagent.rs::{SshKeyEntry,SshFileEntry,SshKeyConfig::save}` (0700 dir / 0600 file) | `sshagent.rs::config_entry_resolves_to_a_served_identity` (only public fields), reviewed by inspection for perms |
+
+**Key-file-swap residual (Low, same-UID):** `FileSshSigner` advertises the
+public key resolved from `<path>.pub` at arm time but reads the private key at
+sign time, and does not re-verify that the produced signature matches the
+advertised public key. A same-UID attacker who swaps the private-key file
+between arm and sign makes the agent emit a signature under a *different* key —
+which the SSH client then rejects (it does not match the offered identity), so
+this breaks the connection rather than forging anything. A same-UID file swap is
+already outside Latch's boundary. Not a distinct escalation; noted for
+completeness.
+
 ---
 
 ## Residuals (honest limits)
@@ -238,3 +302,56 @@ These are real and deliberately surfaced, not defects hidden.
    — no key reuse across a shared construction, no oracle, non-invertible — so it
    is not a weakness, but the sentence in `docs/design/pairing.md` should be
    updated to name both uses. Flagged to the doc owner.
+
+9. **The `env-file` provider relaxes invariant #2: resolved secret VALUES
+   transit daemon RAM, and two copies are un-wiped (by design, bounded).** Unlike
+   the `op` shape — where the daemon injects only a *credential* and the `op`
+   child streams the resolved secret straight to the caller's fd, so no secret
+   value ever enters the daemon — a direct-injection provider **is** the source:
+   it reads KEY=VALUE pairs and places the actual values into the child's
+   environment. The daemon holds those values in a `Zeroizing` buffer that is
+   wiped on drop, and never logs them (`provider.rs::EnvFileProvider::run`). But
+   two un-wiped copies are unavoidable:
+   - **`std::process::Command`'s env map** holds a second, plain `OsString` copy
+     of each value (std does not zeroize; it is freed, not scrubbed, when `cmd`
+     drops at the end of the spawn). This is the *same* std limitation as the SA
+     token in residual #3, except the value here is the resolved secret itself,
+     not a credential. Bounded to the spawn. (The provider source comment was
+     corrected in this review to state this honestly rather than claim the
+     `Zeroizing` buffer was the values' only in-process home.)
+   - **The child's `/proc/<pid>/environ`** carries the injected values for the
+     child's whole lifetime, readable by a same-UID process (`ps eww`, `/proc`).
+     For a short-lived child this is a blink; for a long-running one the secrets
+     sit in its environment the whole time. This is inherent to *any* "inject env
+     and exec" model (the `op` SA token has the same exposure in `op`'s environ),
+     and same-UID is already the boundary Latch does not defend below.
+
+   Leasing is **disabled** for this shape precisely so resolved values never also
+   persist in daemon RAM across a TTL (`daemon.rs::env_file_lease_decision_grants_no_lease`).
+   Net: `env-file` is strictly more exposed than `op`, the doc says so plainly,
+   and it is the reason `op`'s credential-injection shape remains the recommended
+   default. Severity: **Medium, inherent to direct injection, documented not
+   fixed.** The daemon-RAM copy is same-process-scrape only.
+
+10. **The SSH agent's `op` signer holds the whole private key in RAM for one
+    signature (unchanged from `0f41ee4`, now isolated behind the signer seam).**
+    On an approved `SIGN_REQUEST` the `OpSshSigner` fetches the key via the
+    service account into a `Zeroizing` buffer, signs once, and wipes. Because the
+    SA token can read the *whole* key, a compromise at the instant of an approved
+    request leaks durable signing power, not one signature — strictly worse than
+    a secret release. The seam does not change this; it isolates it to that one
+    signer (`FileSshSigner` reads a local file into `Zeroizing` with the same
+    per-signature discipline, and a future SE-resident signer would keep the key
+    in hardware). Bounded to an *approved* request. Severity: **Medium, v1
+    custody exception, documented; v2 moves keys to the Secure Enclave**
+    (`docs/design/ssh-agent.md` §4).
+
+11. **The SSH `session-bind` host line is attacker-nameable (advisory only).**
+    The agent protocol carries no authenticated hostname; the host key a client
+    sends over `session-bind` is not verified by the agent, so a malicious
+    same-UID client can label the approval screen with any destination, including
+    a real public host key. The host line is therefore *context*, not a gate: the
+    binding is the human approving the **data hash** for a **named key**, and an
+    unexpected signature prompt is itself the signal. `derive_host` never
+    fabricates a name (it falls back to the honest `SHA256:` fingerprint). Severity:
+    **Low, inherent to the agent protocol; the data hash is the real binding.**

@@ -1445,8 +1445,14 @@ mod tests {
             audit: None,
         });
 
+        // Prepend (not replace) bindir so system binaries stay reachable for any
+        // parallel test's `#!/bin/sh` helper that resolves `cat`/etc via PATH.
         let prev = std::env::var_os("PATH");
-        std::env::set_var("PATH", &bindir);
+        let mut search = vec![bindir.clone()];
+        if let Some(p) = &prev {
+            search.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
         let (read_end, write_end) = pipe();
         let code = fulfill(&core, &["faketool".into()], "", None, Some(write_end), None);
         match prev {
@@ -2444,5 +2450,139 @@ mod tests {
             Some("Personal".into())
         );
         assert_eq!(parse_vault(&["op".into(), "read".into()]), None);
+    }
+
+    #[test]
+    fn env_file_lease_decision_grants_no_lease() {
+        // Leasing is disabled for a direct-injection provider even when the
+        // decision would grant a session lease: resolved secret VALUES must never
+        // sit in daemon RAM across a TTL. A Lease decision on an env-file command
+        // runs once and leaves no lease behind (the credential block that grants a
+        // lease is gated on `needs_account`, which is false for env-file).
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("envlease");
+        let env_path = dir.join("s.env");
+        std::fs::write(&env_path, "TOKEN=abc123\n").unwrap();
+        let bindir = dir.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = bindir.join("faketool");
+        std::fs::write(&tool, "#!/bin/sh\nprintf 'tok=%s' \"$TOKEN\"\n").unwrap();
+        std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let pending = Arc::new(PendingRegistry::new());
+        // A Lease decision that *would* lease an account-backed provider.
+        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+            .with_dev(DevMode::Lease(Duration::from_secs(60)))
+            .with_control_socket(true);
+        let mut commands = CommandStore::default();
+        commands
+            .add(crate::command::CommandConfig {
+                command: "faketool".into(),
+                provider: EnvFileProvider::ID.into(),
+                source: Some(env_path.to_str().unwrap().to_string()),
+                account: None,
+                risk: RiskLevel::Routine,
+            })
+            .unwrap();
+        let core = Arc::new(Core {
+            keystore,
+            accounts: Mutex::new(AccountStore::default()),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(approver)),
+            pending,
+            lockdown: AtomicBool::new(false),
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::with_defaults(),
+            commands,
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::DevInsecure,
+            ssh_signers: Vec::new(),
+            audit: None,
+        });
+
+        // Prepend (not replace) bindir so faketool resolves first while system
+        // binaries stay reachable for any parallel test's `#!/bin/sh` helper.
+        let prev = std::env::var_os("PATH");
+        let mut search = vec![bindir.clone()];
+        if let Some(p) = &prev {
+            search.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
+        let (read_end, write_end) = pipe();
+        let code = fulfill(&core, &["faketool".into()], "", None, Some(write_end), None);
+        match prev {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert_eq!(code, 0);
+        assert_eq!(read_all(read_end), "tok=abc123");
+        assert_eq!(
+            core.leases.active(),
+            0,
+            "env-file must never lease, even on a lease decision"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ssh_file_signer_denied_gate_yields_no_signature() {
+        // Gate-before-sign, fail closed: no pluggable signer may produce a
+        // signature unless the approval gate has granted. With dev Off + no
+        // resolver + a short timeout the parked request times out to Deny, so
+        // `approve_and_sign` must return None and never reach `signer.sign`.
+        let dir = tmpdir("ssh-denied");
+        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .unwrap();
+        let key_path = dir.join("id_ed25519");
+        std::fs::write(&key_path, key.to_openssh(ssh_key::LineEnding::LF).unwrap()).unwrap();
+        let pk = key.public_key();
+        let id = ServedIdentity {
+            key_blob: pk.to_bytes().unwrap(),
+            comment: "tom@file".into(),
+            key_ref: key_path.to_string_lossy().into_owned(),
+            label: "id_ed25519".into(),
+            fingerprint: pk.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
+        };
+
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let pending = Arc::new(PendingRegistry::new());
+        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+            .with_dev(DevMode::Off)
+            .with_control_socket(true)
+            .with_timeout(Duration::from_millis(50));
+        let core = Core {
+            keystore,
+            accounts: Mutex::new(AccountStore::default()),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(approver)),
+            pending,
+            lockdown: AtomicBool::new(false),
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::with_defaults(),
+            commands: CommandStore::default(),
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::DevInsecure,
+            ssh_signers: vec![Box::new(sshagent::FileSshSigner::new(vec![(
+                id.clone(),
+                key_path.clone(),
+            )]))],
+            audit: None,
+        };
+
+        let host = sshagent::HostContext {
+            host: "(host not bound)".into(),
+        };
+        let out = core.approve_and_sign(sshagent::SignRequest {
+            id: &id,
+            data: b"unapproved-data",
+            host: &host,
+            caller_pid: None,
+        });
+        assert!(out.is_none(), "a denied gate must yield no signature");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

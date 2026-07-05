@@ -361,8 +361,11 @@ impl SecretProvider for EnvFileProvider {
                 127
             }
         };
-        // `cmd` (and its env map, the only place the values lived in this process)
-        // drops here; `vars` is Zeroizing and wiped on drop below.
+        // `vars` is Zeroizing and is wiped when it drops below. `cmd`'s own env
+        // map holds a second, un-wiped copy of each value (std's `Command` stores
+        // env as plain `OsString` and does not zeroize): that copy is freed, not
+        // scrubbed, when `cmd` drops here. This is the same std limitation as the
+        // op SA-token copy (security-claims residual #3), bounded to the spawn.
         drop(vars);
         code
     }
@@ -586,8 +589,15 @@ mod tests {
         let _lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Prepend (not replace) bindir: faketool resolves first, but system
+        // binaries stay reachable for any parallel test's `#!/bin/sh` helper (the
+        // fake-`op` sshagent tests do not take TEST_ENV_LOCK and need `cat`).
         let prev = std::env::var_os("PATH");
-        std::env::set_var("PATH", &bindir);
+        let mut search = vec![bindir.clone()];
+        if let Some(p) = &prev {
+            search.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
 
         let (read_end, write_end) = pipe();
         let code = EnvFileProvider.run(ProviderRun {
