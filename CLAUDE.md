@@ -22,6 +22,12 @@ Vendored skills in `.agents/skills/` are house style: rust-best-practices,
 rust-async-patterns, swiftui-expert-skill, swiftui-pro, building-native-ui,
 expo-deployment, workers-best-practices.
 
+**Review integrity rule:** an implementer NEVER writes a "reviewed and found
+sound" verdict about its own code in docs/security-claims.md. Implementers
+document behavior and residuals; only an independent security-reviewer (one that
+did not write the code) writes review verdicts. Crypto especially gets an
+independent adversarial pass, never self-certification.
+
 ## Non-negotiable invariants (see .claude/agents/security-reviewer.md for the full list)
 
 1. Daemon at rest is inert: tokens are ciphertext; the DEK arrives per-approval
