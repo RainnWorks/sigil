@@ -375,6 +375,33 @@ tr td:last-child, tr th:last-child { padding-right: 0; }
 .st-live { color: var(--ok); }
 .st-dev { color: var(--brass); }
 
+/* inline live/soon tags inside the layers topology nodes */
+.tag-live, .tag-soon {
+  font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+.tag-live { color: var(--ok); }
+.tag-live::before, .tag-soon::before { content: "· "; }
+.tag-soon { color: var(--brass); }
+
+/* featured use-case panel (Latch for 1Password) */
+.feat {
+  border: 1px solid var(--line-strong); border-radius: 14px;
+  padding: 28px; background: var(--surface);
+}
+.feat-grid { display: grid; grid-template-columns: 0.9fr 1.1fr; gap: 40px; align-items: center; }
+@media (max-width: 820px) { .feat { padding: 22px; } .feat-grid { grid-template-columns: 1fr; gap: 28px; } }
+.feat .st.st-live {
+  display: inline-flex; align-items: center; gap: 7px; font-family: var(--mono);
+  font-size: 0.7rem; letter-spacing: 0.04em; text-transform: uppercase;
+  border: 0; margin: 0; padding: 0;
+}
+.feat .st.st-live::before { content: ""; width: 6px; height: 6px; border-radius: 99px; background: var(--ok); }
+.feat-h { margin: 12px 0 10px; font-size: 1.2rem; }
+
+/* provider pill row (in development) */
+.pill-row { display: flex; gap: 10px; flex-wrap: wrap; }
+
 /* status pill (planned / in development) */
 .status-pill {
   display: inline-flex; align-items: center; gap: 7px; font-family: var(--mono);

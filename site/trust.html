@@ -15,7 +15,8 @@
     <a class="brand" href="index.html">latch<span class="cursor">_</span></a>
     <div class="nav-links">
       <a class="opt" href="index.html#how">How it works</a>
-      <a class="opt" href="index.html#transport">Transport</a>
+      <a class="opt" href="index.html#layers">Architecture</a>
+      <a href="uses-1password.html">1Password</a>
       <a href="trust.html" aria-current="page" style="color:var(--ink)">Trust model</a>
       <a class="repo" href="#repo">Source</a>
     </div>
@@ -26,7 +27,7 @@
   <div class="wrap-narrow">
     <p class="kicker" style="margin-bottom:18px"><span class="dot" style="background:var(--cobalt)"></span> The trust model, in full</p>
     <h1 style="font-size:clamp(1.9rem,1.3rem+2.6vw,2.8rem);line-height:1.08;letter-spacing:-0.03em">Assume the network is hostile. The design already did.</h1>
-    <p class="lede mt-s">This is the long version for the reader who does not take "trust us" for an answer. It states the mechanism, the boundary, and the residue at each layer. Where something is not built yet, it says so.</p>
+    <p class="lede mt-s">This is the long version for the reader who does not take "trust us" for an answer. It states the mechanism, the boundary, and the residue at each layer. It is written about the generic gate, so it holds for any provider; 1Password is simply the first one wired in. Where something is not built yet, it says so.</p>
   </div>
 </header>
 
@@ -40,7 +41,7 @@
     <div class="prose">
       <p>At pairing, each device mints an Ed25519 signing key and an X25519 agreement key inside its own secure hardware: the Secure Enclave on iPhone, StrongBox or the hardware Keystore on Android, the Keychain and Secure Enclave on the Mac. The private halves never leave that hardware.</p>
       <p>The public keys cross through a QR code rendered locally on one screen and read by the other camera, then confirmed by a six-word fingerprint that both screens display and you compare by eye. Once confirmed they are pinned forever. From that point every message in both directions is a NaCl-style sealed box (X25519 with XSalsa20-Poly1305) carrying an Ed25519 signature over pinned keys. A compromised network hop can neither read a request nor forge an approval.</p>
-      <p>The unwrap key that decrypts service-account tokens is delivered to the phone once, at pairing, and then erased from the daemon. Optionally it is enveloped a second time to the Mac's Secure Enclave, which is what makes a local Touch ID approval a real cryptographic factor rather than a bypass. Hardened mode never mints that second envelope, making the phone strictly required.</p>
+      <p>The unwrap key that decrypts a provider's credentials, a 1Password service-account token today, is delivered to the phone once, at pairing, and then erased from the daemon. Optionally it is enveloped a second time to the Mac's Secure Enclave, which is what makes a local Touch ID approval a real cryptographic factor rather than a bypass. Hardened mode never mints that second envelope, making the phone strictly required.</p>
     </div>
     <div class="term plain mt-m">
 <pre><span class="t-dim"># both screens must show the same three words twice</span>
@@ -65,8 +66,8 @@
     <div class="tblwrap">
       <table>
         <tr><th>Party</th><th>Sees</th><th>Can never see</th></tr>
-        <tr><td><strong>Daemon</strong></td><td>request metadata, ciphertext tokens, the routing table</td><td>a usable token at rest; the secret bytes in flight, which pass fd to fd</td></tr>
-        <tr><td><strong>Phone</strong></td><td>request context, the unwrap key</td><td>service-account tokens, resolved secret values</td></tr>
+        <tr><td><strong>Daemon</strong></td><td>request metadata, ciphertext credentials, the routing table</td><td>a usable credential at rest; the secret bytes in flight, which pass fd to fd</td></tr>
+        <tr><td><strong>Phone</strong></td><td>request context, the unwrap key</td><td>provider credentials, resolved secret values</td></tr>
         <tr><td><strong>Apple or Google push</strong></td><td>"a pairing has a request" and your signing identity</td><td>reasons, commands, secret names, accounts, keys</td></tr>
         <tr><td><strong>Network path</strong></td><td>sealed, signed packets between pinned keys</td><td>anything at all; every hop carries only ciphertext it cannot read or forge</td></tr>
         <tr><td><strong>Calling process</strong></td><td>the one secret it asked for, on stdout, after approval</td><td>anything it did not ask for; anything without an approval</td></tr>
@@ -184,7 +185,7 @@
     <div class="foot-grid">
       <div>
         <span class="brand">latch<span class="cursor">_</span></span>
-        <p class="tag">A personal instrument for approving 1Password secret access from your phone. Built for one user; the team never knows it exists.</p>
+        <p class="tag">A personal instrument that gates the secrets your CLIs inject, behind an approval on your phone. 1Password is the first provider; built for one user, the team never knows it exists.</p>
       </div>
       <div class="foot-links">
         <div class="foot-col">
