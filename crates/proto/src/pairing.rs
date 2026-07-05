@@ -255,6 +255,7 @@ fn verify_confirmation_tag(k_confirm: &[u8; 32], transcript: &[u8; 32], tag: &[u
 /// sender held the pairing secret and is binding *this* identity to *this* QR.
 /// The `nonce` makes the reply one-shot and unique.
 #[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct PairingResponse {
     /// The phone's public identity, to be pinned by the daemon.
     pub phone: PeerIdentity,
