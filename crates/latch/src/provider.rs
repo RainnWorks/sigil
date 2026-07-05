@@ -321,7 +321,16 @@ impl SecretProvider for EnvFileProvider {
                 return 1;
             }
         };
-        let vars = parse_env_file(&contents);
+        let Some(vars) = parse_env_file(&contents) else {
+            // Invalid UTF-8: fail closed rather than lossy-convert (a lossy
+            // conversion would allocate a non-zeroized String holding the file's
+            // secret bytes). No values are injected.
+            eprintln!(
+                "latch daemon: env file {} is not valid UTF-8; refusing to inject",
+                run.source
+            );
+            return 1;
+        };
         if vars.is_empty() {
             eprintln!(
                 "latch daemon: env file {} defined no KEY=VALUE pairs",
@@ -375,13 +384,24 @@ impl SecretProvider for EnvFileProvider {
     }
 }
 
+/// The parsed env-file: `(KEY, VALUE)` pairs where the key is a plain var name
+/// and each value lives in a [`Zeroizing`] buffer; the whole vec is `Zeroizing`
+/// so it is wiped when the map drops after the spawn.
+type EnvVars = Zeroizing<Vec<(String, Zeroizing<String>)>>;
+
 /// Parse a minimal `.env`: one `KEY=VALUE` per line, `#` comments and blank lines
 /// skipped, an optional leading `export `, and optional matching single/double
 /// quotes stripped from the value. The values land in a [`Zeroizing`] buffer so
 /// they are wiped when the returned map drops. Deliberately small; it is not a
 /// full dotenv parser (no interpolation), which keeps the injected surface exact.
-fn parse_env_file(contents: &[u8]) -> Zeroizing<Vec<(String, Zeroizing<String>)>> {
-    let text = String::from_utf8_lossy(contents);
+///
+/// Returns `None` on an **invalid-UTF-8** file: we borrow the bytes with
+/// [`str::from_utf8`] (a slice into the caller's `Zeroizing` buffer, no
+/// allocation) rather than `String::from_utf8_lossy`, which would allocate an
+/// owned, non-zeroized `String` holding the file's secret bytes. A non-UTF-8 env
+/// file therefore fails closed with no un-wiped copy ever created.
+fn parse_env_file(contents: &[u8]) -> Option<EnvVars> {
+    let text = std::str::from_utf8(contents).ok()?;
     let mut out: Vec<(String, Zeroizing<String>)> = Vec::new();
     for raw in text.lines() {
         let line = raw.trim();
@@ -406,7 +426,7 @@ fn parse_env_file(contents: &[u8]) -> Zeroizing<Vec<(String, Zeroizing<String>)>
         }
         out.push((key.to_string(), Zeroizing::new(value.to_string())));
     }
-    Zeroizing::new(out)
+    Some(Zeroizing::new(out))
 }
 
 /// Parse one argv token into a [`SecretRef`] if it carries an `op://` reference.
@@ -553,7 +573,7 @@ mod tests {
     #[test]
     fn env_file_parses_pairs_and_strips_quotes_and_comments() {
         let src = b"# a comment\nexport FOO=bar\nBAZ=\"quoted value\"\nEMPTY=\nQ='single'\n\nnot a pair line\n";
-        let vars = parse_env_file(src);
+        let vars = parse_env_file(src).expect("valid utf-8 parses");
         let map: std::collections::HashMap<_, _> = vars
             .iter()
             .map(|(k, v)| (k.clone(), v.to_string()))
@@ -563,6 +583,42 @@ mod tests {
         assert_eq!(map.get("Q").map(String::as_str), Some("single"));
         assert_eq!(map.get("EMPTY").map(String::as_str), Some(""));
         assert!(!map.contains_key("not a pair line"));
+    }
+
+    #[test]
+    fn env_file_with_invalid_utf8_is_rejected() {
+        // Invalid UTF-8 must fail closed to `None` rather than lossy-convert into
+        // a non-zeroized String holding secret bytes (the residual this hardens).
+        let src = b"API_KEY=live-key\n\xff\xfe not utf8\n";
+        assert!(
+            parse_env_file(src).is_none(),
+            "an invalid-UTF-8 env file must be refused, not lossy-converted"
+        );
+    }
+
+    #[test]
+    fn env_file_run_fails_closed_on_invalid_utf8() {
+        // End to end through the provider: an invalid-UTF-8 source refuses (exit 1)
+        // and injects nothing, before it ever resolves or spawns a target binary.
+        let dir = std::env::temp_dir().join(format!("latch-envbad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join("bad.env");
+        std::fs::write(&env_path, b"API_KEY=live\n\xff\xfe\n").unwrap();
+
+        // The refusal is reported on the provider's own stderr (eprintln), as with
+        // every other run error; the caller-facing signal is exit 1 and no output.
+        let (read_end, write_end) = pipe();
+        let code = EnvFileProvider.run(ProviderRun {
+            command: &["faketool".into()],
+            cwd: "",
+            credential: None,
+            source: env_path.to_str().unwrap(),
+            stdout: Some(write_end),
+            stderr: None,
+        });
+        assert_eq!(code, 1, "invalid utf-8 must fail closed");
+        assert_eq!(read_all(read_end), "", "no output on a refused run");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

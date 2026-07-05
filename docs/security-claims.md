@@ -13,6 +13,8 @@ Reviewed at commit `3d005aa` (the first end-to-end remote-approval loop).
 Extended at commit `ee49ee3` (any-CLI generalization: provider registry, the
 `env-file` direct-injection provider, the pluggable SSH signer, and the
 CLI-only pairing persistence) — sections 11–13 and residuals 9–11 below.
+Extended again at commit `747b3a4` (the P-256 Secure Enclave DEK wrap) — section
+14 and residual 12; and the env-file invalid-UTF-8 residual was fixed (see §12).
 
 ---
 
@@ -157,7 +159,7 @@ RAM, and the doc is explicit about the exact residual that buys.
 | **Leasing is disabled for env-file**: a lease would hold resolved values in RAM across a TTL, so a direct-injection provider is gated on **every** run — even when the decision grants a session lease | `daemon.rs::fulfill` (the lease short-circuit and the `grant` are both inside `if needs_account` / `if let Some(ciphertext)`, and `EnvFileProvider::needs_account()==false`) | `daemon.rs::env_file_lease_decision_grants_no_lease` (Lease decision → runs once, `leases.active()==0`), `env_file_command_runs_gated_and_injects_env` (`active()==0`) |
 | `needs_account()==false` correctly gates that env-file **never** routes an account, unwraps the DEK, or touches leasing | `provider.rs::EnvFileProvider::needs_account`, `daemon.rs::fulfill` (all account/DEK/lease work guarded by `needs_account`) | `provider.rs::op_provider_needs_an_account_and_env_file_does_not`, `daemon.rs::env_file_command_runs_gated_and_injects_env` |
 | No value is ever logged: every env-file error line names the **path / io error only** | `provider.rs::EnvFileProvider::run` (all `eprintln!` carry `run.source` or `command[0]`, never a value) | reviewed by inspection (no negative-logging assertion) — **UNPROVEN** by test |
-| The parser cannot panic on hostile input (lossy UTF-8, no split, short quotes) | `provider.rs::parse_env_file` (`from_utf8_lossy`, `split_once` guard, `len() >= 2` quote guard) | `provider.rs::env_file_parses_pairs_and_strips_quotes_and_comments` |
+| The parser cannot panic on hostile input, and an **invalid-UTF-8** file fails closed with no owned/un-zeroized `String` allocated (borrows with `str::from_utf8`, returns `None`; `split_once` guard; `len() >= 2` quote guard) | `provider.rs::{parse_env_file,EnvFileProvider::run}` | `provider.rs::{env_file_parses_pairs_and_strips_quotes_and_comments,env_file_with_invalid_utf8_is_rejected,env_file_run_fails_closed_on_invalid_utf8}` |
 
 See **residual 9** for the two un-wiped copies this shape unavoidably leaves (the
 `Command` env map and the child's `/proc/<pid>/environ`).
@@ -189,6 +191,30 @@ which the SSH client then rejects (it does not match the offered identity), so
 this breaks the connection rather than forging anything. A same-UID file swap is
 already outside Latch's boundary. Not a distinct escalation; noted for
 completeness.
+
+## 14. The P-256 Secure Enclave DEK wrap (`747b3a4`)
+
+The Mac local-approval factor unwraps the DEK *inside* the Secure Enclave under
+Touch ID, and the SE holds only P-256 keys — so the Mac-SE wrap is a second,
+independent envelope of the same DEK (the phone path is unchanged X25519). It
+reproduces Apple's `kSecKeyAlgorithmECIESEncryptionCofactorVariableIVX963SHA256AESGCM`
+so `SecKeyCreateDecryptedData` opens it. **Reviewed and found sound.**
+
+| Claim | Enforcing code | Proving test |
+|-------|----------------|--------------|
+| The construction matches Apple's ECIES exactly: ephemeral P-256 → cofactor ECDH (P-256 h=1) → ANSI-X9.63 KDF-SHA256 with sharedInfo = ephemeral X9.63 pubkey → **AES-128** key ‖ 16-byte **variable IV** → AES-128-GCM, empty AAD, 16-byte tag; wire `eph_pub(65) ‖ ct(32) ‖ tag(16) = 113` | `se_ecies.rs::{wrap_dek_p256,x963_kdf_sha256,split_key_iv,Aes128GcmVarIv}` | `se_ecies.rs::{wrap_unwrap_round_trips_the_dek,sealed_blob_has_the_apple_wire_length,x963_kdf_matches_a_known_answer}`; on-device interop is **UNPROVEN — NEEDS-VERIFICATION** (`apps/mac/Tools/se-selftest.swift`, blob must read 113) |
+| The recipient and ephemeral public keys are **validated as on-curve X9.63 points** (identity/garbage refused); P-256 is prime-order so no small-subgroup surface | `se_ecies.rs::{wrap_dek_p256,unwrap_dek_p256}` (`PublicKey::from_sec1_bytes`) | `se_ecies.rs::{a_non_point_recipient_key_is_refused,a_tampered_ephemeral_key_is_rejected}` |
+| Every wrap uses a **fresh ephemeral key** → fresh shared secret → fresh AES key **and** IV, so there is never a `(key, IV)` reuse across wraps (the GCM catastrophe) | `se_ecies.rs::wrap_dek_p256` (`EphemeralSecret::random` per call) | `se_ecies.rs::each_wrap_uses_a_fresh_ephemeral_key` |
+| A wrong SE key or any tampered byte fails closed (GCM auth); no DEK leaks; a truncated blob is refused before any crypto | `se_ecies.rs::unwrap_dek_p256` | `se_ecies.rs::{wrong_se_key_cannot_unwrap,a_tampered_ciphertext_is_rejected,a_truncated_blob_is_rejected}` |
+| Key material is zeroized: ephemeral secret (`EphemeralSecret` ZeroizeOnDrop), shared secret (`SharedSecret` zeroizes), KDF output + AES key + recovered DEK intermediate all `Zeroizing` | `se_ecies.rs::{x963_kdf_sha256,split_key_iv,unwrap_dek_p256}` | reviewed by inspection (the `Zeroizing` wrappers); `unwrap_dek_p256`'s recovered-key copy was wrapped in `Zeroizing` in this review |
+| The wrap is gated on **SAS confirmation** (`Confirmed`/`DekDelivered`), same as the phone DEK delivery; it does not change pairing state | `pairing.rs::DaemonPairing::wrap_dek_for_se_p256` (state guard) | `pairing.rs` SE-wrap round-trip test (line ~1028) |
+| **Empty AAD is correct, not a gap**: `SecKeyCreateDecryptedData` for this ECIES algorithm accepts no AAD, so AAD is fixed-empty on both sides; identity binding via AAD is impossible and unnecessary here (confidentiality = ECDH-to-SE-key, integrity = GCM tag, DEK↔token binding = the account store's own AES-256-GCM). Cross-device/cross-pairing replay fails closed | `se_ecies.rs` module docs §"Binding and sender authentication", `keystore_macos.rs`, `apps/mac/.../SecureEnclaveApprover.swift` (SE decrypt) | design analysis (see residual 12) |
+
+**Wiring status:** `wrap_dek_for_se_p256` is built and unit-tested but **not yet
+called by the shipping daemon/CLI**; the Mac `approve(wrappedDEK:)` path exists
+and `AppModel` currently passes an empty placeholder. The at-rest storage and
+delivery of the wrapped blob are the remaining integration, at which point
+residual 12's local-only assumption must be re-checked.
 
 ---
 
@@ -317,12 +343,11 @@ These are real and deliberately surfaced, not defects hidden.
      drops at the end of the spawn). This is the *same* std limitation as the SA
      token in residual #3, except the value here is the resolved secret itself,
      not a credential. Bounded to the spawn. (The provider source comment was
-     corrected in this review to state this honestly rather than claim the
-     `Zeroizing` buffer was the values' only in-process home.) A third, rarer
-     un-wiped copy: `parse_env_file` calls `String::from_utf8_lossy`, which on an
-     **invalid-UTF-8** env file allocates an owned (non-`Zeroizing`) `String`
-     holding the lossy file contents; on the common valid-UTF-8 path it borrows
-     and copies nothing. Same same-process-scrape severity; noted for completeness.
+     corrected in review to state this honestly rather than claim the `Zeroizing`
+     buffer was the values' only in-process home.) The previously-noted
+     invalid-UTF-8 lossy-`String` copy is now **FIXED**: `parse_env_file` borrows
+     with `str::from_utf8` and returns `None` on non-UTF-8, so an invalid file
+     fails closed with no owned `String` ever allocated (`provider.rs::{env_file_with_invalid_utf8_is_rejected,env_file_run_fails_closed_on_invalid_utf8}`).
    - **The child's `/proc/<pid>/environ`** carries the injected values for the
      child's whole lifetime, readable by a same-UID process (`ps eww`, `/proc`).
      For a short-lived child this is a blink; for a long-running one the secrets
@@ -359,3 +384,22 @@ These are real and deliberately surfaced, not defects hidden.
     unexpected signature prompt is itself the signal. `derive_host` never
     fabricates a name (it falls back to the honest `SHA256:` fingerprint). Severity:
     **Low, inherent to the agent protocol; the data hash is the real binding.**
+
+12. **The P-256 SE DEK wrap carries no sender authentication (correct for the
+    local-only use; a constraint for any future remote use).** ECIES to the SE
+    public key gives confidentiality and (via GCM) integrity, but not *sender*
+    authentication: the SE public key is public, so anyone can wrap an arbitrary
+    value to it. This is safe as designed because the wrap is produced and consumed
+    **locally** — the daemon wraps the DEK to the same Mac's SE key, and the SE
+    unwraps it under Touch ID — so forging or swapping the stored blob already
+    requires same-UID write (outside Latch's boundary) and yields only a fail-closed
+    denial (a substituted DEK cannot decrypt the real AES-256-GCM token ciphertext),
+    never a secret. AAD binding is **impossible** anyway: `SecKeyCreateDecryptedData`
+    for this ECIES algorithm accepts no AAD, so any AAD would break SE interop.
+    **Design constraint, recorded so it is not lost when the wrap is wired in:** if a
+    wrapped-DEK-to-SE blob is ever delivered by a *remote* party (over the relay, or
+    phone→different-machine), it MUST travel inside the signed `Envelope` (Ed25519
+    sender auth + replay guard), never bare and never via GCM AAD the SE cannot
+    validate. Severity: **None today (local-only, fail-closed); a tripwire for the
+    integration step.** Enforcing code: `se_ecies.rs` module docs §"Binding and
+    sender authentication".

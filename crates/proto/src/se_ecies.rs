@@ -52,6 +52,34 @@
 //! For a 32-byte DEK that is `65 + 32 + 16 = 113` bytes. `se-selftest.swift`
 //! prints this length after `SecKeyCreateEncryptedData`; it must read 113.
 //!
+//! # Binding and sender authentication (why empty AAD is correct)
+//!
+//! Apple's `SecKeyCreateDecryptedData` for this ECIES algorithm takes **no AAD**
+//! parameter, so the AAD is fixed-empty on both sides; adding AAD here would make
+//! the Secure Enclave decrypt fail. Empty AAD is therefore not a free choice but a
+//! constraint of SE interop, and it is safe for the intended use:
+//!
+//! * **Confidentiality** comes from ECDH to the SE public key: only that device's
+//!   Enclave (under Touch ID) can open the blob, and a blob sealed to one SE key is
+//!   authenticated garbage to any other (a different device, or a re-provisioned
+//!   key). Cross-device / cross-pairing replay fails closed.
+//! * **Integrity** of the wrapped DEK comes from the GCM tag: a tampered blob does
+//!   not open.
+//! * The **DEK<->token binding** is enforced downstream, not here: account tokens
+//!   are AES-256-GCM ciphertext under the DEK, so a lifted or attacker-substituted
+//!   DEK simply fails to decrypt them (fail closed, no secret leak).
+//!
+//! What ECIES does **not** provide is *sender* authentication: the SE public key is
+//! public, so anyone can wrap an arbitrary value to it. That is acceptable because
+//! the wrap is produced and consumed **locally** — the daemon wraps the DEK to the
+//! same Mac's SE key and the SE unwraps it under Touch ID — so forging or swapping
+//! the stored blob already requires same-UID write (outside Latch's boundary) and
+//! yields only a fail-closed denial, never a secret. **Design constraint for any
+//! future use:** if a wrapped-DEK-to-SE blob is ever delivered by a *remote* party
+//! (over the relay, or from the phone to a different machine), it MUST be carried
+//! inside the signed [`Envelope`](crate::Envelope) (Ed25519 sender auth + replay
+//! guard) — never trusted bare, and never via GCM AAD the SE cannot validate.
+//!
 //! NEEDS-VERIFICATION (on device): that the Secure Enclave opens a blob produced
 //! by [`wrap_dek_p256`]. Confirm with `swift apps/mac/Tools/se-selftest.swift` on
 //! real Apple-silicon hardware with an enrolled biometric (it cannot pass on a VM
@@ -193,9 +221,11 @@ pub fn unwrap_dek_p256(sealed: &[u8], se_secret: &SecretKey) -> Result<Dek, SeEc
     if plaintext.len() != 32 {
         return Err(SeEciesError::Decrypt);
     }
-    let mut bytes = [0u8; 32];
+    // Hold the recovered key material in a Zeroizing intermediate so the copy on
+    // the way into `Dek` is wiped rather than left on the stack.
+    let mut bytes = Zeroizing::new([0u8; 32]);
     bytes.copy_from_slice(&plaintext);
-    Ok(Dek::from_bytes(bytes))
+    Ok(Dek::from_bytes(*bytes))
 }
 
 #[cfg(test)]
