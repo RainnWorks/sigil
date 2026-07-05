@@ -82,7 +82,11 @@ export interface SealParams {
 export function seal<T>(sodium: Sodium, payload: T, params: SealParams): Envelope {
   const plaintext = new TextEncoder().encode(JSON.stringify(payload));
 
-  const ephemeral = sodium.crypto_box_keypair();
+  // react-native-libsodium omits crypto_scalarmult_base, which crypto_box_keypair()
+  // needs to derive the public key from a random secret (the same gap that broke the
+  // identity keypair). A random 32-byte seed through crypto_box_seed_keypair (present
+  // in both bindings) yields an equivalent uniformly-random X25519 ephemeral keypair.
+  const ephemeral = sodium.crypto_box_seed_keypair(sodium.randombytes_buf(32));
   const nonce = sodium.randombytes_buf(sodium.crypto_box_NONCEBYTES);
   const ciphertext = sodium.crypto_box_easy(
     plaintext,
