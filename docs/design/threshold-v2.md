@@ -423,24 +423,41 @@ one DEK gets every account forever.
 This is requirement 5, resolved with the math that bounds it.
 
 **Can the phone's partial be made cryptographically fresh per request (blinded),
-so a captured `Z_F` is useless?** For a *fixed at-rest ciphertext*, **no** — and
-the reason is exactly the SE's X-only output, proven here so the residual is
-understood, not hand-waved:
+so a captured `Z_F` is useless?** Blinding the *wire* partial **is
+constructible** — but it buys no freshness for a *fixed at-rest ciphertext*, so
+the decision is still not to add it. (This corrects an earlier draft that claimed
+blinding was *impossible*; the independent review flagged that claim as false —
+see §15, finding F-1 / **R1**. A false impossibility claim in a security doc is a
+latent hazard, so the reasoning is fixed here even though the decision it supports
+is unchanged.)
 
 - The token ciphertext is fixed at rest, so the key `K` that opens it is fixed,
   so the phone's contribution to `K` — `Z_F = x(f·E)` for the account's fixed `E`
   — is a **fixed** value. Any scheme that reconstructs `K` must reproduce that
-  exact `Z_F`.
-- Multiplicative blinding (Mac sends `r·E`, phone returns `f·(r·E)`, Mac strips
-  `r^{-1}`) is the standard way to hide a static DH partial behind a fresh one —
-  but it operates on **full points**, and the SE returns only `x(f·rE)`. The
-  X-coordinate map is **not homomorphic**: `x(f·rE)` does not let the Mac recover
-  `x(f·E)` by any scalar operation. And the alternative — the phone key-agreeing
-  against a *fresh Mac-chosen* base `C = c·G` — yields `x(f·C) = x(c·F)`, which
-  the Mac can already compute itself from `c` and the public `F`, so it carries
-  **zero** information about the token. Blinding a static X-only partial into a
-  fresh one is therefore not merely hard here; it is **impossible** for a
-  fixed-at-rest ciphertext with an X-only SE.
+  exact `Z_F` **in Mac RAM at combine time**. This is the crux.
+- Multiplicative blinding *is achievable*, contrary to the earlier draft. The
+  unblinding happens on the **Mac**, which has no X-only limitation: the Mac draws
+  a fresh `r`, sends `E' = r·E` (a full-point op on the public `E`, so the phone
+  never sees the real `E`); the phone returns its ordinary SE output
+  `x(f·E') = x(r·(f·E))`; the Mac **decompresses** that X-coordinate to a point `Q`
+  (either sign root) and computes `x(r⁻¹·Q) = x(f·E) = Z_F` (both sign candidates
+  share the same X-coordinate, so the ambiguity is irrelevant). The X-coordinate
+  map need not be homomorphic — the Mac reconstructs the full point and strips `r`
+  itself. (An OPRF/VOPRF is blocked and then rescued the same way, by client-side
+  unblind; it is likewise possible-but-pointless here. An SE *signature* in place
+  of key-agreement cannot serve as a secret 2-of-2 share at all — signatures are
+  public-verifiable and per-message, so they cannot reproduce a fixed `K`.)
+- **But blinding delivers no benefit against the residual attacker.** Whatever the
+  wire carries, the Mac must still re-materialise the *identical static* `Z_F` in
+  its RAM to derive the fixed `K` at combine time — at the exact instant the §9
+  residual attacker (a daemon-RAM scrape during an approved decrypt) is present,
+  when `K` and the plaintext token are equally exposed. Blinding hides `Z_F` on the
+  phone and the wire, not in the combine. **Only changing the ciphertext per use —
+  per-use re-encryption / re-key, which the design already offers (§12) — yields
+  true per-request freshness of the at-rest key.** Blinding therefore remains a
+  MAY (cheap defence-in-depth: the phone never learns the account's base `E` nor
+  emits a reusable static partial, shrinking a compromised-phone-app harvest to
+  single-use values), orthogonal to the 2-of-2 core; it is **not** adopted here.
 
 **What already provides the freshness that matters.** The `Z_F` is *never on the
 wire in a reusable form*: it is sealed inside the per-response `Envelope`, whose
@@ -456,10 +473,12 @@ construction, already has the prize.
   of remote approval is that the human sees what they authorize).
 - The partial is bound to the request by the existing signature + replay guard
   (§8), not by blinding.
-- No per-request key freshness is claimed (it is provably unattainable here); the
-  claimed freshness is that the partial is (a) elicited only by a Mac-signed,
-  fresh, human-Face-ID-approved request, and (b) transmitted only inside a
-  single-use sealed envelope.
+- No per-request freshness of the *at-rest key* is claimed: it is unattainable for
+  a fixed ciphertext without per-use re-encryption (blinding can freshen the wire
+  partial but not the `Z_F` the Mac reconstructs at combine time — see the
+  corrected argument above and §12's re-key path). The claimed freshness is that
+  the partial is (a) elicited only by a Mac-signed, fresh, human-Face-ID-approved
+  request, and (b) transmitted only inside a single-use sealed envelope.
 
 **Residual, stated honestly.** A `Z_F` captured from daemon RAM during an approved
 decrypt is reusable to re-derive **that one account's** `K` *iff* the attacker also
@@ -468,7 +487,8 @@ keeps the same `E`. It does **not** generalize to other accounts (each has its o
 `E` → its own `Z_F`), and the account can be re-keyed (fresh `E`, re-encrypt) to
 invalidate a captured partial. This is a large improvement over v1's "one DEK =
 all accounts, forever, no laptop needed" and is the deliberate, minimal residual
-of choosing visibility over an unattainable blinding.
+of choosing visibility over a blinding that (per the corrected §9 argument) would
+not shrink this residual anyway, absent per-use re-encryption.
 
 ---
 

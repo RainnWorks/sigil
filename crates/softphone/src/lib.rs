@@ -345,6 +345,7 @@ mod tests {
             },
             risk: RiskLevel::Routine,
             reason: None,
+            threshold: None,
             expires_at: NOW + 90_000,
             timeout_ms: 90_000,
         }

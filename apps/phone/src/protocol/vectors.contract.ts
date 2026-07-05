@@ -129,6 +129,39 @@ export interface ReplayVector {
   steps: ReplayStep[];
 }
 
+/**
+ * combiner: the v2 threshold combiner (crates/proto/src/threshold.rs), which the
+ * phone's TS combiner must mirror byte-for-byte.
+ *
+ * `zm`/`zf`/`ephemeralPub`/`accountId` are the INPUTS the phone is given; the
+ * phone computes `K = BLAKE2b("latch.threshold.v2" ‖ len·Zm ‖ len·Zf ‖ len·E ‖
+ * len·accountId)` (32-byte digest; libsodium `crypto_generichash(32, …)`, u64-BE
+ * length prefixes, the 18-byte domain as a raw leading constant) and must match
+ * `expectedK`. `expectedTokenCt` is `AES-256-GCM(token; K, aeadNonce)` as
+ * `ciphertext‖tag`, locking the AEAD leg too. `ecdhAlgo` records which SE output
+ * shape produced these partials (informational for the combiner — it operates on
+ * the already-shaped `zm`/`zf`).
+ */
+export interface CombinerVector {
+  name: string;
+  ecdhAlgo: "raw-x" | "x963-sha256";
+  /** Combiner input Z_M = x(m·E), shaped per ecdhAlgo. 32-byte hex. */
+  zm: string;
+  /** Combiner input Z_F = x(f·E), shaped per ecdhAlgo. 32-byte hex. */
+  zf: string;
+  /** The account base E = e·G, ANSI X9.63 uncompressed (65 bytes). hex. */
+  ephemeralPub: string;
+  accountId: string;
+  /** Expected derived token key K. 32-byte hex. */
+  expectedK: string;
+  /** AES-256-GCM nonce (12 bytes). hex. */
+  aeadNonce: string;
+  /** The plaintext token that was sealed. hex. */
+  token: string;
+  /** Expected AES-256-GCM ciphertext‖tag under K. hex. */
+  expectedTokenCt: string;
+}
+
 export interface LatchVectors {
   version: number;
   canonicalBytes: CanonicalVector[];
@@ -136,6 +169,7 @@ export interface LatchVectors {
   pairingQr: PairingQrVector[];
   open: OpenVector[];
   replay: ReplayVector[];
+  combiner: CombinerVector[];
 }
 
 /** Where verify-vectors.ts expects the Rust-exported file. */

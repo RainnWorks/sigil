@@ -197,6 +197,7 @@ fn cmd_demo(args: &[String]) -> anyhow::Result<()> {
         },
         risk: RiskLevel::Routine,
         reason: None,
+        threshold: None,
         expires_at: now + 90_000,
         timeout_ms: 90_000,
     };

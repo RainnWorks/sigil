@@ -105,6 +105,38 @@ pub struct SshChallenge {
     pub fingerprint: String,
 }
 
+/// The per-request threshold challenge for a v2 account (`docs/design/threshold-v2.md`
+/// §7). Absent on v1 requests and on kinds that read no secret. It carries the
+/// base point the phone must key-agree its Secure-Enclave key `f` against, plus
+/// the account binding the phone shows and consents to.
+///
+/// **R5 (bind consent to the account shown).** `account_id`/`label` name the
+/// account being unlocked; the phone MUST display `label`, bind its Face-ID
+/// consent to it, and cross-check it against the [`SecretRef`]s in the readout, so
+/// a mis-issued challenge cannot decouple "what the human sees" from "what gets
+/// unlocked". This is display/audit context only — `ephemeral_pub` is the sole
+/// cryptographic input, and it is authenticated by the enclosing signed envelope.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ThresholdChallenge {
+    /// Account whose token this unlocks; echoed in the response for correlation.
+    pub account_id: String,
+    /// Human label of that account, shown to and consented to by the approver (R5).
+    pub label: String,
+    /// The account's fixed ECDH base point `E = e·G`, ANSI X9.63 (65 bytes),
+    /// standard-base64. The phone validates it on-curve, then computes
+    /// `Z_F = x(f·E)` against it. (`latch-proto`'s
+    /// [`P256Point`](crate::threshold::P256Point) is the canonical validator; the
+    /// phone MUST use the equivalent validating decoder — R2.)
+    pub ephemeral_pub: String,
+    /// Which pinned SE key `F` to use (a phone may hold more than one over re-pairs).
+    pub se_key_id: String,
+    /// Echoes the record's `Z_F` shape so the phone picks the matching SE
+    /// algorithm: `"raw-x"` or `"x963-sha256"` (see
+    /// [`EcdhAlgo`](crate::threshold::EcdhAlgo)).
+    pub ecdh_algo: String,
+}
+
 /// Daemon-verified provenance. Never built from anything the client claimed.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -139,6 +171,14 @@ pub struct ApprovalRequest {
     /// One reason line for elevated / critical requests.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reason: Option<String>,
+    /// The v2 threshold challenge for a v2 account; absent on v1 requests and on
+    /// kinds that read no secret, so a v1 peer never sees it. A command reading
+    /// several v2 accounts in one approval generalizes this to a
+    /// `Vec<ThresholdChallenge>` keyed by `account_id` (design Q7 / R5), enumerated
+    /// in the readout so one Face ID is informed consent for the whole batch; the
+    /// single-account form is implemented here.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub threshold: Option<ThresholdChallenge>,
     /// Absolute expiry, unix ms.
     pub expires_at: u64,
     /// Full-scale window for the countdown gauge, ms.
@@ -174,17 +214,37 @@ pub struct BlockDirective {
     pub duration_ms: u64,
 }
 
+/// The phone's ECDH partial for a v2 account (`docs/design/threshold-v2.md` §7):
+/// `Z_F = x(f·E)`, the value the Secure Enclave emits under Face ID. For v2
+/// accounts it replaces `wrapped_dek` — the phone no longer holds a self-sufficient
+/// DEK, only its share. Confidential ONLY by virtue of the enclosing sealed
+/// [`Envelope`], exactly as v1's `wrapped_dek` was.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ThresholdPartial {
+    /// Echoes the challenge's account id, correlating the partial to its request.
+    pub account_id: String,
+    /// The SE ECDH partial `Z_F`, 32 bytes, standard-base64.
+    pub zf: String,
+}
+
 /// The response the phone seals to the daemon. Provider-agnostic.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalResponse {
     pub request_id: String,
     pub decision: Decision,
-    /// On approve: standard-base64 of the raw 32-byte DEK. Absent on deny.
-    /// Confidential by virtue of the enclosing sealed [`Envelope`]; see the
-    /// module divergence note.
+    /// On a v1 approve: standard-base64 of the raw 32-byte DEK. Absent on deny and
+    /// on v2 approves. Confidential by virtue of the enclosing sealed [`Envelope`];
+    /// see the module divergence note.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub wrapped_dek: Option<String>,
+    /// On a v2 approve: the phone's threshold partial `Z_F`, replacing
+    /// `wrapped_dek`. Absent on deny and on v1 approves. Exactly one of
+    /// `wrapped_dek` / `partial` is populated per approve, selected by the
+    /// account's record version (R3), never by a wire field.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub partial: Option<ThresholdPartial>,
     /// On "approve for this session": the requested lease, else absent.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lease: Option<InstallLease>,
@@ -195,24 +255,45 @@ pub struct ApprovalResponse {
 }
 
 impl ApprovalResponse {
-    /// Build an approve response carrying the DEK (standard-base64).
+    /// Build a v1 approve response carrying the DEK (standard-base64).
     pub fn approve(request_id: &str, dek: &Dek, decided_at: u64) -> Self {
         Self {
             request_id: request_id.to_string(),
             decision: Decision::Approved,
             wrapped_dek: Some(B64.encode(dek.as_bytes())),
+            partial: None,
             lease: None,
             block: None,
             decided_at,
         }
     }
 
-    /// Build a deny response. Carries no DEK, so a denial cannot release a token.
+    /// Build a v2 approve response carrying the phone's threshold partial `Z_F`
+    /// (32 bytes) instead of a DEK. `account_id` echoes the challenge for
+    /// correlation. Carries no DEK, so a v2 approve can never release a v1 token.
+    pub fn approve_v2(request_id: &str, account_id: &str, zf: &[u8; 32], decided_at: u64) -> Self {
+        Self {
+            request_id: request_id.to_string(),
+            decision: Decision::Approved,
+            wrapped_dek: None,
+            partial: Some(ThresholdPartial {
+                account_id: account_id.to_string(),
+                zf: B64.encode(zf),
+            }),
+            lease: None,
+            block: None,
+            decided_at,
+        }
+    }
+
+    /// Build a deny response. Carries neither a DEK nor a partial, so a denial can
+    /// never release a token on either the v1 or the v2 path.
     pub fn deny(request_id: &str, decided_at: u64) -> Self {
         Self {
             request_id: request_id.to_string(),
             decision: Decision::Denied,
             wrapped_dek: None,
+            partial: None,
             lease: None,
             block: None,
             decided_at,
@@ -236,6 +317,18 @@ impl ApprovalResponse {
         let bytes = zeroize::Zeroizing::new(B64.decode(b64).ok()?);
         let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
         Some(Dek::from_bytes(arr))
+    }
+
+    /// Decode the carried v2 partial `Z_F` and its account id, if any. Returns
+    /// `None` on a denial, a v1 (DEK) response, or if the base64 does not decode to
+    /// exactly 32 bytes (fail closed: a malformed partial yields no share rather
+    /// than a truncated one, mirroring [`Self::dek`]). The 32 bytes are held in a
+    /// `Zeroizing` buffer so the raw share is wiped after use.
+    pub fn partial_zf(&self) -> Option<(String, zeroize::Zeroizing<[u8; 32]>)> {
+        let partial = self.partial.as_ref()?;
+        let bytes = zeroize::Zeroizing::new(B64.decode(&partial.zf).ok()?);
+        let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
+        Some((partial.account_id.clone(), zeroize::Zeroizing::new(arr)))
     }
 }
 
@@ -272,6 +365,7 @@ mod tests {
             },
             risk: RiskLevel::Routine,
             reason: None,
+            threshold: None,
             expires_at: 1_720_000_090_000,
             timeout_ms: 90_000,
         };
@@ -325,5 +419,85 @@ mod tests {
         assert!(resp.dek().is_none());
         resp.wrapped_dek = Some(B64.encode([0u8; 16]));
         assert!(resp.dek().is_none());
+    }
+
+    #[test]
+    fn v2_challenge_is_omitted_on_v1_requests_and_round_trips_when_present() {
+        // A v1-shaped request omits `threshold` entirely (a v1 peer never sees it).
+        let mut req = ApprovalRequest {
+            request_id: "req-1".into(),
+            kind: RequestKind::SecretRead,
+            command: vec!["op".into(), "read".into()],
+            secrets: vec![secret_ref()],
+            ssh: None,
+            provenance: Provenance {
+                process_chain: vec!["op".into()],
+                cwd: "/p".into(),
+                machine: "mac".into(),
+                requested_at: 1,
+            },
+            risk: RiskLevel::Routine,
+            reason: None,
+            threshold: None,
+            expires_at: 2,
+            timeout_ms: 90_000,
+        };
+        assert!(!serde_json::to_string(&req).unwrap().contains("threshold"));
+
+        req.threshold = Some(ThresholdChallenge {
+            account_id: "acct-1".into(),
+            label: "Rowm work".into(),
+            ephemeral_pub: B64.encode([0x04u8; 65]),
+            se_key_id: "se-key-1".into(),
+            ecdh_algo: "raw-x".into(),
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"threshold\""));
+        assert!(json.contains("\"accountId\":\"acct-1\""));
+        assert!(json.contains("\"ephemeralPub\""));
+        assert!(json.contains("\"ecdhAlgo\":\"raw-x\""));
+        let back: ApprovalRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn v2_approve_carries_the_partial_and_deny_never_does() {
+        let zf = [0x5Au8; 32];
+        let ok = ApprovalResponse::approve_v2("req-1", "acct-1", &zf, 42);
+        assert_eq!(ok.decision, Decision::Approved);
+        // A v2 approve carries the partial, never a DEK.
+        assert!(ok.dek().is_none());
+        assert!(ok.wrapped_dek.is_none());
+        let (acct, got) = ok.partial_zf().unwrap();
+        assert_eq!(acct, "acct-1");
+        assert_eq!(*got, zf);
+
+        // Deny carries neither.
+        let no = ApprovalResponse::deny("req-1", 42);
+        assert!(no.partial_zf().is_none());
+        assert!(no.dek().is_none());
+
+        // Wire round-trip and camelCase.
+        let json = serde_json::to_string(&ok).unwrap();
+        assert!(json.contains("\"partial\""));
+        assert!(json.contains("\"zf\""));
+        assert!(!json.contains("wrappedDek"));
+        let back: ApprovalResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ok);
+    }
+
+    #[test]
+    fn malformed_partial_base64_fails_closed_to_none() {
+        let mut resp = ApprovalResponse::approve_v2("r", "a", &[1u8; 32], 1);
+        resp.partial = Some(ThresholdPartial {
+            account_id: "a".into(),
+            zf: "not-base64!!".into(),
+        });
+        assert!(resp.partial_zf().is_none());
+        resp.partial = Some(ThresholdPartial {
+            account_id: "a".into(),
+            zf: B64.encode([0u8; 16]),
+        });
+        assert!(resp.partial_zf().is_none());
     }
 }

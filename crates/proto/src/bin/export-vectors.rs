@@ -25,6 +25,10 @@
 //!     deterministic, which is what the phone verifies.
 //!   * `replay` — a single `ReplayGuard` threaded across steps, its accept/reject
 //!     outcome computed by the real Rust guard so Rust and TS must agree.
+//!   * `combiner` — the v2 threshold combiner: fixed ECDH partials `Z_M`/`Z_F` and
+//!     base `E` in, the derived token key `K` and AES-256-GCM `token_ct` out, for
+//!     both `ecdh_algo` shapes, so the phone's TS combiner is locked to this Rust
+//!     one (`threshold.rs`).
 
 use std::path::PathBuf;
 
@@ -34,6 +38,7 @@ use uuid::Uuid;
 use latch_proto::envelope::Envelope;
 use latch_proto::identity::DeviceIdentity;
 use latch_proto::pairing::{PairingPayload, PairingSecret};
+use latch_proto::threshold::{aead_seal, combine, EcdhAlgo, MacShare};
 use latch_proto::{
     fingerprint_words, mailbox_id, PeerIdentity, ReplayError, ReplayGuard, REPLAY_WINDOW_MS,
 };
@@ -331,14 +336,65 @@ fn replay_vectors() -> Vec<Value> {
     ]
 }
 
+/// A deterministic P-256 scalar from a fixed seed, so the combiner vectors are
+/// reproducible. The pattern stays non-zero and below the group order.
+fn fixed_share(seed: u8) -> MacShare {
+    let bytes: [u8; 32] = std::array::from_fn(|i| seed.wrapping_add(i as u8).wrapping_mul(3) | 1);
+    MacShare::from_scalar_bytes(&bytes).expect("fixed seed is a valid P-256 scalar")
+}
+
+/// combiner: the v2 threshold combiner (`threshold.rs`), locked to the phone's TS
+/// mirror. Fixed scalars `m`, `f`, `e` derive the two ECDH partials `Z_M = x(m·E)`
+/// and `Z_F = x(f·E)`; the phone replays `combine(Z_M, Z_F, E, account_id)` and
+/// must reproduce `K` (and the AES-256-GCM `token_ct` under it) byte-for-byte. Both
+/// `ecdh_algo` shapes (`raw-x` and the NV-7 `x963-sha256`) are pinned.
+fn combiner_vectors() -> Vec<Value> {
+    let m = fixed_share(0x11);
+    let f = fixed_share(0x22);
+    let e = fixed_share(0x33);
+    let e_point = e.public_point();
+    let e_x963 = *e_point.as_x963();
+    let account_id = "acct-threshold-01";
+    let token: &[u8] = b"ops_eyJzaWduSW5BZGRyZXNzIjoiZXhhbXBsZSJ9.demo-service-account-token";
+    let nonce: [u8; 12] = std::array::from_fn(|i| (0xA0 + i as u8) ^ 0x5A);
+
+    [
+        ("raw-x", EcdhAlgo::RawX),
+        ("x963-sha256", EcdhAlgo::X963Sha256),
+    ]
+    .into_iter()
+    .map(|(name, algo)| {
+        // Z_M is the Mac's shaped partial; Z_F stands in for the Secure
+        // Enclave's shaped x(f·E). Both are combiner INPUTS the phone is given.
+        let zm = m.partial(&e_point, algo, &e_x963);
+        let zf = f.partial(&e_point, algo, &e_x963);
+        let k = combine(&zm, &zf, &e_x963, account_id);
+        let token_ct = aead_seal(&k, &nonce, token).expect("aead seal");
+        json!({
+            "name": name,
+            "ecdhAlgo": name,
+            "zm": hex(&*zm),
+            "zf": hex(&*zf),
+            "ephemeralPub": hex(&e_x963),
+            "accountId": account_id,
+            "expectedK": hex(&*k),
+            "aeadNonce": hex(&nonce),
+            "token": hex(token),
+            "expectedTokenCt": hex(&token_ct),
+        })
+    })
+    .collect()
+}
+
 fn main() {
     let doc = json!({
-        "version": 1,
+        "version": 2,
         "canonicalBytes": canonical_vectors(),
         "fingerprint": fingerprint_vectors(),
         "pairingQr": pairing_qr_vectors(),
         "open": open_vectors(),
         "replay": replay_vectors(),
+        "combiner": combiner_vectors(),
     });
 
     let out = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

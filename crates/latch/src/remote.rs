@@ -114,6 +114,7 @@ impl RemoteApprover {
             },
             risk: ctx.risk,
             reason: None,
+            threshold: None,
             expires_at: now + timeout_ms,
             timeout_ms,
         }

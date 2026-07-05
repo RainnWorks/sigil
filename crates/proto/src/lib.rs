@@ -14,6 +14,7 @@ pub mod pairing;
 pub mod replay;
 pub mod request;
 pub mod se_ecies;
+pub mod threshold;
 pub mod transport;
 
 pub use envelope::{Envelope, OpenError, SealError};
@@ -27,9 +28,14 @@ pub use pairing::{
 pub use replay::{ReplayError, ReplayGuard};
 pub use request::{
     ApprovalRequest, ApprovalResponse, BlockDirective, Decision, InstallLease, Provenance,
-    RequestKind, RiskLevel, SecretRef, SshChallenge,
+    RequestKind, RiskLevel, SecretRef, SshChallenge, ThresholdChallenge, ThresholdPartial,
 };
 pub use se_ecies::{unwrap_dek_p256, wrap_dek_p256, SeEciesError};
+pub use threshold::{
+    aead_open, aead_seal, all_ephemerals_unique, combine, decode_partial, EcdhAlgo, MacShare,
+    P256Point, ThresholdError, ThresholdRecord, KDF_ALGO_ID, THRESHOLD_DOMAIN,
+    THRESHOLD_RECORD_VERSION,
+};
 pub use transport::{Direction, LocalRelay, Transport, TransportError};
 
 /// Maximum allowed clock skew between sender and receiver, in milliseconds.
