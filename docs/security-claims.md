@@ -318,7 +318,11 @@ These are real and deliberately surfaced, not defects hidden.
      token in residual #3, except the value here is the resolved secret itself,
      not a credential. Bounded to the spawn. (The provider source comment was
      corrected in this review to state this honestly rather than claim the
-     `Zeroizing` buffer was the values' only in-process home.)
+     `Zeroizing` buffer was the values' only in-process home.) A third, rarer
+     un-wiped copy: `parse_env_file` calls `String::from_utf8_lossy`, which on an
+     **invalid-UTF-8** env file allocates an owned (non-`Zeroizing`) `String`
+     holding the lossy file contents; on the common valid-UTF-8 path it borrows
+     and copies nothing. Same same-process-scrape severity; noted for completeness.
    - **The child's `/proc/<pid>/environ`** carries the injected values for the
      child's whole lifetime, readable by a same-UID process (`ps eww`, `/proc`).
      For a short-lived child this is a blink; for a long-running one the secrets
