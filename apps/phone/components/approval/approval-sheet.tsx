@@ -113,6 +113,20 @@ export function ApprovalSheet({
 
         <TypeBanner kind={request.kind} />
 
+        {/* R5: name the account this approval unlocks, so consent is bound to the
+            account the threshold challenge claims, cross-checkable against the
+            readout below. The Face ID prompt repeats this label. */}
+        {request.threshold ? (
+          <View style={{ flexDirection: "row", alignItems: "baseline", gap: 8 }}>
+            <Mono size={12} tone="faint">
+              unlocks account
+            </Mono>
+            <Mono size={14} weight="semibold">
+              {request.threshold.label}
+            </Mono>
+          </View>
+        ) : null}
+
         {request.secrets.length > 0 ? (
           <SecretReadout secrets={request.secrets} />
         ) : request.ssh ? (

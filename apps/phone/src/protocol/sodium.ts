@@ -71,6 +71,15 @@ export interface Sodium {
    */
   crypto_generichash(hashLength: number, message: Uint8Array, key?: Uint8Array | null): Uint8Array;
 
+  /**
+   * SHA-256, 32-byte digest. Used only by the v2 threshold ECDH shaping
+   * (`x963-sha256`): the reference mirror of Apple's ANSI-X9.63 SHA-256 KDF over
+   * the raw shared X-coordinate. Both bindings export it. On device the
+   * authoritative shaping is CryptoKit's `x963DerivedSymmetricKey`; this is the
+   * TS reference that the shared combiner vectors lock.
+   */
+  crypto_hash_sha256(message: Uint8Array): Uint8Array;
+
   readonly crypto_box_NONCEBYTES: number;
   readonly crypto_box_PUBLICKEYBYTES: number;
   readonly crypto_box_SECRETKEYBYTES: number;

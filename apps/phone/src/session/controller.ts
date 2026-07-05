@@ -18,11 +18,14 @@
 import {
   type ApprovalRequest,
   fingerprintWords,
+  fromBase64,
   loadSodium,
   peerIdentity,
+  shapeEcdh,
   type Sodium,
   toBase64,
 } from "@/src/protocol";
+import { computePartial, isSecureEnclaveAvailable } from "@/modules/latch-se";
 import { store } from "@/src/state/store";
 import { PhoneRelay } from "@/src/transport/phone-relay";
 import { LatchSession } from "./session";
@@ -117,6 +120,11 @@ export type ApproveOutcome = "sent" | "refused" | "no-session" | "error";
  */
 export async function liveApprove(request: ApprovalRequest): Promise<ApproveOutcome> {
   if (!live) return "no-session";
+  // v2 accounts carry a threshold challenge: the release factor is the Secure
+  // Enclave key-agreement (Z_F), not a stored DEK. Selected by the presence of
+  // the challenge, never by a wire flag; a v2 approve never emits a DEK.
+  if (request.threshold) return liveApproveThreshold(request);
+
   const dek = await loadDek("Approve secret release");
   if (!dek) return "refused";
   try {
@@ -126,6 +134,47 @@ export async function liveApprove(request: ApprovalRequest): Promise<ApproveOutc
     return "error";
   } finally {
     dek.fill(0);
+  }
+}
+
+/**
+ * The v2 approve: derive the phone's partial `Z_F = x(f·E)` in the Secure Enclave
+ * and seal it as a `ThresholdPartial` (never a DEK). The enclave key-agreement is
+ * itself the Face ID gate, so there is no separate biometric and no unguarded
+ * path. R5: the biometric prompt's reason names the account being unlocked
+ * (`threshold.label`), binding the human's consent to the account the challenge
+ * claims. Fails closed to "refused" on a denied/failed biometric or an off-curve
+ * `E`, and "error" if this device has no Secure Enclave (a v2 account cannot be
+ * approved without it).
+ */
+async function liveApproveThreshold(request: ApprovalRequest): Promise<ApproveOutcome> {
+  if (!live) return "no-session";
+  const ch = request.threshold;
+  if (!ch) return "error";
+  if (!isSecureEnclaveAvailable()) return "error";
+
+  let zfB64: string;
+  try {
+    const sodium = await loadSodium();
+    // The enclave key-agreement is the Face ID gate; the reason names the account
+    // (R5). It returns the RAW 32-byte X-coordinate; the ECDH-output shaping
+    // (raw-x identity vs x963-sha256) is applied here in the vector-locked TS
+    // combiner core, byte-exact with the Mac's threshold.rs, so the phone never
+    // depends on CryptoKit's KDF parameters (NV-7).
+    const rawXB64 = await computePartial(ch.seKeyId, ch.ephemeralPub, `Approve ${ch.label}`);
+    const zf = shapeEcdh(sodium, fromBase64(rawXB64), ch.ecdhAlgo, fromBase64(ch.ephemeralPub));
+    zfB64 = toBase64(zf);
+  } catch {
+    // Denied/failed Face ID, an off-curve E (R2), or a missing key: no partial.
+    return "refused";
+  }
+  try {
+    await live.session.respond(request, "approved", {
+      partial: { accountId: ch.accountId, zf: zfB64 },
+    });
+    return "sent";
+  } catch {
+    return "error";
   }
 }
 

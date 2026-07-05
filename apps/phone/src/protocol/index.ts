@@ -13,4 +13,5 @@ export * from "./wire";
 export * from "./pairing";
 export * from "./pairing-handshake";
 export * from "./requests";
+export * from "./threshold";
 export { WORDS } from "./words";

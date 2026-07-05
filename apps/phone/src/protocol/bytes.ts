@@ -25,6 +25,12 @@ export function u64be(value: number | bigint): Uint8Array {
   return out;
 }
 
+/** A u32 as 4 big-endian bytes, matching Rust `u32::to_be_bytes`. */
+export function u32be(value: number): Uint8Array {
+  if (value < 0 || value > 0xffffffff) throw new RangeError("u32be: out of range");
+  return new Uint8Array([(value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff]);
+}
+
 export function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
   let diff = 0;

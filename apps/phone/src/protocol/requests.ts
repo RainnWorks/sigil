@@ -57,6 +57,54 @@ export interface SshChallenge {
   fingerprint: string;
 }
 
+/** Which shape the Secure Enclave's ECDH output takes; mirrors proto EcdhAlgo. */
+export type EcdhAlgo = "raw-x" | "x963-sha256";
+
+/**
+ * The per-request v2 threshold challenge (docs/design/threshold-v2.md §7),
+ * mirroring proto `ThresholdChallenge`. Absent on v1 requests and on kinds that
+ * read no secret. It carries the base point the phone key-agrees its
+ * Secure-Enclave key `f` against, plus the account binding the phone shows and
+ * consents to.
+ *
+ * R5 (bind consent to the account shown): `accountId`/`label` name the account
+ * being unlocked. The phone MUST display `label`, bind its Face ID consent to
+ * it, and cross-check it against the request's `secrets`, so a mis-issued
+ * challenge cannot decouple what the human sees from what gets unlocked.
+ * `ephemeralPub` is the only cryptographic input and is authenticated by the
+ * enclosing signed envelope.
+ */
+export interface ThresholdChallenge {
+  /** Account whose token this unlocks; echoed in the response for correlation. */
+  accountId: string;
+  /** Human label of that account, shown to and consented to by the approver (R5). */
+  label: string;
+  /**
+   * The account's fixed ECDH base point `E = e·G`, ANSI X9.63 (65 bytes),
+   * standard-base64. The phone validates it on-curve (R2), then computes
+   * `Z_F = x(f·E)` against it.
+   */
+  ephemeralPub: string;
+  /** Which pinned SE key `F` to use (a phone may hold more than one over re-pairs). */
+  seKeyId: string;
+  /** Echoes the record's `Z_F` shape so the phone picks the matching SE algorithm. */
+  ecdhAlgo: EcdhAlgo;
+}
+
+/**
+ * The phone's ECDH partial for a v2 account, mirroring proto `ThresholdPartial`:
+ * `Z_F = x(f·E)`, the value the Secure Enclave emits under Face ID. For v2
+ * accounts it replaces `wrappedDek` — the phone no longer holds a self-sufficient
+ * DEK, only its share. Confidential ONLY by virtue of the enclosing sealed
+ * envelope, exactly as v1's `wrappedDek` was.
+ */
+export interface ThresholdPartial {
+  /** Echoes the challenge's account id, correlating the partial to its request. */
+  accountId: string;
+  /** The SE ECDH partial `Z_F`, 32 bytes, standard-base64. */
+  zf: string;
+}
+
 /** Daemon-verified provenance. Rendered in SF Mono, hairline-separated. */
 export interface Provenance {
   /** Resolved ancestor chain, root-first, e.g. ["zsh", "claude", "op"]. */
@@ -85,6 +133,12 @@ export interface ApprovalRequest {
   risk: RiskLevel;
   /** One reason line for elevated / critical (e.g. "Production vault."). */
   reason?: string;
+  /**
+   * The v2 threshold challenge for a v2 account; absent on v1 requests and on
+   * kinds that read no secret, so a v1 peer never sees it. Present => this
+   * approve must produce a `ThresholdPartial` (Z_F) instead of a DEK.
+   */
+  threshold?: ThresholdChallenge;
   /** Absolute expiry, unix ms. The gauge depletes to this. */
   expiresAt: number;
   /** Full-scale window for the gauge, ms (expiresAt - queuedAt). */
@@ -97,10 +151,18 @@ export interface ApprovalResponse {
   requestId: string;
   decision: Decision;
   /**
-   * On approve: standard-base64 of the raw 32-byte DEK. Absent on deny, so a
-   * denial cannot release a token. Confidential by virtue of the enclosing seal.
+   * On a v1 approve: standard-base64 of the raw 32-byte DEK. Absent on deny and
+   * on v2 approves, so a denial cannot release a token. Confidential by virtue of
+   * the enclosing seal.
    */
   wrappedDek?: string;
+  /**
+   * On a v2 approve: the phone's threshold partial `Z_F`, replacing `wrappedDek`.
+   * Absent on deny and on v1 approves. Exactly one of `wrappedDek` / `partial` is
+   * populated per approve, selected by the account's record version (R3), never by
+   * a wire field.
+   */
+  partial?: ThresholdPartial | null;
   /** On approve with "for this session": a lease grant, else null. */
   lease?: { grantKey: string; ttlMs: number } | null;
   /** On deny-and-block: the process name to block, and for how long, else null. */

@@ -9,7 +9,12 @@ import { StatusBar } from "expo-status-bar";
 import { paletteFor } from "@/theme/tokens";
 import { DEMO, store, useSelector } from "@/src/state/store";
 import { armLiveSession } from "@/src/session/controller";
-import { demoReadRequest, demoRoutineRequest, demoSshRequest } from "@/src/state/demo";
+import {
+  demoReadRequest,
+  demoRoutineRequest,
+  demoSshRequest,
+  demoThresholdRequest,
+} from "@/src/state/demo";
 
 /**
  * Root layout. A Stack holding the tab group plus the modal surfaces: the
@@ -33,7 +38,12 @@ export default function RootLayout() {
     // Demo seed is OFF unless the explicit dev flag is set, so no Release build
     // ever shows canned pending requests. Exercises the same crypto path as real.
     if (DEMO && store.getState().pending.length === 0) {
-      store.seedPending([demoReadRequest(), demoSshRequest(), demoRoutineRequest()]);
+      store.seedPending([
+        demoReadRequest(),
+        demoThresholdRequest(),
+        demoSshRequest(),
+        demoRoutineRequest(),
+      ]);
     }
   }, []);
 

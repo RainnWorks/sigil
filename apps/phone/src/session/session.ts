@@ -73,7 +73,7 @@ export class LatchSession {
   async respond(
     request: ApprovalRequest,
     decision: Decision,
-    extras: Pick<ApprovalResponse, "wrappedDek" | "lease" | "block"> = {},
+    extras: Pick<ApprovalResponse, "wrappedDek" | "partial" | "lease" | "block"> = {},
   ): Promise<void> {
     const response: ApprovalResponse = {
       requestId: request.requestId,

@@ -6,17 +6,31 @@
  *
  * Intended to become a CI job: build the Rust vectors, then run this.
  */
+import { createCipheriv } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-import { fromHex, toHex } from "./bytes";
+import { concatBytes, fromHex, toHex } from "./bytes";
 import { canonicalBytes, EnvelopeOpenError, open } from "./envelope";
 import { fingerprintWords, mailboxId } from "./fingerprint";
 import { pairingToQrString } from "./pairing";
 import { ReplayGuard, ReplayRejected } from "./replay";
 import { loadSodiumForTests } from "./sodium-node";
+import { combine } from "./threshold";
 import { envelopeFromWire, type EnvelopeWire } from "./wire";
 import { type LatchVectors, VECTORS_PATH } from "./vectors.contract";
+
+/**
+ * AES-256-GCM seal returning ciphertext‖tag, mirroring proto `aead_seal`. Uses
+ * Node's crypto (this file is Node-only); the phone runtime never runs AES — the
+ * Mac holds the AEAD leg — so this stays out of the app bundle. Locking token_ct
+ * proves the derived K feeds the same AEAD the daemon uses.
+ */
+function aeadSeal(key: Uint8Array, nonce: Uint8Array, pt: Uint8Array): Uint8Array {
+  const cipher = createCipheriv("aes-256-gcm", key, nonce);
+  const ct = concatBytes(new Uint8Array(cipher.update(pt)), new Uint8Array(cipher.final()));
+  return concatBytes(ct, new Uint8Array(cipher.getAuthTag()));
+}
 
 function peer(p: { verifying: string; agreement: string }) {
   return { verifying: fromHex(p.verifying), agreement: fromHex(p.agreement) };
@@ -108,6 +122,13 @@ async function main(): Promise<void> {
       void i;
     }
     check(allOk, `replay/${r.name}`);
+  }
+
+  for (const c of v.combiner ?? []) {
+    const k = combine(sodium, fromHex(c.zm), fromHex(c.zf), fromHex(c.ephemeralPub), c.accountId);
+    check(toHex(k) === c.expectedK, `combiner/${c.name}/K`);
+    const ct = aeadSeal(k, fromHex(c.aeadNonce), fromHex(c.token));
+    check(toHex(ct) === c.expectedTokenCt, `combiner/${c.name}/tokenCt`);
   }
 
   console.log(`vectors: ${pass} passed, ${fails.length} failed`);

@@ -66,6 +66,42 @@ export function demoRoutineRequest(): ApprovalRequest {
   });
 }
 
+/**
+ * A v2 threshold read: elevated, carrying a ThresholdChallenge so the approve
+ * path exercises the Secure Enclave partial (Z_F) instead of a DEK. The
+ * `ephemeralPub` is a real on-curve P-256 X9.63 point (from the shared combiner
+ * vectors), so on-device validation and key-agreement have a valid E to work on.
+ */
+export function demoThresholdRequest(): ApprovalRequest {
+  return demoReadRequest({
+    requestId: crypto.randomUUID(),
+    command: ["op", "read", "op://Production/stripe/secret-key"],
+    secrets: [
+      {
+        provider: "1password",
+        reference: "op://Production/stripe/secret-key",
+        segments: ["Production", "stripe", "secret-key"],
+        label: "stripe",
+      },
+    ],
+    reason: "Production vault, two-party unlock.",
+    threshold: {
+      accountId: "acct-threshold-01",
+      label: "Rowm work",
+      ephemeralPub:
+        "BDL7XFpNKQfd2BPO8UdFsbtiq03vEUbm1UKEQlvXYOB2HFHIzga7fiN4tvA07gU1Y+Djqw6GsJ5Svb3nx8x6fvw=",
+      seKeyId: "se-key-1",
+      ecdhAlgo: "raw-x",
+    },
+    provenance: {
+      processChain: ["zsh", "claude", "op read"],
+      cwd: "~/Projects/rowm-api",
+      machine: "studio.local",
+      requestedAt: now,
+    },
+  });
+}
+
 /** A critical SSH signature to a production host: hold to approve. */
 export function demoSshRequest(): ApprovalRequest {
   return {
