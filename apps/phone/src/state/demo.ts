@@ -161,6 +161,37 @@ export const demoHistory: HistoryEntry[] = [
   },
 ];
 
+/** The settings every fresh install starts with; shared by both seeds. */
+export function defaultSettings(): AppState["settings"] {
+  return {
+    faceIdBeforeApprove: true,
+    reduceMotion: false,
+    defaultTimeoutSec: 90,
+    notificationsEnabled: true,
+  };
+}
+
+/**
+ * The REAL shipping boot state: unpaired, nothing seen yet. The store starts here
+ * and then hydrates from the device keystore — if a real pairing is stored the
+ * session controller flips `paired` on; if not, the app routes into pairing. No
+ * demo data ever reaches a Release build through this path.
+ */
+export function emptyInitialState(): AppState {
+  return {
+    paired: false,
+    arm: "idle",
+    connection: { rung: "none", machine: "", lastSeenAt: 0 },
+    pending: [],
+    history: [],
+    accounts: [],
+    leases: [],
+    settings: defaultSettings(),
+    pairingWords: null,
+    ownFingerprint: null,
+  };
+}
+
 export function demoInitialState(): AppState {
   return {
     paired: true,
@@ -170,12 +201,7 @@ export function demoInitialState(): AppState {
     history: demoHistory,
     accounts: demoAccounts,
     leases: demoLeases,
-    settings: {
-      faceIdBeforeApprove: true,
-      reduceMotion: false,
-      defaultTimeoutSec: 90,
-      notificationsEnabled: true,
-    },
+    settings: defaultSettings(),
     pairingWords: null,
     ownFingerprint: "tide brass anchor harbor reef mast",
   };

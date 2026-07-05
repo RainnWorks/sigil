@@ -17,13 +17,16 @@
  */
 import {
   type ApprovalRequest,
+  fingerprintWords,
   loadSodium,
+  peerIdentity,
   type Sodium,
   toBase64,
 } from "@/src/protocol";
+import { store } from "@/src/state/store";
 import { PhoneRelay } from "@/src/transport/phone-relay";
 import { LatchSession } from "./session";
-import { loadDek, loadPairing } from "./keystore";
+import { clearPairing, loadDek, loadPairing, type StoredPairing } from "./keystore";
 
 interface Live {
   session: LatchSession;
@@ -64,13 +67,43 @@ export async function armLiveSession(): Promise<boolean> {
   });
   await session.start();
   live = { session, transport };
+  // Reflect the real pairing into the store so the UI shows paired (not demo) and
+  // stops routing into the pairing flow. This is the single point both boot-time
+  // hydration and a just-completed ceremony pass through.
+  store.reflectPairing({
+    ownFingerprint: ownFingerprint(sodium, pairing),
+    machine: relayHost(pairing.relayBase),
+    seenAt: pairing.pairedAt,
+  });
   return true;
 }
 
-/** Tear the live session down (unpair, lockdown, or app teardown). */
+/** This phone's own public-key fingerprint words, for the pairing/device UI. */
+function ownFingerprint(sodium: Sodium, pairing: StoredPairing): string {
+  const pub = peerIdentity(sodium, pairing.phone);
+  return fingerprintWords(sodium, pub, pub).join(" ");
+}
+
+/** Host label for the connection line, derived from the relay base URL. */
+function relayHost(relayBase: string): string {
+  return relayBase.replace(/^https?:\/\//, "").replace(/\/.*$/, "") || "relay";
+}
+
+/** Tear the live session down (lockdown or app teardown). Keeps the stored pairing. */
 export function disarmLiveSession(): void {
   live?.session.stop();
   live = null;
+}
+
+/**
+ * Reset the pairing entirely: tear down the live session, erase the stored
+ * identity + DEK from the keystore, and return the store to the unpaired empty
+ * state so the app routes back into the pairing flow. Used by "Reset pairing".
+ */
+export async function unpair(): Promise<void> {
+  disarmLiveSession();
+  await clearPairing();
+  store.clearPairingState();
 }
 
 export type ApproveOutcome = "sent" | "refused" | "no-session" | "error";

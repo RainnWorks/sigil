@@ -1,5 +1,5 @@
 import { Link } from "expo-router";
-import { Pressable, ScrollView, Switch, View } from "react-native";
+import { Alert, Pressable, ScrollView, Switch, View } from "react-native";
 
 import { Sf } from "@/components/ui/sf";
 import { Mono, Sans } from "@/components/ui/text";
@@ -7,6 +7,7 @@ import { Card, Hairline, SectionHeader } from "@/components/ui/primitives";
 import { useTheme } from "@/theme/colors";
 import { radius, space } from "@/theme/tokens";
 import { useCountdown } from "@/src/lib/use-countdown";
+import { unpair } from "@/src/session/controller";
 import { type Lease } from "@/src/domain/types";
 import { store, useAppState } from "@/src/state/store";
 
@@ -17,6 +18,23 @@ import { store, useAppState } from "@/src/state/store";
 export default function SettingsScreen() {
   const p = useTheme();
   const s = useAppState();
+
+  function confirmReset(): void {
+    Alert.alert(
+      "Reset pairing?",
+      "This erases the stored keys for this Mac. You will need to pair again from the Mac's QR code before any secret can be approved.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Reset",
+          style: "destructive",
+          // unpair() clears the keystore + store; the root layout then routes
+          // back into the pairing flow because `paired` flips to false.
+          onPress: () => void unpair(),
+        },
+      ],
+    );
+  }
 
   return (
     <ScrollView
@@ -116,6 +134,21 @@ export default function SettingsScreen() {
               <Sf name="chevron.right" color={p.faint} size={14} />
             </Pressable>
           </Link>
+          {s.paired ? (
+            <>
+              <Hairline inset={space.lg} />
+              <Pressable
+                onPress={confirmReset}
+                style={{ flexDirection: "row", alignItems: "center", gap: space.md, padding: space.lg }}
+              >
+                <Sf name="trash" color={p.deny} size={18} />
+                <Sans size={16} style={{ flex: 1, color: p.deny }}>
+                  Reset pairing
+                </Sans>
+                <Sf name="chevron.right" color={p.faint} size={14} />
+              </Pressable>
+            </>
+          ) : null}
         </Card>
       </View>
     </ScrollView>

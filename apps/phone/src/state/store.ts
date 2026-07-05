@@ -14,12 +14,23 @@ import {
   type PendingRequest,
   type RequestState,
 } from "@/src/domain/types";
-import { demoInitialState } from "./demo";
+import { demoInitialState, emptyInitialState } from "./demo";
 
 type Listener = () => void;
 
+/**
+ * Demo/dev seed is OFF unless explicitly enabled. The shipping build boots from
+ * the REAL empty state and hydrates the stored pairing from the keystore; only an
+ * explicit dev flag replaces that with the canned demo data.
+ */
+export const DEMO = process.env.EXPO_PUBLIC_LATCH_DEMO === "1";
+
+function initialState(): AppState {
+  return DEMO ? demoInitialState() : emptyInitialState();
+}
+
 class Store {
-  private state: AppState = demoInitialState();
+  private state: AppState = initialState();
   private readonly listeners = new Set<Listener>();
 
   getState = (): AppState => this.state;
@@ -120,6 +131,25 @@ class Store {
     this.patch({ pairingWords: words });
   }
 
+  /**
+   * Reflect a real stored pairing into the store, called once the live session is
+   * armed (at boot from the keystore, or right after the pairing ceremony). Marks
+   * the phone paired and arms it, unless it is currently locked down.
+   */
+  reflectPairing(info: { ownFingerprint: string | null; machine: string; seenAt: number }): void {
+    this.patch({
+      paired: true,
+      arm: this.state.arm === "lockedDown" ? "lockedDown" : "armed",
+      ownFingerprint: info.ownFingerprint,
+      connection: { rung: "relay", machine: info.machine, lastSeenAt: info.seenAt },
+    });
+  }
+
+  /** Drop all pairing-derived state and return to the unpaired empty boot state. */
+  clearPairingState(): void {
+    this.set(emptyInitialState());
+  }
+
   private find(requestId: string): PendingRequest | undefined {
     return this.state.pending.find((p) => p.request.requestId === requestId);
   }
@@ -153,7 +183,7 @@ class Store {
   }
 
   reset(): void {
-    this.set(demoInitialState());
+    this.set(initialState());
   }
 }
 
