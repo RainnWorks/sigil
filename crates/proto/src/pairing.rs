@@ -292,8 +292,9 @@ impl PairingResponse {
 /// The 256-bit data-encryption key: the missing half of the daemon's crypto.
 ///
 /// Zeroized on drop. Delivered to the phone once, at pairing, sealed inside an
-/// [`Envelope`]; optionally wrapped a second time to the Mac's Secure Enclave
-/// for local Touch ID approvals; then erased from the daemon.
+/// [`Envelope`] (X25519); optionally wrapped a second time to the Mac's Secure
+/// Enclave (P-256 ECIES, see [`crate::se_ecies`]) for local Touch ID approvals;
+/// then erased from the daemon.
 #[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct Dek([u8; 32]);
 
@@ -388,6 +389,8 @@ pub enum HandshakeError {
     Seal(#[from] SealError),
     #[error("opening the DEK failed: {0}")]
     Open(#[from] OpenError),
+    #[error("wrapping the DEK to the Mac Secure Enclave failed: {0}")]
+    SeEcies(#[from] crate::se_ecies::SeEciesError),
 }
 
 /// Daemon-side driver for the handshake. Owns the daemon's private identity, the
@@ -515,10 +518,14 @@ impl DaemonPairing {
         Ok(env)
     }
 
-    /// Wrap a second copy of the DEK to another recipient (the Mac's Secure
-    /// Enclave public identity) for local Touch ID approvals. Available once the
-    /// SAS is confirmed. Does not change state: it is an extra copy, not the
-    /// phone delivery.
+    /// Wrap a second copy of the DEK to another **X25519** recipient (e.g. a
+    /// second phone or backup approver) inside a standard [`Envelope`]. Available
+    /// once the SAS is confirmed. Does not change state: it is an extra copy, not
+    /// the phone delivery.
+    ///
+    /// This is NOT the Mac Secure Enclave path: the SE holds only P-256 keys and
+    /// cannot open an X25519 envelope, so the Mac-SE wrap uses
+    /// [`wrap_dek_for_se_p256`](Self::wrap_dek_for_se_p256) instead.
     pub fn wrap_dek_for(
         &self,
         dek: &Dek,
@@ -539,6 +546,30 @@ impl DaemonPairing {
             &self.identity.signing,
             recipient,
         )?)
+    }
+
+    /// Wrap the DEK to the Mac's Secure Enclave P-256 key for local Touch ID
+    /// approvals. `se_pub_x963` is the SE public key in ANSI X9.63 uncompressed
+    /// form, exported by the Mac app at "Enable Mac approvals" time. Returns the
+    /// Apple-compatible ECIES blob the SE opens under Touch ID (see
+    /// [`crate::se_ecies`]).
+    ///
+    /// This is the P-256 sibling of [`wrap_dek_for`](Self::wrap_dek_for): the
+    /// Secure Enclave holds only P-256 keys, so the Mac-SE wrap cannot reuse the
+    /// phone's X25519 envelope. It is a second, independent wrap of the same DEK,
+    /// gated on the same SAS confirmation, and does not change state.
+    pub fn wrap_dek_for_se_p256(
+        &self,
+        dek: &Dek,
+        se_pub_x963: &[u8],
+    ) -> Result<Vec<u8>, HandshakeError> {
+        if self.state != PairingState::Confirmed && self.state != PairingState::DekDelivered {
+            return Err(HandshakeError::WrongState {
+                expected: PairingState::Confirmed,
+                actual: self.state,
+            });
+        }
+        Ok(crate::se_ecies::wrap_dek_p256(dek, se_pub_x963)?)
     }
 
     fn expect(&self, want: PairingState) -> Result<(), HandshakeError> {
@@ -932,9 +963,11 @@ mod tests {
 
     #[test]
     fn second_recipient_wrap_recovers_the_same_dek() {
-        // After confirmation the daemon wraps a second copy of the DEK to the
-        // Mac's Secure Enclave identity; the SE recovers the same key, and a
-        // wrong sender key is rejected on the signature.
+        // After confirmation the daemon wraps a second copy of the DEK to another
+        // X25519 recipient (a second phone / backup approver); that recipient
+        // recovers the same key, and a wrong sender key is rejected on the
+        // signature. (The Mac Secure Enclave path is P-256, tested separately in
+        // `se_p256_wrap_is_gated_on_confirmation_and_round_trips`.)
         let daemon_id = DeviceIdentity::generate();
         let daemon_pub = daemon_id.peer_identity();
         let (mut daemon, payload) = DaemonPairing::mint(daemon_id, endpoints(), NOW);
@@ -965,5 +998,45 @@ mod tests {
     fn dek_debug_does_not_leak() {
         let d = Dek::from_bytes([9u8; 32]);
         assert_eq!(format!("{d:?}"), "Dek(<redacted>)");
+    }
+
+    #[test]
+    fn se_p256_wrap_is_gated_on_confirmation_and_round_trips() {
+        use crate::se_ecies::unwrap_dek_p256;
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+        // A stand-in Secure Enclave P-256 key (software here; on the Mac the
+        // private half never leaves the enclave).
+        let se_secret = p256::SecretKey::random(&mut rand_core::OsRng);
+        let se_pub = se_secret
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+
+        let daemon_id = DeviceIdentity::generate();
+        let (mut daemon, payload) = DaemonPairing::mint(daemon_id, endpoints(), NOW);
+        let mut phone = PhonePairing::scan(DeviceIdentity::generate(), payload, NOW).unwrap();
+        let resp = phone.respond().unwrap();
+        daemon.receive_response(&resp, NOW).unwrap();
+
+        let dek = Dek::generate();
+
+        // Before SAS confirmation the SE wrap is refused, exactly like the phone
+        // wrap: no DEK material is produced for a key no human confirmed.
+        assert!(matches!(
+            daemon.wrap_dek_for_se_p256(&dek, &se_pub),
+            Err(HandshakeError::WrongState {
+                expected: PairingState::Confirmed,
+                actual: PairingState::ResponseReceived,
+            })
+        ));
+
+        daemon.confirm().unwrap();
+
+        // After confirmation the SE (via its P-256 secret) recovers the same DEK.
+        let sealed = daemon.wrap_dek_for_se_p256(&dek, &se_pub).unwrap();
+        let recovered = unwrap_dek_p256(&sealed, &se_secret).unwrap();
+        assert_eq!(recovered.as_bytes(), dek.as_bytes());
     }
 }

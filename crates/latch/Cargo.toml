@@ -7,6 +7,15 @@ description = "Latch daemon, op shim, and CLI as one multicall binary"
 
 # A library target holds all the modules so unit tests and the seam traits are
 # public API (a binary-only crate would flag every test-only helper as dead).
+[features]
+# real-relay: opt-in the e2e tests that spawn an external `bun` relay process and
+# drive a real WebSocket round-trip. They are excluded from a plain `cargo test`
+# for two reasons: they need `bun` + the relay script on the box, and several of
+# them contend on ephemeral ports / relay processes and deadlock when run in
+# parallel with each other. Run them serially on a Mac that has bun:
+#   cargo test -p latch --features real-relay -- --test-threads=1
+real-relay = []
+
 [lib]
 name = "latch"
 path = "src/lib.rs"

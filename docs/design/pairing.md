@@ -89,8 +89,12 @@ Messages 1-3 are the handshake added here.
    + replay fields) and advances to `DekDelivered`. `PhonePairing::receive_dek`
    opens it and recovers the DEK. The daemon then erases its plaintext DEK; from
    here on the DEK arrives per-approval from the phone. The DEK may also be
-   wrapped a second time to the Mac's Secure Enclave identity
-   (`wrap_dek_for`) for local Touch ID approvals.
+   wrapped a second time to the Mac's Secure Enclave for local Touch ID
+   approvals; because the Secure Enclave holds **only** P-256 keys (it cannot
+   store or agree with an X25519 key), that second wrap is **P-256 ECIES**
+   (`wrap_dek_for_se_p256`, see [The Mac Secure Enclave wrap](#the-mac-secure-enclave-wrap-p-256-ecies)),
+   independent of the phone's X25519 envelope. `wrap_dek_for` remains available
+   for wrapping to a second *X25519* recipient (e.g. a backup phone).
 
 ```mermaid
 sequenceDiagram
@@ -159,6 +163,65 @@ tag       = BLAKE2bMac(key = K_confirm, msg = transcript)               // MAC
 Verification recomputes the MAC and calls `Mac::verify_slice`, which compares in
 **constant time**, so a wrong tag leaks no timing signal about how many bytes
 matched.
+
+## The Mac Secure Enclave wrap (P-256 ECIES)
+
+The local-approval path unwraps the DEK *inside the Secure Enclave* under a live
+Touch ID. The Secure Enclave can hold **only** NIST P-256 keys; it cannot store,
+import, or key-agree with an X25519 key. So the Mac-SE DEK wrap cannot reuse the
+phone's X25519 `crypto_box` envelope. It is a second, independent wrap of the
+same DEK, using **P-256 ECIES**, and either factor (the phone's X25519 key or the
+Mac SE's P-256 key) can recover the DEK on its own.
+
+Implementation: `crates/proto/src/se_ecies.rs`
+(`wrap_dek_p256` / `unwrap_dek_p256`), reached from the handshake via
+`DaemonPairing::wrap_dek_for_se_p256`, which is gated on SAS `Confirmed` exactly
+like the phone and X25519 wraps.
+
+**The construction is interop-critical**: it must reproduce Apple's
+`kSecKeyAlgorithmECIESEncryptionCofactorVariableIVX963SHA256AESGCM` exactly so
+that `SecKeyCreateDecryptedData` on the enclave side opens what the daemon
+produces. The Mac app exports its SE public key in ANSI X9.63 uncompressed form
+(`SecKeyCopyExternalRepresentation`, 65 bytes) at "Enable Mac approvals" time;
+the daemon wraps the DEK to it as follows, for a P-256 recipient:
+
+1. Generate an ephemeral P-256 key pair `(d_E, Q_E)`.
+2. `Z = ECDH_cofactor(d_E, Q_recipient)` — the 32-byte big-endian X coordinate of
+   the shared point. P-256's cofactor is 1, so cofactor ECDH equals plain ECDH.
+3. ANSI-X9.63 KDF with SHA-256, deriving 32 bytes:
+   `K = SHA256(Z ∥ 0x00000001 ∥ SharedInfo)`, where `SharedInfo = Q_E` in ANSI
+   X9.63 uncompressed form (`0x04 ∥ X ∥ Y`, 65 bytes). 32 bytes fit one SHA-256
+   block, so the KDF counter never advances past 1.
+   - `aes_key = K[0..16]` — **AES-128** (Apple uses a 128-bit AES key for EC keys
+     up to 256 bits, despite the `SHA256` in the algorithm name).
+   - `iv = K[16..32]` — the **variable** 16-byte GCM IV. (The non-`VariableIV`
+     algorithm would instead use a fixed all-zero 16-byte IV; we must match the
+     `VariableIV` variant, which is what `se-selftest.swift` uses.)
+4. AES-128-GCM over the 32-byte DEK with that key and 16-byte IV, empty AAD,
+   producing a 16-byte tag.
+
+**Wire format** (exactly what `SecKeyCreateDecryptedData` expects):
+
+```text
+Q_E (65 bytes, ANSI X9.63 0x04 ∥ X ∥ Y) ∥ ciphertext (== DEK len = 32) ∥ tag (16)
+```
+
+For a 32-byte DEK that is `65 + 32 + 16 = 113` bytes.
+
+**Crypto choice, justified.** The Secure Enclave dictates P-256, so the wrap adds
+the `p256` crate (RustCrypto ECDH, matching the tree's other RustCrypto
+primitives). The KDF hash must be SHA-256 to interoperate with Apple, so `sha2`
+is added (this crate's `blake2` cannot be substituted here). The AEAD is
+AES-128-GCM with a 16-byte IV, reusing `aes-gcm` 0.10 already in the workspace
+(the standard `Aes128Gcm` alias fixes a 12-byte nonce, so the IV size is named
+explicitly as `AesGcm<Aes128, U16>`). Forward secrecy comes from the per-wrap
+ephemeral key, as with the X25519 envelope.
+
+**NEEDS VERIFICATION (on device).** The in-crate tests prove `wrap`/`unwrap` are
+self-consistent in Rust; only real hardware proves Apple's decrypt agrees. Run
+`swift apps/mac/Tools/se-selftest.swift` on Apple-silicon with an enrolled
+biometric; it seals a known DEK with this same algorithm and unwraps it under
+Touch ID, and its printed blob length must be 113.
 
 ## Crypto rules and the choices behind them
 
@@ -288,11 +351,21 @@ device layers land:
   StrongBox / Secure Enclave. If the platform keystore cannot perform X25519
   agreement in hardware, document where the private key lives in software and for
   how long.
-- **NEEDS VERIFICATION:** the Mac Secure Enclave's public identity used by
-  `wrap_dek_for`. The SE second-recipient wrap assumes an SE-held X25519 key the
-  Enclave can open against for local Touch ID approvals; confirm the SE exposes a
-  usable agreement public key and that the DEK envelope can be opened by the SE
-  seam (`apps/mac`).
+- **NEEDS VERIFICATION (on device):** that the Mac Secure Enclave opens a DEK
+  blob produced by `wrap_dek_for_se_p256` / `se_ecies::wrap_dek_p256`. The SE
+  holds only a P-256 key, so the wrap is P-256 ECIES matching Apple's
+  `eciesEncryptionCofactorVariableIVX963SHA256AESGCM` (see
+  [The Mac Secure Enclave wrap](#the-mac-secure-enclave-wrap-p-256-ecies)). The
+  Rust round-trip tests prove the construction is self-consistent, but only real
+  hardware proves `SecKeyCreateDecryptedData` agrees byte-for-byte. Confirm with:
+
+  ```sh
+  swift apps/mac/Tools/se-selftest.swift
+  ```
+
+  It must run on Apple-silicon with an enrolled biometric (it cannot pass on a VM
+  or the Simulator), and it prints the sealed-blob length, which must read 113
+  for a 32-byte DEK.
 - **NEEDS VERIFICATION:** QR camera capture fidelity and the practical upper
   bound on payload size (endpoints list length) for reliable single-frame scans.
 - **NEEDS VERIFICATION:** clock skew between Mac and phone against the 180s TTL in

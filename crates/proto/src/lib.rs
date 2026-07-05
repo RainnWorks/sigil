@@ -13,6 +13,7 @@ pub mod identity;
 pub mod pairing;
 pub mod replay;
 pub mod request;
+pub mod se_ecies;
 pub mod transport;
 
 pub use envelope::{Envelope, OpenError, SealError};
@@ -28,6 +29,7 @@ pub use request::{
     ApprovalRequest, ApprovalResponse, BlockDirective, Decision, InstallLease, Provenance,
     RequestKind, RiskLevel, SecretRef, SshChallenge,
 };
+pub use se_ecies::{unwrap_dek_p256, wrap_dek_p256, SeEciesError};
 pub use transport::{Direction, LocalRelay, Transport, TransportError};
 
 /// Maximum allowed clock skew between sender and receiver, in milliseconds.

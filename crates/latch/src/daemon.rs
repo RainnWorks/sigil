@@ -1920,6 +1920,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "real-relay"),
+        ignore = "spawns an external bun relay; run: cargo test -p latch --features real-relay -- --test-threads=1"
+    )]
     fn remote_approval_over_the_real_relay_delivers_the_secret() {
         let Some((base, _server)) = obtain_relay() else {
             eprintln!(
@@ -2015,6 +2019,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "real-relay"),
+        ignore = "spawns an external bun relay; run: cargo test -p latch --features real-relay -- --test-threads=1"
+    )]
     fn daemon_relay_resumes_after_the_relay_is_bounced() {
         // Reconnect/resume: attach the daemon, drop the relay out from under it,
         // bring a fresh relay up on the same port, and prove the approval loop
@@ -2249,6 +2257,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "real-relay"),
+        ignore = "spawns an external bun relay; run: cargo test -p latch --features real-relay -- --test-threads=1"
+    )]
     fn reloaded_pairing_serves_a_secret_over_the_real_relay() {
         // The end-to-end proof of the critical path: persist a pairing, reload
         // it from disk, and use the RELOADED daemon identity to satisfy a real
@@ -2344,6 +2356,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "real-relay"),
+        ignore = "spawns an external bun relay; run: cargo test -p latch --features real-relay -- --test-threads=1"
+    )]
     fn latch_pair_completes_the_ceremony_over_the_real_relay() {
         // Drive the real `latch pair` ceremony end to end over the blind relay:
         // the daemon side uses the raw WebSocket rendezvous (`RendezvousWs` via

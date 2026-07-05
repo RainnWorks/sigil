@@ -97,10 +97,14 @@ impl Keystore for MacKeystore {
         //        kSecPrivateKeyAttrs: { kSecAttrIsPermanent: true,
         //          kSecAttrApplicationTag: b"com.rowm.latch.dek",
         //          kSecAttrAccessControl: <the control above> }})
-        //   3. Generate a fresh 32-byte DEK (secrets::generate_dek), then
-        //      SecKeyCreateEncryptedData(pubkey,
-        //        kSecKeyAlgorithmECIESEncryptionCofactorX963SHA256AESGCM, dek)
-        //      and store_blob(DEK_ENVELOPE_LABEL, sealed) here.
+        //   3. Wrap the DEK to the SE public key with P-256 ECIES and
+        //      store_blob(DEK_ENVELOPE_LABEL, sealed). The wrap uses Apple's
+        //      kSecKeyAlgorithmECIESEncryptionCofactorVariableIVX963SHA256AESGCM
+        //      (the VariableIV variant se-selftest.swift verifies), so the
+        //      daemon can produce the exact blob in Rust via
+        //      latch_proto::wrap_dek_p256(&dek, se_pub_x963) -- byte-compatible
+        //      with SecKeyCreateEncryptedData(pubkey, <that algorithm>, dek) --
+        //      and never needs the DEK plaintext to touch Security.framework.
         //
         // Confirm on device with the companion mac-app agent, or a scratch
         // binary, then:
@@ -121,8 +125,10 @@ impl Keystore for MacKeystore {
         //      the biometric prompt carries our reason string.
         //   3. SecItemCopyMatching for the private key by application tag, then
         //      SecKeyCreateDecryptedData(privkey,
-        //        kSecKeyAlgorithmECIESEncryptionCofactorX963SHA256AESGCM,
-        //        sealed) -> 32 raw bytes -> Zeroizing<[u8;32]>.
+        //        kSecKeyAlgorithmECIESEncryptionCofactorVariableIVX963SHA256AESGCM,
+        //        sealed) -> 32 raw bytes -> Zeroizing<[u8;32]>. This is the
+        //      VariableIV variant matching latch_proto::wrap_dek_p256 and
+        //      se-selftest.swift; the fixed-IV variant will NOT decrypt the blob.
         //   Touch ID fires inside SecKeyCreateDecryptedData because the key's
         //   access control demands `.biometryCurrentSet`; a declined or absent
         //   biometric returns errSecUserCanceled / errSecAuthFailed, which map
