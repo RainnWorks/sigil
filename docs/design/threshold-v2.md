@@ -5,10 +5,11 @@ static DEK delivered per-approval from the phone) is live in a demo and is
 untouched here. Everything below is a *versioned, additive* successor gated
 behind a new account-store `version` and a new pairing capability; a v1 daemon
 neither reads nor is affected by any v2 field. This is the rust-core design
-deliverable; per the review-integrity rule in `CLAUDE.md`, the "reviewed and
-found sound" verdict is written by the independent security-reviewer, not here.
-This document states behavior, the exact math and wire formats, the residuals,
-and an explicit open-questions list for that reviewer.
+deliverable; per the review-integrity rule in `CLAUDE.md`, the soundness verdict
+is written by the independent security-reviewer, not here. §§1–14 state behavior,
+the exact math and wire formats, the residuals, and an explicit open-questions
+list for that reviewer. **The independent reviewer's verdict and findings are in
+§15** (verdict: sound to implement, subject to required corrections R1–R5).
 
 Companion docs: `docs/design/pairing.md` (root of trust), `docs/security-claims.md`
 (claim → code → test map), `crates/proto/src/se_ecies.rs` (the P-256/Apple-ECIES
@@ -661,6 +662,211 @@ account; old `token_ct` dies because its `Z_F` is gone forever. This is the same
 
 ---
 
+## 15. Independent security review — verdict and findings
+
+*Written by the independent security-reviewer, which did **not** author this
+design (rust-core wrote §§1–14 in `16b393e`). Per the `CLAUDE.md`
+review-integrity rule the verdict is the reviewer's; the designer deliberately
+left it blank (§intro). This is a DESIGN review; no code was written.*
+
+### Verdict
+
+**SOUND TO IMPLEMENT — with the required corrections R1–R5 below.** The
+concatenative dual-ECDH construction is a genuine 2-of-2 threshold whose security
+reduces to computational Diffie–Hellman on P-256 with the BLAKE2b combiner modeled
+as a random oracle / PRF. The additive-vs-concatenative decision (§3–§4) is
+correct: the Secure Enclave's X-coordinate-only output makes the concatenative
+KEM-combiner the right realization, and additive genuinely buys nothing here. The
+blast-radius improvement over v1 (one account, needs `m` + a live Face ID, only at
+the instant the token is already exposed) is real and correctly derived.
+
+None of R1–R5 change the construction. R1 corrects one **incorrect impossibility
+claim** (a landmine if left in a security doc); R2–R5 are implementation
+constraints that must be honored and tested when the design is built. With them,
+I would record §14's open proof obligations as discharged at the design level;
+the on-device items (§13, extended below) remain genuine NEEDS-VERIFICATION.
+
+### Answers to the five questions (my own analysis, not a rubber stamp)
+
+**Q1 — Is the concatenative KDF combiner sound (RO/PRF + CDH), and is raw
+X-coordinate input safe? Any twist/subgroup issue; can `Z_M`/`Z_F` be collided or
+attacker-controlled?**
+Sound. `K = BLAKE2b(dom ∥ len·Z_M ∥ len·Z_F ∥ len·E ∥ len·account_id)` is the
+standard "concatenate the shared secrets and hash, with the shared base folded
+in" KEM-combiner. Folding `E` (the shared encapsulation) and `account_id` in is
+exactly what makes such a combiner robust rather than the naive `H(k1∥k2)`; they
+add domain/context binding, no entropy is claimed from them, and nothing about
+them is exploitable (both public). The length-prefixed absorb is injective — the
+three leading fields are fixed length (32/32/65) and the only variable field
+(`account_id`) is length-prefixed and last, so there is no concatenation
+ambiguity. Feeding the raw X-coordinate straight into the KDF and never using it
+as a key is precisely the "hash the ECDH secret" guidance (NIST SP 800-56A uses
+the X-coordinate as `Z`); it is correct, not a shortcut. P-256 is prime order
+(cofactor 1), so there is **no** small-subgroup surface and no need for cofactor
+multiplication. `Z_M`/`Z_F` are each fully determined by a secret scalar (`m`/`f`)
+and the per-account base `E`; an attacker who lacks the scalar faces CDH and
+cannot compute, collide, or control them, **provided** `E` is validated on-curve
+before each scalar multiplication (see R2 — this is the one live twist concern,
+since P-256's quadratic twist is not twist-secure and an off-curve `E` fed to an
+unvalidated key-agreement would leak `f`). One modeling caveat: robustness of the
+plain-concatenation combiner is proven in the **random-oracle** model; that is a
+reasonable assumption for BLAKE2b and consistent with the rest of the codebase,
+but the doc should state the assumption explicitly. (If a standard-model PRF
+combiner were ever required, the dual-PRF XOR form `F_{Z_M}(ctx) ⊕ F_{Z_F}(ctx)`
+is the drop-in — not needed here.)
+
+**Q2 — Sanity-check the "blinding is impossible" claim (§9) HARD.**
+**The impossibility claim is INCORRECT (finding F-1).** Multiplicative blinding
+*is* constructible here, and the specific reasoning in §9 — "the X-coordinate map
+is not homomorphic, so `x(f·rE)` does not let the Mac recover `x(f·E)` by any
+scalar operation" — is false. It overlooks x-only / decompress-then-multiply
+scalar multiplication, which the **Mac** (not the SE) performs and which is
+unconstrained:
+
+> Decrypt with blinding: Mac draws fresh `r`, sends `E' = r·E` (a full-point op on
+> the public `E`; the phone never sees the real `E`). Phone returns
+> `x(f·E') = x(r·(f·E))` from its normal SE key-agreement. Mac decompresses that
+> X-coordinate to a point `Q` (either sign), computes `x(r⁻¹·Q) = x(f·E) = Z_F`
+> (the two sign candidates `±(f·E)` share the same X-coordinate, so the ambiguity
+> is irrelevant), then combines `K` as before.
+
+So per-request freshness of the *wire* partial is achievable, contradicting the
+§9 conclusion that it is unattainable. The SE's X-only limitation does **not**
+block this because the unblinding happens on the Mac, which has no such limit.
+The §9 dismissal of a "fresh Mac-chosen base" only covers the case where the Mac
+knows the base's discrete log to `G` (then `x(f·C)=x(c·F)`, self-computable); it
+misses `C = r·E` where the Mac knows the DL to `E` but **not** to `G` (because `e`
+was destroyed) — which is exactly the working blinding.
+
+**However, the design's DECISION (do not add blinding) still stands, for a
+different and correct reason:** for a *fixed at-rest ciphertext* the key `K` is
+fixed, so the static `Z_F = x(f·E)` must be reconstructed in Mac RAM to derive
+`K` at combine time. Blinding hides `Z_F` on the phone/wire but re-materialises
+the identical static `Z_F` in Mac RAM at the exact instant the §9 residual
+attacker (daemon-RAM scrape during an approved decrypt) is present — when `K` and
+the plaintext token are equally exposed. So blinding cannot deliver per-request
+freshness of the *at-rest key*; only changing the ciphertext per use (re-key /
+re-encryption, which the design already offers) can. I checked the other
+candidates the lead named: an **SE signature** in place of key-agreement cannot
+be a secret 2-of-2 share (signatures are public-verifiable and, being
+per-message, cannot reproduce a fixed `K`); an **OPRF/VOPRF** is blocked for the
+*same* reason as blinding and then rescued the *same* way (client-side unblind),
+so it is likewise "possible but pointless" for a fixed ciphertext; **per-use
+re-encryption** is the only thing that delivers true freshness and is exactly the
+re-key path in §9/§12. Net: **replace §9's "impossible" with "possible but
+without benefit against the residual attacker, absent per-use re-encryption."**
+Optionally, blinding MAY be adopted as cheap defence-in-depth (the phone then
+never learns the account's base `E` nor emits a reusable static partial, shrinking
+a compromised-phone-app harvest to single-use values) — a MAY, not a MUST,
+orthogonal to the 2-of-2 core.
+
+**Q3 — Encrypt-time trust window: accept it, or make account-add two-party?**
+**Accept it (as designed).** At `account add` the Mac necessarily holds the
+plaintext **token** — that is the very secret being protected, and it is present
+in the clear at ingest no matter how the key is derived. Making account-add
+two-party (phone computes `Z_F` so the Mac never sees it) hides the *key share*
+but not the *token*, so a Mac compromised at add-time captures the prize directly;
+the phone-present ceremony buys no confidentiality for the token being added and
+adds real friction (phone required at every add). This is identical in kind to
+v1's DEK-generation window and to the unavoidable "ingest sees plaintext" fact.
+Recommendation: keep the Mac-only, human-present CLI ceremony; the only
+obligation is prompt zeroization of `e, Z_M, Z_F, K` after the seal (already
+specified in §5). Do **not** adopt Q5's phone-present add.
+
+**Q4 — Residual #7 carry-over honesty.**
+Confirmed and honestly stated. A live same-UID Mac attacker holds the Ed25519
+signing key and can originate a validly-signed request for a real account's `E`;
+v2 shrinks the gain (one account, still needs `m` and a live human Face ID) but
+does not eliminate it, and the human declining a request they did not initiate is
+honestly the last line. One concrete hardening is required (R5): the phone must
+display, and bind its Face-ID consent to, the **account identity carried in the
+challenge** (`account_id` → its human label), cross-checked against the secret
+refs it shows — otherwise a residual-#7 Mac attacker can show the human account A
+in the readout while sending `E` for account B and unlocking B. Note the
+designer's own Q4 suggestion (bind the prompt to a hash of `E`) is **not** worth
+doing: an `E`-hash is not human-actionable (the user cannot tell a right hash from
+a wrong one); the account label is the meaningful binding.
+
+**Q5 — Replay/forgery: does riding inside the sealed+signed+replay-guarded
+Envelope, verified before the SE op, close the oracle and cross-request replay?**
+Yes. Verify-then-act (Ed25519 against the pinned Mac key, then the replay guard,
+**then** Face ID + SE op) means the phone contributes `Z_F` only to a request
+provably originated by the paired Mac, fresh, and never seen — so it is not a
+chosen-`E` oracle to any party lacking the Mac's signing key (residual #7 is the
+sole, documented exception, mitigated by R5 + the human). Cross-request replay of
+a captured *response* is stopped by the Mac's ReplayGuard (single-use uuidv7 +
+strictly-monotonic counter + 90 s window) and the request-id correlation; the
+whole `hostile_relay.rs` suite applies unchanged because v2 alters only the
+plaintext inside the seal. The one honest nuance (already in §9): because `Z_F` is
+static for a fixed `E`, "replay is prevented" is an **envelope**-level property,
+not a value-level one — a `Z_F` scraped from Mac RAM in the clear is reusable
+with `m`; that is the accepted residual, not a replay hole.
+
+### Required before implementation (R1–R5) — none change the construction
+
+- **R1 (correct the reasoning).** Replace the §9 / Q3 "blinding is impossible"
+  claim with the corrected statement above (F-1): blinding is *constructible* but
+  *without benefit* against the residual attacker for a fixed at-rest ciphertext;
+  true per-request freshness requires per-use re-encryption (the re-key path). A
+  false impossibility claim in a security design is a latent hazard; the decision
+  it supports is fine, the reasoning is not.
+- **R2 (load-bearing crypto constraint).** Mandate **on-curve validation of `E`
+  on the phone, before the SE key-agreement**, via a validating parser
+  (`P256.KeyAgreement.PublicKey(x963Representation:)` or `SecKeyCreateWithData`
+  with EC type, which reject off-curve points) — never a raw-coordinate path.
+  This is what protects the crown-jewel `f` from an invalid-curve/twist attack
+  (P-256's twist is not twist-secure). The Mac-side on-curve check of `E` at load
+  and of `F` at pairing (mirroring `se_ecies.rs::PublicKey::from_sec1_bytes`) is
+  also required but is the lesser one. Add as NV-6.
+- **R3 (no downgrade).** The decrypt-path/version selection MUST be driven by the
+  **at-rest account record `version`**, never by any network-supplied field, so a
+  MITM or a live-Mac attacker cannot force a v2 account down a v1/static-DEK path.
+  (There is nothing to downgrade *to* — a v2 account has no DEK — but the code
+  must not read version from the wire.)
+- **R4 (E-uniqueness is load-bearing).** Enforce a fresh random `e`/`E` per
+  account and per re-key. The "one captured partial = one account" blast-radius
+  claim depends on it: two accounts sharing an `E` would share `Z_F`/`Z_M`
+  (account-separation would then rest solely on `account_id` in the KDF, a weaker
+  position than intended). The design specifies per-account random `e`; make it an
+  explicit invariant with a test.
+- **R5 (bind consent to the account shown).** Per Q4: the phone displays the
+  challenge's `account_id`/label as the account being unlocked and cross-checks it
+  against the secret refs in the readout, so a residual-#7 Mac cannot decouple
+  "what the human sees" from "what gets unlocked." For multi-secret requests
+  (Q7), the readout MUST enumerate every account in the batch so one Face ID is
+  informed consent for the whole set; that condition granted, `Vec<ThresholdChallenge>`
+  under one Face ID is acceptable.
+
+### NEEDS-VERIFICATION additions (extend §13)
+
+- **NV-6 (critical).** Phone-side **on-curve rejection of a malformed/off-curve
+  `E`** by whatever API constructs the public point before the SE op (R2). Prove
+  an off-curve `E` is refused, not key-agreed.
+- **NV-7.** If `ecdh_algo = "x963-sha256"` (SE refuses raw `.ecdhKeyExchangeStandard`),
+  pin the **exact** X9.63-KDF parameters the SE applies — `sharedInfo`, counter,
+  and output length in `SecKeyCopyKeyExchangeResult`'s parameter dict — and prove
+  the Mac reproduces `Z_F` byte-for-byte at account-add with a shared test vector.
+  Do not assume `se_ecies.rs::x963_kdf_sha256`'s ECIES `sharedInfo`/32-byte output
+  transfer unchanged to a bare key-agreement; they are a different use.
+- **NV-8.** The Keychain access control on `m` permits the daemon to read it in
+  its **launchd/GUI runtime context without an interactive prompt** during a
+  remote approval (this class of thing has bitten the pairing identity before —
+  see the device checklist's LOCAL_PEERPID/launchd notes).
+- **NV-9.** `mlock` of `m`/partials succeeds under the daemon's `RLIMIT_MEMLOCK`
+  on macOS; degrade loudly (not silently to un-pinned memory) if not.
+
+### Attack surface I probed and found closed
+Cross-account key confusion (blocked by per-account `E` + `account_id` in the
+KDF, R4); AES-GCM nonce reuse (each account has a fresh `K`, so a shared nonce is
+harmless; rotation draws fresh `e`→fresh `K`); at-rest inertness (records yield
+only `{token_ct, E, m sealed, F public}` → CDH to decrypt, P-3 holds); downgrade
+to v1 (no DEK exists for a v2 account; enforce R3); KDF collision to alias a
+victim account's `K` (BLAKE2b preimage/collision resistance). No break found in
+any of these.
+
+---
+
 *This document is the design. Implementation is a separate, later task
-(`#24`/`#26` successors) and must not land until the independent security-reviewer
-has recorded a verdict per the `CLAUDE.md` review-integrity rule.*
+(`#24`/`#26` successors); per §15 it may proceed once R1–R5 are folded in, with
+the §13 + NV-6…9 items verified on-device before the biometric/threshold factor
+is trusted in production.*
