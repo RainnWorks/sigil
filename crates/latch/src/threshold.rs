@@ -39,6 +39,12 @@ use latch_proto::threshold::{
 /// sealed. Versioned so a future key-format change can migrate cleanly.
 pub const MAC_SHARE_LABEL: &str = "threshold.mac-share.v2";
 
+/// The SE key id assigned to the phone's threshold share pinned at pairing. The
+/// pairing wire carries only `F` (one field); the Mac names it locally and echoes
+/// this id in each challenge so the phone selects the matching key. A phone holds
+/// one SE threshold key today; a future multi-key setup would carry the id too.
+pub const DEFAULT_SE_KEY_ID: &str = "phone-se.v2";
+
 /// The wire tag for an [`EcdhAlgo`], as the per-request challenge carries it to
 /// the phone. Matches the serde `rename`s in [`latch_proto::threshold::EcdhAlgo`].
 pub fn ecdh_algo_tag(algo: EcdhAlgo) -> &'static str {
