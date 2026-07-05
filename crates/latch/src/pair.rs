@@ -176,6 +176,9 @@ pub fn run_ceremony(daemon_identity: DeviceIdentity, opts: CeremonyOpts<'_>) -> 
         relay_url: opts.relay_url,
         sas_words,
         paired_at: (opts.now)(),
+        // v1 ceremony delivers a DEK; the v2 SE share F is pinned by the separate
+        // `latch pair upgrade` path, not this DEK-handoff ceremony.
+        phone_share: None,
     })
 }
 

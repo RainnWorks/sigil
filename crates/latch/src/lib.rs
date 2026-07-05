@@ -32,6 +32,7 @@ pub mod setup;
 pub mod shim;
 pub mod sshagent;
 pub mod style;
+pub mod threshold;
 
 /// A process-wide lock serializing tests that mutate global environment
 /// variables (`LATCH_HOME` in particular). Cargo runs a crate's tests in

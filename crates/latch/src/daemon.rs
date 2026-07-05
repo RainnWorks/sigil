@@ -61,6 +61,10 @@ const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 pub struct Core {
     keystore: Arc<dyn Keystore>,
     accounts: Mutex<AccountStore>,
+    /// The v2 (threshold) account catalogue, loaded once at arm time, exactly as
+    /// [`accounts`](Self::accounts) is. A record here is opened by the two-party
+    /// combine, never a DEK; its presence (by version) chooses the decrypt path.
+    threshold: Mutex<crate::threshold::ThresholdStore>,
     leases: LeaseStore,
     gate: ApprovalGate,
     pending: Arc<PendingRegistry>,
@@ -100,6 +104,10 @@ pub struct RemotePairingConfig {
     pub daemon_identity: DeviceIdentity,
     /// The pinned phone identity the daemon seals to and verifies.
     pub phone: PeerIdentity,
+    /// The phone's pinned v2 threshold share `F`, when this is a v2 pairing.
+    /// `None` for a v1 pairing (the DEK path). Not needed per request (the record
+    /// carries `E`); pinned here so v2 account-add and re-key can wrap to it.
+    pub phone_share: Option<crate::threshold::PhoneShare>,
 }
 
 impl RemotePairingConfig {
@@ -168,6 +176,15 @@ impl Core {
     pub fn for_host(dev_insecure: bool) -> anyhow::Result<Self> {
         let keystore = keystore::for_host();
         let accounts = AccountStore::load().context("loading account store")?;
+        // The v2 threshold accounts (if any). A missing/unreadable store is
+        // logged and treated as empty so the daemon still arms on its v1 accounts.
+        let threshold = match crate::threshold::ThresholdStore::load() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("latch daemon: ignoring an unreadable threshold store: {e}");
+                crate::threshold::ThresholdStore::default()
+            }
+        };
         let pending = Arc::new(PendingRegistry::new());
 
         let remote = load_remote_pairing(&keystore);
@@ -203,6 +220,7 @@ impl Core {
         Ok(Self {
             keystore,
             accounts: Mutex::new(accounts),
+            threshold: Mutex::new(threshold),
             leases: LeaseStore::new(),
             gate,
             pending,
@@ -381,6 +399,8 @@ impl SshBackend for Core {
             // A signature is an authentication event: elevated by default.
             risk: RiskLevel::Elevated,
             ssh: Some(challenge),
+            // SSH keys are v1-only for now (op-fetch / file signers).
+            threshold: None,
         };
 
         let outcome = self.gate.decide(gk, &ctx);
@@ -776,20 +796,55 @@ fn fulfill(
     let caller = lease::walk_ancestry(core.proc_table.as_ref(), peer.unwrap_or(-1));
     let gk = lease::grant_key(&caller, cwd, &scope);
 
-    // Route the 1Password account only for providers that inject a stored token.
-    // Clone what we need so the store lock is released before the approval wait.
-    let (account_label, ciphertext) = if needs_account {
-        let vault = parse_vault(argv).or_else(|| cfg.account.clone());
-        let store = core.accounts.lock().expect("accounts poisoned");
-        match store.route(vault.as_deref()) {
-            Ok(acct) => match acct.ciphertext() {
-                Ok(ct) => (acct.label.clone(), Some(ct)),
-                Err(e) => return fail_closed(stderr, &format!("latch account error: {e}\n")),
-            },
-            Err(e) => return fail_closed(stderr, &format!("latch: {e}\n")),
-        }
+    // Route the account only for providers that inject a stored token.
+    let vault = if needs_account {
+        parse_vault(argv).or_else(|| cfg.account.clone())
     } else {
-        (String::new(), None)
+        None
+    };
+
+    // A v2 (threshold) account takes precedence: its token is opened per request
+    // by the two-party combine (Mac share m + the phone's partial Z_F), never a
+    // DEK. The decrypt path is chosen HERE, from the at-rest record (R3: never
+    // from any wire field). When v1 accounts coexist (a migration store) v2 claims
+    // only an EXACT vault match, so it never over-captures a v1 request; once the
+    // store is fully v2 (no v1 accounts) v2 also serves the single-account
+    // fallback. v1 accounts keep the byte-identical DEK path.
+    let v2 = if needs_account {
+        let v1_empty = core
+            .accounts
+            .lock()
+            .expect("accounts poisoned")
+            .accounts
+            .is_empty();
+        let store = core.threshold.lock().expect("threshold store poisoned");
+        let picked = store.route_exact(vault.as_deref()).or_else(|| {
+            if v1_empty {
+                store.route(vault.as_deref())
+            } else {
+                None
+            }
+        });
+        picked.map(|a| (a.label().to_string(), a.record.clone()))
+    } else {
+        None
+    };
+
+    // Clone what we need so the store lock is released before the approval wait.
+    let (account_label, ciphertext) = match &v2 {
+        // v2: the label comes from the record; there is no v1 ciphertext/DEK.
+        Some((label, _)) => (label.clone(), None),
+        None if needs_account => {
+            let store = core.accounts.lock().expect("accounts poisoned");
+            match store.route(vault.as_deref()) {
+                Ok(acct) => match acct.ciphertext() {
+                    Ok(ct) => (acct.label.clone(), Some(ct)),
+                    Err(e) => return fail_closed(stderr, &format!("latch account error: {e}\n")),
+                },
+                Err(e) => return fail_closed(stderr, &format!("latch: {e}\n")),
+            }
+        }
+        None => (String::new(), None),
     };
 
     // A live lease short-circuits the approval — only for account-backed
@@ -819,6 +874,20 @@ fn fulfill(
         }
     }
 
+    // For a v2 account, carry the threshold challenge to the phone: the base
+    // point E it key-agrees against, plus the account binding it shows and
+    // consents to (R5). E is public and authenticated by the enclosing signed
+    // envelope; the phone validates it on-curve before its Secure-Enclave op.
+    let threshold = v2
+        .as_ref()
+        .map(|(label, record)| latch_proto::ThresholdChallenge {
+            account_id: record.account_id.clone(),
+            label: label.clone(),
+            ephemeral_pub: record.ephemeral_pub.clone(),
+            se_key_id: record.se_key_id.clone(),
+            ecdh_algo: crate::threshold::ecdh_algo_tag(record.ecdh_algo).to_string(),
+        });
+
     // The provider describes the request in provider-agnostic terms; the
     // approver never sees provider semantics.
     let ctx = ApprovalContext {
@@ -833,6 +902,7 @@ fn fulfill(
         kind: provider.kind(argv),
         risk: cfg.risk,
         ssh: None,
+        threshold,
     };
     let outcome = core.gate.decide(gk, &ctx);
     let decision = outcome.decision;
@@ -851,11 +921,45 @@ fn fulfill(
     }
 
     // Account-backed providers need the decrypted token; direct-injection
-    // providers source their own env and need no credential. The DEK either
-    // arrived with the approval (a paired phone delivered it, re-sealed to this
-    // daemon) or is unwrapped from the local keystore (Touch ID on macOS). Both
-    // live in `Zeroizing`, wiped on drop.
-    let credential = if let Some(ciphertext) = &ciphertext {
+    // providers source their own env and need no credential.
+    //
+    // v2 accounts open the token by the two-party combine: the phone returned its
+    // partial Z_F with the approval, and the daemon combines it with its Mac share
+    // m (loaded into mlock'd memory for this one op) to derive K and decrypt. No
+    // full private key is ever assembled; m, K, and the token are all zeroized.
+    let credential = if let Some((_, record)) = &v2 {
+        let zf = match outcome.zf.as_deref() {
+            Some(zf) => zf,
+            // An approve with no partial cannot open a v2 token (e.g. the local
+            // factor cannot produce Z_F): fail closed rather than serving nothing.
+            None => {
+                return fail_closed(
+                    stderr,
+                    "latch: v2 approval carried no threshold partial; no phone factor?\n",
+                )
+            }
+        };
+        let m = match crate::threshold::load_mac_share(core.keystore.as_ref()) {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                return fail_closed(
+                    stderr,
+                    "latch: no Mac threshold share on this daemon; re-pair for v2\n",
+                )
+            }
+            Err(e) => return fail_closed(stderr, &format!("latch: {e}\n")),
+        };
+        let token = match crate::threshold::decrypt(record, &m, zf) {
+            Ok(t) => t,
+            Err(e) => return fail_closed(stderr, &format!("latch token decrypt failed: {e}\n")),
+        };
+        drop(m); // the Mac share is held only for the one combine
+        if let Some(ttl) = decision.lease_ttl() {
+            core.leases
+                .grant(gk, &account_label, &scope, token.clone(), ttl);
+        }
+        Some(token)
+    } else if let Some(ciphertext) = &ciphertext {
         let dek = match outcome.dek {
             Some(dek) => dek,
             None => match core
@@ -1022,6 +1126,7 @@ mod tests {
         let core = Core {
             keystore,
             accounts: Mutex::new(accounts),
+            threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending: pending.clone(),
@@ -1106,6 +1211,7 @@ mod tests {
         let core = Core {
             keystore,
             accounts: Mutex::new(accounts),
+            threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
@@ -1432,6 +1538,7 @@ mod tests {
         let core = Arc::new(Core {
             keystore,
             accounts: Mutex::new(AccountStore::default()),
+            threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
@@ -1495,6 +1602,7 @@ mod tests {
         let core = Core {
             keystore,
             accounts: Mutex::new(AccountStore::default()),
+            threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
@@ -1685,6 +1793,7 @@ mod tests {
         Arc::new(Core {
             keystore: Arc::new(MemoryKeystore::new()), // no DEK at rest
             accounts: Mutex::new(accounts),
+            threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
@@ -1821,6 +1930,311 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // --- v2 threshold: the full daemon round trip over the socket ----------
+
+    /// Pair a softphone as in [`pair_softphone`], then attach a software
+    /// Secure-Enclave threshold share `f` to it (standing in for the real
+    /// enclave). Returns the daemon identity, the v2-capable softphone, the
+    /// public share `F` (ANSI X9.63) for the daemon to pin, and the SE key id.
+    fn pair_softphone_v2(
+        policy: Policy,
+    ) -> (
+        DeviceIdentity,
+        Softphone,
+        [u8; latch_proto::threshold::P256_X963_POINT_LEN],
+        &'static str,
+    ) {
+        let (daemon_for_approver, softphone, _dek) = pair_softphone(policy);
+        let f = latch_proto::threshold::MacShare::generate();
+        let se_key_id = "se-key-1";
+        let softphone = softphone.with_phone_share(f, se_key_id);
+        let f_x963 = softphone
+            .phone_share_x963()
+            .expect("softphone holds an SE share");
+        (daemon_for_approver, softphone, f_x963, se_key_id)
+    }
+
+    /// An inert daemon core whose one account is a **v2 threshold** account: the
+    /// token is sealed under `K = combine(Z_M, Z_F, E, id)`, the Mac share `m` is
+    /// generated into the (memory) keystore, and the record is held in the core's
+    /// threshold store. The daemon holds NO DEK and no phone secret.
+    #[allow(clippy::too_many_arguments)]
+    fn remote_core_v2(
+        dir: &Path,
+        daemon_id: DeviceIdentity,
+        phone: latch_proto::PeerIdentity,
+        transport: Arc<dyn latch_proto::Transport>,
+        timeout: Duration,
+        f_x963: &[u8],
+        se_key_id: &str,
+        token: &str,
+        secret: &str,
+    ) -> Arc<Core> {
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        // Mint/seal the Mac share m in the keystore, then seal the token to
+        // (m, F) as a v2 record and persist it to the threshold store on disk.
+        let m = crate::threshold::load_or_create_mac_share(keystore.as_ref()).unwrap();
+        let phone_share = crate::threshold::PhoneShare::from_x963(
+            se_key_id,
+            f_x963,
+            latch_proto::threshold::EcdhAlgo::RawX,
+        )
+        .unwrap();
+        let mut store = crate::threshold::ThresholdStore::default();
+        crate::threshold::seal_account(
+            &mut store,
+            "Rowm",
+            &m,
+            &phone_share,
+            token.as_bytes(),
+            vec!["Engineering".into()],
+        )
+        .unwrap();
+        drop(m);
+
+        let approver = RemoteApprover::new(transport, daemon_id, phone).with_timeout(timeout);
+        Arc::new(Core {
+            keystore,                                      // holds m (sealed); NO DEK
+            accounts: Mutex::new(AccountStore::default()), // no v1 accounts
+            threshold: Mutex::new(store),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(approver)),
+            pending: Arc::new(PendingRegistry::new()),
+            lockdown: AtomicBool::new(false),
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
+                write_fake_op(dir, token, secret),
+            ))]),
+            commands: CommandStore::default(),
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::Phone,
+            ssh_signers: Vec::new(),
+            audit: None,
+        })
+    }
+
+    #[test]
+    fn remote_v2_threshold_approval_decrypts_via_two_party_combine() {
+        // The headline v2 loop: the phone contributes Z_F = x(f·E) under its
+        // policy, the daemon combines it with its Mac share m to derive K, and the
+        // token reaches the caller's fd. No DEK exists anywhere; e was destroyed at
+        // account-add, so only the two parties together can open the token.
+        let _home = HomeGuard::new("remote-v2");
+        let dir = tmpdir("remote-v2");
+        let relay = LocalRelay::new();
+        let (daemon_id, softphone, f_x963, se_key_id) = pair_softphone_v2(Policy::Approve);
+        let phone_pub = softphone.phone_identity();
+        let mailbox = softphone.mailbox();
+
+        let core = remote_core_v2(
+            &dir,
+            daemon_id,
+            phone_pub,
+            Arc::new(relay.clone()),
+            Duration::from_secs(3),
+            &f_x963,
+            se_key_id,
+            "v2-token-xyz",
+            "v2-secret-99",
+        );
+
+        let softphone = Arc::new(softphone);
+        let (shutdown, approver_thread) = spawn_approver(softphone.clone(), relay.clone());
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let (read_end, write_end) = pipe();
+        let (err_r, err_w) = pipe();
+        let argv = vec![
+            "op".into(),
+            "read".into(),
+            "op://Engineering/.env/password".into(),
+        ];
+        local::send_frame(
+            &client,
+            &Frame::Run {
+                argv,
+                cwd: String::new(),
+            },
+            &[write_end.as_raw_fd(), err_w.as_raw_fd()],
+        )
+        .unwrap();
+        drop(write_end);
+        drop(err_w);
+
+        let worker = std::thread::spawn(move || handle_conn(core, server));
+        worker.join().unwrap().unwrap();
+
+        // The secret reached the caller, and only via the two-party combine.
+        assert_eq!(read_all(read_end), "v2-secret-99");
+        let mut client = client;
+        assert_eq!(
+            local::recv_reply(&mut client).unwrap(),
+            Reply::Exit { code: 0 }
+        );
+        assert_eq!(
+            relay.depth(mailbox, latch_proto::Direction::ToDaemon),
+            0,
+            "the v2 partial response was consumed by the daemon"
+        );
+        let _ = err_r;
+
+        shutdown.store(true, Ordering::SeqCst);
+        approver_thread.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remote_v2_denial_fails_closed_with_no_secret() {
+        // A v2 deny carries no partial, so the combine cannot run: fail closed.
+        let _home = HomeGuard::new("remote-v2-deny");
+        let dir = tmpdir("remote-v2-deny");
+        let relay = LocalRelay::new();
+        let (daemon_id, softphone, f_x963, se_key_id) = pair_softphone_v2(Policy::Deny);
+        let phone_pub = softphone.phone_identity();
+
+        let core = remote_core_v2(
+            &dir,
+            daemon_id,
+            phone_pub,
+            Arc::new(relay.clone()),
+            Duration::from_secs(3),
+            &f_x963,
+            se_key_id,
+            "tok",
+            "should-never-appear",
+        );
+
+        let softphone = Arc::new(softphone);
+        let (shutdown, approver_thread) = spawn_approver(softphone.clone(), relay.clone());
+
+        let (read_end, write_end) = pipe();
+        let (err_r, err_w) = pipe();
+        let argv = vec![
+            "op".into(),
+            "read".into(),
+            "op://Engineering/.env/password".into(),
+        ];
+        let code = fulfill(&core, &argv, "", None, Some(write_end), Some(err_w));
+        assert_eq!(code, 1, "a v2 denial must fail closed");
+        assert_eq!(read_all(read_end), "", "no secret on a denied v2 request");
+        assert!(read_all(err_r).contains("denied"));
+
+        shutdown.store(true, Ordering::SeqCst);
+        approver_thread.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fake `op` that echoes whatever token reached its env, so a test can
+    /// assert which account's token was injected on each route.
+    fn write_echo_op(dir: &Path) -> PathBuf {
+        let path = dir.join("op");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nprintf '%s' \"$OP_SERVICE_ACCOUNT_TOKEN\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn v1_and_v2_accounts_coexist_and_each_takes_its_own_path() {
+        // The migration invariant (R3): a v1 account still decrypts via the DEK
+        // path while a v2 account in the same store decrypts via the two-party
+        // combine. The path is chosen by the at-rest record, and one paired phone
+        // (holding both the DEK and the SE share f) answers either kind.
+        use latch_proto::threshold::{EcdhAlgo, MacShare};
+
+        let dir = tmpdir("remote-mixed");
+        let relay = LocalRelay::new();
+        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Approve);
+        let f = MacShare::generate();
+        let se_key_id = "se-key-1";
+        let softphone = softphone.with_phone_share(f, se_key_id);
+        let f_x963 = softphone.phone_share_x963().unwrap();
+        let phone_pub = softphone.phone_identity();
+
+        // v1 account "Legacy", token sealed under the phone-delivered DEK.
+        let sealing_dek: crate::secrets::Dek = Zeroizing::new(dek_bytes);
+        let mut accounts = AccountStore::default();
+        accounts
+            .add("Legacy", &sealing_dek, b"v1-token", vec!["Legacy".into()])
+            .unwrap();
+
+        // v2 account "Rowm", token sealed under (m, F).
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let m = crate::threshold::load_or_create_mac_share(keystore.as_ref()).unwrap();
+        let phone_share =
+            crate::threshold::PhoneShare::from_x963(se_key_id, &f_x963, EcdhAlgo::RawX).unwrap();
+        let mut tstore = crate::threshold::ThresholdStore::default();
+        crate::threshold::seal_account(
+            &mut tstore,
+            "Rowm",
+            &m,
+            &phone_share,
+            b"v2-token",
+            vec!["Engineering".into()],
+        )
+        .unwrap();
+        drop(m);
+
+        let approver = RemoteApprover::new(Arc::new(relay.clone()), daemon_id, phone_pub)
+            .with_timeout(Duration::from_secs(3));
+        let core = Arc::new(Core {
+            keystore,
+            accounts: Mutex::new(accounts),
+            threshold: Mutex::new(tstore),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(approver)),
+            pending: Arc::new(PendingRegistry::new()),
+            lockdown: AtomicBool::new(false),
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
+                write_echo_op(&dir),
+            ))]),
+            commands: CommandStore::default(),
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::Phone,
+            ssh_signers: Vec::new(),
+            audit: None,
+        });
+
+        let softphone = Arc::new(softphone);
+        let (shutdown, approver_thread) = spawn_approver(softphone.clone(), relay.clone());
+
+        // The v2 vault routes through the threshold combine → the v2 token.
+        let (r2, w2) = pipe();
+        let v2_argv = vec![
+            "op".into(),
+            "read".into(),
+            "--vault".into(),
+            "Engineering".into(),
+            "op://Engineering/x".into(),
+        ];
+        assert_eq!(fulfill(&core, &v2_argv, "", None, Some(w2), None), 0);
+        assert_eq!(
+            read_all(r2),
+            "v2-token",
+            "v2 vault must use the combine path"
+        );
+
+        // The v1 vault routes through the DEK path → the v1 token.
+        let (r1, w1) = pipe();
+        let v1_argv = vec![
+            "op".into(),
+            "read".into(),
+            "--vault".into(),
+            "Legacy".into(),
+            "op://Legacy/x".into(),
+        ];
+        assert_eq!(fulfill(&core, &v1_argv, "", None, Some(w1), None), 0);
+        assert_eq!(read_all(r1), "v1-token", "v1 vault must use the DEK path");
+
+        shutdown.store(true, Ordering::SeqCst);
+        approver_thread.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn remote_pairing_config_derives_the_shared_mailbox() {
         // The persisted phone-factor config must derive the exact mailbox both
@@ -1831,6 +2245,7 @@ mod tests {
             relay_url: "https://relay.example".into(),
             daemon_identity: daemon_id,
             phone: softphone.phone_identity(),
+            phone_share: None,
         };
         assert_eq!(cfg.mailbox(), softphone.mailbox());
     }
@@ -1944,6 +2359,7 @@ mod tests {
             relay_url: base.clone(),
             daemon_identity: clone_device(&daemon_id),
             phone: phone_pub,
+            phone_share: None,
         };
         assert_eq!(cfg.mailbox(), mailbox);
 
@@ -2109,6 +2525,7 @@ mod tests {
         Arc::new(Core {
             keystore,
             accounts: Mutex::new(accounts),
+            threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate,
             pending,
@@ -2206,6 +2623,7 @@ mod tests {
             relay_url: "ws://127.0.0.1:1".into(),
             daemon_identity: daemon_id,
             phone: softphone.phone_identity(),
+            phone_share: None,
         };
         let ks: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
@@ -2240,6 +2658,7 @@ mod tests {
             relay_url: "ws://127.0.0.1:1".into(),
             sas_words: sas_of(&daemon_pub, &phone),
             paired_at: REMOTE_NOW,
+            phone_share: None,
         };
         pairing_store::save(ks.as_ref(), &np).unwrap();
 
@@ -2289,6 +2708,7 @@ mod tests {
             relay_url: base.clone(),
             sas_words: sas_of(&daemon_pub, &phone_pub),
             paired_at: REMOTE_NOW,
+            phone_share: None,
         };
         pairing_store::save(ks.as_ref(), &np).unwrap();
         let cfg = pairing_store::load(ks.as_ref()).unwrap().expect("saved");
@@ -2508,6 +2928,7 @@ mod tests {
         let core = Arc::new(Core {
             keystore,
             accounts: Mutex::new(AccountStore::default()),
+            threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
@@ -2575,6 +2996,7 @@ mod tests {
         let core = Core {
             keystore,
             accounts: Mutex::new(AccountStore::default()),
+            threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,

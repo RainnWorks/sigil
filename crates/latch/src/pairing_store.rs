@@ -30,14 +30,18 @@
 //! (keystore), phone public identity, relay URL, SAS words}` and deliberately
 //! excludes any DEK or DEK envelope.
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use latch_proto::identity::DeviceIdentity;
+use latch_proto::threshold::EcdhAlgo;
 use latch_proto::PeerIdentity;
 
 use crate::daemon::RemotePairingConfig;
 use crate::keystore::{Keystore, KeystoreError};
 use crate::paths;
+use crate::threshold::PhoneShare;
 
 /// Keystore blob label under which the daemon's own 64-byte private identity is
 /// sealed. Versioned so a future key-format change can migrate cleanly.
@@ -62,6 +66,23 @@ pub enum PairingStoreError {
     MissingIdentity,
     #[error("the stored daemon identity is corrupt; re-pair with `latch pair`")]
     CorruptIdentity,
+    #[error("the persisted phone Secure-Enclave share F is not a valid P-256 point; re-pair")]
+    CorruptPhoneShare,
+}
+
+/// The phone's Secure-Enclave threshold share `F`, as persisted in the plaintext
+/// config. Public key material only (a point, an id, and a shape tag); the
+/// enclave private key `f` never leaves the phone. Additive and optional, so a v1
+/// pairing (no v2 share) round-trips unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedPhoneShare {
+    /// Which pinned SE key this is (echoed into the per-request challenge).
+    se_key_id: String,
+    /// `F = f·G`, ANSI X9.63 uncompressed (65 bytes), base64.
+    f_x963: String,
+    /// Which SE ECDH output shape this key emits (NV-2/NV-7).
+    ecdh_algo: EcdhAlgo,
 }
 
 /// The public half of a persisted pairing: everything safe to keep in a
@@ -78,6 +99,19 @@ struct PersistedPairing {
     paired_at: u64,
     /// The six SAS words this pairing confirmed, kept for display only.
     sas_words: Vec<String>,
+    /// The phone's v2 threshold share `F`, present only for a v2 pairing. A v1
+    /// pairing omits it; `#[serde(default)]` keeps old configs loading unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phone_share: Option<PersistedPhoneShare>,
+}
+
+/// The phone's v2 threshold share as handed to [`save`]: the id, the raw 65-byte
+/// `F` in ANSI X9.63 form, and the SE output shape. Validated on-curve at load.
+#[derive(Debug, Clone)]
+pub struct NewPhoneShare {
+    pub se_key_id: String,
+    pub f_x963: Vec<u8>,
+    pub ecdh_algo: EcdhAlgo,
 }
 
 /// The inputs a completed pairing hands this module to persist.
@@ -92,6 +126,9 @@ pub struct NewPairing {
     pub sas_words: [String; 6],
     /// Pairing completion time, unix ms.
     pub paired_at: u64,
+    /// The phone's v2 Secure-Enclave threshold share `F`, when this is a v2
+    /// pairing. `None` for a v1 pairing (DEK handoff), which keeps working.
+    pub phone_share: Option<NewPhoneShare>,
 }
 
 /// A read-only summary of the persisted pairing, for `list-paired-devices`. Uses
@@ -131,6 +168,11 @@ pub fn save(ks: &dyn Keystore, p: &NewPairing) -> Result<(), PairingStoreError> 
         phone: p.phone,
         paired_at: p.paired_at,
         sas_words: p.sas_words.to_vec(),
+        phone_share: p.phone_share.as_ref().map(|s| PersistedPhoneShare {
+            se_key_id: s.se_key_id.clone(),
+            f_x963: B64.encode(&s.f_x963),
+            ecdh_algo: s.ecdh_algo,
+        }),
     };
     let path = config_path()?;
     if let Some(dir) = path.parent() {
@@ -168,10 +210,25 @@ pub fn load(ks: &dyn Keystore) -> Result<Option<RemotePairingConfig>, PairingSto
     let daemon_identity =
         DeviceIdentity::from_secret_bytes(&blob).ok_or(PairingStoreError::CorruptIdentity)?;
 
+    // Validate and pin the phone's v2 threshold share F on-curve (R2). A v1
+    // pairing has none, which is not an error (it takes the DEK path).
+    let phone_share = match &persisted.phone_share {
+        Some(s) => {
+            let f = B64
+                .decode(&s.f_x963)
+                .map_err(|_| PairingStoreError::CorruptPhoneShare)?;
+            let share = PhoneShare::from_x963(&s.se_key_id, &f, s.ecdh_algo)
+                .map_err(|_| PairingStoreError::CorruptPhoneShare)?;
+            Some(share)
+        }
+        None => None,
+    };
+
     Ok(Some(RemotePairingConfig {
         relay_url: persisted.relay_url,
         daemon_identity,
         phone: persisted.phone,
+        phone_share,
     }))
 }
 
@@ -266,6 +323,7 @@ mod tests {
                 "mast".into(),
             ],
             paired_at: 1_720_000_000_000,
+            phone_share: None,
         };
         // Rebuild a daemon identity handle with the same public id for asserts.
         (DeviceIdentity::generate(), daemon_pub, np)
@@ -343,6 +401,62 @@ mod tests {
         assert_eq!(s.phone, phone);
         assert_eq!(s.sas_words.len(), 6);
         assert_eq!(s.relay_url, "https://relay.example");
+    }
+
+    #[test]
+    fn v2_pairing_persists_and_revalidates_the_phone_share_f() {
+        use latch_proto::threshold::{EcdhAlgo, MacShare};
+        let _home = HomeGuard::new("v2-share");
+        let ks = MemoryKeystore::new();
+        let (_i, _p, mut np) = new_pairing();
+
+        // A valid on-curve F (software stand-in for the phone's SE public key).
+        let f = MacShare::generate();
+        let f_x963 = f.public_point().as_x963().to_vec();
+        np.phone_share = Some(NewPhoneShare {
+            se_key_id: "se-key-1".into(),
+            f_x963: f_x963.clone(),
+            ecdh_algo: EcdhAlgo::RawX,
+        });
+        save(&ks, &np).unwrap();
+
+        // Reload validates F on-curve (R2) and pins it.
+        let cfg = load(&ks).unwrap().expect("a v2 pairing was saved");
+        let share = cfg.phone_share.expect("the phone share round-trips");
+        assert_eq!(share.se_key_id, "se-key-1");
+        assert_eq!(share.point.as_x963().to_vec(), f_x963);
+        assert_eq!(share.ecdh_algo, EcdhAlgo::RawX);
+    }
+
+    #[test]
+    fn a_corrupt_persisted_phone_share_fails_closed_on_load() {
+        use latch_proto::threshold::EcdhAlgo;
+        let _home = HomeGuard::new("v2-corrupt");
+        let ks = MemoryKeystore::new();
+        let (_i, _p, mut np) = new_pairing();
+        // 65 bytes that are not an on-curve point.
+        np.phone_share = Some(NewPhoneShare {
+            se_key_id: "se-key-1".into(),
+            f_x963: vec![0x04u8; 65],
+            ecdh_algo: EcdhAlgo::RawX,
+        });
+        save(&ks, &np).unwrap();
+        assert!(matches!(
+            load(&ks),
+            Err(PairingStoreError::CorruptPhoneShare)
+        ));
+    }
+
+    #[test]
+    fn a_v1_pairing_without_a_phone_share_still_loads() {
+        // Additive field: a pairing saved with no v2 share reconstructs with
+        // `phone_share: None` and takes the DEK path, unchanged.
+        let _home = HomeGuard::new("v1-still");
+        let ks = MemoryKeystore::new();
+        let (_i, _p, np) = new_pairing();
+        save(&ks, &np).unwrap();
+        let cfg = load(&ks).unwrap().unwrap();
+        assert!(cfg.phone_share.is_none());
     }
 
     #[test]

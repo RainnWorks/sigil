@@ -114,7 +114,9 @@ impl RemoteApprover {
             },
             risk: ctx.risk,
             reason: None,
-            threshold: None,
+            // A v2 account carries its threshold challenge to the phone; a v1
+            // account leaves this absent and takes the DEK path.
+            threshold: ctx.threshold.clone(),
             expires_at: now + timeout_ms,
             timeout_ms,
         }
@@ -158,15 +160,25 @@ impl RemoteApprover {
         match resp.decision {
             ProtoDecision::Denied => Some(ApprovalOutcome::local(Decision::Deny)),
             ProtoDecision::Approved => {
-                // An approve MUST carry the DEK; without it we cannot serve the
-                // token, so fail closed rather than approving emptily.
-                let dek = resp.dek()?;
-                let dek = Zeroizing::new(*dek.as_bytes());
                 let decision = match &resp.lease {
                     Some(lease) => Decision::Lease(Duration::from_millis(lease.ttl_ms)),
                     None => Decision::Approve,
                 };
-                Some(ApprovalOutcome::with_dek(decision, dek))
+                if let Some(challenge) = &req.threshold {
+                    // v2 account: an approve MUST carry the phone's partial Z_F for
+                    // this exact account. A missing/short partial, or one for a
+                    // different account, fails closed rather than approving emptily.
+                    let (account_id, zf) = resp.partial_zf()?;
+                    if account_id != challenge.account_id {
+                        return None;
+                    }
+                    Some(ApprovalOutcome::with_partial(decision, zf))
+                } else {
+                    // v1 account: an approve MUST carry the DEK.
+                    let dek = resp.dek()?;
+                    let dek = Zeroizing::new(*dek.as_bytes());
+                    Some(ApprovalOutcome::with_dek(decision, dek))
+                }
             }
         }
     }
@@ -223,6 +235,7 @@ mod tests {
             kind: RequestKind::SecretRead,
             risk: RiskLevel::Elevated,
             ssh: None,
+            threshold: None,
         };
         let req = approver.build_request(&ctx);
         assert_eq!(req.request_id, "req-1");

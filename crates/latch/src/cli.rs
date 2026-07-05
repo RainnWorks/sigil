@@ -474,6 +474,10 @@ fn account_add(args: &[String], json: bool) -> i32 {
         eprintln!("latch: refusing to read a token from argv; pass --token-stdin");
         return 2;
     }
+    // A v2 (threshold) account is sealed under the two-party key, not a DEK.
+    if has_flag(args, "--threshold") {
+        return account_add_v2(&label, json);
+    }
     let Some(token) = read_token_stdin() else {
         return 1;
     };
@@ -528,6 +532,99 @@ fn account_add(args: &[String], json: bool) -> i32 {
     }
 
     println!("{} account {} added", s.ok("\u{2713}"), s.cobalt(&label));
+    if !vaults.is_empty() {
+        println!("  {} {}", s.dim("vaults"), vaults.join(", "));
+    }
+    0
+}
+
+/// Add a v2 (threshold) service account: seal the token under the two-party key
+/// `K = combine(Z_M, Z_F, E, account_id)`, destroying the ephemeral `e` so `Z_F`
+/// becomes computable only by the phone's Secure Enclave. Requires a v2 pairing
+/// (one that pinned the phone's SE share `F`); the Mac share `m` is generated and
+/// sealed on first use.
+fn account_add_v2(label: &str, json: bool) -> i32 {
+    let s = Style::stdout();
+    let ks = keystore::for_host();
+
+    // The pairing must have pinned the phone's SE share F (a v2 pairing).
+    let phone = match crate::pairing_store::load(ks.as_ref()) {
+        Ok(Some(cfg)) => match cfg.phone_share {
+            Some(share) => share,
+            None => {
+                eprintln!(
+                    "latch: this pairing has no phone Secure-Enclave share; \
+                     re-pair for v2 threshold accounts"
+                );
+                return 1;
+            }
+        },
+        Ok(None) => {
+            eprintln!("latch: no phone is paired; run `latch pair` first");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("latch: loading the pairing: {e}");
+            return 1;
+        }
+    };
+
+    let token = match read_token_stdin() {
+        Some(t) => t,
+        None => return 1,
+    };
+
+    // Generate/seal the Mac share m on first use, then seal the token.
+    let m = match crate::threshold::load_or_create_mac_share(ks.as_ref()) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("latch: provisioning the Mac threshold share: {e}");
+            return 1;
+        }
+    };
+
+    let vaults = OpProvider::new().probe(&token).unwrap_or_default();
+
+    let mut store = match crate::threshold::ThresholdStore::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("latch: loading the threshold store: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) =
+        crate::threshold::seal_account(&mut store, label, &m, &phone, &token, vaults.clone())
+    {
+        eprintln!("latch: {e}");
+        return 1;
+    }
+    drop(m);
+    if let Err(e) = store.save() {
+        eprintln!("latch: saving the threshold store: {e}");
+        return 1;
+    }
+
+    if json {
+        // The v2 account presents the same GUI shape as a v1 account.
+        println!(
+            "{}",
+            json::to_line(&json::AccountJson {
+                id: label.to_string(),
+                label: label.to_string(),
+                vaults: vaults.clone(),
+                health: "healthy".into(),
+                detail: Some("threshold (v2)".into()),
+                last_used_ms: None,
+            })
+        );
+        return 0;
+    }
+
+    println!(
+        "{} threshold account {} added",
+        s.ok("\u{2713}"),
+        s.cobalt(label)
+    );
     if !vaults.is_empty() {
         println!("  {} {}", s.dim("vaults"), vaults.join(", "));
     }
@@ -599,11 +696,21 @@ fn account_remove(args: &[String], json: bool) -> i32 {
             return 1;
         }
     };
-    let removed = store.remove(&id);
+    let mut removed = store.remove(&id);
     if removed {
         if let Err(e) = store.save() {
             eprintln!("latch: saving account store: {e}");
             return 1;
+        }
+    }
+    // A label may name a v2 (threshold) account instead; remove it there too.
+    if let Ok(mut v2) = crate::threshold::ThresholdStore::load() {
+        if v2.remove(&id) {
+            removed = true;
+            if let Err(e) = v2.save() {
+                eprintln!("latch: saving the threshold store: {e}");
+                return 1;
+            }
         }
     }
     let result = if removed {
@@ -635,12 +742,22 @@ fn account_list(json: bool) -> i32 {
             return 1;
         }
     };
+    // v2 (threshold) accounts live in a separate store; list both.
+    let v2 = crate::threshold::ThresholdStore::load().unwrap_or_default();
     if json {
-        let list: Vec<_> = store.accounts.iter().map(account_json).collect();
+        let mut list: Vec<_> = store.accounts.iter().map(account_json).collect();
+        list.extend(v2.accounts.iter().map(|a| json::AccountJson {
+            id: a.label().to_string(),
+            label: a.label().to_string(),
+            vaults: a.vaults.clone(),
+            health: "healthy".into(),
+            detail: Some("threshold (v2)".into()),
+            last_used_ms: None,
+        }));
         println!("{}", json::to_pretty(&list));
         return 0;
     }
-    if store.accounts.is_empty() {
+    if store.accounts.is_empty() && v2.accounts.is_empty() {
         println!("  {}", s.dim("no accounts; run: latch account add"));
         return 0;
     }
@@ -653,6 +770,19 @@ fn account_list(json: bool) -> i32 {
             s.dim(&a.vaults.join(", "))
         };
         println!("  {}  {}", pad(&a.label, 20), vaults);
+    }
+    for a in &v2.accounts {
+        let vaults = if a.vaults.is_empty() {
+            s.dim("no vaults probed")
+        } else {
+            s.dim(&a.vaults.join(", "))
+        };
+        println!(
+            "  {}  {}  {}",
+            pad(a.label(), 20),
+            vaults,
+            s.dim("threshold (v2)")
+        );
     }
     0
 }

@@ -68,22 +68,40 @@ impl Decision {
 pub struct ApprovalOutcome {
     pub decision: Decision,
     pub dek: Option<Dek>,
+    /// For a v2 (threshold) account: the phone's partial `Z_F = x(f·E)` the
+    /// daemon combines with its Mac share `m` to open the token. Mutually
+    /// exclusive with [`dek`](Self::dek) in practice — a v1 approve carries a
+    /// DEK, a v2 approve carries this. Zeroize-on-drop.
+    pub zf: Option<zeroize::Zeroizing<[u8; 32]>>,
 }
 
 impl ApprovalOutcome {
-    /// A decision with no DEK: the daemon unwraps its own key (local path).
+    /// A decision with no key material: the daemon unwraps its own key (local
+    /// path) or, for v2, this is a deny.
     pub fn local(decision: Decision) -> Self {
         Self {
             decision,
             dek: None,
+            zf: None,
         }
     }
 
-    /// A grant that carries the phone-delivered DEK (remote path).
+    /// A grant that carries the phone-delivered DEK (remote v1 path).
     pub fn with_dek(decision: Decision, dek: Dek) -> Self {
         Self {
             decision,
             dek: Some(dek),
+            zf: None,
+        }
+    }
+
+    /// A grant that carries the phone's v2 threshold partial `Z_F` (remote v2
+    /// path). The daemon combines it with the Mac share to derive the token key.
+    pub fn with_partial(decision: Decision, zf: zeroize::Zeroizing<[u8; 32]>) -> Self {
+        Self {
+            decision,
+            dek: None,
+            zf: Some(zf),
         }
     }
 }
@@ -118,6 +136,11 @@ pub struct ApprovalContext {
     /// destination, and data-to-sign fingerprint the approver renders. `None`
     /// for secret reads and control requests.
     pub ssh: Option<latch_proto::SshChallenge>,
+    /// Present when the routed account is a v2 (threshold) account: the base
+    /// point `E` the phone key-agrees against, plus the account binding it shows
+    /// and consents to (R5). The remote approver copies this into the request; a
+    /// v1 account leaves it `None` and takes the DEK path.
+    pub threshold: Option<latch_proto::ThresholdChallenge>,
 }
 
 /// Resolves an approval request to an [`ApprovalOutcome`]. Blocking; may time
@@ -501,6 +524,7 @@ mod tests {
             kind: latch_proto::RequestKind::SecretRead,
             risk: latch_proto::RiskLevel::Routine,
             ssh: None,
+            threshold: None,
         }
     }
 

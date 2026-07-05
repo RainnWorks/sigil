@@ -25,13 +25,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
+
 use latch_proto::envelope::Envelope;
 use latch_proto::identity::DeviceIdentity;
 use latch_proto::pairing::{Dek, PairingResponse};
+use latch_proto::threshold::{EcdhAlgo, MacShare, P256Point, ThresholdError};
 use latch_proto::{
     mailbox_id, now_ms, ApprovalRequest, ApprovalResponse, Direction, HandshakeError, InstallLease,
     OpenError, PairingError, PairingPayload, PeerIdentity, PhonePairing, ReplayGuard, SealError,
-    Transport, TransportError,
+    ThresholdChallenge, Transport, TransportError,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -46,6 +50,30 @@ pub enum SoftphoneError {
     Seal(#[from] SealError),
     #[error("transport: {0}")]
     Transport(#[from] TransportError),
+    #[error("a v2 threshold request arrived but this softphone holds no SE share f")]
+    NoThresholdShare,
+    #[error("the v2 challenge base point E is malformed or off-curve")]
+    BadChallenge(#[from] ThresholdError),
+}
+
+/// The software stand-in for the phone's Secure-Enclave threshold key `f`: a
+/// P-256 scalar the softphone key-agrees with a challenge base `E` to produce
+/// `Z_F = x(f·E)`. On a real phone `f` is non-exportable inside the enclave; here
+/// it is an ordinary scalar so the v2 loop runs headlessly.
+pub struct SoftphoneShare {
+    /// The SE share `f`.
+    pub f: MacShare,
+    /// Which pinned SE key this stands in for (echoed by the daemon's challenge).
+    pub se_key_id: String,
+}
+
+/// Parse the wire ECDH-algo tag the daemon's challenge carries.
+fn parse_ecdh_algo(tag: &str) -> EcdhAlgo {
+    match tag {
+        "x963-sha256" => EcdhAlgo::X963Sha256,
+        // Default to the recommended raw X-coordinate for any unknown tag.
+        _ => EcdhAlgo::RawX,
+    }
 }
 
 /// What a policy decides for one request.
@@ -173,19 +201,24 @@ impl Pairing {
             pairing_id,
             dek,
             policy: self.policy,
+            phone_share: None,
             outbound_counter: AtomicU64::new(0),
             inbound_guard: Mutex::new(ReplayGuard::new()),
         })
     }
 }
 
-/// A paired softphone: holds the DEK and answers sealed approval requests.
+/// A paired softphone: holds the DEK (v1) and, when configured, the SE share `f`
+/// (v2), and answers sealed approval requests.
 pub struct Softphone {
     identity: DeviceIdentity,
     daemon: PeerIdentity,
     pairing_id: [u8; 32],
     dek: Dek,
     policy: Policy,
+    /// The v2 Secure-Enclave threshold share `f`, when this softphone was paired
+    /// for v2. `None` means v1-only (DEK path); a v2 request then fails closed.
+    phone_share: Option<SoftphoneShare>,
     /// phone -> daemon envelope counter (monotonic).
     outbound_counter: AtomicU64,
     /// daemon -> phone replay guard.
@@ -215,6 +248,50 @@ impl Softphone {
         self.policy = policy;
     }
 
+    /// Configure this softphone with a v2 Secure-Enclave threshold share `f`, so
+    /// it can answer threshold challenges. The daemon pins the returned public
+    /// point `F` at pairing.
+    pub fn with_phone_share(mut self, f: MacShare, se_key_id: &str) -> Self {
+        self.phone_share = Some(SoftphoneShare {
+            f,
+            se_key_id: se_key_id.to_string(),
+        });
+        self
+    }
+
+    /// The public threshold share `F = f·G` in ANSI X9.63 form, for the daemon to
+    /// pin at pairing. `None` if this softphone holds no SE share.
+    pub fn phone_share_x963(&self) -> Option<[u8; latch_proto::threshold::P256_X963_POINT_LEN]> {
+        self.phone_share
+            .as_ref()
+            .map(|s| *s.f.public_point().as_x963())
+    }
+
+    /// The SE key id this softphone answers challenges for, if any.
+    pub fn se_key_id(&self) -> Option<&str> {
+        self.phone_share.as_ref().map(|s| s.se_key_id.as_str())
+    }
+
+    /// Compute the threshold partial `Z_F = x(f·E)` for a challenge, validating
+    /// `E` on-curve first (R2). Errors if this softphone holds no SE share or the
+    /// base point is malformed.
+    fn threshold_partial(
+        &self,
+        challenge: &ThresholdChallenge,
+    ) -> Result<[u8; 32], SoftphoneError> {
+        let share = self
+            .phone_share
+            .as_ref()
+            .ok_or(SoftphoneError::NoThresholdShare)?;
+        let e_bytes = B64
+            .decode(&challenge.ephemeral_pub)
+            .map_err(|_| ThresholdError::Base64)?;
+        let e_point = P256Point::from_x963(&e_bytes)?;
+        let algo = parse_ecdh_algo(&challenge.ecdh_algo);
+        let zf = share.f.partial(&e_point, algo, e_point.as_x963());
+        Ok(*zf)
+    }
+
     /// Verify, replay-check, and decrypt a sealed request envelope.
     pub fn open_request(&self, env: &Envelope) -> Result<ApprovalRequest, SoftphoneError> {
         let mut guard = self.inbound_guard.lock().expect("inbound guard poisoned");
@@ -229,19 +306,31 @@ impl Softphone {
         now: u64,
     ) -> Result<(Envelope, PolicyDecision), SoftphoneError> {
         let decision = self.policy.decide(req);
+        // On approve, a v2 request (one carrying a threshold challenge) is answered
+        // with the SE partial Z_F; a v1 request with the DEK. Deny carries neither.
+        let approve_body = |now: u64| -> Result<ApprovalResponse, SoftphoneError> {
+            match &req.threshold {
+                Some(challenge) => {
+                    let zf = self.threshold_partial(challenge)?;
+                    Ok(ApprovalResponse::approve_v2(
+                        &req.request_id,
+                        &challenge.account_id,
+                        &zf,
+                        now,
+                    ))
+                }
+                None => Ok(ApprovalResponse::approve(&req.request_id, &self.dek, now)),
+            }
+        };
         let resp = match decision {
             PolicyDecision::Deny => ApprovalResponse::deny(&req.request_id, now),
-            PolicyDecision::Approve => ApprovalResponse::approve(&req.request_id, &self.dek, now),
-            PolicyDecision::ApproveWithLease(ttl) => {
-                ApprovalResponse::approve(&req.request_id, &self.dek, now).with_lease(
-                    InstallLease {
-                        // The daemon derives and trusts its own grant key; this field
-                        // is echoed for display only.
-                        grant_key: String::new(),
-                        ttl_ms: ttl.as_millis() as u64,
-                    },
-                )
-            }
+            PolicyDecision::Approve => approve_body(now)?,
+            PolicyDecision::ApproveWithLease(ttl) => approve_body(now)?.with_lease(InstallLease {
+                // The daemon derives and trusts its own grant key; this field
+                // is echoed for display only.
+                grant_key: String::new(),
+                ttl_ms: ttl.as_millis() as u64,
+            }),
         };
         let counter = self.outbound_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let env = Envelope::seal(
