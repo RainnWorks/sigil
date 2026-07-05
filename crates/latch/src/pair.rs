@@ -86,6 +86,12 @@ pub struct CeremonyOpts<'a> {
     /// Confirm the six SAS words match the phone's screen. Returns false to
     /// cancel.
     pub confirm_sas: &'a mut dyn FnMut(&[&'static str; 6]) -> bool,
+    /// How long to wait, after the DEK is delivered, for the phone's sealed
+    /// [`ThresholdShare`](latch_proto::ThresholdShare) (its v2 Secure-Enclave
+    /// share `F`). The phone sends it only if it has a Secure Enclave, so this is
+    /// best-effort: a timeout means a v1-only pairing, not a failure. Zero skips
+    /// the wait entirely (a pure v1 pairing).
+    pub share_wait: Duration,
     /// The keystore's DEK: the single key `latch account add` seals tokens
     /// under. The ceremony delivers *this* key to the phone so a later approval
     /// returns a DEK that actually decrypts the stored token ciphertext. It is
@@ -169,16 +175,16 @@ pub fn run_ceremony(daemon_identity: DeviceIdentity, opts: CeremonyOpts<'_>) -> 
     let phone = daemon
         .phone()
         .expect("phone is pinned once the response verified");
-    // The ceremony delivers the v1 DEK (above) AND, when the phone's response
-    // carried its v2 Secure-Enclave threshold share F (already tag-bound and
-    // on-curve-validated by `receive_response`), pins F too, so one pairing arms
-    // both v1 accounts (DEK) and v2 accounts (threshold). The wire carries only F;
-    // the Mac names the key locally and defaults its ECDH shape (NV-2/NV-7).
-    let phone_share = daemon.phone_se_share().map(|f| NewPhoneShare {
-        se_key_id: crate::threshold::DEFAULT_SE_KEY_ID.to_string(),
-        f_x963: f.to_vec(),
-        ecdh_algo: crate::threshold::DEFAULT_ECDH_ALGO,
-    });
+
+    // 5. v2 (best-effort): after opening the DEK, the phone may deliver its
+    //    Secure-Enclave threshold share F as a sealed `ThresholdShare` on the
+    //    rendezvous mailbox. Open it (the same signed + replay-guarded envelope
+    //    path as the DEK, reversed), validate F on-curve (R2), and pin it, so this
+    //    one pairing arms both v1 (DEK) and v2 (threshold) accounts. A phone with
+    //    no Secure Enclave never sends it; a timeout is a v1-only pairing, not a
+    //    failure.
+    let phone_share = receive_phone_share(channel.as_ref(), opts.share_wait, &phone, &retained);
+
     let sas_words: [String; 6] = std::array::from_fn(|i| words[i].to_string());
     Ok(NewPairing {
         daemon_identity: retained,
@@ -187,6 +193,43 @@ pub fn run_ceremony(daemon_identity: DeviceIdentity, opts: CeremonyOpts<'_>) -> 
         sas_words,
         paired_at: (opts.now)(),
         phone_share,
+    })
+}
+
+/// Receive and open the phone's sealed [`ThresholdShare`](latch_proto::ThresholdShare)
+/// on the rendezvous channel, returning the validated share to persist, or `None`
+/// (best-effort) on timeout, a malformed/unauthenticated envelope, or an
+/// off-curve `F`. The envelope is signed by the pinned phone and sealed to the
+/// daemon, opened via the same signature + replay + decrypt path as every other
+/// message; then `F` is validated on-curve (R2) before it is pinned. A failure
+/// never aborts a pairing whose v1 DEK already landed.
+fn receive_phone_share(
+    channel: &dyn PairChannel,
+    share_wait: Duration,
+    phone: &latch_proto::PeerIdentity,
+    daemon_identity: &DeviceIdentity,
+) -> Option<NewPhoneShare> {
+    if share_wait.is_zero() {
+        return None;
+    }
+    let wire = match channel.recv(share_wait) {
+        Ok(Some(w)) => w,
+        _ => return None,
+    };
+    let env: latch_proto::Envelope = serde_json::from_str(&wire).ok()?;
+    let mut guard = latch_proto::ReplayGuard::new();
+    let share: latch_proto::ThresholdShare = env
+        .open(phone, &daemon_identity.agreement, &mut guard)
+        .ok()?;
+    // Validate F on-curve before pinning it (R2); store the canonical encoding.
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&share.f_x963)
+        .ok()?;
+    let point = latch_proto::P256Point::from_x963(&raw).ok()?;
+    Some(NewPhoneShare {
+        se_key_id: share.se_key_id,
+        f_x963: point.as_x963().to_vec(),
+        ecdh_algo: share.ecdh_algo,
     })
 }
 
@@ -291,6 +334,7 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
+            share_wait: Duration::ZERO,
             dek: &dek,
         };
         let np = run_ceremony(daemon_id, opts).expect("ceremony completes");
@@ -342,6 +386,7 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
+            share_wait: Duration::ZERO,
             dek: &dek,
         };
         let err = match run_ceremony(daemon_id, opts) {
@@ -431,6 +476,7 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
+            share_wait: Duration::ZERO,
             dek: &keystore_dek,
         };
         run_ceremony(daemon_id, opts).expect("ceremony completes");
@@ -451,14 +497,15 @@ mod tests {
     }
 
     #[test]
-    fn ceremony_pins_the_phone_threshold_share_f_when_sent() {
-        // When the phone's pairing response carries its v2 SE share F (tag-bound
-        // and on-curve-validated in receive_response), run_ceremony persists it in
-        // the returned NewPairing so v2 account-add can wrap tokens to it.
+    fn ceremony_pins_the_phone_threshold_share_after_the_dek() {
+        // The v2 pairing tail: after the daemon delivers the DEK, the phone seals
+        // its SE share F as a `ThresholdShare` on the rendezvous mailbox; the
+        // ceremony opens it (signed by the pinned phone), validates F on-curve, and
+        // persists it, so one pairing arms both v1 (DEK) and v2 (threshold).
         use base64::engine::general_purpose::STANDARD as B64S;
         use latch_proto::pairing::PhonePairing;
-        use latch_proto::threshold::MacShare;
-        use latch_proto::PairingPayload;
+        use latch_proto::threshold::{EcdhAlgo, MacShare};
+        use latch_proto::{mailbox_id, Envelope, PairingPayload, ThresholdShare};
 
         // The phone's SE share f (software stand-in) and its public F.
         let f = MacShare::generate();
@@ -469,19 +516,47 @@ mod tests {
         let p2d = Arc::new(Mutex::new(VecDeque::<String>::new()));
         let (qr_tx, qr_rx) = std::sync::mpsc::channel::<String>();
 
+        // The phone: respond (message 1), wait for the DEK on d2p (message 3),
+        // then seal a ThresholdShare signed by its pinned identity and submit it
+        // on the rendezvous channel (message 4) — exactly as apps/phone does.
         let phone_thread = {
+            let d2p = d2p.clone();
             let p2d = p2d.clone();
             let f_b64 = f_b64.clone();
             std::thread::spawn(move || {
                 let qr = qr_rx.recv().expect("daemon rendered a QR");
                 let payload = PairingPayload::from_qr_string(&qr).unwrap();
-                let mut phone =
-                    PhonePairing::scan(DeviceIdentity::generate(), payload, NOW + 1_000)
-                        .unwrap()
-                        .with_se_share(&f_b64);
+                let daemon_pub = payload.daemon;
+                let phone_id = DeviceIdentity::generate();
+                let phone_pub = phone_id.peer_identity();
+                let mut phone = PhonePairing::scan(
+                    DeviceIdentity::from_secret_bytes(&phone_id.to_secret_bytes()[..]).unwrap(),
+                    payload,
+                    NOW + 1_000,
+                )
+                .unwrap();
                 let resp = phone.respond().unwrap();
-                let resp_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&resp).unwrap());
-                p2d.lock().unwrap().push_back(resp_b64);
+                p2d.lock()
+                    .unwrap()
+                    .push_back(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&resp).unwrap()));
+                // Wait for the DEK before sending the share (mirrors the phone).
+                loop {
+                    if d2p.lock().unwrap().pop_front().is_some() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let share = ThresholdShare {
+                    se_key_id: "latch-se-test".into(),
+                    f_x963: f_b64,
+                    ecdh_algo: EcdhAlgo::RawX,
+                };
+                let pairing_id = mailbox_id(&phone_pub, &daemon_pub);
+                let env =
+                    Envelope::seal(&share, pairing_id, 1, &phone_id.signing, &daemon_pub).unwrap();
+                p2d.lock()
+                    .unwrap()
+                    .push_back(serde_json::to_string(&env).unwrap());
             })
         };
 
@@ -504,15 +579,69 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
+            share_wait: Duration::from_secs(5),
             dek: &dek,
         };
         let np = run_ceremony(daemon_id, opts).expect("ceremony completes");
         phone_thread.join().unwrap();
 
-        let share = np.phone_share.expect("F was pinned");
+        let share = np
+            .phone_share
+            .expect("F pinned from the sealed ThresholdShare");
         assert_eq!(share.f_x963, f_x963.to_vec(), "the exact F is persisted");
-        assert_eq!(share.se_key_id, crate::threshold::DEFAULT_SE_KEY_ID);
-        assert_eq!(share.ecdh_algo, crate::threshold::DEFAULT_ECDH_ALGO);
+        assert_eq!(share.se_key_id, "latch-se-test");
+        assert_eq!(share.ecdh_algo, EcdhAlgo::RawX);
+    }
+
+    #[test]
+    fn ceremony_without_a_share_stays_v1_only() {
+        // A phone with no Secure Enclave never sends a ThresholdShare; the daemon
+        // waits out `share_wait` and pairs v1-only (phone_share is None).
+        use latch_proto::pairing::PhonePairing;
+        use latch_proto::PairingPayload;
+
+        let d2p = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        let p2d = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        let (qr_tx, qr_rx) = std::sync::mpsc::channel::<String>();
+        let phone_thread = {
+            let p2d = p2d.clone();
+            std::thread::spawn(move || {
+                let qr = qr_rx.recv().unwrap();
+                let payload = PairingPayload::from_qr_string(&qr).unwrap();
+                let mut phone =
+                    PhonePairing::scan(DeviceIdentity::generate(), payload, NOW + 1_000).unwrap();
+                let resp = phone.respond().unwrap();
+                p2d.lock()
+                    .unwrap()
+                    .push_back(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&resp).unwrap()));
+            })
+        };
+        let daemon_id = DeviceIdentity::generate();
+        let mut make_channel = |_m: [u8; 32]| -> Result<Box<dyn PairChannel>> {
+            Ok(Box::new(MemChannel {
+                d2p: d2p.clone(),
+                p2d: p2d.clone(),
+            }))
+        };
+        let mut present_qr = |_u: &str, b64: &str| qr_tx.send(b64.to_string()).unwrap();
+        let mut confirm = |_w: &[&'static str; 6]| true;
+        let clock = || NOW;
+        let dek = crate::secrets::generate_dek();
+        let opts = CeremonyOpts {
+            relay_url: "ws://relay.test".into(),
+            response_timeout: Duration::from_secs(5),
+            flush_grace: Duration::ZERO,
+            now: &clock,
+            make_channel: &mut make_channel,
+            present_qr: &mut present_qr,
+            confirm_sas: &mut confirm,
+            // A short wait so the test does not linger; the phone sends no share.
+            share_wait: Duration::from_millis(50),
+            dek: &dek,
+        };
+        let np = run_ceremony(daemon_id, opts).expect("ceremony completes");
+        phone_thread.join().unwrap();
+        assert!(np.phone_share.is_none(), "no SE share => v1-only pairing");
     }
 
     #[test]

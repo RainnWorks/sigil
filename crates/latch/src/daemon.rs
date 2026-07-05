@@ -2838,6 +2838,7 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
+            share_wait: Duration::ZERO,
             dek: &dek,
         };
         let np = crate::pair::run_ceremony(daemon_id, opts).expect("pairing over the relay");

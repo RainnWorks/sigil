@@ -1231,6 +1231,11 @@ fn run_pairing(args: &[String]) -> i32 {
         make_channel: &mut make_channel,
         present_qr: &mut present_qr,
         confirm_sas: &mut confirm,
+        // After the DEK, wait briefly for the phone's sealed ThresholdShare (its
+        // v2 SE share F); a phone with a Secure Enclave sends it automatically. A
+        // phone without one (e.g. the Simulator) sends nothing and this times out
+        // to a v1-only pairing.
+        share_wait: std::time::Duration::from_secs(10),
         dek: &dek,
     };
 
@@ -1319,6 +1324,11 @@ fn run_pairing_json(args: &[String]) -> i32 {
         make_channel: &mut make_channel,
         present_qr: &mut present_qr,
         confirm_sas: &mut confirm,
+        // After the DEK, wait briefly for the phone's sealed ThresholdShare (its
+        // v2 SE share F); a phone with a Secure Enclave sends it automatically. A
+        // phone without one (e.g. the Simulator) sends nothing and this times out
+        // to a v1-only pairing.
+        share_wait: std::time::Duration::from_secs(10),
         dek: &dek,
     };
 

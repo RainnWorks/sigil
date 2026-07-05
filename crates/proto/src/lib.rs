@@ -23,7 +23,7 @@ pub use identity::{DeviceIdentity, PeerIdentity};
 pub use pairing::{
     open_dek, rendezvous_mailbox, seal_dek, verify_sas, DaemonPairing, Dek, HandshakeError,
     PairingError, PairingPayload, PairingResponse, PairingSecret, PairingState, PhonePairing,
-    PAIRING_SECRET_TTL_MS,
+    ThresholdShare, PAIRING_SECRET_TTL_MS,
 };
 pub use replay::{ReplayError, ReplayGuard};
 pub use request::{
