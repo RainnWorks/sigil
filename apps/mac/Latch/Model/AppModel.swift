@@ -29,6 +29,7 @@ final class AppModel {
     var ceremony: PairingCeremony = .idle
 
     private var pollTask: Task<Void, Never>?
+    private var pendingTask: Task<Void, Never>?
 
     init(daemon: DaemonClient, approver: LocalApprovalService) {
         self.daemon = daemon
@@ -52,19 +53,29 @@ final class AppModel {
                 try? await Task.sleep(for: .seconds(3))
             }
         }
+        // The pending set is pushed live (socket subscription), not polled, so the
+        // menubar reflects a new or resolved request the moment the daemon does.
+        pendingTask = Task { [weak self] in
+            guard let stream = self?.daemon.subscribePending() else { return }
+            for await snapshot in stream {
+                guard let self else { return }
+                self.pending = snapshot
+            }
+        }
     }
 
-    func stop() { pollTask?.cancel(); pollTask = nil }
+    func stop() {
+        pollTask?.cancel(); pollTask = nil
+        pendingTask?.cancel(); pendingTask = nil
+    }
 
     func refresh() async {
         do {
             async let s = daemon.status()
             async let l = daemon.leases()
-            async let p = daemon.pending()
             async let d = daemon.pairedDevice()
             status = try await s
             leases = try await l
-            pending = try await p
             paired = try await d
             lastError = nil
         } catch {

@@ -57,6 +57,11 @@ protocol DaemonClient: Sendable {
 
     // Pending requests + decisions (menubar)
     func pending() async throws -> [PendingRequest]
+    /// A live feed of the pending set: the current set now, and a fresh snapshot
+    /// on every change, until the consumer stops iterating. The socket client
+    /// backs this with the daemon's `subscribe_pending` event stream; the default
+    /// below polls `pending()` for clients that have no push channel (mock, CLI).
+    func subscribePending() -> AsyncStream<[PendingRequest]>
     func approve(id: String, lease: Bool) async throws -> ControlResult
     func deny(id: String) async throws -> ControlResult
 
@@ -80,6 +85,24 @@ protocol DaemonClient: Sendable {
     func settings() async throws -> AppSettings
     func saveSettings(_ settings: AppSettings) async throws
     func wipe() async throws -> ControlResult
+}
+
+extension DaemonClient {
+    /// Fallback pending feed for clients without a push channel: poll `pending()`
+    /// on a short interval. SocketDaemonClient overrides this with the daemon's
+    /// live event stream. Iterating stops the poll (via onTermination).
+    func subscribePending() -> AsyncStream<[PendingRequest]> {
+        AsyncStream { continuation in
+            let task = Task {
+                while !Task.isCancelled {
+                    if let snapshot = try? await pending() { continuation.yield(snapshot) }
+                    try? await Task.sleep(for: .seconds(2))
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
 
 /// One doctor row. Mirrors cli.rs `check(label, ok, hint)`.

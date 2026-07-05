@@ -58,9 +58,15 @@ private struct LeaseRow: View {
                       reduceMotion: reduceMotion, size: 44)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(lease.caller).font(.system(size: 12, weight: .semibold))
-                    Text("·").foregroundStyle(.tertiary)
-                    Text(lease.account).font(.system(size: 11)).foregroundStyle(.secondary)
+                    // The daemon retains the grant key, not the caller provenance,
+                    // so `caller` is empty over the socket: lead with the account.
+                    if lease.caller.isEmpty {
+                        Text(lease.account).font(.system(size: 12, weight: .semibold))
+                    } else {
+                        Text(lease.caller).font(.system(size: 12, weight: .semibold))
+                        Text("·").foregroundStyle(.tertiary)
+                        Text(lease.account).font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
                 }
                 MonoText(lease.scope, size: 11, color: .secondary)
                 MonoText("grant \(lease.grantHex)  ·  \(clockRemaining(remaining)) left",

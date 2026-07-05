@@ -1,18 +1,19 @@
 //  CLIDaemonClient.swift
-//  The real DaemonClient: it drives the `latch` binary the same way a human
-//  would from a shell, because the brief's invariant is that everything the GUI
-//  does the CLI can do headless.
+//  Drives the `latch` binary the same way a human would from a shell. Its live
+//  role is the shell-out half of SocketDaemonClient: the CLI-only keystore/config
+//  mutations that the least-privilege split (PROTOCOL.md) keeps out of the daemon
+//  — account add/rotate/remove + list, settings, wipe, mac-approvals, shim
+//  install, unpair, and the pairing NDJSON ceremony. Those `--json` shapes are
+//  specified in crates/latch/JSON.md.
 //
-//  CONTRACT NOTE — machine-readable output needed from rust-core.
-//  Today crates/latch/src/cli.rs emits styled, human-formatted text (aligned
-//  columns, ANSI, glyphs) with no stable machine surface. Parsing that is
-//  brittle and would couple the app to cosmetic layout. So this client is coded
-//  against a small `--json` contract the app needs rust-core to add. Each method
-//  below states the exact command and the JSON shape it expects. Until those
-//  land, the app should run on MockDaemonClient; the parsing here is written to
-//  the contract so the seam is real, not a stub.
+//  It still conforms to the full DaemonClient (its status/doctor/leases/history/
+//  pending/control verbs shell out too) so it remains a usable headless client on
+//  its own, but the shipping app reaches the daemon's report/control verbs over
+//  the socket via SocketDaemonClient — the read DTOs below (StatusDTO, CheckDTO,
+//  LeaseDTO, HistoryDTO, PendingDTO) are shared by both so the wire shape is
+//  decoded in exactly one place.
 //
-//  Requested `latch <cmd> --json` outputs (stdout, one JSON value, no ANSI):
+//  `latch <cmd> --json` outputs (stdout, one JSON value, no ANSI):
 //
 //    latch status --json
 //      { "daemon_up": bool, "socket": str, "shim": {"kind": "healthy|drift|not_installed|unknown",
@@ -252,7 +253,9 @@ struct CLIDaemonClient: DaemonClient {
 
 private struct ControlDTO: Decodable { let ok: Bool; let lines: [String] }
 
-private struct StatusDTO: Decodable {
+// Shared with SocketDaemonClient: the socket's Reply.json bodies are these exact
+// shapes (crates/latch/src/json.rs), so they are decoded in one place only.
+struct StatusDTO: Decodable {
     struct Shim: Decodable { let kind: String; let path: String?; let issue: String? }
     struct Op: Decodable { let found: Bool; let path: String? }
     struct FactorDTO: Decodable { let kind: String; let relay: String? }
@@ -284,7 +287,7 @@ private struct StatusDTO: Decodable {
     }
 }
 
-private struct CheckDTO: Decodable { let label: String; let ok: Bool; let hint: String }
+struct CheckDTO: Decodable { let label: String; let ok: Bool; let hint: String }
 
 private struct AccountDTO: Decodable {
     let id: String; let label: String; let vaults: [String]
@@ -296,7 +299,7 @@ private struct AccountDTO: Decodable {
     }
 }
 
-private struct LeaseDTO: Decodable {
+struct LeaseDTO: Decodable {
     let grant_hex: String; let caller: String; let account: String; let scope: String
     let granted_ms: Int; let expires_ms: Int
     func model() -> Lease {
@@ -306,7 +309,7 @@ private struct LeaseDTO: Decodable {
     }
 }
 
-private struct HistoryDTO: Decodable {
+struct HistoryDTO: Decodable {
     let id: String; let kind: String; let label: String; let account: String
     let process: String; let cwd: String; let decision: String; let note: String?
     let at_ms: Int; let via: String
@@ -318,7 +321,7 @@ private struct HistoryDTO: Decodable {
     }
 }
 
-private struct PendingDTO: Decodable {
+struct PendingDTO: Decodable {
     struct SecretDTO: Decodable { let provider: String; let segments: [String]; let label: String }
     struct SshDTO: Decodable { let key_label: String; let host: String; let fingerprint: String }
     struct ProvDTO: Decodable { let process_chain: [String]; let cwd: String; let machine: String; let requested_ms: Int }

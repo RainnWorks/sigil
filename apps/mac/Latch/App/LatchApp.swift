@@ -44,7 +44,10 @@ struct LatchApp: App {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    /// Choose the real or mock seams. The app defaults to the real CLI client but
+    /// Choose the real or mock seams. The app defaults to the real socket client,
+    /// which speaks the daemon control socket and self-degrades to a calm "daemon
+    /// not running" state when the socket is not listening (so no daemon probe is
+    /// needed at launch — it tracks the daemon coming up and going down live). It
     /// falls back to the mock when `LATCH_MOCK=1` (dev, demo, no daemon) so every
     /// screen renders. Previews use the mock directly.
     @MainActor
@@ -54,7 +57,7 @@ struct LatchApp: App {
             return AppModel(daemon: MockDaemonClient(scenario: .pendingRequests),
                             approver: MockApprover())
         }
-        return AppModel(daemon: CLIDaemonClient(), approver: SecureEnclaveApprover())
+        return AppModel(daemon: SocketDaemonClient(), approver: SecureEnclaveApprover())
     }
 }
 
