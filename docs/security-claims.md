@@ -198,7 +198,21 @@ The Mac local-approval factor unwraps the DEK *inside* the Secure Enclave under
 Touch ID, and the SE holds only P-256 keys — so the Mac-SE wrap is a second,
 independent envelope of the same DEK (the phone path is unchanged X25519). It
 reproduces Apple's `kSecKeyAlgorithmECIESEncryptionCofactorVariableIVX963SHA256AESGCM`
-so `SecKeyCreateDecryptedData` opens it. **Reviewed and found sound.**
+so `SecKeyCreateDecryptedData` opens it.
+
+**Independent review verdict — CONFIRMED SOUND.** This verdict is written by the
+security-reviewer, which did **not** author `se_ecies.rs` (implemented by
+rust-core in `747b3a4`); per the review-integrity rule the implementer documents
+behavior and residuals, and only the independent reviewer records a "reviewed"
+verdict — this is not a self-certification. The adversarial pass covered the
+construction against Apple's spec (the AES-128-not-256 and VariableIV gotchas),
+on-curve point validation of both the recipient and ephemeral keys, per-wrap
+IV/key freshness (no GCM nonce reuse), zeroization of every secret intermediate,
+the SAS-Confirmed gate, and the AAD / envelope-binding question (see residual
+12); no correctness issue was found and no code change to the construction was
+needed. The only outstanding item is on-device interop
+(`SecKeyCreateDecryptedData` opening a `wrap_dek_p256` blob), which is
+**NEEDS-VERIFICATION** off-hardware and marked in the table below.
 
 | Claim | Enforcing code | Proving test |
 |-------|----------------|--------------|
