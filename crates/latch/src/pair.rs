@@ -5,9 +5,10 @@
 //! (and a base64url line),
 //! waits on the relay rendezvous mailbox for the phone's `PairingResponse`,
 //! verifies its MAC (pinning the phone), has the human confirm the six SAS
-//! words, seals the fresh DEK to the phone, and persists the result so the
-//! daemon can arm the phone factor with no `--dev-insecure` (see
-//! [`crate::pairing_store`]).
+//! words, seals the keystore's DEK to the phone (the same key `latch account
+//! add` encrypts tokens under, so a later approval returns a DEK that actually
+//! decrypts them), and persists the result so the daemon can arm the phone
+//! factor with no `--dev-insecure` (see [`crate::pairing_store`]).
 //!
 //! The ceremony is written against a [`PairChannel`] so it is exercised
 //! end-to-end headlessly (in-process, with the softphone) as well as over the
@@ -88,11 +89,17 @@ pub struct CeremonyOpts<'a> {
     /// Confirm the six SAS words match the phone's screen. Returns false to
     /// cancel.
     pub confirm_sas: &'a mut dyn FnMut(&[&'static str; 6]) -> bool,
+    /// The keystore's DEK: the single key `latch account add` seals tokens
+    /// under. The ceremony delivers *this* key to the phone so a later approval
+    /// returns a DEK that actually decrypts the stored token ciphertext. It is
+    /// never a fresh key: sealing under one DEK and unlocking with another is
+    /// exactly the divergence this field exists to prevent.
+    pub dek: &'a crate::secrets::Dek,
 }
 
-/// Run the full daemon-side ceremony and return what to persist. The DEK is
-/// generated, delivered to the phone, and dropped (zeroized) here; it is
-/// deliberately absent from the returned [`NewPairing`].
+/// Run the full daemon-side ceremony and return what to persist. The keystore's
+/// DEK ([`CeremonyOpts::dek`]) is delivered to the phone and dropped (zeroized)
+/// here; it is deliberately absent from the returned [`NewPairing`].
 pub fn run_ceremony(daemon_identity: DeviceIdentity, opts: CeremonyOpts<'_>) -> Result<NewPairing> {
     // Keep a copy of the daemon identity to persist: `mint` consumes the one we
     // pass it. Rebuilding from the secret bytes yields the same pinned keys.
@@ -143,8 +150,13 @@ pub fn run_ceremony(daemon_identity: DeviceIdentity, opts: CeremonyOpts<'_>) -> 
     }
     daemon.confirm().context("confirming the SAS")?;
 
-    // 4. Deliver the fresh DEK, sealed to the phone (message 3), then erase it.
-    let dek = Dek::generate();
+    // 4. Deliver the KEYSTORE's DEK, sealed to the phone (message 3), then erase
+    //    the transport copy. This must be the same key `latch account add` seals
+    //    tokens under, never a fresh one, or a real approval would return a DEK
+    //    that cannot decrypt the stored token. `Dek::from_bytes` copies into a
+    //    proto `Dek`, which is `ZeroizeOnDrop`; the keystore's own copy is the
+    //    caller's `Zeroizing` and outlives this call.
+    let dek = Dek::from_bytes(**opts.dek);
     let env = daemon.deliver_dek(&dek, 1).context("sealing the DEK")?;
     let env_wire = serde_json::to_string(&env).context("serializing the DEK envelope")?;
     channel
@@ -261,6 +273,7 @@ mod tests {
         };
         let mut confirm = |_w: &[&'static str; 6]| true;
         let clock = || NOW;
+        let dek = crate::secrets::generate_dek();
 
         let opts = CeremonyOpts {
             relay_url: "ws://relay.test".into(),
@@ -270,6 +283,7 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
+            dek: &dek,
         };
         let np = run_ceremony(daemon_id, opts).expect("ceremony completes");
 
@@ -311,6 +325,7 @@ mod tests {
         let mut present_qr = |_u: &str, b64: &str| qr_tx.send(b64.to_string()).unwrap();
         let mut confirm = |_w: &[&'static str; 6]| false; // human says the words differ
         let clock = || NOW;
+        let dek = crate::secrets::generate_dek();
         let opts = CeremonyOpts {
             relay_url: "ws://relay.test".into(),
             response_timeout: Duration::from_secs(5),
@@ -319,6 +334,7 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
+            dek: &dek,
         };
         let err = match run_ceremony(daemon_id, opts) {
             Err(e) => e,
@@ -326,6 +342,104 @@ mod tests {
         };
         assert!(err.to_string().contains("SAS"), "cancelled at SAS: {err}");
         phone_thread.join().unwrap();
+    }
+
+    /// The regression for the DEK-divergence bug: the ceremony must deliver the
+    /// *keystore* DEK (the one `latch account add` seals tokens under), not a
+    /// fresh key. This drives the real seam end to end — provision a keystore
+    /// DEK, seal a known token under it, run the ceremony passing that DEK, have
+    /// the phone recover the delivered DEK, and assert the recovered DEK
+    /// decrypts the token back to plaintext.
+    ///
+    /// Against the old `Dek::generate()` code the phone recovers a *different*
+    /// key and `decrypt_token` fails (AEAD error), so this test fails pre-fix
+    /// and passes post-fix.
+    #[test]
+    fn delivered_dek_decrypts_a_token_sealed_under_the_keystore_dek() {
+        use crate::keystore::{Keystore, MemoryKeystore};
+        use crate::secrets::{decrypt_token, encrypt_token};
+        use latch_proto::pairing::PhonePairing;
+        use latch_proto::{PairingPayload, ReplayGuard};
+        use zeroize::Zeroizing;
+
+        const TOKEN: &[u8] = b"ops_eyJzaWduSW5BZGRyZXNzIjoi.example.account.token";
+
+        // 1. Provision the keystore DEK and seal a known token under it, exactly
+        //    as `latch account add` does.
+        let ks = MemoryKeystore::new();
+        ks.ensure_dek().unwrap();
+        let keystore_dek = ks.unwrap_dek("seal the account token").unwrap();
+        let ciphertext = encrypt_token(&keystore_dek, TOKEN).unwrap();
+
+        let d2p = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        let p2d = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        let (qr_tx, qr_rx) = std::sync::mpsc::channel::<String>();
+
+        // The phone: scan, respond, confirm, then open the delivered DEK and
+        // return its raw bytes so the test can try to decrypt with them.
+        let phone_thread = {
+            let d2p = d2p.clone();
+            let p2d = p2d.clone();
+            std::thread::spawn(move || -> [u8; 32] {
+                let qr = qr_rx.recv().expect("daemon rendered a QR");
+                let phone_id = DeviceIdentity::generate();
+                let payload = PairingPayload::from_qr_string(&qr).unwrap();
+                let mut phone = PhonePairing::scan(phone_id, payload, NOW + 1_000).unwrap();
+                let resp = phone.respond().unwrap();
+                let resp_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&resp).unwrap());
+                p2d.lock().unwrap().push_back(resp_b64);
+                phone.confirm().unwrap();
+                let env_wire = loop {
+                    if let Some(s) = d2p.lock().unwrap().pop_front() {
+                        break s;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                };
+                let env: Envelope = serde_json::from_str(&env_wire).unwrap();
+                let mut guard = ReplayGuard::new();
+                let recovered = phone.receive_dek(&env, &mut guard).unwrap();
+                *recovered.as_bytes()
+            })
+        };
+
+        let daemon_id = DeviceIdentity::generate();
+        let mut make_channel = |_mailbox: [u8; 32]| -> Result<Box<dyn PairChannel>> {
+            Ok(Box::new(MemChannel {
+                d2p: d2p.clone(),
+                p2d: p2d.clone(),
+            }))
+        };
+        let mut present_qr = |_unicode: &str, b64: &str| {
+            qr_tx.send(b64.to_string()).unwrap();
+        };
+        let mut confirm = |_w: &[&'static str; 6]| true;
+        let clock = || NOW;
+
+        let opts = CeremonyOpts {
+            relay_url: "ws://relay.test".into(),
+            response_timeout: Duration::from_secs(5),
+            flush_grace: Duration::ZERO,
+            now: &clock,
+            make_channel: &mut make_channel,
+            present_qr: &mut present_qr,
+            confirm_sas: &mut confirm,
+            dek: &keystore_dek,
+        };
+        run_ceremony(daemon_id, opts).expect("ceremony completes");
+
+        let recovered_bytes = phone_thread.join().unwrap();
+        let recovered_dek: crate::secrets::Dek = Zeroizing::new(recovered_bytes);
+
+        // The phone recovered the very key the daemon sealed the token with.
+        assert_eq!(
+            &recovered_dek[..],
+            &keystore_dek[..],
+            "the delivered DEK diverged from the keystore DEK"
+        );
+        // The whole point: that recovered DEK decrypts the stored token.
+        let plaintext = decrypt_token(&recovered_dek, &ciphertext)
+            .expect("the phone-delivered DEK must decrypt the account token");
+        assert_eq!(&plaintext[..], TOKEN);
     }
 
     #[test]

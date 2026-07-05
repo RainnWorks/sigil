@@ -2409,6 +2409,7 @@ mod tests {
         let mut make_channel = |mailbox: [u8; 32]| crate::pair::relay_channel(&base, mailbox);
         let mut present_qr = |_u: &str, b64: &str| qr_tx.send(b64.to_string()).unwrap();
         let mut confirm = |_w: &[&'static str; 6]| true;
+        let dek = crate::secrets::generate_dek();
         let opts = crate::pair::CeremonyOpts {
             relay_url: base.clone(),
             response_timeout: Duration::from_secs(15),
@@ -2417,6 +2418,7 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
+            dek: &dek,
         };
         let np = crate::pair::run_ceremony(daemon_id, opts).expect("pairing over the relay");
 

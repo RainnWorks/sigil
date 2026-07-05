@@ -930,6 +930,21 @@ fn run_pairing(args: &[String]) -> i32 {
     }
 
     let ks = keystore::for_host();
+    // Provision (idempotently) and unwrap the keystore DEK so the ceremony
+    // delivers the SAME key `latch account add` seals tokens under. A first-time
+    // pair provisions it; a later account add reuses it (ensure_dek never
+    // regenerates an existing DEK).
+    if let Err(e) = ks.ensure_dek() {
+        eprintln!("{} provisioning the DEK: {e}", s.deny("\u{2717}"));
+        return 1;
+    }
+    let dek = match ks.unwrap_dek("Deliver the encryption key to your phone during pairing") {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{} unwrapping the DEK: {e}", s.deny("\u{2717}"));
+            return 1;
+        }
+    };
     let daemon_identity = DeviceIdentity::generate();
 
     let mut present_qr = |unicode: &str, b64: &str| {
@@ -975,6 +990,7 @@ fn run_pairing(args: &[String]) -> i32 {
         make_channel: &mut make_channel,
         present_qr: &mut present_qr,
         confirm_sas: &mut confirm,
+        dek: &dek,
     };
 
     let new_pairing = match crate::pair::run_ceremony(daemon_identity, opts) {
@@ -1023,6 +1039,26 @@ fn run_pairing_json(args: &[String]) -> i32 {
     };
 
     let ks = keystore::for_host();
+    // Same key discipline as the interactive path: the ceremony delivers the
+    // keystore DEK that `latch account add` seals tokens under, provisioned
+    // idempotently here so a first-time pair still arms the daemon.
+    if let Err(e) = ks.ensure_dek() {
+        emit_ndjson(&serde_json::json!({
+            "event": "failed",
+            "reason": format!("provisioning the DEK: {e}")
+        }));
+        return 1;
+    }
+    let dek = match ks.unwrap_dek("Deliver the encryption key to your phone during pairing") {
+        Ok(d) => d,
+        Err(e) => {
+            emit_ndjson(&serde_json::json!({
+                "event": "failed",
+                "reason": format!("unwrapping the DEK: {e}")
+            }));
+            return 1;
+        }
+    };
     let daemon_identity = DeviceIdentity::generate();
 
     let mut present_qr = |_unicode: &str, b64: &str| {
@@ -1042,6 +1078,7 @@ fn run_pairing_json(args: &[String]) -> i32 {
         make_channel: &mut make_channel,
         present_qr: &mut present_qr,
         confirm_sas: &mut confirm,
+        dek: &dek,
     };
 
     match crate::pair::run_ceremony(daemon_identity, opts) {
