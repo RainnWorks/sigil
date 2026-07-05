@@ -38,6 +38,13 @@ export interface StoredPairing {
   relayBase: string;
   sasWords: string[];
   pairedAt: number;
+  /**
+   * The pinned v2 Secure-Enclave share key id, when this phone minted one at
+   * pairing. Passcode-tier: it only names which non-exportable enclave key to
+   * key-agree with (the private `f` lives in the Secure Enclave, never here).
+   * Absent on a v1-only pairing.
+   */
+  seKeyId?: string;
 }
 
 interface IdentityJson {
@@ -49,6 +56,8 @@ interface IdentityJson {
   relayBase: string;
   sasWords: string[];
   pairedAt: number;
+  /** Optional: absent on v1-only pairings persisted before v2. */
+  seKeyId?: string;
 }
 
 function encodeIdentity(p: StoredPairing): IdentityJson {
@@ -61,6 +70,7 @@ function encodeIdentity(p: StoredPairing): IdentityJson {
     relayBase: p.relayBase,
     sasWords: p.sasWords,
     pairedAt: p.pairedAt,
+    ...(p.seKeyId ? { seKeyId: p.seKeyId } : {}),
   };
 }
 
@@ -78,6 +88,7 @@ function decodeIdentity(j: IdentityJson): StoredPairing {
     relayBase: j.relayBase,
     sasWords: j.sasWords,
     pairedAt: j.pairedAt,
+    ...(j.seKeyId ? { seKeyId: j.seKeyId } : {}),
   };
 }
 

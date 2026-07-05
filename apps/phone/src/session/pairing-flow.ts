@@ -26,6 +26,7 @@ import {
   type DeviceIdentity,
   type Envelope,
   envelopeFromWire,
+  envelopeToWire,
   type EnvelopeWire,
   agreementSecretKey,
   fingerprintWords,
@@ -41,11 +42,20 @@ import {
   recoverDek,
   rendezvousMailbox,
   ReplayGuard,
+  seal,
+  signingSecretKey,
   type Sodium,
+  type ThresholdShare,
 } from "@/src/protocol";
 import { RelayMailbox, relayBaseFromEndpoints } from "@/src/transport/relay-http";
 import { armLiveSession } from "./controller";
 import { savePairing } from "./keystore";
+import {
+  mintShareKey,
+  newSeKeyId,
+  PHONE_SE_ECDH_ALGO,
+  secureEnclaveAvailable,
+} from "./threshold-se";
 
 /** QR / pairing-secret lifetime, matching proto `PAIRING_SECRET_TTL_MS` (180s). */
 const PAIRING_SECRET_TTL_MS = 180_000;
@@ -141,8 +151,11 @@ export async function submitPairingResponse(): Promise<void> {
 /**
  * Message 3: wait on the rendezvous mailbox for the daemon's sealed DEK, open it
  * (verify the daemon's signature, replay-check, decrypt), recover the DEK, store
- * it behind Face ID, and arm the live approval session. Called only after the
- * human confirmed the SAS. Throws on timeout or a bad envelope (fail closed).
+ * it behind Face ID, then (v2) mint the Secure-Enclave share `f` and deliver its
+ * public point `F` back to the Mac, and finally arm the live approval session.
+ * Called only after the human confirmed the SAS. Throws on timeout or a bad DEK
+ * envelope (fail closed); the v2 share delivery is best-effort and never aborts a
+ * pairing whose v1 DEK already landed.
  */
 export async function awaitDekDelivery(): Promise<void> {
   const s = await sod();
@@ -172,6 +185,34 @@ export async function awaitDekDelivery(): Promise<void> {
   });
   const dek = recoverDek(payload);
 
+  // v2: mint the Secure-Enclave share key `f` (if this device has an SE) and
+  // deliver its public point `F` to the Mac, sealed in a standard Envelope to the
+  // rendezvous mailbox (design §5/§7: phone->Mac, after SAS). The private `f`
+  // never leaves the enclave. On the Simulator (no SE) the phone pairs v1-only.
+  // Best-effort: a v2 share-delivery failure must not abort a pairing whose v1
+  // DEK already succeeded; the share can be re-delivered by a later upgrade.
+  let seKeyId: string | undefined;
+  if (secureEnclaveAvailable()) {
+    try {
+      const id = newSeKeyId(s);
+      const fX963 = await mintShareKey(id);
+      const share: ThresholdShare = { seKeyId: id, fX963, ecdhAlgo: PHONE_SE_ECDH_ALGO };
+      // Sealed to the pinned daemon, signed by this phone. pairingId is the
+      // steady mailbox (mirroring the v1 deliver_dek convention, reversed
+      // direction); counter 1 is the phone's first outbound on this pairing.
+      const env = seal(s, share, {
+        pairingId: c.mailbox,
+        counter: 1,
+        senderSigningSecret: signingSecretKey(s, c.phone),
+        recipient: c.scanned.daemon,
+      });
+      await rendezvous.submit(JSON.stringify(envelopeToWire(env)));
+      seKeyId = id;
+    } catch {
+      seKeyId = undefined;
+    }
+  }
+
   await savePairing(
     {
       phone: c.phone,
@@ -180,6 +221,7 @@ export async function awaitDekDelivery(): Promise<void> {
       relayBase: c.relayBase,
       sasWords: c.confirmWords,
       pairedAt: Date.now(),
+      ...(seKeyId ? { seKeyId } : {}),
     },
     dek,
   );
