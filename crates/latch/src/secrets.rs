@@ -173,6 +173,36 @@ impl AccountStore {
         Ok(())
     }
 
+    /// Re-encrypt `token` under `dek` for the existing account `label`,
+    /// replacing its ciphertext and (when non-empty) its probed vault routing.
+    /// Errors if no account has that label.
+    pub fn rotate(
+        &mut self,
+        label: &str,
+        dek: &Dek,
+        token: &[u8],
+        vaults: Vec<String>,
+    ) -> Result<(), SecretsError> {
+        let ct = encrypt_token(dek, token)?;
+        let acct = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.label == label)
+            .ok_or_else(|| SecretsError::NoRoute(label.to_string()))?;
+        acct.token_b64 = B64.encode(ct);
+        if !vaults.is_empty() {
+            acct.vaults = vaults;
+        }
+        Ok(())
+    }
+
+    /// Remove the account with `label`. Returns true if one was removed.
+    pub fn remove(&mut self, label: &str) -> bool {
+        let before = self.accounts.len();
+        self.accounts.retain(|a| a.label != label);
+        self.accounts.len() != before
+    }
+
     /// Pick the account that serves `vault`. With one account and no vault
     /// hint, that account is used; otherwise a vault must match.
     pub fn route(&self, vault: Option<&str>) -> Result<&Account, SecretsError> {
@@ -313,6 +343,34 @@ mod tests {
             store.route(Some("Nope")).unwrap_err(),
             SecretsError::NoRoute(_)
         ));
+    }
+
+    #[test]
+    fn rotate_replaces_ciphertext_and_remove_drops_the_account() {
+        let dek = generate_dek();
+        let mut store = AccountStore::default();
+        store
+            .add("Rowm", &dek, b"old-token", vec!["Engineering".into()])
+            .unwrap();
+
+        // Rotate installs a new token; the old vault routing is kept when the
+        // rotate passes an empty probe.
+        store.rotate("Rowm", &dek, b"new-token", vec![]).unwrap();
+        let acct = store.route(Some("Engineering")).unwrap();
+        let pt = decrypt_token(&dek, &acct.ciphertext().unwrap()).unwrap();
+        assert_eq!(&pt[..], b"new-token");
+        assert_eq!(acct.vaults, vec!["Engineering".to_string()]);
+
+        // Rotating an unknown account is an error.
+        assert!(matches!(
+            store.rotate("Nope", &dek, b"x", vec![]).unwrap_err(),
+            SecretsError::NoRoute(_)
+        ));
+
+        // Remove drops it; a second remove is a no-op.
+        assert!(store.remove("Rowm"));
+        assert!(!store.remove("Rowm"));
+        assert!(store.accounts.is_empty());
     }
 
     #[test]

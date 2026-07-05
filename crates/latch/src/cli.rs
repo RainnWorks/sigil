@@ -8,34 +8,48 @@ use latch_proto::DeviceIdentity;
 use zeroize::Zeroizing;
 
 use crate::daemon;
+use crate::json::{self, ControlResult};
 use crate::keystore;
 use crate::local::{self, Frame, Reply};
 use crate::paths;
 use crate::provider::{OpProvider, SecretProvider};
 use crate::secrets::AccountStore;
+use crate::settings::{self, Settings};
 use crate::style::Style;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Dispatch `latch <cmd>`. Returns the process exit code.
+///
+/// `--json` is a global flag: it is stripped from the args once here (so each
+/// subcommand's own flag parsing is unchanged) and threaded to the emitting
+/// commands as a bool. A global flag is cleaner than a per-subcommand one for
+/// this hand-rolled dispatcher — every machine-readable verb needs it uniformly,
+/// and stripping it in one place keeps the human path and its tests untouched.
 pub fn run() -> i32 {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let json = extract_flag(&mut args, "--json");
     match args.first().map(String::as_str).unwrap_or("") {
         "" | "status" => cmd_status(),
         "daemon" => cmd_daemon(&args[1..]),
         "doctor" => cmd_doctor(),
         "setup" => cmd_setup(&args[1..]),
-        "pair" => cmd_pair(&args[1..]),
-        "unpair" => cmd_unpair(),
+        "pair" => cmd_pair(&args[1..], json),
+        "unpair" => cmd_unpair(json),
         "start" | "stop" | "restart" => cmd_service(&args[0]),
-        "account" => cmd_account(&args[1..]),
+        "account" => cmd_account(&args[1..], json),
         "lease" => cmd_lease(&args[1..]),
         "lockdown" => cmd_lockdown(&args[1..]),
         "approve" => cmd_approve(&args[1..]),
         "deny" => cmd_deny(&args[1..]),
+        "history" => cmd_history(),
+        "pending" => cmd_pending(),
+        "mac-approvals" => cmd_mac_approvals(&args[1..], json),
+        "settings" => cmd_settings(&args[1..], json),
+        "wipe" => cmd_wipe(&args[1..], json),
         "ssh" => cmd_ssh(&args[1..]),
         "sshagent" => cmd_sshagent(),
-        "shim" => cmd_shim(args.get(1).map(String::as_str)),
+        "shim" => cmd_shim(args.get(1).map(String::as_str), json),
         "version" | "--version" | "-V" => {
             println!("latch {VERSION}");
             0
@@ -50,6 +64,21 @@ pub fn run() -> i32 {
             2
         }
     }
+}
+
+/// Remove every occurrence of `name` from `args`, returning whether it was
+/// present. Used to lift the global `--json` flag out before subcommand parsing.
+fn extract_flag(args: &mut Vec<String>, name: &str) -> bool {
+    let before = args.len();
+    args.retain(|a| a != name);
+    args.len() != before
+}
+
+/// Print a locally-built control result (no daemon round trip) as JSON, and
+/// return its exit code.
+fn emit_local_control(result: &ControlResult) -> i32 {
+    println!("{}", json::to_line(result));
+    i32::from(!result.ok)
 }
 
 fn print_help() {
@@ -70,81 +99,109 @@ usage: latch <command>
   start|stop|restart   control the launchd daemon agent
   account add       add a service-account token (reads token from stdin)
   account list      list configured accounts and their vault routing
+  account rotate --id <id>  replace an account's token (reads from stdin)
+  account remove --id <id>  forget an account
   lease list        list active session leases with countdowns
   lease revoke <p>  revoke leases whose grant-key hex starts with <p>
   lockdown [--clear]  seal the daemon (deny + refuse) or unseal it
   approve --local --id <id> [--lease]  approve a pending request at the Mac
   deny --local --id <id>               deny a pending request at the Mac
+  history           the decision audit log (names and metadata only)
+  pending           requests currently parked for a local decision
+  mac-approvals --enable|--phone-only  toggle the Mac local-approval factor
+  settings get|set  read or change preferences (timeouts, relay, retention)
+  wipe [--force]    remove pairing, accounts, keys, and settings
   ssh add           serve a 1Password SSH key (--vault --item --pubkey-file)
   ssh list          list the SSH keys the agent serves
   ssh remove <item> stop serving an SSH key
   sshagent          print the SSH_AUTH_SOCK to point ssh/git at Latch
   shim install      symlink ~/.latch/bin/op at this binary
   version           print version
-  help              print this message"
+  help              print this message
+
+The Mac app speaks the daemon control socket directly (see PROTOCOL.md):
+status, doctor, lease, lockdown, approve, deny, history, and pending are
+socket queries the human CLI renders. --json is for the CLI-only mutation
+commands the app shells out for: account, settings, wipe, mac-approvals,
+shim install, unpair, and pair (NDJSON ceremony stream)."
     );
 }
 
-/// True if the daemon socket accepts a connection right now.
-fn daemon_up() -> bool {
-    UnixStream::connect(local::socket_path()).is_ok()
+/// Fetch the status report. When the daemon is up it is the source of truth
+/// (`Frame::Status`); when it is down the CLI computes the host-side view locally
+/// via the same [`crate::report`] builder so `latch status` still works headless.
+fn fetch_status() -> json::StatusJson {
+    if let Ok(Reply::Json { body }) = send_control(&Frame::Status) {
+        if let Ok(st) = serde_json::from_str::<json::StatusJson>(&body) {
+            return st;
+        }
+    }
+    crate::report::status(false, crate::report::Runtime::down())
 }
 
 fn cmd_status() -> i32 {
     let s = Style::stdout();
-    let up = daemon_up();
-    let sock = local::socket_path();
-    let shim = paths::ShimStatus::detect();
-    let real_op = paths::find_real_op();
+    let st = fetch_status();
 
-    let state = if up { s.ok("armed") } else { s.deny("down") };
-    println!("{} {} {}", s.cobalt("latch"), s.faint("·"), state);
+    let head = if st.locked_down {
+        s.brass("locked down")
+    } else if st.daemon_up && st.factor.kind != "fail_closed" {
+        s.ok("armed")
+    } else if st.daemon_up {
+        s.brass("idle")
+    } else {
+        s.deny("down")
+    };
+    println!("{} {} {}", s.cobalt("latch"), s.faint("\u{b7}"), head);
     println!();
 
     // daemon
-    let (glyph, label, note) = if up {
-        (
-            s.ok("\u{25cf}"),
-            "listening",
-            s.dim(&sock.display().to_string()),
-        )
+    let (glyph, label, note) = if st.daemon_up {
+        (s.ok("\u{25cf}"), "listening", s.dim(&st.socket))
     } else {
         (s.deny("\u{2717}"), "down", s.dim("socket not listening"))
     };
     println!("  {}  {glyph} {}  {note}", s.dim("daemon"), pad(label, 13));
 
     // shim (with drift detection)
-    let (glyph, label, note) = if shim.healthy() {
-        let where_ = paths::shim_bin_dir()
-            .map(|p| p.join("op").display().to_string())
-            .unwrap_or_default();
-        (s.ok("\u{2713}"), "on PATH", s.dim(&where_))
-    } else if let Some(issue) = shim.issue() {
-        let label = if shim.installed {
-            "drift"
-        } else {
-            "not installed"
-        };
-        (s.brass("\u{2717}"), label, s.brass(&issue))
-    } else {
-        (s.brass("\u{2717}"), "unknown", s.dim(""))
+    let (glyph, label, note) = match st.shim.kind.as_str() {
+        "healthy" => (
+            s.ok("\u{2713}"),
+            "on PATH",
+            s.dim(st.shim.path.as_deref().unwrap_or("")),
+        ),
+        "not_installed" => (
+            s.brass("\u{2717}"),
+            "not installed",
+            s.brass(st.shim.issue.as_deref().unwrap_or("")),
+        ),
+        "drift" => (
+            s.brass("\u{2717}"),
+            "drift",
+            s.brass(st.shim.issue.as_deref().unwrap_or("")),
+        ),
+        _ => (s.brass("\u{2717}"), "unknown", s.dim("")),
     };
     println!("  {}    {glyph} {}  {note}", s.dim("shim"), pad(label, 13));
 
     // op
-    let (glyph, label, note) = match &real_op {
-        Some(p) => (s.ok("\u{2713}"), "found", s.dim(&p.display().to_string())),
-        None => (s.deny("\u{2717}"), "missing", s.dim("no `op` on PATH")),
+    let (glyph, label, note) = if st.op.found {
+        (
+            s.ok("\u{2713}"),
+            "found",
+            s.dim(st.op.path.as_deref().unwrap_or("")),
+        )
+    } else {
+        (s.deny("\u{2717}"), "missing", s.dim("no `op` on PATH"))
     };
     println!("  {}      {glyph} {}  {note}", s.dim("op"), pad(label, 13));
 
     // accounts
-    let accounts = AccountStore::load().map(|s| s.accounts.len()).unwrap_or(0);
-    let (glyph, label, note) = if accounts > 0 {
+    let (glyph, label, note) = if st.accounts > 0 {
         (
             s.ok("\u{2713}"),
             "configured",
-            s.dim(&format!("{accounts} account(s)")),
+            s.dim(&format!("{} account(s)", st.accounts)),
         )
     } else {
         (
@@ -155,31 +212,31 @@ fn cmd_status() -> i32 {
     };
     println!("  {} {glyph} {}  {note}", s.dim("accounts"), pad(label, 13));
 
-    // factor: what the daemon would gate with (phone > biometric > fail closed).
-    let paired = crate::pairing_store::summary().ok().flatten();
-    let biometric = keystore::for_host().is_biometric();
-    let (glyph, label, note) = if let Some(p) = &paired {
-        (
+    // factor
+    let (glyph, label, note) = match st.factor.kind.as_str() {
+        "phone" => (
             s.ok("\u{25cf}"),
             "paired phone",
-            s.dim(&format!("via {}", p.relay_url)),
-        )
-    } else if biometric {
-        (
+            s.dim(&format!(
+                "via {}",
+                st.factor.relay.as_deref().unwrap_or("relay")
+            )),
+        ),
+        "biometric" => (
             s.ok("\u{25cf}"),
             "biometric",
             s.dim("hardware Touch ID (Secure Enclave)"),
-        )
-    } else {
-        (
+        ),
+        _ => (
             s.brass("\u{2717}"),
             "fail closed",
             s.brass("no factor; run: latch pair"),
-        )
+        ),
     };
     println!("  {}   {glyph} {}  {note}", s.dim("factor"), pad(label, 13));
 
-    // ssh agent: how many keys it would serve.
+    // ssh agent: how many keys it would serve (a local CLI convenience row; the
+    // count is not part of the machine status shape).
     let ssh_count = crate::sshagent::SshKeyConfig::load()
         .map(|c| c.keys.len())
         .unwrap_or(0);
@@ -188,7 +245,7 @@ fn cmd_status() -> i32 {
             s.ok("\u{25cf}"),
             "serving",
             s.dim(&format!(
-                "{ssh_count} key(s) · point SSH_AUTH_SOCK: latch sshagent"
+                "{ssh_count} key(s) \u{b7} point SSH_AUTH_SOCK: latch sshagent"
             )),
         )
     } else {
@@ -260,18 +317,52 @@ fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
-fn cmd_account(args: &[String]) -> i32 {
+fn cmd_account(args: &[String], json: bool) -> i32 {
     match args.first().map(String::as_str) {
-        Some("add") => account_add(&args[1..]),
-        Some("list") => account_list(),
+        Some("add") => account_add(&args[1..], json),
+        Some("list") => account_list(json),
+        Some("rotate") => account_rotate(&args[1..], json),
+        Some("remove") | Some("rm") => account_remove(&args[1..], json),
         _ => {
-            eprintln!("usage: latch account <add|list>");
+            eprintln!("usage: latch account <add|list|rotate|remove>");
             2
         }
     }
 }
 
-fn account_add(args: &[String]) -> i32 {
+/// The GUI-facing shape for one account. The store keys accounts by their unique
+/// label, so `id == label`; it retains no token-health or last-used metadata, so
+/// those are `healthy`/absent (see JSON.md).
+fn account_json(a: &crate::secrets::Account) -> json::AccountJson {
+    json::AccountJson {
+        id: a.label.clone(),
+        label: a.label.clone(),
+        vaults: a.vaults.clone(),
+        health: "healthy".into(),
+        detail: None,
+        last_used_ms: None,
+    }
+}
+
+/// Read a service-account token from stdin into a wiped buffer, trimming a
+/// trailing newline. `None` (with a printed error) on read failure or empty.
+fn read_token_stdin() -> Option<Zeroizing<Vec<u8>>> {
+    let mut token = Zeroizing::new(Vec::new());
+    if let Err(e) = std::io::stdin().read_to_end(&mut token) {
+        eprintln!("latch: reading token from stdin: {e}");
+        return None;
+    }
+    while matches!(token.last(), Some(b'\n' | b'\r')) {
+        token.pop();
+    }
+    if token.is_empty() {
+        eprintln!("latch: empty token on stdin");
+        return None;
+    }
+    Some(token)
+}
+
+fn account_add(args: &[String], json: bool) -> i32 {
     let s = Style::stdout();
     let Some(label) = flag_value(args, "--label").map(str::to_string) else {
         eprintln!("usage: latch account add --token-stdin --label <name>");
@@ -281,20 +372,9 @@ fn account_add(args: &[String]) -> i32 {
         eprintln!("latch: refusing to read a token from argv; pass --token-stdin");
         return 2;
     }
-
-    // Read the token from stdin into a wiped buffer; trim one trailing newline.
-    let mut token = Zeroizing::new(Vec::new());
-    if let Err(e) = std::io::stdin().read_to_end(&mut token) {
-        eprintln!("latch: reading token from stdin: {e}");
+    let Some(token) = read_token_stdin() else {
         return 1;
-    }
-    while matches!(token.last(), Some(b'\n' | b'\r')) {
-        token.pop();
-    }
-    if token.is_empty() {
-        eprintln!("latch: empty token on stdin");
-        return 1;
-    }
+    };
 
     // Unwrap the DEK (biometric on macOS) and encrypt the token under it.
     let ks = keystore::for_host();
@@ -313,7 +393,7 @@ fn account_add(args: &[String]) -> i32 {
     // Probe the vaults this token can actually route (best effort), through the
     // provider seam rather than calling `op` directly.
     let vaults = OpProvider::new().probe(&token).unwrap_or_default();
-    if vaults.is_empty() {
+    if vaults.is_empty() && !json {
         println!(
             "  {} {}",
             s.brass("\u{2717}"),
@@ -337,6 +417,14 @@ fn account_add(args: &[String]) -> i32 {
         return 1;
     }
 
+    if json {
+        // Echo the newly-added account shape the Swift client decodes.
+        if let Some(a) = store.accounts.iter().find(|a| a.label == label) {
+            println!("{}", json::to_line(&account_json(a)));
+        }
+        return 0;
+    }
+
     println!("{} account {} added", s.ok("\u{2713}"), s.cobalt(&label));
     if !vaults.is_empty() {
         println!("  {} {}", s.dim("vaults"), vaults.join(", "));
@@ -344,7 +432,99 @@ fn account_add(args: &[String]) -> i32 {
     0
 }
 
-fn account_list() -> i32 {
+fn account_rotate(args: &[String], json: bool) -> i32 {
+    let s = Style::stdout();
+    let Some(id) = flag_value(args, "--id").map(str::to_string) else {
+        eprintln!("usage: latch account rotate --id <id> --token-stdin");
+        return 2;
+    };
+    let Some(token) = read_token_stdin() else {
+        return 1;
+    };
+
+    let ks = keystore::for_host();
+    if let Err(e) = ks.ensure_dek() {
+        eprintln!("latch: provisioning the DEK: {e}");
+        return 1;
+    }
+    let dek = match ks.unwrap_dek(&format!("Rotate the {id} service-account token")) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("latch: unwrapping the DEK: {e}");
+            return 1;
+        }
+    };
+
+    // Re-probe the vaults the new token can route; an empty probe keeps the
+    // previous routing rather than erasing it.
+    let vaults = OpProvider::new().probe(&token).unwrap_or_default();
+
+    let mut store = match AccountStore::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("latch: loading account store: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = store.rotate(&id, &dek, &token, vaults) {
+        eprintln!("latch: {e}");
+        return 1;
+    }
+    if let Err(e) = store.save() {
+        eprintln!("latch: saving account store: {e}");
+        return 1;
+    }
+
+    if json {
+        if let Some(a) = store.accounts.iter().find(|a| a.label == id) {
+            println!("{}", json::to_line(&account_json(a)));
+        }
+        return 0;
+    }
+    println!("{} account {} rotated", s.ok("\u{2713}"), s.cobalt(&id));
+    0
+}
+
+fn account_remove(args: &[String], json: bool) -> i32 {
+    let Some(id) = flag_value(args, "--id").map(str::to_string) else {
+        eprintln!("usage: latch account remove --id <id>");
+        return 2;
+    };
+    let mut store = match AccountStore::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("latch: loading account store: {e}");
+            return 1;
+        }
+    };
+    let removed = store.remove(&id);
+    if removed {
+        if let Err(e) = store.save() {
+            eprintln!("latch: saving account store: {e}");
+            return 1;
+        }
+    }
+    let result = if removed {
+        ControlResult::line(true, format!("account {id} removed"))
+    } else {
+        ControlResult::line(false, format!("no account named {id}"))
+    };
+    if json {
+        return emit_local_control(&result);
+    }
+    let s = Style::stdout();
+    for line in &result.lines {
+        let glyph = if result.ok {
+            s.ok("\u{2713}")
+        } else {
+            s.brass("\u{2717}")
+        };
+        println!("  {glyph} {line}");
+    }
+    i32::from(!result.ok)
+}
+
+fn account_list(json: bool) -> i32 {
     let s = Style::stdout();
     let store = match AccountStore::load() {
         Ok(st) => st,
@@ -353,6 +533,11 @@ fn account_list() -> i32 {
             return 1;
         }
     };
+    if json {
+        let list: Vec<_> = store.accounts.iter().map(account_json).collect();
+        println!("{}", json::to_pretty(&list));
+        return 0;
+    }
     if store.accounts.is_empty() {
         println!("  {}", s.dim("no accounts; run: latch account add"));
         return 0;
@@ -370,18 +555,41 @@ fn account_list() -> i32 {
     0
 }
 
+/// Deserialize a `Reply::Json` array body from a query frame into a typed vec,
+/// or `None` when the daemon is unreachable / replied unexpectedly.
+fn query_list<T: serde::de::DeserializeOwned>(frame: &Frame) -> Option<Vec<T>> {
+    match send_control(frame) {
+        Ok(Reply::Json { body }) => serde_json::from_str(&body).ok(),
+        _ => None,
+    }
+}
+
 fn cmd_lease(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("list") | None => {
-            let reply = send_control(&Frame::LeaseList);
-            // A lease list with no lines is not a failure; print a note.
-            if let Ok(Reply::Control { lines, .. }) = &reply {
-                if lines.is_empty() {
-                    println!("  {}", Style::stdout().dim("no active leases"));
-                    return 0;
-                }
+            let s = Style::stdout();
+            let Some(leases) = query_list::<json::LeaseJson>(&Frame::LeaseList) else {
+                println!("  {}", s.dim("daemon unreachable; is it running?"));
+                return 0;
+            };
+            if leases.is_empty() {
+                println!("  {}", s.dim("no active leases"));
+                return 0;
             }
-            print_control(reply)
+            let now = latch_proto::now_ms();
+            println!("{}", s.cobalt("leases"));
+            println!();
+            for l in &leases {
+                let left = l.expires_ms.saturating_sub(now) / 1000;
+                println!(
+                    "  {}  {}  {}  {}",
+                    s.dim(&l.grant_hex[..12.min(l.grant_hex.len())]),
+                    pad(&l.account, 14),
+                    l.scope,
+                    s.faint(&format!("{left}s left"))
+                );
+            }
+            0
         }
         Some("revoke") => {
             let Some(prefix) = args.get(1) else {
@@ -424,6 +632,55 @@ fn cmd_deny(args: &[String]) -> i32 {
     print_control(send_control(&Frame::Deny { id }))
 }
 
+/// `latch history`: the decision audit log, newest-first. Read from the daemon
+/// (`Frame::History`) when up, else directly from the on-disk log so it works
+/// headless (the log is a read-only file the daemon owns as writer).
+fn cmd_history() -> i32 {
+    let s = Style::stdout();
+    let entries: Vec<json::HistoryJson> = query_list(&Frame::History)
+        .unwrap_or_else(|| crate::audit::load().iter().map(|e| e.to_json()).collect());
+    if entries.is_empty() {
+        println!("  {}", s.dim("no history yet"));
+        return 0;
+    }
+    println!("{}", s.cobalt("history"));
+    println!();
+    for e in &entries {
+        let glyph = match e.decision.as_str() {
+            "approved" => s.ok("\u{2713}"),
+            "denied" => s.deny("\u{2717}"),
+            _ => s.brass("\u{25cb}"),
+        };
+        println!(
+            "  {glyph} {}  {}  {}",
+            pad(&e.label, 28),
+            s.dim(&e.account),
+            s.faint(&format!("{} \u{b7} {}", e.process, e.via))
+        );
+    }
+    0
+}
+
+/// `latch pending`: the requests parked for a local decision. A socket query;
+/// the Mac app subscribes to `Frame::SubscribePending` for live updates instead.
+fn cmd_pending() -> i32 {
+    let s = Style::stdout();
+    let Some(items) = query_list::<json::PendingJson>(&Frame::Pending) else {
+        println!("  {}", s.dim("daemon unreachable; is it running?"));
+        return 0;
+    };
+    if items.is_empty() {
+        println!("  {}", s.dim("nothing awaiting a local decision"));
+        return 0;
+    }
+    println!("{}", s.cobalt("pending"));
+    println!();
+    for it in &items {
+        println!("  {}  {}", s.dim(&it.id), it.command.join(" "));
+    }
+    0
+}
+
 fn cmd_daemon(args: &[String]) -> i32 {
     match daemon::run(args) {
         Ok(()) => 0,
@@ -434,101 +691,37 @@ fn cmd_daemon(args: &[String]) -> i32 {
     }
 }
 
+/// Fetch the doctor checks. Source of truth is the daemon (`Frame::Doctor`) when
+/// up; otherwise the CLI runs the same [`crate::report`] builder locally so
+/// `latch doctor` still diagnoses a down daemon.
+fn fetch_doctor() -> Vec<json::CheckJson> {
+    if let Ok(Reply::Json { body }) = send_control(&Frame::Doctor) {
+        if let Ok(checks) = serde_json::from_str::<Vec<json::CheckJson>>(&body) {
+            return checks;
+        }
+    }
+    crate::report::doctor(false)
+}
+
 fn cmd_doctor() -> i32 {
+    let checks = fetch_doctor();
     let s = Style::stdout();
     println!("{}", s.cobalt("latch doctor"));
     println!();
-
-    let shim = paths::ShimStatus::detect();
-    let real_op = paths::find_real_op();
     let mut ok = true;
-
-    // 1. shim health (drift): installed, first on PATH, points at this binary.
-    ok &= check(
-        &s,
-        shim.healthy(),
-        "shim wins on PATH and is current",
-        &shim.issue().unwrap_or_default(),
-    );
-
-    // 2. daemon socket reachable.
-    let up = daemon_up();
-    ok &= check(
-        &s,
-        up,
-        "daemon socket reachable",
-        if up {
-            ""
+    for (i, c) in checks.iter().enumerate() {
+        let informational = i + 1 == checks.len(); // the ssh-agent row
+        if informational {
+            println!(
+                "  {} {}  {}",
+                s.ok("\u{2713}"),
+                c.label,
+                s.dim(&format!("\u{2014} {}", c.hint))
+            );
         } else {
-            "daemon not running (latch start)"
-        },
-    );
-
-    // 3. socket path fits sun_path (a too-long path binds a truncated name).
-    match crate::service::socket_path_fits() {
-        Ok(()) => {
-            ok &= check(&s, true, "socket path length ok", "");
-        }
-        Err(e) => {
-            ok &= check(&s, false, "socket path length ok", &e);
+            ok &= check(&s, c.ok, &c.label, &c.hint);
         }
     }
-
-    // 4. approving factor: paired phone > biometric > fail closed.
-    let paired = crate::pairing_store::summary().ok().flatten();
-    let biometric = keystore::for_host().is_biometric();
-    let (factor_ok, factor_hint) = match (&paired, biometric) {
-        (Some(_), _) => (true, "paired phone (sealed remote approval)".to_string()),
-        (None, true) => (true, "hardware biometric (Secure Enclave)".to_string()),
-        (None, false) => (
-            false,
-            "no factor: fails closed. Run `latch pair`, or start `--dev-insecure` for dev".into(),
-        ),
-    };
-    ok &= check(&s, factor_ok, "approving factor resolved", &factor_hint);
-
-    // 5. relay reachable, when a pairing names one.
-    if let Some(p) = &paired {
-        let reachable = relay_reachable(&p.relay_url);
-        ok &= check(
-            &s,
-            reachable,
-            "relay reachable",
-            if reachable {
-                ""
-            } else {
-                "cannot reach the paired relay (approvals will time out)"
-            },
-        );
-    }
-
-    // 6. a real op to run.
-    ok &= check(
-        &s,
-        real_op.is_some(),
-        "real op found",
-        if real_op.is_some() {
-            ""
-        } else {
-            "no `op` on PATH"
-        },
-    );
-
-    // 7. ssh-agent: report the socket to point SSH_AUTH_SOCK at and the served
-    //    key count. Informational (not a pass/fail gate): serving zero keys is a
-    //    valid state until Tom adds one.
-    let ssh_sock = crate::sshagent::socket_path();
-    let ssh_count = crate::sshagent::SshKeyConfig::load()
-        .map(|c| c.keys.len())
-        .unwrap_or(0);
-    println!(
-        "  {} ssh-agent socket  {}",
-        s.ok("\u{2713}"),
-        s.dim(&format!(
-            "— {ssh_count} key(s); export SSH_AUTH_SOCK={}",
-            ssh_sock.display()
-        ))
-    );
 
     println!();
     if ok {
@@ -538,40 +731,6 @@ fn cmd_doctor() -> i32 {
         println!("  {}", s.brass("some checks need attention"));
         1
     }
-}
-
-/// Best-effort relay reachability: parse `http(s)://host[:port]` and try a short
-/// TCP connect. Dependency-free (no HTTP client in this binary); a successful
-/// connect is enough to distinguish "relay down" from "relay up" for the doctor.
-fn relay_reachable(url: &str) -> bool {
-    use std::net::ToSocketAddrs;
-    use std::time::Duration;
-
-    let (rest, default_port) = if let Some(r) = url.strip_prefix("https://") {
-        (r, 443u16)
-    } else if let Some(r) = url.strip_prefix("http://") {
-        (r, 80u16)
-    } else if let Some(r) = url.strip_prefix("wss://") {
-        (r, 443u16)
-    } else if let Some(r) = url.strip_prefix("ws://") {
-        (r, 80u16)
-    } else {
-        (url, 443u16)
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (h, p.parse().unwrap_or(default_port)),
-        None => (authority, default_port),
-    };
-    let Ok(addrs) = (host, port).to_socket_addrs() else {
-        return false;
-    };
-    for addr in addrs {
-        if std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok() {
-            return true;
-        }
-    }
-    false
 }
 
 fn check(s: &Style, ok: bool, label: &str, hint: &str) -> bool {
@@ -588,16 +747,33 @@ fn check(s: &Style, ok: bool, label: &str, hint: &str) -> bool {
     ok
 }
 
-fn cmd_pair(args: &[String]) -> i32 {
+fn cmd_pair(args: &[String], json: bool) -> i32 {
     if args.first().map(String::as_str) == Some("list") {
-        return pair_list();
+        return pair_list(json);
+    }
+    if json {
+        return run_pairing_json(args);
     }
     run_pairing(args)
 }
 
-/// `latch pair list` / `latch list-paired-devices`: show the persisted pairing.
-fn pair_list() -> i32 {
+/// `latch pair list`: show the persisted pairing. The device name is not
+/// captured by the ceremony, so the JSON form reports a fixed `iPhone` (gap).
+fn pair_list(json: bool) -> i32 {
     let s = Style::stdout();
+    if json {
+        let paired = crate::pairing_store::summary()
+            .ok()
+            .flatten()
+            .map(|p| json::PairedJson {
+                name: "iPhone".into(),
+                sas_words: p.sas_words,
+                relay_url: p.relay_url,
+                paired_ms: p.paired_at,
+            });
+        println!("{}", json::to_pretty(&json::PairListJson { paired }));
+        return 0;
+    }
     match crate::pairing_store::summary() {
         Ok(Some(p)) => {
             println!("{}", s.cobalt("paired devices"));
@@ -734,9 +910,90 @@ fn run_pairing(args: &[String]) -> i32 {
     0
 }
 
-fn cmd_unpair() -> i32 {
+/// `latch pair --relay <url> --json`: run the ceremony, streaming NDJSON events
+/// (`qr`, `sas`, `paired`, `failed`) one object per line so the GUI renders it
+/// live. The SAS is auto-confirmed once emitted: the JSON stream is one-way, so
+/// the human confirms on the phone, exactly as the interactive `--yes` does.
+fn run_pairing_json(args: &[String]) -> i32 {
+    let relay = flag_value(args, "--relay")
+        .map(str::to_string)
+        .or_else(|| std::env::var("LATCH_RELAY_URL").ok());
+    let Some(relay) = relay else {
+        emit_ndjson(&serde_json::json!({
+            "event": "failed",
+            "reason": "no relay: pass --relay <url> or set LATCH_RELAY_URL"
+        }));
+        return 2;
+    };
+
+    let ks = keystore::for_host();
+    let daemon_identity = DeviceIdentity::generate();
+
+    let mut present_qr = |_unicode: &str, b64: &str| {
+        emit_ndjson(&serde_json::json!({ "event": "qr", "payload_b64": b64 }));
+    };
+    let mut confirm = |words: &[&'static str; 6]| -> bool {
+        emit_ndjson(&serde_json::json!({ "event": "sas", "words": words.to_vec() }));
+        true
+    };
+    let mut make_channel = |mailbox: [u8; 32]| crate::pair::relay_channel(&relay, mailbox);
+
+    let opts = crate::pair::CeremonyOpts {
+        relay_url: relay.clone(),
+        response_timeout: std::time::Duration::from_secs(180),
+        flush_grace: std::time::Duration::from_millis(750),
+        now: &latch_proto::now_ms,
+        make_channel: &mut make_channel,
+        present_qr: &mut present_qr,
+        confirm_sas: &mut confirm,
+    };
+
+    match crate::pair::run_ceremony(daemon_identity, opts) {
+        Ok(np) => {
+            let sas: Vec<String> = np.sas_words.to_vec();
+            let relay_url = np.relay_url.clone();
+            let paired_ms = np.paired_at;
+            if let Err(e) = crate::pairing_store::save(ks.as_ref(), &np) {
+                emit_ndjson(&serde_json::json!({
+                    "event": "failed",
+                    "reason": format!("paired but could not save: {e}")
+                }));
+                return 1;
+            }
+            emit_ndjson(&serde_json::json!({
+                "event": "paired",
+                "name": "iPhone",
+                "sas_words": sas,
+                "relay_url": relay_url,
+                "paired_ms": paired_ms
+            }));
+            0
+        }
+        Err(e) => {
+            emit_ndjson(&serde_json::json!({ "event": "failed", "reason": format!("{e:#}") }));
+            1
+        }
+    }
+}
+
+/// Print one NDJSON event line and flush, so the GUI reading the stream sees
+/// each ceremony event as it happens rather than at teardown.
+fn emit_ndjson(value: &serde_json::Value) {
+    println!("{value}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+fn cmd_unpair(json: bool) -> i32 {
     let s = Style::stdout();
     let ks = keystore::for_host();
+    if json {
+        let result = match crate::pairing_store::remove(ks.as_ref()) {
+            Ok(true) => ControlResult::line(true, "phone unpaired"),
+            Ok(false) => ControlResult::line(true, "no phone was paired"),
+            Err(e) => ControlResult::line(false, format!("unpair failed: {e}")),
+        };
+        return emit_local_control(&result);
+    }
     match crate::pairing_store::remove(ks.as_ref()) {
         Ok(true) => {
             println!("{} phone unpaired", s.ok("\u{2713}"));
@@ -1066,9 +1323,9 @@ fn cmd_sshagent() -> i32 {
     0
 }
 
-fn cmd_shim(sub: Option<&str>) -> i32 {
+fn cmd_shim(sub: Option<&str>, json: bool) -> i32 {
     match sub {
-        Some("install") => shim_install(),
+        Some("install") => shim_install(json),
         _ => {
             eprintln!("usage: latch shim install");
             2
@@ -1076,15 +1333,30 @@ fn cmd_shim(sub: Option<&str>) -> i32 {
     }
 }
 
-fn shim_install() -> i32 {
+fn shim_install(json: bool) -> i32 {
     let s = Style::stdout();
     let (link, target) = match crate::setup::install_shim() {
         Ok(pair) => pair,
         Err(e) => {
+            if json {
+                return emit_local_control(&ControlResult::line(
+                    false,
+                    format!("shim install failed: {e:#}"),
+                ));
+            }
             eprintln!("latch: {e:#}");
             return 1;
         }
     };
+
+    if json {
+        return emit_local_control(&ControlResult::ok(vec![
+            "shim installed".to_string(),
+            format!("link {}", link.display()),
+            format!("-> {}", target.display()),
+            "add ~/.latch/bin to PATH so the shim wins".to_string(),
+        ]));
+    }
 
     println!("{} shim installed", s.ok("\u{2713}"));
     println!("  {} {}", s.dim("link"), link.display());
@@ -1100,6 +1372,248 @@ fn shim_install() -> i32 {
     println!(
         "  {}",
         s.faint("or run `latch setup`, which edits your profile and loads the daemon.")
+    );
+    0
+}
+
+/// `latch mac-approvals --enable | --phone-only`: toggle the Mac local-approval
+/// factor / hardened mode. `--phone-only` persists the hardened intent (every
+/// approval degrades to the phone). `--enable` needs the Mac Secure Enclave DEK
+/// envelope, whose minting is not yet verified on hardware (task #17): it
+/// succeeds on the dev keystores and honestly reports "needs verification" on a
+/// real enclave rather than pretending.
+fn cmd_mac_approvals(args: &[String], json: bool) -> i32 {
+    let s = Style::stdout();
+    let enable = has_flag(args, "--enable");
+    let phone_only = has_flag(args, "--phone-only");
+    if enable == phone_only {
+        eprintln!("usage: latch mac-approvals --enable | --phone-only");
+        return 2;
+    }
+
+    let mut settings = match Settings::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("latch: loading settings: {e}");
+            return 1;
+        }
+    };
+
+    if phone_only {
+        // Hardened: the phone is strictly required. We persist the intent; the
+        // Secure Enclave envelope teardown itself defers to task #17.
+        settings.mac_approvals = settings::MAC_APPROVALS_PHONE_ONLY.to_string();
+        if let Err(e) = settings.save() {
+            eprintln!("latch: saving settings: {e}");
+            return 1;
+        }
+        if json {
+            println!("{}", json::to_line(&json::MacApprovalsJson { ok: true }));
+        } else {
+            println!(
+                "{} mac approvals hardened (phone required)",
+                s.ok("\u{2713}")
+            );
+        }
+        return 0;
+    }
+
+    // --enable: provision the local DEK envelope. On a dev keystore this
+    // succeeds; on a real Secure Enclave the mint path is unverified and returns
+    // NeedsVerification, which we surface honestly rather than faking success.
+    let ks = keystore::for_host();
+    match ks.ensure_dek() {
+        Ok(()) => {
+            settings.mac_approvals = settings::MAC_APPROVALS_ENABLED.to_string();
+            if let Err(e) = settings.save() {
+                eprintln!("latch: saving settings: {e}");
+                return 1;
+            }
+            if json {
+                println!("{}", json::to_line(&json::MacApprovalsJson { ok: true }));
+            } else {
+                println!(
+                    "{} mac approvals enabled (Touch ID can approve)",
+                    s.ok("\u{2713}")
+                );
+            }
+            0
+        }
+        Err(e) => {
+            // Honest failure: the SE envelope could not be minted here.
+            eprintln!(
+                "latch: cannot enable Mac approvals: {e}. \
+                 Secure Enclave minting is pending device verification (task #17); \
+                 the phone remains the approving factor."
+            );
+            if json {
+                println!("{}", json::to_line(&json::MacApprovalsJson { ok: false }));
+            }
+            1
+        }
+    }
+}
+
+/// `latch settings get|set`: read or change preferences. `set` takes either a
+/// `<key> <value>` pair or, with `--json`, a JSON object patch on stdin (the
+/// form the Mac app uses); a patch is *merged*, so unlisted keys are untouched.
+fn cmd_settings(args: &[String], json: bool) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("get") | None => settings_get(json),
+        Some("set") => settings_set(&args[1..], json),
+        _ => {
+            eprintln!("usage: latch settings <get|set <key> <value>>");
+            2
+        }
+    }
+}
+
+fn settings_get(json: bool) -> i32 {
+    let settings = match Settings::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("latch: loading settings: {e}");
+            return 1;
+        }
+    };
+    if json {
+        println!("{}", json::to_pretty(&settings.to_json()));
+        return 0;
+    }
+    let s = Style::stdout();
+    println!("{}", s.cobalt("settings"));
+    println!();
+    println!(
+        "  {}  {}",
+        pad("approval_timeout_sec", 22),
+        s.dim(&settings.approval_timeout_sec.to_string())
+    );
+    println!(
+        "  {}  {}",
+        pad("notifications", 22),
+        s.dim(&settings.notifications.to_string())
+    );
+    println!(
+        "  {}  {}",
+        pad("retention_days", 22),
+        s.dim(&settings.retention_days.to_string())
+    );
+    println!("  {}  {}", pad("relay_url", 22), s.dim(&settings.relay_url));
+    println!(
+        "  {}  {}",
+        pad("reduce_motion", 22),
+        s.dim(&settings.reduce_motion.to_string())
+    );
+    println!(
+        "  {}  {}",
+        pad("mac_approvals", 22),
+        s.dim(&settings.mac_approvals)
+    );
+    0
+}
+
+fn settings_set(args: &[String], json: bool) -> i32 {
+    let mut settings = match Settings::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("latch: loading settings: {e}");
+            return 1;
+        }
+    };
+
+    // A positional `<key> <value>` wins; otherwise read a JSON object patch from
+    // stdin (the Mac app pipes its five settings fields this way).
+    let outcome = match (args.first(), args.get(1)) {
+        (Some(key), Some(value)) => settings.set(key, value).map_err(|e| e.to_string()),
+        _ => {
+            let mut buf = String::new();
+            if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+                Err(format!("reading the settings patch from stdin: {e}"))
+            } else if buf.trim().is_empty() {
+                Err("usage: latch settings set <key> <value>  (or pipe a JSON patch)".to_string())
+            } else {
+                serde_json::from_str::<serde_json::Value>(&buf)
+                    .map_err(|e| format!("parsing the settings patch: {e}"))
+                    .and_then(|patch| settings.merge_json(&patch).map_err(|e| e.to_string()))
+            }
+        }
+    };
+
+    if let Err(msg) = outcome {
+        eprintln!("latch: {msg}");
+        return 2;
+    }
+    if let Err(e) = settings.save() {
+        eprintln!("latch: saving settings: {e}");
+        return 1;
+    }
+
+    if json {
+        println!("{}", json::to_pretty(&settings.to_json()));
+        return 0;
+    }
+    println!("{} settings saved", Style::stdout().ok("\u{2713}"));
+    0
+}
+
+/// `latch wipe [--force]`: remove the pairing, accounts, keys, and settings.
+/// The destructive path is explicit: without `--force` it refuses.
+fn cmd_wipe(args: &[String], json: bool) -> i32 {
+    let s = Style::stdout();
+    if !has_flag(args, "--force") {
+        if json {
+            return emit_local_control(&ControlResult::failed(vec![
+                "refusing to wipe without --force".to_string(),
+            ]));
+        }
+        eprintln!(
+            "{} latch wipe removes the pairing, accounts, SSH keys, settings, and history.\n  \
+             Re-run with --force to confirm: latch wipe --force",
+            s.brass("\u{2717}")
+        );
+        return 2;
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+
+    // The pairing (config file + the daemon identity blob in the keystore).
+    let ks = keystore::for_host();
+    match crate::pairing_store::remove(ks.as_ref()) {
+        Ok(true) => lines.push("removed pairing".to_string()),
+        Ok(false) => {}
+        Err(e) => lines.push(format!("pairing: {e}")),
+    }
+
+    // The remaining ~/.latch state files.
+    if let Some(home) = paths::latch_home() {
+        for (name, path) in [
+            ("accounts", home.join("latch.db")),
+            ("ssh keys", home.join("ssh-keys.json")),
+            ("settings", home.join("settings.json")),
+            ("dev keystore", home.join("dev-keystore.json")),
+            ("history", home.join("history.jsonl")),
+        ] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => lines.push(format!("removed {name}")),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => lines.push(format!("{name}: {e}")),
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push("nothing to remove".to_string());
+    }
+    let result = ControlResult::ok(lines);
+    if json {
+        return emit_local_control(&result);
+    }
+    for line in &result.lines {
+        println!("  {} {line}", s.ok("\u{2713}"));
+    }
+    println!(
+        "  {}",
+        s.faint("restart the daemon to apply: latch restart")
     );
     0
 }

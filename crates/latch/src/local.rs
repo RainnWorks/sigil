@@ -35,25 +35,53 @@ pub fn socket_path() -> PathBuf {
     base.join("latch").join("daemon.sock")
 }
 
-/// A request frame from a client. Tagged so op traffic and control commands
+/// A request frame from a client. Tagged so op traffic and the control protocol
 /// share one socket unambiguously.
+///
+/// This is the daemon control protocol — the single machine interface the Mac
+/// app speaks directly and the human CLI renders (see `crates/latch/PROTOCOL.md`).
+/// It splits into three groups: read/report queries that return a
+/// [`Reply::Json`] body (`Status`, `Doctor`, `LeaseList`, `Pending`, `History`),
+/// runtime-control commands that return a [`Reply::Control`] result (`Lockdown`,
+/// `LeaseRevoke`, `Approve`, `Deny`), and the [`Frame::SubscribePending`] stream
+/// that emits a [`Reply::Event`] per pending-set change. The `Op` variant is the
+/// shim's separate SCM_RIGHTS secret path and is untouched by the control
+/// surface. Keystore/config *mutations* (account add/rotate/remove, settings,
+/// wipe, mac-approvals, shim install, pairing) are deliberately NOT here: they
+/// stay short-lived CLI operations so a compromised always-on daemon cannot
+/// perform them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Frame {
     /// An `op` invocation: the original argv and the caller's cwd. The caller's
     /// stdout/stderr descriptors ride alongside as SCM_RIGHTS.
     Op { argv: Vec<String>, cwd: String },
-    /// Resolve a pending local approval as approve; `lease` makes it a session
-    /// lease rather than a single shot.
-    Approve { id: String, lease: bool },
-    /// Resolve a pending local approval as deny.
-    Deny { id: String },
-    /// Seal (or, with `clear`, unseal) the daemon.
-    Lockdown { clear: bool },
-    /// List active leases.
+    /// The full status report (armed state, factor, shim drift, relay, counts,
+    /// lockdown). Returns [`Reply::Json`] of a `StatusJson`.
+    Status,
+    /// The doctor checks. Returns [`Reply::Json`] of a `[CheckJson]`.
+    Doctor,
+    /// Active session leases. Returns [`Reply::Json`] of a `[LeaseJson]`.
     LeaseList,
-    /// Revoke leases whose grant-key hex starts with `prefix`.
+    /// Requests currently parked for a local decision. Returns [`Reply::Json`]
+    /// of a `[PendingJson]`.
+    Pending,
+    /// The decision audit log, newest-first. Returns [`Reply::Json`] of a
+    /// `[HistoryJson]`.
+    History,
+    /// Seal (or, with `clear`, unseal) the daemon. Returns [`Reply::Control`].
+    Lockdown { clear: bool },
+    /// Revoke leases whose grant-key hex starts with `prefix`. [`Reply::Control`].
     LeaseRevoke { prefix: String },
+    /// Resolve a pending local approval as approve; `lease` makes it a session
+    /// lease rather than a single shot. [`Reply::Control`].
+    Approve { id: String, lease: bool },
+    /// Resolve a pending local approval as deny. [`Reply::Control`].
+    Deny { id: String },
+    /// Subscribe to pending-set changes: the daemon emits a [`Reply::Event`]
+    /// carrying the current `[PendingJson]` immediately and again on every
+    /// change, until the client disconnects. Drives the live menubar.
+    SubscribePending,
 }
 
 /// The daemon's reply.
@@ -62,8 +90,17 @@ pub enum Frame {
 pub enum Reply {
     /// The `op` exit code to mirror.
     Exit { code: i32 },
-    /// A control result: success flag plus display lines.
+    /// A control result: success flag plus display lines. The reply to the
+    /// runtime-control commands (`Lockdown`, `LeaseRevoke`, `Approve`, `Deny`).
     Control { ok: bool, lines: Vec<String> },
+    /// A pre-serialized JSON body (one value, no trailing newline) for the
+    /// read/report queries. Carried as a `String` so [`Reply`] stays `Eq`; the
+    /// client parses it into the matching DTO.
+    Json { body: String },
+    /// One item of a subscription stream (e.g. a pending-set snapshot). The
+    /// daemon writes these repeatedly on one connection until the client hangs
+    /// up. Same `String`-body convention as [`Reply::Json`].
+    Event { body: String },
 }
 
 fn invalid_data<E: std::error::Error + Send + Sync + 'static>(e: E) -> io::Error {
@@ -251,6 +288,43 @@ mod tests {
         let mut daemon = daemon;
         send_reply(&mut daemon, &Reply::Exit { code: 3 }).unwrap();
         assert_eq!(recv_reply(&mut shim).unwrap(), Reply::Exit { code: 3 });
+    }
+
+    #[test]
+    fn a_malformed_frame_is_rejected() {
+        // A rogue client sending non-JSON must be rejected as InvalidData, never
+        // silently misparsed into a control command.
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut a = a;
+        a.write_all(b"this is not a frame\n").unwrap();
+        let err = recv_frame(&b).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn json_and_event_replies_roundtrip() {
+        // The two stream/report reply shapes must survive the wire intact.
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut server = server;
+        send_reply(&mut server, &Reply::Json { body: "[]".into() }).unwrap();
+        send_reply(
+            &mut server,
+            &Reply::Event {
+                body: "{\"k\":1}".into(),
+            },
+        )
+        .unwrap();
+        let mut client = client;
+        assert_eq!(
+            recv_reply(&mut client).unwrap(),
+            Reply::Json { body: "[]".into() }
+        );
+        assert_eq!(
+            recv_reply(&mut client).unwrap(),
+            Reply::Event {
+                body: "{\"k\":1}".into()
+            }
+        );
     }
 
     #[test]

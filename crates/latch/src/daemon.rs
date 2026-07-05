@@ -79,6 +79,11 @@ pub struct Core {
     /// The `op` binary the SSH sign path shells out to for the per-signature key
     /// fetch. `None` uses PATH discovery; tests point it at a fake `op`.
     ssh_op_path: Option<std::path::PathBuf>,
+    /// Audit logging: `Some(retention_days)` appends a metadata-only line per
+    /// decision to `history.jsonl` (pruned to the window); `None` disables it.
+    /// The real daemon enables it; tests leave it off so they never write to a
+    /// developer's `~/.latch`.
+    audit: Option<u32>,
 }
 
 /// A persisted daemon<->phone pairing: everything needed to reach the phone as
@@ -195,7 +200,66 @@ impl Core {
             factor,
             ssh_keys,
             ssh_op_path: None,
+            audit: Some(
+                crate::settings::Settings::load()
+                    .map(|s| s.retention_days)
+                    .unwrap_or(30),
+            ),
         })
+    }
+
+    /// The full status report, the daemon's answer to `Frame::Status`. It is the
+    /// source of truth: the host-side facts from [`crate::report`] plus the
+    /// daemon's own runtime state (lockdown + live lease count).
+    fn status_report(&self) -> crate::json::StatusJson {
+        crate::report::status(
+            true,
+            crate::report::Runtime {
+                locked_down: self.lockdown.load(Ordering::SeqCst),
+                leases: self.leases.active(),
+            },
+        )
+    }
+
+    /// The audit `via` label for a fresh grant under the resolved factor.
+    fn grant_via(&self) -> &'static str {
+        match self.factor {
+            Factor::Phone => "phone",
+            Factor::Biometric => "biometric",
+            Factor::DevInsecure => "dev",
+            Factor::NoFactor => "none",
+        }
+    }
+
+    /// Append one metadata-only audit line, if auditing is enabled. Best-effort:
+    /// never fails a request. Records names and provenance only, never a secret.
+    #[allow(clippy::too_many_arguments)]
+    fn record_audit(
+        &self,
+        id: &str,
+        kind: latch_proto::RequestKind,
+        label: &str,
+        account: &str,
+        process: &str,
+        cwd: &str,
+        decision: &str,
+        via: &str,
+    ) {
+        if let Some(retention) = self.audit {
+            let entry = crate::audit::entry(
+                id,
+                kind,
+                label,
+                account,
+                process,
+                cwd,
+                decision,
+                None,
+                latch_proto::now_ms(),
+                via,
+            );
+            crate::audit::append(&entry, retention);
+        }
     }
 }
 
@@ -428,10 +492,16 @@ fn handle_conn(core: Arc<Core>, mut stream: UnixStream) -> anyhow::Result<()> {
 
     let (frame, fds) = match local::recv_frame(&stream) {
         Ok(v) => v,
-        // A probe (status/doctor) connects then hangs up; not an error.
+        // A probe connects then hangs up; not an error.
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
         Err(e) => return Err(e.into()),
     };
+
+    // The pending subscription streams many replies on this one connection, so
+    // it is handled outside the single-reply match below.
+    if matches!(frame, Frame::SubscribePending) {
+        return stream_pending(&core, &mut stream);
+    }
 
     let reply = match frame {
         Frame::Op { argv, cwd } => {
@@ -483,31 +553,41 @@ fn handle_conn(core: Arc<Core>, mut stream: UnixStream) -> anyhow::Result<()> {
                 )
             }
         }
-        Frame::LeaseList => {
-            let lines: Vec<String> = core
-                .leases
-                .list()
-                .into_iter()
-                .map(|l| {
-                    format!(
-                        "{}  {}  {}  {}s left",
-                        &l.grant_hex[..12.min(l.grant_hex.len())],
-                        l.account,
-                        l.scope,
-                        l.remaining.as_secs()
-                    )
-                })
-                .collect();
-            Reply::Control { ok: true, lines }
-        }
         Frame::LeaseRevoke { prefix } => {
             let n = core.leases.revoke(&prefix);
             control_reply(n > 0, &format!("revoked {n} lease(s)"))
         }
+        Frame::Status => json_reply(&core.status_report()),
+        Frame::Doctor => json_reply(&crate::report::doctor(true)),
+        Frame::LeaseList => json_reply(&leases_json(&core)),
+        Frame::Pending => json_reply(&pending_json(&core)),
+        Frame::History => {
+            let entries: Vec<_> = crate::audit::load().iter().map(|e| e.to_json()).collect();
+            json_reply(&entries)
+        }
+        // Handled above via an early return; the match stays exhaustive.
+        Frame::SubscribePending => unreachable!("subscribe streams before the match"),
     };
 
     local::send_reply(&mut stream, &reply)?;
     Ok(())
+}
+
+/// Stream the pending set to a subscriber: emit the current snapshot, then
+/// re-emit on every change (and as a ~30s keepalive that also detects a hung-up
+/// client), until the connection breaks. Runs on the blocking pool.
+fn stream_pending(core: &Core, stream: &mut UnixStream) -> anyhow::Result<()> {
+    loop {
+        // Read the version before snapshotting so a change during snapshotting
+        // is never missed (at worst it costs one duplicate emit).
+        let version = core.pending.version();
+        let body = serde_json::to_string(&pending_json(core)).unwrap_or_else(|_| "[]".to_string());
+        if local::send_reply(stream, &Reply::Event { body }).is_err() {
+            return Ok(()); // client hung up
+        }
+        core.pending
+            .wait_for_change(version, Duration::from_secs(30));
+    }
 }
 
 fn control_reply(ok: bool, msg: &str) -> Reply {
@@ -515,6 +595,77 @@ fn control_reply(ok: bool, msg: &str) -> Reply {
         ok,
         lines: vec![msg.to_string()],
     }
+}
+
+/// Wrap any serializable value as a [`Reply::Json`] (a pre-serialized body the
+/// CLI prints verbatim). Serialization of these small owned structs never fails.
+fn json_reply<T: serde::Serialize>(value: &T) -> Reply {
+    Reply::Json {
+        body: serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
+    }
+}
+
+/// The active leases as the `lease list --json` array. The store holds
+/// monotonic `Instant`s, so absolute unix-ms timestamps are reconstructed from
+/// `now` plus each lease's age/remaining. `caller` is empty: a lease retains the
+/// grant key, not the provenance that derived it (see JSON.md).
+fn leases_json(core: &Core) -> Vec<crate::json::LeaseJson> {
+    let now = latch_proto::now_ms();
+    core.leases
+        .list()
+        .into_iter()
+        .map(|l| crate::json::LeaseJson {
+            grant_hex: l.grant_hex,
+            caller: String::new(),
+            account: l.account,
+            scope: l.scope,
+            granted_ms: now.saturating_sub(l.age.as_millis() as u64),
+            expires_ms: now + l.remaining.as_millis() as u64,
+        })
+        .collect()
+}
+
+/// The parked requests as the `pending --json` array. Enumerates the local
+/// control-socket queue; `risk`/`reason`/`coalesced` are the honest defaults for
+/// that path (see JSON.md).
+fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
+    core.pending
+        .snapshot()
+        .into_iter()
+        .map(|s| {
+            let ctx = s.ctx;
+            crate::json::PendingJson {
+                id: ctx.id,
+                kind: crate::json::request_kind_str(ctx.kind).to_string(),
+                command: ctx.command,
+                secrets: ctx
+                    .secret_refs
+                    .into_iter()
+                    .map(|r| crate::json::SecretRefJson {
+                        provider: r.provider,
+                        segments: r.segments,
+                        label: r.label,
+                    })
+                    .collect(),
+                ssh: ctx.ssh.map(|c| crate::json::SshJson {
+                    key_label: c.key_label,
+                    host: c.host,
+                    fingerprint: c.fingerprint,
+                }),
+                provenance: crate::json::ProvJson {
+                    process_chain: crate::json::split_provenance(&ctx.provenance),
+                    cwd: ctx.cwd,
+                    machine: crate::json::hostname(),
+                    requested_ms: s.queued_at_ms,
+                },
+                risk: "routine".to_string(),
+                reason: None,
+                expires_ms: s.queued_at_ms + s.timeout_ms,
+                timeout_ms: s.timeout_ms,
+                coalesced: 0,
+            }
+        })
+        .collect()
 }
 
 /// The gated fulfillment path. Returns the exit code to mirror to the shim.
@@ -552,6 +703,17 @@ fn fulfill(
 
     // A live lease short-circuits the approval.
     if let Some(token) = core.leases.token_for(&gk, &account_label, &scope) {
+        let refs = core.provider.describe(argv);
+        core.record_audit(
+            &uuid::Uuid::now_v7().to_string(),
+            core.provider.kind(argv),
+            &audit_label(&refs, &scope),
+            &account_label,
+            &caller.provenance(),
+            cwd,
+            "approved",
+            "lease",
+        );
         return core.provider.run(ProviderRun {
             command: argv,
             cwd,
@@ -578,6 +740,16 @@ fn fulfill(
     let outcome = core.gate.decide(gk, &ctx);
     let decision = outcome.decision;
     if !decision.is_grant() {
+        core.record_audit(
+            &ctx.id,
+            ctx.kind,
+            &audit_label(&ctx.secret_refs, &scope),
+            &account_label,
+            &ctx.provenance,
+            cwd,
+            "denied",
+            "",
+        );
         return fail_closed(stderr, "op: request denied\n");
     }
 
@@ -612,6 +784,17 @@ fn fulfill(
             .grant(gk, &account_label, &scope, token.clone(), ttl);
     }
 
+    core.record_audit(
+        &ctx.id,
+        ctx.kind,
+        &audit_label(&ctx.secret_refs, &scope),
+        &account_label,
+        &ctx.provenance,
+        cwd,
+        "approved",
+        core.grant_via(),
+    );
+
     // Run through the provider: it injects the credential and streams the
     // resolved secrets straight to the caller's fds. The daemon never holds a
     // secret value; it holds only the credential (token), zeroized below.
@@ -624,6 +807,14 @@ fn fulfill(
     });
     drop(token); // zeroized here; the child holds its own copy in its env
     code
+}
+
+/// The brightest audit label for an op request: the first secret ref's item
+/// label, or the scope string when the provider named none.
+fn audit_label(refs: &[latch_proto::SecretRef], scope: &str) -> String {
+    refs.first()
+        .map(|r| r.label.clone())
+        .unwrap_or_else(|| scope.to_string())
 }
 
 /// Write a fail-closed message to the caller's stderr fd (if present) and
@@ -740,6 +931,7 @@ mod tests {
             factor: Factor::DevInsecure,
             ssh_keys: Vec::new(),
             ssh_op_path: None,
+            audit: None,
         };
         (Arc::new(core), pending)
     }
@@ -786,6 +978,224 @@ mod tests {
         assert_eq!(read_all(read_end), "known-secret-42");
         // No lease was requested, so none is held.
         assert_eq!(core.leases.active(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn approved_request_is_recorded_in_the_audit_log() {
+        // The daemon appends one metadata-only line per decision. Build a
+        // dev-approve core with auditing enabled to a private LATCH_HOME and
+        // prove the approved request lands in history.jsonl with the right
+        // decision/account/via.
+        let _home = HomeGuard::new("audit-approve");
+        let dir = tmpdir("audit");
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::with_dek());
+        let dek = keystore.unwrap_dek("seed").unwrap();
+        let mut accounts = AccountStore::default();
+        accounts
+            .add("Rowm", &dek, b"tok", vec!["Engineering".into()])
+            .unwrap();
+        drop(dek);
+        let pending = Arc::new(PendingRegistry::new());
+        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+            .with_dev(DevMode::Approve)
+            .with_control_socket(true);
+        let core = Core {
+            keystore,
+            accounts: Mutex::new(accounts),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(approver)),
+            pending,
+            lockdown: AtomicBool::new(false),
+            proc_table: Box::new(EmptyTable),
+            provider: Box::new(OpProvider::with_binary(write_fake_op(
+                &dir, "tok", "secret-1",
+            ))),
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::DevInsecure,
+            ssh_keys: Vec::new(),
+            ssh_op_path: None,
+            audit: Some(30),
+        };
+
+        let (read_end, write_end) = pipe();
+        let argv = vec![
+            "op".into(),
+            "read".into(),
+            "op://Engineering/.env/password".into(),
+        ];
+        // Empty cwd: the fake op runs in the test's own directory (a real path).
+        assert_eq!(fulfill(&core, &argv, "", None, Some(write_end), None), 0);
+        assert_eq!(read_all(read_end), "secret-1");
+
+        let hist = crate::audit::load();
+        assert_eq!(hist.len(), 1, "one decision, one audit line");
+        assert_eq!(hist[0].decision, "approved");
+        assert_eq!(hist[0].account, "Rowm");
+        assert_eq!(hist[0].via, "dev");
+        assert_eq!(hist[0].kind, "secret_read");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Drive one request/reply frame through `handle_conn` over a socketpair and
+    /// return the reply. For the non-streaming control protocol frames.
+    fn query_reply(core: Arc<Core>, frame: Frame) -> Reply {
+        let (client, server) = UnixStream::pair().unwrap();
+        local::send_frame(&client, &frame, &[]).unwrap();
+        let h = std::thread::spawn(move || handle_conn(core, server).unwrap());
+        let mut client = client;
+        let reply = local::recv_reply(&mut client).unwrap();
+        h.join().unwrap();
+        reply
+    }
+
+    fn json_body(reply: Reply) -> String {
+        match reply {
+            Reply::Json { body } => body,
+            other => panic!("expected Reply::Json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_read_frames_return_parseable_json() {
+        // Every read/report frame must round-trip: the daemon builds a JSON body
+        // that deserializes back into the matching DTO the Mac app decodes.
+        let _home = HomeGuard::new("read-frames");
+        let dir = tmpdir("read-frames");
+        let (core, _pending) = test_core(
+            &dir,
+            "tok",
+            "secret",
+            DevMode::Approve,
+            Duration::from_millis(50),
+        );
+
+        let st: crate::json::StatusJson =
+            serde_json::from_str(&json_body(query_reply(core.clone(), Frame::Status))).unwrap();
+        assert!(!st.socket.is_empty());
+
+        let checks: Vec<crate::json::CheckJson> =
+            serde_json::from_str(&json_body(query_reply(core.clone(), Frame::Doctor))).unwrap();
+        assert!(checks
+            .iter()
+            .any(|c| c.label == "approving factor resolved"));
+
+        let leases: Vec<crate::json::LeaseJson> =
+            serde_json::from_str(&json_body(query_reply(core.clone(), Frame::LeaseList))).unwrap();
+        assert!(leases.is_empty());
+
+        let pend: Vec<crate::json::PendingJson> =
+            serde_json::from_str(&json_body(query_reply(core.clone(), Frame::Pending))).unwrap();
+        assert!(pend.is_empty());
+
+        let hist: Vec<crate::json::HistoryJson> =
+            serde_json::from_str(&json_body(query_reply(core.clone(), Frame::History))).unwrap();
+        assert!(hist.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn control_approve_for_an_unknown_id_is_refused() {
+        // A control client cannot conjure an approval: `Approve` only resolves a
+        // genuinely-parked request. With `NullApprover`/`NoFactor` nothing ever
+        // parks, so the socket can never bypass the real factor (Finding-1).
+        let dir = tmpdir("approve-unknown");
+        let (core, _p) = test_core(
+            &dir,
+            "tok",
+            "secret",
+            DevMode::Off,
+            Duration::from_millis(50),
+        );
+        match query_reply(
+            core,
+            Frame::Approve {
+                id: "not-a-real-id".into(),
+                lease: false,
+            },
+        ) {
+            Reply::Control { ok, .. } => assert!(!ok, "approving a non-pending id must fail"),
+            other => panic!("unexpected {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn subscribe_pending_streams_ordered_snapshots() {
+        // The live-menubar stream: emit the current snapshot, then a fresh one on
+        // every change, in order. Park a request, see it appear; resolve it, see
+        // it clear.
+        fn read_event(client: &mut UnixStream) -> Vec<crate::json::PendingJson> {
+            match local::recv_reply(client).unwrap() {
+                Reply::Event { body } => serde_json::from_str(&body).unwrap(),
+                other => panic!("expected Event, got {other:?}"),
+            }
+        }
+
+        let dir = tmpdir("subscribe");
+        let (core, pending) = test_core(
+            &dir,
+            "tok",
+            "secret",
+            DevMode::Off, // parks on the control socket and waits
+            Duration::from_secs(3),
+        );
+
+        let (client, server) = UnixStream::pair().unwrap();
+        local::send_frame(&client, &Frame::SubscribePending, &[]).unwrap();
+        let stream_core = core.clone();
+        let h = std::thread::spawn(move || {
+            let _ = handle_conn(stream_core, server);
+        });
+        let mut client = client;
+
+        // First event: the current (empty) snapshot.
+        assert!(
+            read_event(&mut client).is_empty(),
+            "first snapshot is empty"
+        );
+
+        // Park a request by driving a gated fulfill on a background thread.
+        let park_core = core.clone();
+        let (_r, w) = pipe();
+        let worker = std::thread::spawn(move || {
+            let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
+            fulfill(&park_core, &argv, "", None, Some(w), None)
+        });
+
+        // A subsequent event carries the parked request.
+        let mut tries = 0;
+        loop {
+            let ev = read_event(&mut client);
+            if !ev.is_empty() {
+                assert_eq!(ev.len(), 1, "one parked request");
+                assert_eq!(ev[0].command, vec!["op", "read", "op://Engineering/.env"]);
+                break;
+            }
+            tries += 1;
+            assert!(tries < 50, "request never appeared in the stream");
+        }
+
+        // Resolve it (deny), unblocking the worker; the stream then reports empty.
+        let id = pending
+            .pending_ids()
+            .into_iter()
+            .next()
+            .expect("a parked id");
+        assert!(pending.resolve(&id, Decision::Deny));
+        loop {
+            if read_event(&mut client).is_empty() {
+                break;
+            }
+        }
+
+        assert_eq!(worker.join().unwrap(), 1, "denied request fails closed");
+        // Dropping the client ends the stream; the handler notices on its next
+        // emit. We detach rather than join so the test does not wait out the
+        // keepalive interval (a non-joined thread does not delay process exit).
+        drop(client);
+        drop(h);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1006,6 +1416,7 @@ mod tests {
             factor: Factor::Phone,
             ssh_keys: Vec::new(),
             ssh_op_path: None,
+            audit: None,
         })
     }
 
@@ -1419,6 +1830,7 @@ mod tests {
             factor,
             ssh_keys: Vec::new(),
             ssh_op_path: None,
+            audit: None,
         })
     }
 

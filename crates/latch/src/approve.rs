@@ -124,12 +124,42 @@ pub trait Approver: Send + Sync {
     fn decide(&self, ctx: &ApprovalContext) -> ApprovalOutcome;
 }
 
+/// One parked local approval: the channel a decision is delivered on, plus the
+/// request context and timing the daemon needs to enumerate it for `pending`.
+struct Waiter {
+    tx: Sender<Decision>,
+    ctx: ApprovalContext,
+    queued_at_ms: u64,
+    timeout_ms: u64,
+}
+
+/// A read-only view of one parked request, for `latch pending --json`.
+#[derive(Debug, Clone)]
+pub struct PendingSnapshot {
+    pub ctx: ApprovalContext,
+    /// When the request parked, unix ms.
+    pub queued_at_ms: u64,
+    /// The local-decision timeout, ms (the countdown full scale).
+    pub timeout_ms: u64,
+}
+
+/// The mutable inside of [`PendingRegistry`]: the parked waiters plus a version
+/// counter bumped on every change, so a subscriber can block until the set moves.
+#[derive(Default)]
+struct Inner {
+    waiters: HashMap<String, Waiter>,
+    version: u64,
+}
+
 /// Registry of pending local approvals, keyed by request id. Shared between the
 /// [`LocalApprover`] (which parks a waiter) and the daemon's control handler
-/// (which resolves it when `latch approve --local` arrives).
+/// (which resolves it, enumerates the parked set for `pending`, or streams
+/// changes for `subscribe_pending`).
 #[derive(Default)]
 pub struct PendingRegistry {
-    waiters: Mutex<HashMap<String, Sender<Decision>>>,
+    inner: Mutex<Inner>,
+    /// Notified whenever `inner.version` changes, waking `wait_for_change`.
+    changed: Condvar,
 }
 
 impl PendingRegistry {
@@ -137,31 +167,45 @@ impl PendingRegistry {
         Self::default()
     }
 
-    fn park(&self, id: &str) -> Receiver<Decision> {
+    /// Bump the version and wake any subscriber. Caller holds `inner`.
+    fn bump(&self, inner: &mut Inner) {
+        inner.version += 1;
+        self.changed.notify_all();
+    }
+
+    fn park(&self, ctx: &ApprovalContext, timeout: Duration) -> Receiver<Decision> {
         let (tx, rx) = std::sync::mpsc::channel();
-        self.waiters
-            .lock()
-            .expect("pending registry poisoned")
-            .insert(id.to_string(), tx);
+        let mut inner = self.inner.lock().expect("pending registry poisoned");
+        inner.waiters.insert(
+            ctx.id.clone(),
+            Waiter {
+                tx,
+                ctx: ctx.clone(),
+                queued_at_ms: latch_proto::now_ms(),
+                timeout_ms: timeout.as_millis() as u64,
+            },
+        );
+        self.bump(&mut inner);
         rx
     }
 
     fn unpark(&self, id: &str) {
-        self.waiters
-            .lock()
-            .expect("pending registry poisoned")
-            .remove(id);
+        let mut inner = self.inner.lock().expect("pending registry poisoned");
+        if inner.waiters.remove(id).is_some() {
+            self.bump(&mut inner);
+        }
     }
 
     /// Deliver a decision to a parked local approval. Returns true if a waiter
     /// was found (the id was pending).
     pub fn resolve(&self, id: &str, decision: Decision) -> bool {
         let tx = self
-            .waiters
+            .inner
             .lock()
             .expect("pending registry poisoned")
+            .waiters
             .get(id)
-            .cloned();
+            .map(|w| w.tx.clone());
         match tx {
             Some(tx) => tx.send(decision).is_ok(),
             None => false,
@@ -170,12 +214,52 @@ impl PendingRegistry {
 
     /// Ids currently awaiting a local decision.
     pub fn pending_ids(&self) -> Vec<String> {
-        self.waiters
+        self.inner
             .lock()
             .expect("pending registry poisoned")
+            .waiters
             .keys()
             .cloned()
             .collect()
+    }
+
+    /// A snapshot of every parked request, for enumeration. Newest-first.
+    pub fn snapshot(&self) -> Vec<PendingSnapshot> {
+        let mut out: Vec<PendingSnapshot> = self
+            .inner
+            .lock()
+            .expect("pending registry poisoned")
+            .waiters
+            .values()
+            .map(|w| PendingSnapshot {
+                ctx: w.ctx.clone(),
+                queued_at_ms: w.queued_at_ms,
+                timeout_ms: w.timeout_ms,
+            })
+            .collect();
+        out.sort_by_key(|s| std::cmp::Reverse(s.queued_at_ms));
+        out
+    }
+
+    /// The current change version. A subscriber records this alongside a
+    /// snapshot, then calls [`wait_for_change`](Self::wait_for_change) with it.
+    pub fn version(&self) -> u64 {
+        self.inner
+            .lock()
+            .expect("pending registry poisoned")
+            .version
+    }
+
+    /// Block until the pending set changes from `since`, or `timeout` elapses.
+    /// Returns the current version (equal to `since` only on timeout). The
+    /// subscribe loop calls this, then re-snapshots when the version advances.
+    pub fn wait_for_change(&self, since: u64, timeout: Duration) -> u64 {
+        let inner = self.inner.lock().expect("pending registry poisoned");
+        let (inner, _timeout) = self
+            .changed
+            .wait_timeout_while(inner, timeout, |i| i.version == since)
+            .expect("pending registry poisoned");
+        inner.version
     }
 }
 
@@ -322,7 +406,7 @@ impl LocalApprover {
             "latch daemon: approval required · {} · {}\n            approve: latch approve --local --id {}\n            deny:    latch deny --local --id {}",
             ctx.account, ctx.scope, ctx.id, ctx.id
         );
-        let rx = self.pending.park(&ctx.id);
+        let rx = self.pending.park(ctx, self.timeout);
         let decision = rx.recv_timeout(self.timeout).unwrap_or(Decision::Deny);
         self.pending.unpark(&ctx.id);
         decision
@@ -542,6 +626,68 @@ mod tests {
         }
         assert!(pending.resolve("req-1", Decision::Approve));
         assert_eq!(handle.join().unwrap(), Decision::Approve);
+    }
+
+    #[test]
+    fn snapshot_exposes_the_parked_request_context_for_pending() {
+        // The `pending` verb reads this snapshot: a parked request must surface
+        // its full context (command, kind, cwd) plus a queued time and timeout,
+        // so the menubar can render it.
+        let pending = Arc::new(PendingRegistry::new());
+        let ks: Arc<dyn Keystore> = Arc::new(crate::keystore::MemoryKeystore::new());
+        let approver = Arc::new(
+            LocalApprover::new(ks, pending.clone())
+                .with_control_socket(true)
+                .with_timeout(Duration::from_secs(2)),
+        );
+        let a2 = approver.clone();
+        let handle = std::thread::spawn(move || a2.decide(&ctx("req-snap", "read .env")).decision);
+
+        let mut tries = 0;
+        while pending.snapshot().is_empty() {
+            std::thread::sleep(Duration::from_millis(5));
+            tries += 1;
+            assert!(tries < 200, "request never parked");
+        }
+        let snap = pending.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].ctx.id, "req-snap");
+        assert_eq!(snap[0].ctx.command, vec!["op", "read"]);
+        assert_eq!(snap[0].timeout_ms, 2000);
+        assert!(snap[0].queued_at_ms > 0);
+
+        assert!(pending.resolve("req-snap", Decision::Deny));
+        assert_eq!(handle.join().unwrap(), Decision::Deny);
+        // Once resolved and unparked, the snapshot is empty again.
+        assert!(pending.snapshot().is_empty());
+    }
+
+    #[test]
+    fn version_advances_and_wakes_a_waiter_on_change() {
+        // The subscribe stream relies on: the version moves when the set changes,
+        // and wait_for_change returns immediately if it already moved past `since`.
+        let pending = Arc::new(PendingRegistry::new());
+        let ks: Arc<dyn Keystore> = Arc::new(crate::keystore::MemoryKeystore::new());
+        let approver = Arc::new(
+            LocalApprover::new(ks, pending.clone())
+                .with_control_socket(true)
+                .with_timeout(Duration::from_secs(2)),
+        );
+        let v0 = pending.version();
+        // A timeout with no change returns the same version.
+        assert_eq!(pending.wait_for_change(v0, Duration::from_millis(20)), v0);
+
+        // Parking a request advances the version.
+        let a2 = approver.clone();
+        let handle = std::thread::spawn(move || a2.decide(&ctx("req-v", "read .env")).decision);
+        let v1 = pending.wait_for_change(v0, Duration::from_secs(2));
+        assert_ne!(v1, v0, "park must advance the version");
+
+        // Resolving (and the approver unparking) advances it again.
+        assert!(pending.resolve("req-v", Decision::Deny));
+        assert_eq!(handle.join().unwrap(), Decision::Deny);
+        let v2 = pending.wait_for_change(v1, Duration::from_secs(2));
+        assert_ne!(v2, v1, "unpark must advance the version");
     }
 
     #[test]

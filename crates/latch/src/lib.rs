@@ -7,9 +7,11 @@
 //! part of the crate's public API rather than dead code in a binary.
 
 pub mod approve;
+pub mod audit;
 pub mod cli;
 pub mod daemon;
 pub mod factor;
+pub mod json;
 pub mod keystore;
 #[cfg(target_os = "macos")]
 pub mod keystore_macos;
@@ -20,8 +22,10 @@ pub mod pairing_store;
 pub mod paths;
 pub mod provider;
 pub mod remote;
+pub mod report;
 pub mod secrets;
 pub mod service;
+pub mod settings;
 pub mod setup;
 pub mod shim;
 pub mod sshagent;
