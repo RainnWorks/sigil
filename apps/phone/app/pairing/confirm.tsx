@@ -13,6 +13,7 @@ import {
   resetCeremony,
   submitPairingResponse,
 } from "@/src/session/pairing-flow";
+import { armLiveSession } from "@/src/session/controller";
 
 type Phase = "handshaking" | "confirm" | "delivering" | "error";
 
@@ -65,6 +66,10 @@ export default function ConfirmScreen() {
     try {
       // Message 3: the daemon seals the DEK once its human confirms too.
       await awaitDekDelivery();
+      // Reflect the freshly persisted pairing into the store (paired: true, armed)
+      // so the root layout keeps us on the tabs instead of bouncing back into the
+      // pairing stack. Without this the flag only flips on the next cold boot.
+      await armLiveSession();
       router.replace({ pathname: "/pairing/done", params: { ok: "1" } });
     } catch (e) {
       setError(e instanceof Error ? e.message : "The Mac did not deliver the key.");
