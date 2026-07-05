@@ -9,6 +9,18 @@ the gap named.
 Paths are relative to the repo root. Test names are the `#[test]` fn names;
 run any with `cargo test <name>`.
 
+**Authorship convention (review integrity).** The claim/code/test rows and the
+residuals are maintained by whoever touches the surface. But a *verdict* — any
+"reviewed and found sound" / "CONFIRMED SOUND" statement about whether a
+construction is correct — is written **only by an independent security-reviewer
+that did not author the code under review**, never by the implementer
+(self-certification is not a verdict). A proving-test cell reading "reviewed by
+inspection" is a narrower thing: a reviewer's note that a specific claim is
+verified by manual inspection because it has no automated test (and it is flagged
+**UNPROVEN** where inspection is the only evidence). It is not a soundness
+verdict. Sweep at `747b3a4`: the only construction verdict in this document is
+§14 (P-256 SE wrap), written by the reviewer, not the implementer.
+
 Reviewed at commit `3d005aa` (the first end-to-end remote-approval loop).
 Extended at commit `ee49ee3` (any-CLI generalization: provider registry, the
 `env-file` direct-injection provider, the pluggable SSH signer, and the
