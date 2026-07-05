@@ -7,6 +7,7 @@
 //! JSON and base64url-encoded so it fits a QR with no padding characters to
 //! confuse scanners.
 
+use base64::engine::general_purpose::STANDARD as B64_STD;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use blake2::digest::consts::U32;
@@ -167,6 +168,7 @@ fn pairing_transcript(
     created_at: u64,
     phone: &PeerIdentity,
     nonce: &[u8; 32],
+    se_share_pub: Option<&str>,
 ) -> [u8; 32] {
     let mut h = Blake2b512::new();
     h.update(PAIRING_DOMAIN);
@@ -180,6 +182,14 @@ fn pairing_transcript(
     absorb(&mut h, &phone.verifying);
     absorb(&mut h, &phone.agreement);
     absorb(&mut h, nonce);
+    // v2: bind the phone's Secure-Enclave threshold share `F` into the same MAC
+    // that pins the phone's identity, so a relay can neither substitute nor strip
+    // it without breaking the tag (it lacks the pairing secret). Absorbed ONLY
+    // when present, so a v1 response (no share) hashes byte-identically to before.
+    // The base64 string is bound verbatim; on-curve validation happens at pin.
+    if let Some(share) = se_share_pub {
+        absorb(&mut h, share.as_bytes());
+    }
     let digest = h.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest[..32]);
@@ -215,6 +225,20 @@ fn confirmation_tag(k_confirm: &[u8; 32], transcript: &[u8; 32]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
+/// Decode and on-curve-validate a phone threshold share `F` (standard base64 of
+/// the 65-byte ANSI X9.63 uncompressed P-256 point). Rejects wrong lengths and
+/// off-curve/twist points via the shared [`crate::threshold::P256Point`]
+/// validator (the same one the daemon uses at account-add), so an invalid `F`
+/// never gets pinned. Returns the canonical 65-byte encoding.
+fn validate_se_share(b64: &str) -> Result<[u8; 65], HandshakeError> {
+    let bytes = B64_STD
+        .decode(b64)
+        .map_err(|_| HandshakeError::BadThresholdShare)?;
+    let point = crate::threshold::P256Point::from_x963(&bytes)
+        .map_err(|_| HandshakeError::BadThresholdShare)?;
+    Ok(*point.as_x963())
+}
+
 /// Constant-time verification of a confirmation tag. `Mac::verify_slice`
 /// compares in constant time, so a wrong tag leaks no timing signal about how
 /// many leading bytes matched.
@@ -238,30 +262,43 @@ pub struct PairingResponse {
     pub nonce: [u8; 32],
     /// BLAKE2b-keyed confirmation tag over the transcript.
     pub tag: [u8; 32],
+    /// The phone's v2 threshold share `F = f·G`, ANSI X9.63 uncompressed (65
+    /// bytes), **standard base64**. Present only for a v2 pairing; a v1 phone
+    /// omits it (`#[serde(default)]`, so old responses still parse). Bound into
+    /// the confirmation [`tag`](Self::tag), so a relay cannot swap or strip it,
+    /// and validated on-curve by the daemon when it pins it (see
+    /// [`DaemonPairing::receive_response`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub se_share_pub: Option<String>,
 }
 
 impl PairingResponse {
-    /// Build a response from decomposed QR fields plus the phone identity.
+    /// Build a response from decomposed QR fields plus the phone identity, and an
+    /// optional v2 threshold share `F` (standard base64 x963) to pin.
     fn build(
         daemon: &PeerIdentity,
         endpoints: &[String],
         created_at: u64,
         phone: &PeerIdentity,
         secret: &PairingSecret,
+        se_share_pub: Option<&str>,
     ) -> Self {
         let mut nonce = [0u8; 32];
         rand_core::OsRng.fill_bytes(&mut nonce);
         let k_confirm = derive_subkey(secret, SUBKEY_CONFIRM_LABEL);
-        let transcript = pairing_transcript(daemon, endpoints, created_at, phone, &nonce);
+        let transcript =
+            pairing_transcript(daemon, endpoints, created_at, phone, &nonce, se_share_pub);
         let tag = confirmation_tag(&k_confirm, &transcript);
         Self {
             phone: *phone,
             nonce,
             tag,
+            se_share_pub: se_share_pub.map(str::to_string),
         }
     }
 
-    /// Phone side: build the authenticated response to a scanned `payload`.
+    /// Phone side (v1): build the authenticated response to a scanned `payload`,
+    /// carrying no threshold share.
     pub fn create(payload: &PairingPayload, phone: &PeerIdentity) -> Self {
         Self::build(
             &payload.daemon,
@@ -269,12 +306,31 @@ impl PairingResponse {
             payload.created_at,
             phone,
             &payload.secret,
+            None,
+        )
+    }
+
+    /// Phone side (v2): build the authenticated response and pin the phone's
+    /// Secure-Enclave threshold share `F` (`se_share_pub`, standard base64 of the
+    /// 65-byte ANSI X9.63 public point). `F` is bound into the confirmation tag.
+    pub fn create_with_share(
+        payload: &PairingPayload,
+        phone: &PeerIdentity,
+        se_share_pub: &str,
+    ) -> Self {
+        Self::build(
+            &payload.daemon,
+            &payload.endpoints,
+            payload.created_at,
+            phone,
+            &payload.secret,
+            Some(se_share_pub),
         )
     }
 
     /// Daemon side: verify the tag against the daemon's own view of the QR it
     /// minted. Returns `true` only if the sender held the secret and bound
-    /// exactly `self.phone` to exactly this pairing.
+    /// exactly `self.phone` (and any `self.se_share_pub`) to exactly this pairing.
     pub fn verify(
         &self,
         daemon: &PeerIdentity,
@@ -283,8 +339,14 @@ impl PairingResponse {
         secret: &PairingSecret,
     ) -> bool {
         let k_confirm = derive_subkey(secret, SUBKEY_CONFIRM_LABEL);
-        let transcript =
-            pairing_transcript(daemon, endpoints, created_at, &self.phone, &self.nonce);
+        let transcript = pairing_transcript(
+            daemon,
+            endpoints,
+            created_at,
+            &self.phone,
+            &self.nonce,
+            self.se_share_pub.as_deref(),
+        );
         verify_confirmation_tag(&k_confirm, &transcript, &self.tag)
     }
 }
@@ -383,6 +445,8 @@ pub enum HandshakeError {
     SecretConsumed,
     #[error("confirmation tag did not verify: wrong secret or substituted phone key")]
     BadTag,
+    #[error("the phone's v2 threshold share F is malformed or off-curve")]
+    BadThresholdShare,
     #[error("SAS mismatch: the two devices did not pin the same keys")]
     SasMismatch,
     #[error("sealing the DEK failed: {0}")]
@@ -405,6 +469,9 @@ pub struct DaemonPairing {
     secret_ttl_ms: u64,
     consumed: bool,
     phone: Option<PeerIdentity>,
+    /// The phone's v2 threshold share `F` (ANSI X9.63, 65 bytes), pinned from an
+    /// accepted response after on-curve validation. `None` for a v1 pairing.
+    phone_se_share: Option<[u8; 65]>,
 }
 
 impl DaemonPairing {
@@ -433,6 +500,7 @@ impl DaemonPairing {
             secret_ttl_ms: PAIRING_SECRET_TTL_MS,
             consumed: false,
             phone: None,
+            phone_se_share: None,
         };
         (driver, payload)
     }
@@ -483,10 +551,26 @@ impl DaemonPairing {
         ) {
             return Err(HandshakeError::BadTag);
         }
+        // v2: the response may pin the phone's threshold share F. The tag already
+        // proved it was not swapped/stripped (F is bound into the transcript);
+        // now validate it decodes to an on-curve P-256 point before pinning it
+        // (lesser R2). A malformed share fails the whole response closed.
+        let phone_se_share = match &resp.se_share_pub {
+            Some(b64) => Some(validate_se_share(b64)?),
+            None => None,
+        };
         self.consumed = true;
         self.phone = Some(resp.phone);
+        self.phone_se_share = phone_se_share;
         self.state = PairingState::ResponseReceived;
         Ok(resp.phone)
+    }
+
+    /// The phone's pinned v2 threshold share `F` (ANSI X9.63, 65 bytes), if the
+    /// accepted response carried one. `None` for a v1 pairing. Available once a
+    /// response has been received.
+    pub fn phone_se_share(&self) -> Option<[u8; 65]> {
+        self.phone_se_share
     }
 
     /// The six SAS words for this pairing, to be read aloud and matched against
@@ -597,6 +681,10 @@ pub struct PhonePairing {
     /// Taken (and thus zeroized) the moment the one response is produced.
     secret: Option<PairingSecret>,
     qr_ttl_ms: u64,
+    /// The phone's v2 threshold share `F` to pin at pairing (standard base64
+    /// x963), set via [`Self::with_se_share`] before [`Self::respond`]. `None`
+    /// keeps the v1 (no-share) response.
+    se_share_pub: Option<String>,
 }
 
 impl PhonePairing {
@@ -624,12 +712,21 @@ impl PhonePairing {
             created_at: payload.created_at,
             secret: Some(payload.secret),
             qr_ttl_ms: PAIRING_SECRET_TTL_MS,
+            se_share_pub: None,
         })
     }
 
     /// Override the QR freshness limit (mainly for tests).
     pub fn with_qr_ttl(mut self, ttl_ms: u64) -> Self {
         self.qr_ttl_ms = ttl_ms;
+        self
+    }
+
+    /// Pin the phone's v2 Secure-Enclave threshold share `F` (standard base64 of
+    /// the 65-byte ANSI X9.63 point) so the next [`respond`](Self::respond)
+    /// carries it, bound into the confirmation tag. Call before `respond`.
+    pub fn with_se_share(mut self, se_share_pub: &str) -> Self {
+        self.se_share_pub = Some(se_share_pub.to_string());
         self
     }
 
@@ -649,6 +746,7 @@ impl PhonePairing {
             self.created_at,
             &self.phone_pub,
             &secret,
+            self.se_share_pub.as_deref(),
         ))
     }
 
@@ -840,6 +938,98 @@ mod tests {
         assert_eq!(daemon.state(), PairingState::Init);
     }
 
+    /// A valid on-curve F in standard base64, plus its 65 raw bytes.
+    fn sample_share() -> (String, [u8; 65]) {
+        let f = crate::threshold::MacShare::generate();
+        let raw = *f.public_point().as_x963();
+        (B64_STD.encode(raw), raw)
+    }
+
+    #[test]
+    fn v2_threshold_share_round_trips_and_is_pinned() {
+        let daemon_id = DeviceIdentity::generate();
+        let (mut daemon, payload) = DaemonPairing::mint(daemon_id, endpoints(), NOW);
+        let (share_b64, share_raw) = sample_share();
+        let mut phone = PhonePairing::scan(DeviceIdentity::generate(), payload, NOW)
+            .unwrap()
+            .with_se_share(&share_b64);
+        let resp = phone.respond().unwrap();
+        assert_eq!(resp.se_share_pub.as_deref(), Some(share_b64.as_str()));
+
+        daemon.receive_response(&resp, NOW).unwrap();
+        // The daemon pinned exactly the F the phone sent, on-curve validated.
+        assert_eq!(daemon.phone_se_share(), Some(share_raw));
+    }
+
+    #[test]
+    fn a_swapped_or_stripped_share_breaks_the_tag() {
+        // F is bound into the confirmation tag, so a relay that swaps it for
+        // another valid F' (to seal future tokens to a key it controls) or strips
+        // it (to downgrade) is caught by the MAC, not silently accepted.
+        let daemon_id = DeviceIdentity::generate();
+        let daemon_pub = daemon_id.peer_identity();
+        let (mut daemon, payload) = DaemonPairing::mint(daemon_id, endpoints(), NOW);
+        let (share_b64, _) = sample_share();
+        let mut phone = PhonePairing::scan(DeviceIdentity::generate(), payload, NOW)
+            .unwrap()
+            .with_se_share(&share_b64);
+        let good = phone.respond().unwrap();
+
+        // Swap F for a different valid on-curve F'.
+        let (other_b64, _) = sample_share();
+        let mut swapped = good.clone();
+        swapped.se_share_pub = Some(other_b64);
+        assert_eq!(
+            daemon.receive_response(&swapped, NOW),
+            Err(HandshakeError::BadTag)
+        );
+
+        // Strip F entirely (downgrade attempt).
+        let mut stripped = good.clone();
+        stripped.se_share_pub = None;
+        assert_eq!(
+            daemon.receive_response(&stripped, NOW),
+            Err(HandshakeError::BadTag)
+        );
+
+        // The genuine response still verifies (secret not burned by the failures).
+        assert_eq!(daemon.receive_response(&good, NOW).unwrap(), good.phone);
+        let _ = daemon_pub;
+    }
+
+    #[test]
+    fn an_off_curve_share_is_rejected_even_with_a_valid_tag() {
+        // The tag can be honestly computed over a malformed F (the phone controls
+        // the string it MACs); the daemon must still refuse to pin an off-curve
+        // point (lesser R2), failing the whole response closed.
+        let daemon_id = DeviceIdentity::generate();
+        let (mut daemon, payload) = DaemonPairing::mint(daemon_id, endpoints(), NOW);
+        // 65 bytes that are not a valid point.
+        let bad = B64_STD.encode([0x04u8; 65]);
+        let mut phone = PhonePairing::scan(DeviceIdentity::generate(), payload, NOW)
+            .unwrap()
+            .with_se_share(&bad);
+        let resp = phone.respond().unwrap();
+        assert_eq!(
+            daemon.receive_response(&resp, NOW),
+            Err(HandshakeError::BadThresholdShare)
+        );
+    }
+
+    #[test]
+    fn a_v1_response_without_a_share_is_unchanged() {
+        // No share => the transcript and wire bytes are byte-identical to v1, and
+        // nothing is pinned. This is what keeps the live v1 demo working.
+        let daemon_id = DeviceIdentity::generate();
+        let (mut daemon, payload) = DaemonPairing::mint(daemon_id, endpoints(), NOW);
+        let mut phone = PhonePairing::scan(DeviceIdentity::generate(), payload, NOW).unwrap();
+        let resp = phone.respond().unwrap();
+        assert!(resp.se_share_pub.is_none());
+        assert!(!serde_json::to_string(&resp).unwrap().contains("seSharePub"));
+        daemon.receive_response(&resp, NOW).unwrap();
+        assert_eq!(daemon.phone_se_share(), None);
+    }
+
     #[test]
     fn tag_rejected_under_wrong_secret() {
         // The daemon's stored secret differs from the one the response used.
@@ -851,7 +1041,8 @@ mod tests {
         // daemon identity and endpoints.
         let wrong_secret = PairingSecret::generate();
         let phone = DeviceIdentity::generate().peer_identity();
-        let resp = PairingResponse::build(&daemon_pub, &endpoints(), NOW, &phone, &wrong_secret);
+        let resp =
+            PairingResponse::build(&daemon_pub, &endpoints(), NOW, &phone, &wrong_secret, None);
 
         assert_eq!(
             daemon.receive_response(&resp, NOW),

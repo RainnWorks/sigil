@@ -26,7 +26,7 @@ use latch_proto::identity::DeviceIdentity;
 use latch_proto::pairing::{DaemonPairing, Dek};
 use latch_proto::{rendezvous_mailbox, PairingResponse, TransportError};
 
-use crate::pairing_store::NewPairing;
+use crate::pairing_store::{NewPairing, NewPhoneShare};
 
 /// The opaque-string channel the pairing ceremony runs over: send toward the
 /// phone, receive from the phone. Implemented by [`RendezvousWs`] for the real
@@ -169,6 +169,16 @@ pub fn run_ceremony(daemon_identity: DeviceIdentity, opts: CeremonyOpts<'_>) -> 
     let phone = daemon
         .phone()
         .expect("phone is pinned once the response verified");
+    // The ceremony delivers the v1 DEK (above) AND, when the phone's response
+    // carried its v2 Secure-Enclave threshold share F (already tag-bound and
+    // on-curve-validated by `receive_response`), pins F too, so one pairing arms
+    // both v1 accounts (DEK) and v2 accounts (threshold). The wire carries only F;
+    // the Mac names the key locally and defaults its ECDH shape (NV-2/NV-7).
+    let phone_share = daemon.phone_se_share().map(|f| NewPhoneShare {
+        se_key_id: crate::threshold::DEFAULT_SE_KEY_ID.to_string(),
+        f_x963: f.to_vec(),
+        ecdh_algo: crate::threshold::DEFAULT_ECDH_ALGO,
+    });
     let sas_words: [String; 6] = std::array::from_fn(|i| words[i].to_string());
     Ok(NewPairing {
         daemon_identity: retained,
@@ -176,9 +186,7 @@ pub fn run_ceremony(daemon_identity: DeviceIdentity, opts: CeremonyOpts<'_>) -> 
         relay_url: opts.relay_url,
         sas_words,
         paired_at: (opts.now)(),
-        // v1 ceremony delivers a DEK; the v2 SE share F is pinned by the separate
-        // `latch pair upgrade` path, not this DEK-handoff ceremony.
-        phone_share: None,
+        phone_share,
     })
 }
 
@@ -440,6 +448,71 @@ mod tests {
         let plaintext = decrypt_token(&recovered_dek, &ciphertext)
             .expect("the phone-delivered DEK must decrypt the account token");
         assert_eq!(&plaintext[..], TOKEN);
+    }
+
+    #[test]
+    fn ceremony_pins_the_phone_threshold_share_f_when_sent() {
+        // When the phone's pairing response carries its v2 SE share F (tag-bound
+        // and on-curve-validated in receive_response), run_ceremony persists it in
+        // the returned NewPairing so v2 account-add can wrap tokens to it.
+        use base64::engine::general_purpose::STANDARD as B64S;
+        use latch_proto::pairing::PhonePairing;
+        use latch_proto::threshold::MacShare;
+        use latch_proto::PairingPayload;
+
+        // The phone's SE share f (software stand-in) and its public F.
+        let f = MacShare::generate();
+        let f_x963 = *f.public_point().as_x963();
+        let f_b64 = B64S.encode(f_x963);
+
+        let d2p = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        let p2d = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        let (qr_tx, qr_rx) = std::sync::mpsc::channel::<String>();
+
+        let phone_thread = {
+            let p2d = p2d.clone();
+            let f_b64 = f_b64.clone();
+            std::thread::spawn(move || {
+                let qr = qr_rx.recv().expect("daemon rendered a QR");
+                let payload = PairingPayload::from_qr_string(&qr).unwrap();
+                let mut phone =
+                    PhonePairing::scan(DeviceIdentity::generate(), payload, NOW + 1_000)
+                        .unwrap()
+                        .with_se_share(&f_b64);
+                let resp = phone.respond().unwrap();
+                let resp_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&resp).unwrap());
+                p2d.lock().unwrap().push_back(resp_b64);
+            })
+        };
+
+        let daemon_id = DeviceIdentity::generate();
+        let mut make_channel = |_m: [u8; 32]| -> Result<Box<dyn PairChannel>> {
+            Ok(Box::new(MemChannel {
+                d2p: d2p.clone(),
+                p2d: p2d.clone(),
+            }))
+        };
+        let mut present_qr = |_u: &str, b64: &str| qr_tx.send(b64.to_string()).unwrap();
+        let mut confirm = |_w: &[&'static str; 6]| true;
+        let clock = || NOW;
+        let dek = crate::secrets::generate_dek();
+        let opts = CeremonyOpts {
+            relay_url: "ws://relay.test".into(),
+            response_timeout: Duration::from_secs(5),
+            flush_grace: Duration::ZERO,
+            now: &clock,
+            make_channel: &mut make_channel,
+            present_qr: &mut present_qr,
+            confirm_sas: &mut confirm,
+            dek: &dek,
+        };
+        let np = run_ceremony(daemon_id, opts).expect("ceremony completes");
+        phone_thread.join().unwrap();
+
+        let share = np.phone_share.expect("F was pinned");
+        assert_eq!(share.f_x963, f_x963.to_vec(), "the exact F is persisted");
+        assert_eq!(share.se_key_id, crate::threshold::DEFAULT_SE_KEY_ID);
+        assert_eq!(share.ecdh_algo, crate::threshold::DEFAULT_ECDH_ALGO);
     }
 
     #[test]
