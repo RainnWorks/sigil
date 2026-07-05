@@ -101,22 +101,3 @@ export function looksLikeX963P256(bytes: Uint8Array): boolean {
   return false;
 }
 
-/**
- * The pairing message that delivers the phone's public SE share `F` to the Mac
- * (docs/design/threshold-v2.md §5/§7): phone→Mac, sealed in a standard Envelope
- * after SAS Confirmed. `F = f·G` is the public half of the non-exportable
- * Secure-Enclave key; the private `f` never leaves the enclave.
- *
- * RECONCILE WITH THE DAEMON (#30): the daemon's persisted share is
- * `{ se_key_id, f_x963 (base64), ecdh_algo }` (crates/latch/src/pairing_store.rs
- * `PersistedPhoneShare`). This wire payload matches it camelCase: `seKeyId`,
- * `fX963` (standard-base64 of the 65-byte X9.63 `F`), `ecdhAlgo`. If the daemon's
- * inbound wire type diverges, this interface is the single place to reconcile.
- */
-export interface ThresholdShare {
-  seKeyId: string;
-  /** F = f·G, ANSI X9.63 uncompressed (65 bytes), standard-base64. */
-  fX963: string;
-  /** Which SE ECDH output shape this key's partials will take (NV-2). */
-  ecdhAlgo: EcdhAlgo;
-}

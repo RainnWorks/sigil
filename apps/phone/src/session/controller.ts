@@ -109,7 +109,7 @@ export async function unpair(): Promise<void> {
   store.clearPairingState();
 }
 
-export type ApproveOutcome = "sent" | "refused" | "no-session" | "error";
+export type ApproveOutcome = "sent" | "refused" | "mismatch" | "no-session" | "error";
 
 /**
  * Approve `request` over the live transport. Reads the DEK behind Face ID and,
@@ -153,6 +153,13 @@ async function liveApproveThreshold(request: ApprovalRequest): Promise<ApproveOu
   if (!ch) return "error";
   if (!isSecureEnclaveAvailable()) return "error";
 
+  // R5: bind consent to the account shown. The sheet displays `ch.label` as the
+  // account being unlocked; refuse (fail closed, before the SE op) if that
+  // account shares nothing with the secret refs in the readout, so a mis-issued
+  // challenge cannot show the human account A while cryptographically unlocking
+  // account B.
+  if (!consentConsistent(ch.label, ch.accountId, request.secrets)) return "mismatch";
+
   let zfB64: string;
   try {
     const sodium = await loadSodium();
@@ -176,6 +183,38 @@ async function liveApproveThreshold(request: ApprovalRequest): Promise<ApproveOu
   } catch {
     return "error";
   }
+}
+
+/**
+ * R5 consent cross-check: does the account named in the challenge agree with the
+ * secret refs shown in the readout? A residual-#7 Mac attacker can only decouple
+ * "what the human sees" from "what gets unlocked" if the account label and the
+ * displayed secrets can drift apart, so we refuse when the challenge's account
+ * shares no meaningful token with any secret ref. Consistent (or nothing to
+ * cross-check, i.e. no secrets) => true.
+ */
+function consentConsistent(
+  label: string,
+  accountId: string,
+  secrets: ApprovalRequest["secrets"],
+): boolean {
+  if (secrets.length === 0) return true;
+  const account = new Set([...tokens(label), ...tokens(accountId)]);
+  if (account.size === 0) return false;
+  for (const ref of secrets) {
+    for (const t of [ref.label, ref.provider, ...ref.segments].flatMap(tokens)) {
+      if (account.has(t)) return true;
+    }
+  }
+  return false;
+}
+
+/** Lowercase word tokens (>=3 chars) for the fuzzy consent cross-check. */
+function tokens(s: string): string[] {
+  return s
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length >= 3);
 }
 
 export type DenyOutcome = "sent" | "no-session" | "error";

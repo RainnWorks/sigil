@@ -78,6 +78,7 @@ function pairingTranscript(
   createdAt: number,
   phone: PeerIdentity,
   nonce: Uint8Array,
+  seSharePub?: string,
 ): Uint8Array {
   const parts: Uint8Array[] = [PAIRING_DOMAIN];
   absorb(parts, daemon.verifying);
@@ -88,6 +89,12 @@ function pairingTranscript(
   absorb(parts, phone.verifying);
   absorb(parts, phone.agreement);
   absorb(parts, nonce);
+  // v2: bind the phone's Secure-Enclave threshold share `F` (se_share_pub) into
+  // the same MAC that pins the phone's identity, so a relay cannot swap or strip
+  // it without the pairing secret. Absorbed ONLY when present, so a v1 response
+  // hashes byte-identically to before. The base64 STRING bytes are bound verbatim
+  // (mirrors proto `pairing_transcript`); on-curve validation happens at pin.
+  if (seSharePub !== undefined) absorb(parts, enc.encode(seSharePub));
   const digest = sodium.crypto_generichash(64, concatBytes(...parts));
   return digest.slice(0, 32);
 }
@@ -114,6 +121,12 @@ export interface PairingResponse {
   phone: PeerIdentity;
   nonce: Uint8Array;
   tag: Uint8Array;
+  /**
+   * The phone's v2 threshold share `F = f·G`, ANSI X9.63 uncompressed (65 bytes),
+   * STANDARD base64. Present only for a v2 pairing; a v1 phone omits it. Bound
+   * into {@link tag} via the transcript, so a relay cannot swap or strip it.
+   */
+  seSharePub?: string;
 }
 
 /** The serde form the daemon deserializes (byte arrays as number arrays). */
@@ -121,18 +134,27 @@ interface PairingResponseJson {
   phone: { verifying: number[]; agreement: number[] };
   nonce: number[];
   tag: number[];
+  /**
+   * Mirrors proto `se_share_pub`. proto's PairingResponse is
+   * `#[serde(rename_all = "camelCase")]` with `#[serde(default,
+   * skip_serializing_if = "Option::is_none")]`, so the WIRE key is `seSharePub`
+   * and the field is omitted entirely when absent.
+   */
+  seSharePub?: string;
 }
 
 /**
  * Build the response with a caller-supplied nonce. Used by the shared-vector
  * parity harness (fixed nonce => reproducible tag); production code calls
- * {@link buildPairingResponse}, which supplies a fresh CSPRNG nonce.
+ * {@link buildPairingResponse}, which supplies a fresh CSPRNG nonce. `seSharePub`
+ * is the optional v2 threshold share `F` (standard base64 x963) to pin.
  */
 export function buildPairingResponseWithNonce(
   sodium: Sodium,
   payload: PairingPayload,
   phone: PeerIdentity,
   nonce: Uint8Array,
+  seSharePub?: string,
 ): PairingResponse {
   const kConfirm = deriveSubkey(sodium, payload.secret, SUBKEY_CONFIRM_LABEL);
   const transcript = pairingTranscript(
@@ -142,28 +164,31 @@ export function buildPairingResponseWithNonce(
     payload.createdAt,
     phone,
     nonce,
+    seSharePub,
   );
   const tag = confirmationTag(sodium, kConfirm, transcript);
-  return { phone, nonce, tag };
+  return seSharePub !== undefined ? { phone, nonce, tag, seSharePub } : { phone, nonce, tag };
 }
 
 /**
  * Build the phone's authenticated response to a scanned `payload`. A fresh
  * 256-bit nonce is drawn per response, matching proto's `PairingResponse::build`
- * (the phone emits exactly one response per scan).
+ * (the phone emits exactly one response per scan). `seSharePub` is the optional
+ * v2 threshold share `F` (standard base64 x963) to bind and deliver.
  */
 export function buildPairingResponse(
   sodium: Sodium,
   payload: PairingPayload,
   phone: PeerIdentity,
+  seSharePub?: string,
 ): PairingResponse {
   const nonce = sodium.randombytes_buf(32);
-  return buildPairingResponseWithNonce(sodium, payload, phone, nonce);
+  return buildPairingResponseWithNonce(sodium, payload, phone, nonce, seSharePub);
 }
 
 /** The serde JSON the daemon expects (matches `serde_json::to_vec(&resp)`). */
 export function pairingResponseToJson(resp: PairingResponse): PairingResponseJson {
-  return {
+  const json: PairingResponseJson = {
     phone: {
       verifying: Array.from(resp.phone.verifying),
       agreement: Array.from(resp.phone.agreement),
@@ -171,6 +196,10 @@ export function pairingResponseToJson(resp: PairingResponse): PairingResponseJso
     nonce: Array.from(resp.nonce),
     tag: Array.from(resp.tag),
   };
+  // Omit when absent, mirroring proto's skip_serializing_if = Option::is_none, so
+  // a v1 response serializes byte-identically to before.
+  if (resp.seSharePub !== undefined) json.seSharePub = resp.seSharePub;
+  return json;
 }
 
 /**

@@ -26,7 +26,6 @@ import {
   type DeviceIdentity,
   type Envelope,
   envelopeFromWire,
-  envelopeToWire,
   type EnvelopeWire,
   agreementSecretKey,
   fingerprintWords,
@@ -42,20 +41,21 @@ import {
   recoverDek,
   rendezvousMailbox,
   ReplayGuard,
-  seal,
-  signingSecretKey,
   type Sodium,
-  type ThresholdShare,
 } from "@/src/protocol";
 import { RelayMailbox, relayBaseFromEndpoints } from "@/src/transport/relay-http";
+import { generateShareKey, isSecureEnclaveAvailable } from "@/modules/latch-se";
 import { armLiveSession } from "./controller";
 import { savePairing } from "./keystore";
-import {
-  mintShareKey,
-  newSeKeyId,
-  PHONE_SE_ECDH_ALGO,
-  secureEnclaveAvailable,
-} from "./threshold-se";
+
+/**
+ * The SE share key id. FIXED, and must equal the daemon's `DEFAULT_SE_KEY_ID`
+ * ("phone-se.v2", crates/latch/src/threshold.rs): the Mac assigns this id locally
+ * at pairing and echoes it in every per-request `ThresholdChallenge.seKeyId`, so
+ * the phone must store `f` under exactly this id or `computePartial` cannot
+ * reload it. Re-pairing overwrites `f` under the same id (recovery = rotation).
+ */
+const PHONE_SE_KEY_ID = "phone-se.v2";
 
 /** QR / pairing-secret lifetime, matching proto `PAIRING_SECRET_TTL_MS` (180s). */
 const PAIRING_SECRET_TTL_MS = 180_000;
@@ -83,6 +83,10 @@ export interface Ceremony {
   relayBase?: string;
   /** The bootstrap rendezvous mailbox, once scanned. */
   rendezvous?: Uint8Array;
+  /** The v2 SE share key id minted for this pairing (device-only; no SE => absent). */
+  seKeyId?: string;
+  /** F = f·G, standard base64 x963, carried on the PairingResponse as se_share_pub. */
+  seSharePub?: string;
   /** True once the PairingResponse has been submitted (message 1 sent). */
   responseSubmitted?: boolean;
 }
@@ -135,6 +139,13 @@ export async function acceptScan(qr: string): Promise<Ceremony> {
  * Message 1: build the authenticated PairingResponse and POST it (base64url) to
  * the rendezvous mailbox. Sent before SAS, because the daemon needs it to pin
  * this phone and show its matching six words.
+ *
+ * v2: mint the Secure-Enclave share key `f` (if this device has an SE) FIRST, so
+ * its public point `F` rides on this response as `se_share_pub`, bound into the
+ * confirmation MAC (a relay can neither swap nor strip it without the pairing
+ * secret). Minting needs no biometric; the Face ID gate is on later
+ * key-agreement. On the Simulator (no SE) the phone pairs v1-only. The private
+ * `f` never leaves the enclave; a mint failure degrades to a v1 pairing.
  */
 export async function submitPairingResponse(): Promise<void> {
   const s = await sod();
@@ -142,7 +153,18 @@ export async function submitPairingResponse(): Promise<void> {
   if (!c?.scanned || !c.rendezvous || !c.relayBase) {
     throw new Error("no scanned pairing to respond to");
   }
-  const resp = buildPairingResponse(s, c.scanned, c.phonePub);
+  if (isSecureEnclaveAvailable() && !c.seSharePub) {
+    try {
+      // Standard base64 (with padding) of the 65-byte x963 F, minted under the
+      // daemon's fixed key id so per-request challenges resolve `f`.
+      c.seSharePub = await generateShareKey(PHONE_SE_KEY_ID);
+      c.seKeyId = PHONE_SE_KEY_ID;
+    } catch {
+      c.seSharePub = undefined;
+      c.seKeyId = undefined;
+    }
+  }
+  const resp = buildPairingResponse(s, c.scanned, c.phonePub, c.seSharePub);
   const mailbox = new RelayMailbox(c.relayBase, c.rendezvous);
   await mailbox.submit(pairingResponseToSubmitString(resp));
   c.responseSubmitted = true;
@@ -151,11 +173,10 @@ export async function submitPairingResponse(): Promise<void> {
 /**
  * Message 3: wait on the rendezvous mailbox for the daemon's sealed DEK, open it
  * (verify the daemon's signature, replay-check, decrypt), recover the DEK, store
- * it behind Face ID, then (v2) mint the Secure-Enclave share `f` and deliver its
- * public point `F` back to the Mac, and finally arm the live approval session.
- * Called only after the human confirmed the SAS. Throws on timeout or a bad DEK
- * envelope (fail closed); the v2 share delivery is best-effort and never aborts a
- * pairing whose v1 DEK already landed.
+ * it behind Face ID, persist the pairing (including the v2 SE key id, whose `F`
+ * was already delivered on message 1), and arm the live approval session. Called
+ * only after the human confirmed the SAS. Throws on timeout or a bad DEK envelope
+ * (fail closed).
  */
 export async function awaitDekDelivery(): Promise<void> {
   const s = await sod();
@@ -185,33 +206,11 @@ export async function awaitDekDelivery(): Promise<void> {
   });
   const dek = recoverDek(payload);
 
-  // v2: mint the Secure-Enclave share key `f` (if this device has an SE) and
-  // deliver its public point `F` to the Mac, sealed in a standard Envelope to the
-  // rendezvous mailbox (design §5/§7: phone->Mac, after SAS). The private `f`
-  // never leaves the enclave. On the Simulator (no SE) the phone pairs v1-only.
-  // Best-effort: a v2 share-delivery failure must not abort a pairing whose v1
-  // DEK already succeeded; the share can be re-delivered by a later upgrade.
-  let seKeyId: string | undefined;
-  if (secureEnclaveAvailable()) {
-    try {
-      const id = newSeKeyId(s);
-      const fX963 = await mintShareKey(id);
-      const share: ThresholdShare = { seKeyId: id, fX963, ecdhAlgo: PHONE_SE_ECDH_ALGO };
-      // Sealed to the pinned daemon, signed by this phone. pairingId is the
-      // steady mailbox (mirroring the v1 deliver_dek convention, reversed
-      // direction); counter 1 is the phone's first outbound on this pairing.
-      const env = seal(s, share, {
-        pairingId: c.mailbox,
-        counter: 1,
-        senderSigningSecret: signingSecretKey(s, c.phone),
-        recipient: c.scanned.daemon,
-      });
-      await rendezvous.submit(JSON.stringify(envelopeToWire(env)));
-      seKeyId = id;
-    } catch {
-      seKeyId = undefined;
-    }
-  }
+  // v2: the phone's SE share `F` was already delivered to the Mac ON message 1
+  // (as `se_share_pub`, bound into the confirmation MAC — see
+  // submitPairingResponse), so there is nothing to send here. Persist the SE key
+  // id so per-request approvals can reload `f`; absent on a v1 (no-SE) pairing.
+  const seKeyId = c.seKeyId;
 
   await savePairing(
     {

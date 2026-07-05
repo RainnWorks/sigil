@@ -62,7 +62,9 @@ export function ApprovalSheet({
         setGateNote(
           outcome === "refused"
             ? "Face ID did not pass. Nothing was approved."
-            : "Could not reach your Mac. Nothing was approved.",
+            : outcome === "mismatch"
+              ? "This request's account does not match the secret shown. Nothing was approved."
+              : "Could not reach your Mac. Nothing was approved.",
         );
         return;
       }
