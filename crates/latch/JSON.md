@@ -25,8 +25,24 @@ are explicit strings. Timestamps are integer unix milliseconds.
 ### `latch account rotate --id <id> --token-stdin --json`
 Each echoes one account object (same shape as a `list` element).
 
+### `latch config list --json`
+```json
+[ { "command": str, "provider": str, "source": str?, "account": str?,
+    "risk": "routine|elevated|critical" }, ... ]
+```
+
+### `latch config add <cmd> --provider <id> [...] --json`
+Echoes the one added command object (same shape as a `list` element). Validated
+CLI-side: an unknown provider or risk, or an `env-file` provider without
+`--source`, is rejected (exit 2) before the store is written.
+
+### `latch config remove <cmd> --json`
+Returns the control shape `{ "ok": bool, "lines": [str] }` (`ok:false` when no
+such command was configured).
+
 ### `latch account remove --id <id> --json`
 ### `latch shim install --json`
+### `latch shim add <cmd> --json`
 ### `latch unpair --json`
 ### `latch wipe --force --json`
 All return the control shape:
@@ -34,7 +50,7 @@ All return the control shape:
 { "ok": bool, "lines": [str] }
 ```
 `wipe` refuses (`ok:false`) without `--force`. `wipe --force` removes the
-pairing, accounts, SSH keys, settings, dev keystore, and history.
+pairing, accounts, SSH keys, command config, settings, dev keystore, and history.
 
 ### `latch mac-approvals --enable | --phone-only --json`
 ```json

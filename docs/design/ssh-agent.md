@@ -439,3 +439,38 @@ PY
 (`session-bind@openssh.com`, `restrict-destination-v00@openssh.com`), 1Password CLI
 `op read` `?ssh-format=openssh`, ssh-key 0.6.7 docs.rs, and live tests against the
 Rowm service account on 2026-07-04.*
+
+---
+
+## Addendum: the pluggable signer seam (generalization, 2026-07-05)
+
+SSH is reframed as a distinct **Integration** on the generic core (its event is a
+signature, not an env injection), and the **key source is now pluggable** the way
+the `SecretProvider` seam is pluggable for secrets. The change is additive; the
+wire listener and the phone gate are untouched.
+
+- **`SshSigner` trait** (`crates/latch/src/sshagent.rs`): `identities()`,
+  `needs_account()`, `sign(id, data, credential)`, `owns(key_blob)`. It is the
+  key-source seam *inside* the daemon; `SshBackend` remains the listener-facing
+  seam. `Core` now holds `Vec<Box<dyn SshSigner>>`, aggregates their identities,
+  and — after the phone approval grants — routes a `SIGN_REQUEST` to the signer
+  that owns the key.
+- **Two signers ship.** `OpSshSigner` (the default) is the fetch-per-signature
+  path from §2a unchanged: `needs_account()` is true, so the daemon routes the
+  account, unwraps the DEK, decrypts the SA token, and hands it in; the residual
+  from §4 (whole key in RAM for one signature) is unchanged and confined to this
+  signer. `FileSshSigner` signs from a local `~/.ssh/id_*` file for users who do
+  not keep keys in 1Password: `needs_account()` is false (no account, no DEK, no
+  token), the public blob comes from the sibling `<path>.pub`, and the private key
+  is read into a `Zeroizing` buffer for the one signature and wiped. v1 both
+  signers are ed25519-only.
+- **The gate is signer-agnostic.** `Core::approve_and_sign` applies the same
+  sealed phone-approval round-trip regardless of signer, so `latch ssh` is useful
+  to anyone however they hold their keys. The hard trade from the memory entry
+  stands: SA-fetch buys {1Password-managed, works-remotely} at the cost of a brief
+  key-in-RAM; a file/SE signer buys {key-never-touches-1Password, works-remotely}
+  but is not 1Password-managed. Future SE-resident and proxy signers are new
+  `SshSigner` impls; nothing else moves. **Routed to security-reviewer.**
+- **CLI:** `latch ssh add-file --path <key>` registers a file signer entry
+  (`~/.latch/ssh-keys.json` gains a `files` list beside `keys`); `latch ssh list`
+  shows both sources tagged `1password ·` / `file ·`.

@@ -5,14 +5,14 @@
 //! same-machine, same-user channel (the socket is 0600). It carries two kinds
 //! of traffic, distinguished by a tagged [`Frame`]:
 //!
-//! * an **op request** from the shim, which also passes the caller's own
-//!   stdout/stderr file descriptors over SCM_RIGHTS, so the real `op` child
-//!   writes secrets straight to the caller's terminal or pipe and the daemon
-//!   never sees output; and
+//! * a **run request** from the shim / `latch <cmd>` primitive, which also passes
+//!   the caller's own stdout/stderr file descriptors over SCM_RIGHTS, so the
+//!   underlying tool's child writes secrets straight to the caller's terminal or
+//!   pipe and the daemon never sees output; and
 //! * **control commands** from the CLI (local approve/deny, lockdown, lease
 //!   list/revoke), which carry no descriptors.
 //!
-//! The daemon replies with a [`Reply`]: an exit code to mirror for op requests,
+//! The daemon replies with a [`Reply`]: an exit code to mirror for run requests,
 //! or a small status payload for control commands.
 
 use std::io::{self, Read, Write};
@@ -44,18 +44,20 @@ pub fn socket_path() -> PathBuf {
 /// [`Reply::Json`] body (`Status`, `Doctor`, `LeaseList`, `Pending`, `History`),
 /// runtime-control commands that return a [`Reply::Control`] result (`Lockdown`,
 /// `LeaseRevoke`, `Approve`, `Deny`), and the [`Frame::SubscribePending`] stream
-/// that emits a [`Reply::Event`] per pending-set change. The `Op` variant is the
-/// shim's separate SCM_RIGHTS secret path and is untouched by the control
-/// surface. Keystore/config *mutations* (account add/rotate/remove, settings,
-/// wipe, mac-approvals, shim install, pairing) are deliberately NOT here: they
-/// stay short-lived CLI operations so a compromised always-on daemon cannot
-/// perform them.
+/// that emits a [`Reply::Event`] per pending-set change. The `Run` variant is the
+/// shim / `latch <cmd>` separate SCM_RIGHTS secret path and is untouched by the
+/// control surface. Keystore/config *mutations* (account add/rotate/remove,
+/// command config, settings, wipe, mac-approvals, shim install, pairing) are
+/// deliberately NOT here: they stay short-lived CLI operations so a compromised
+/// always-on daemon cannot perform them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Frame {
-    /// An `op` invocation: the original argv and the caller's cwd. The caller's
-    /// stdout/stderr descriptors ride alongside as SCM_RIGHTS.
-    Op { argv: Vec<String>, cwd: String },
+    /// A gated command invocation: the original argv (argv[0] is the command
+    /// name) and the caller's cwd. The caller's stdout/stderr descriptors ride
+    /// alongside as SCM_RIGHTS. The daemon looks up the command config, gates it,
+    /// injects the provider's environment, and runs it.
+    Run { argv: Vec<String>, cwd: String },
     /// The full status report (armed state, factor, shim drift, relay, counts,
     /// lockdown). Returns [`Reply::Json`] of a `StatusJson`.
     Status,
@@ -107,7 +109,7 @@ fn invalid_data<E: std::error::Error + Send + Sync + 'static>(e: E) -> io::Error
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
-/// Send a frame, optionally with descriptors (op requests pass stdout/stderr).
+/// Send a frame, optionally with descriptors (run requests pass stdout/stderr).
 pub fn send_frame(stream: &UnixStream, frame: &Frame, fds: &[RawFd]) -> io::Result<()> {
     let mut line = serde_json::to_vec(frame).map_err(invalid_data)?;
     line.push(b'\n');
@@ -264,7 +266,7 @@ mod tests {
         let read_end = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
         let write_end = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
 
-        let frame = Frame::Op {
+        let frame = Frame::Run {
             argv: vec!["op".into(), "read".into()],
             cwd: "/work".into(),
         };

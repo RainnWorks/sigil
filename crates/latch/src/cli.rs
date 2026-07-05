@@ -49,7 +49,9 @@ pub fn run() -> i32 {
         "wipe" => cmd_wipe(&args[1..], json),
         "ssh" => cmd_ssh(&args[1..]),
         "sshagent" => cmd_sshagent(),
-        "shim" => cmd_shim(args.get(1).map(String::as_str), json),
+        "shim" => cmd_shim(&args[1..], json),
+        "config" => cmd_config(&args[1..], json),
+        "run" => cmd_run(&args[1..]),
         "version" | "--version" | "-V" => {
             println!("latch {VERSION}");
             0
@@ -59,10 +61,93 @@ pub fn run() -> i32 {
             0
         }
         other => {
-            eprintln!("latch: unknown command '{other}'\n");
-            print_help();
-            2
+            // Not a reserved verb: the `latch <cmd> [args]` primitive. A leading
+            // '-' is a flag typo, not a command, so show help instead of trying
+            // to gate a "command" named like an option.
+            debug_assert!(
+                !is_reserved_verb(other),
+                "a reserved verb reached command dispatch; the match above must handle it"
+            );
+            if other.starts_with('-') {
+                eprintln!("latch: unknown option '{other}'\n");
+                print_help();
+                return 2;
+            }
+            dispatch_command(&args)
         }
+    }
+}
+
+/// Whether `cmd` is a reserved `latch` verb (handled by the dispatch above) and
+/// therefore takes precedence over the `latch <cmd>` command primitive. The
+/// unambiguous escape hatch for a tool named like a verb is `latch run -- <cmd>`.
+/// Kept in one place so the precedence is testable and cannot silently drift from
+/// the match.
+pub fn is_reserved_verb(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "" | "status"
+            | "daemon"
+            | "doctor"
+            | "setup"
+            | "pair"
+            | "unpair"
+            | "start"
+            | "stop"
+            | "restart"
+            | "account"
+            | "lease"
+            | "lockdown"
+            | "approve"
+            | "deny"
+            | "history"
+            | "pending"
+            | "mac-approvals"
+            | "settings"
+            | "wipe"
+            | "ssh"
+            | "sshagent"
+            | "shim"
+            | "config"
+            | "run"
+            | "version"
+            | "--version"
+            | "-V"
+            | "help"
+            | "--help"
+            | "-h"
+    )
+}
+
+/// Forward a `latch <cmd> [args]` invocation to the daemon (gated), or exec the
+/// real tool if the daemon is down. `argv[0]` is the command name. Shared by the
+/// primitive dispatch, `latch run -- <cmd>`, and the transparent shim alias
+/// (via [`crate::shim::dispatch`]). Never returns.
+fn dispatch_command(argv: &[String]) -> ! {
+    crate::shim::dispatch(argv.to_vec())
+}
+
+/// `latch run [--] <cmd> [args]`: the unambiguous escape hatch for a command that
+/// collides with a reserved verb (or whose args look like latch flags). Strips a
+/// leading `--`, then dispatches the rest exactly like the `latch <cmd>`
+/// primitive. Never returns (the child's exit code becomes ours).
+fn cmd_run(args: &[String]) -> i32 {
+    let rest = strip_run_prefix(args);
+    if rest.is_empty() {
+        eprintln!("usage: latch run [--] <cmd> [args...]");
+        return 2;
+    }
+    dispatch_command(rest)
+}
+
+/// Strip an optional leading `--` from `latch run`'s arguments, yielding the
+/// command and its args. `latch run -- op ...` and `latch run op ...` are
+/// equivalent; the `--` only matters when the tool's own args would otherwise be
+/// eaten as latch flags.
+fn strip_run_prefix(args: &[String]) -> &[String] {
+    match args.first().map(String::as_str) {
+        Some("--") => &args[1..],
+        _ => args,
     }
 }
 
@@ -83,10 +168,19 @@ fn emit_local_control(result: &ControlResult) -> i32 {
 
 fn print_help() {
     println!(
-        "latch {VERSION} — remote-approval instrument for 1Password secrets
+        "latch {VERSION} — remote-approval instrument: gate any CLI on your phone
 
-usage: latch <command>
+usage: latch <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
+       latch <verb>            a reserved verb (below)
 
+  <cmd> [args...]   run a configured command gated on your phone (e.g.
+                    latch op read op://…, latch gcloud …). An unconfigured
+                    command is refused; add it with: latch config add <cmd>
+  run -- <cmd>      escape hatch: run <cmd> even if it collides with a verb
+  config add <cmd> --provider <id> [--source <p>] [--account <l>] [--risk <r>]
+                    configure a command (providers: 1password, env-file)
+  config list       list configured commands
+  config remove <cmd>  forget a command's config
   status            instrument panel: daemon, shim, op, factor
   setup             guided first run: shim, PATH, launchd, then pair
   daemon [--dev-insecure]  run the approval daemon (foreground). Without a
@@ -112,10 +206,12 @@ usage: latch <command>
   settings get|set  read or change preferences (timeouts, relay, retention)
   wipe [--force]    remove pairing, accounts, keys, and settings
   ssh add           serve a 1Password SSH key (--vault --item --pubkey-file)
+  ssh add-file      serve a local key file (--path <key>, signs from ~/.ssh/…)
   ssh list          list the SSH keys the agent serves
   ssh remove <item> stop serving an SSH key
   sshagent          print the SSH_AUTH_SOCK to point ssh/git at Latch
   shim install      symlink ~/.latch/bin/op at this binary
+  shim add <cmd>    drop a transparent alias binary for a configured command
   version           print version
   help              print this message
 
@@ -1125,13 +1221,65 @@ fn format_unix_ms(ms: u64) -> String {
 fn cmd_ssh(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("add") => ssh_add(&args[1..]),
+        Some("add-file") => ssh_add_file(&args[1..]),
         Some("list") | None => ssh_list(),
         Some("remove") | Some("rm") => ssh_remove(args.get(1).map(String::as_str)),
         _ => {
-            eprintln!("usage: latch ssh <add|list|remove>");
+            eprintln!("usage: latch ssh <add|add-file|list|remove>");
             2
         }
     }
+}
+
+/// `latch ssh add-file --path <private-key> [--comment <c>]`: serve a local
+/// OpenSSH key file (the file-based signer). The sibling `<path>.pub` supplies
+/// the public key; the private key is read only at sign time. For users who do
+/// not keep their SSH keys in 1Password. v1 serves ed25519 only.
+fn ssh_add_file(args: &[String]) -> i32 {
+    let s = Style::stdout();
+    let Some(path) = flag_value(args, "--path").map(str::to_string) else {
+        eprintln!("usage: latch ssh add-file --path <private-key-path> [--comment <c>]");
+        return 2;
+    };
+    let comment = flag_value(args, "--comment").unwrap_or("").to_string();
+    let entry = crate::sshagent::SshFileEntry {
+        path: path.clone(),
+        comment,
+    };
+    // Validate before persisting: the sibling .pub must parse as ed25519.
+    let Some(id) = crate::sshagent::resolve_file_identity(&entry) else {
+        eprintln!(
+            "{} could not read an ed25519 public key at {path}.pub (v1 serves ed25519 only)",
+            s.deny("\u{2717}")
+        );
+        return 1;
+    };
+
+    let mut cfg = match crate::sshagent::SshKeyConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("latch: loading ssh-keys config: {e}");
+            return 1;
+        }
+    };
+    if cfg.files.iter().any(|f| f.path == path) {
+        eprintln!("latch: {path} is already served (remove it first to replace)");
+        return 1;
+    }
+    cfg.files.push(entry);
+    if let Err(e) = cfg.save() {
+        eprintln!("latch: saving ssh-keys config: {e}");
+        return 1;
+    }
+
+    println!("{} serving {}", s.ok("\u{2713}"), s.cobalt(&id.label));
+    println!("  {}  {}", s.dim("key"), s.dim(&id.fingerprint));
+    println!("  {}  {}", s.dim("file"), s.dim(&path));
+    println!(
+        "  {}",
+        s.faint("restart the daemon to serve it: latch restart")
+    );
+    0
 }
 
 /// `latch ssh add --vault <V> --item <I> [--field <f>] [--comment <c>]
@@ -1229,10 +1377,10 @@ fn ssh_list() -> i32 {
             return 1;
         }
     };
-    if cfg.keys.is_empty() {
+    if cfg.keys.is_empty() && cfg.files.is_empty() {
         println!(
             "  {}",
-            s.dim("no SSH keys served; add one: latch ssh add --vault <V> --item <I> --pubkey-file <p>")
+            s.dim("no SSH keys served; add one: latch ssh add --vault <V> --item <I> --pubkey-file <p>  (or: latch ssh add-file --path <key>)")
         );
         return 0;
     }
@@ -1245,13 +1393,33 @@ fn ssh_list() -> i32 {
                 println!(
                     "  {}  {}",
                     pad("", 18),
-                    s.faint(&format!("op://{}/{} · {}", e.vault, e.item, id.comment))
+                    s.faint(&format!(
+                        "1password · op://{}/{} · {}",
+                        e.vault, e.item, id.comment
+                    ))
                 );
             }
             None => println!(
                 "  {}  {}",
                 pad(&e.item, 18),
                 s.brass("unusable (not an ed25519 public key)")
+            ),
+        }
+    }
+    for e in &cfg.files {
+        match crate::sshagent::resolve_file_identity(e) {
+            Some(id) => {
+                println!("  {}  {}", pad(&id.label, 18), s.dim(&id.fingerprint));
+                println!(
+                    "  {}  {}",
+                    pad("", 18),
+                    s.faint(&format!("file · {} · {}", e.path, id.comment))
+                );
+            }
+            None => println!(
+                "  {}  {}",
+                pad(&e.path, 18),
+                s.brass("unusable (need an ed25519 key with a sibling .pub)")
             ),
         }
     }
@@ -1323,14 +1491,82 @@ fn cmd_sshagent() -> i32 {
     0
 }
 
-fn cmd_shim(sub: Option<&str>, json: bool) -> i32 {
-    match sub {
+fn cmd_shim(args: &[String], json: bool) -> i32 {
+    match args.first().map(String::as_str) {
         Some("install") => shim_install(json),
+        Some("add") => shim_add(args.get(1).map(String::as_str), json),
         _ => {
-            eprintln!("usage: latch shim install");
+            eprintln!("usage: latch shim <install | add <cmd>>");
             2
         }
     }
+}
+
+/// `latch shim add <cmd>`: drop a transparent alias binary (`~/.latch/bin/<cmd>`)
+/// so a bare `<cmd>` on PATH re-enters as `latch <cmd>`. For callers that cannot
+/// be modified (a launcher shelling out to a bare tool, `git` reaching the SSH
+/// agent, an AI agent that only knows the real name). The command should already
+/// be configured (`latch config add <cmd>`); a warning notes it if not.
+fn shim_add(cmd: Option<&str>, json: bool) -> i32 {
+    let s = Style::stdout();
+    let Some(cmd) = cmd else {
+        eprintln!("usage: latch shim add <cmd>");
+        return 2;
+    };
+    let configured = crate::command::CommandStore::load()
+        .map(|st| st.resolve(cmd).is_some())
+        .unwrap_or(false);
+    let (link, target) = match crate::setup::install_shim_for(cmd) {
+        Ok(pair) => pair,
+        Err(e) => {
+            if json {
+                return emit_local_control(&ControlResult::line(
+                    false,
+                    format!("shim add failed: {e:#}"),
+                ));
+            }
+            eprintln!("latch: {e:#}");
+            return 1;
+        }
+    };
+    if json {
+        let mut lines = vec![
+            format!("shim alias for {cmd} installed"),
+            format!("link {}", link.display()),
+            format!("-> {}", target.display()),
+        ];
+        if !configured {
+            lines.push(format!(
+                "warning: {cmd} is not configured; run latch config add {cmd}"
+            ));
+        }
+        return emit_local_control(&ControlResult::ok(lines));
+    }
+    println!(
+        "{} shim alias for {} installed",
+        s.ok("\u{2713}"),
+        s.cobalt(cmd)
+    );
+    println!(
+        "  {} {} -> {}",
+        s.dim("link"),
+        link.display(),
+        target.display()
+    );
+    if !configured {
+        println!(
+            "  {} {}",
+            s.brass("\u{2717}"),
+            s.dim(&format!(
+                "{cmd} is not configured yet; run: latch config add {cmd} --provider <id>"
+            ))
+        );
+    }
+    println!(
+        "  {}",
+        s.faint("ensure ~/.latch/bin is first on PATH so the alias wins")
+    );
+    0
 }
 
 fn shim_install(json: bool) -> i32 {
@@ -1374,6 +1610,199 @@ fn shim_install(json: bool) -> i32 {
         s.faint("or run `latch setup`, which edits your profile and loads the daemon.")
     );
     0
+}
+
+/// `latch config <add|list|remove>`: manage the per-command configuration that
+/// makes `latch <cmd>` gate-and-run. A config *mutation*, so it lives CLI-side
+/// (the daemon only reads it); re-run `latch restart` to apply a change.
+fn cmd_config(args: &[String], json: bool) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("add") => config_add(&args[1..], json),
+        Some("list") | None => config_list(json),
+        Some("remove") | Some("rm") => config_remove(args.get(1).map(String::as_str), json),
+        _ => {
+            eprintln!("usage: latch config <add <cmd> --provider <id> | list | remove <cmd>>");
+            2
+        }
+    }
+}
+
+/// The GUI/JSON shape for one command config.
+fn command_json(c: &crate::command::CommandConfig) -> json::CommandJson {
+    json::CommandJson {
+        command: c.command.clone(),
+        provider: c.provider.clone(),
+        source: c.source.clone(),
+        account: c.account.clone(),
+        risk: crate::command::risk_str(c.risk).to_string(),
+    }
+}
+
+fn config_add(args: &[String], json: bool) -> i32 {
+    let s = Style::stdout();
+    // The command is the first positional token after `add`.
+    let Some(cmd) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
+        eprintln!(
+            "usage: latch config add <cmd> --provider <id> [--source <path>] [--account <label>] [--risk routine|elevated|critical]"
+        );
+        return 2;
+    };
+    let Some(provider) = flag_value(args, "--provider").map(str::to_string) else {
+        eprintln!("latch: --provider <id> is required (e.g. 1password, env-file)");
+        return 2;
+    };
+    // Validate the provider against the shipping registry so a typo is caught
+    // here rather than as a silent fail-closed at run time.
+    let registry = crate::provider::ProviderRegistry::with_defaults();
+    if registry.get(&provider).is_none() {
+        eprintln!(
+            "latch: unknown provider '{provider}'; known providers: {}",
+            registry.ids().join(", ")
+        );
+        return 2;
+    }
+    let source = flag_value(args, "--source").map(str::to_string);
+    let account = flag_value(args, "--account").map(str::to_string);
+    let risk = match flag_value(args, "--risk") {
+        Some(r) => match crate::command::parse_risk(r) {
+            Some(risk) => risk,
+            None => {
+                eprintln!("latch: unknown risk '{r}'; use routine, elevated, or critical");
+                return 2;
+            }
+        },
+        None => latch_proto::RiskLevel::Routine,
+    };
+    // env-file needs a source; refuse a config that could never inject anything.
+    if provider == crate::provider::EnvFileProvider::ID && source.is_none() {
+        eprintln!("latch: the env-file provider needs --source <path> to the KEY=VALUE file");
+        return 2;
+    }
+
+    let cfg = crate::command::CommandConfig {
+        command: cmd.clone(),
+        provider,
+        source,
+        account,
+        risk,
+    };
+
+    let mut store = match crate::command::CommandStore::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("latch: loading command config: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = store.add(cfg.clone()) {
+        eprintln!("latch: {e}");
+        return 1;
+    }
+    if let Err(e) = store.save() {
+        eprintln!("latch: saving command config: {e}");
+        return 1;
+    }
+
+    if json {
+        println!("{}", json::to_line(&command_json(&cfg)));
+        return 0;
+    }
+    println!("{} configured {}", s.ok("\u{2713}"), s.cobalt(&cmd));
+    println!("  {}  {}", s.dim("provider"), s.dim(&cfg.provider));
+    if let Some(src) = &cfg.source {
+        println!("  {}    {}", s.dim("source"), s.dim(src));
+    }
+    println!(
+        "  {}      {}",
+        s.dim("risk"),
+        s.dim(crate::command::risk_str(cfg.risk))
+    );
+    println!(
+        "  {}",
+        s.faint(&format!(
+            "restart the daemon to apply, then: latch {cmd} <args>  (or: latch shim add {cmd})"
+        ))
+    );
+    0
+}
+
+fn config_list(json: bool) -> i32 {
+    let s = Style::stdout();
+    let store = match crate::command::CommandStore::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("latch: loading command config: {e}");
+            return 1;
+        }
+    };
+    if json {
+        let list: Vec<_> = store.commands.iter().map(command_json).collect();
+        println!("{}", json::to_pretty(&list));
+        return 0;
+    }
+    if store.commands.is_empty() {
+        println!(
+            "  {}",
+            s.dim("no commands configured (op works by default); add one: latch config add <cmd> --provider <id>")
+        );
+        return 0;
+    }
+    println!("{}", s.cobalt("configured commands"));
+    println!();
+    for c in &store.commands {
+        let extra = c
+            .source
+            .as_deref()
+            .or(c.account.as_deref())
+            .map(|x| format!(" \u{b7} {x}"))
+            .unwrap_or_default();
+        println!(
+            "  {}  {}  {}",
+            pad(&c.command, 14),
+            pad(&c.provider, 12),
+            s.dim(&format!("{}{}", crate::command::risk_str(c.risk), extra))
+        );
+    }
+    0
+}
+
+fn config_remove(cmd: Option<&str>, json: bool) -> i32 {
+    let Some(cmd) = cmd else {
+        eprintln!("usage: latch config remove <cmd>");
+        return 2;
+    };
+    let mut store = match crate::command::CommandStore::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("latch: loading command config: {e}");
+            return 1;
+        }
+    };
+    let removed = store.remove(cmd);
+    if removed {
+        if let Err(e) = store.save() {
+            eprintln!("latch: saving command config: {e}");
+            return 1;
+        }
+    }
+    let result = if removed {
+        ControlResult::line(true, format!("command {cmd} removed"))
+    } else {
+        ControlResult::line(false, format!("no configured command named {cmd}"))
+    };
+    if json {
+        return emit_local_control(&result);
+    }
+    let s = Style::stdout();
+    for line in &result.lines {
+        let glyph = if result.ok {
+            s.ok("\u{2713}")
+        } else {
+            s.brass("\u{2717}")
+        };
+        println!("  {glyph} {line}");
+    }
+    i32::from(!result.ok)
 }
 
 /// `latch mac-approvals --enable | --phone-only`: toggle the Mac local-approval
@@ -1567,7 +1996,7 @@ fn cmd_wipe(args: &[String], json: bool) -> i32 {
             ]));
         }
         eprintln!(
-            "{} latch wipe removes the pairing, accounts, SSH keys, settings, and history.\n  \
+            "{} latch wipe removes the pairing, accounts, SSH keys, command config, settings, and history.\n  \
              Re-run with --force to confirm: latch wipe --force",
             s.brass("\u{2717}")
         );
@@ -1589,6 +2018,7 @@ fn cmd_wipe(args: &[String], json: bool) -> i32 {
         for (name, path) in [
             ("accounts", home.join("latch.db")),
             ("ssh keys", home.join("ssh-keys.json")),
+            ("command config", home.join("commands.json")),
             ("settings", home.join("settings.json")),
             ("dev keystore", home.join("dev-keystore.json")),
             ("history", home.join("history.jsonl")),
@@ -1625,5 +2055,37 @@ fn pad(s: &str, width: usize) -> String {
         s.to_string()
     } else {
         format!("{s}{}", " ".repeat(width - s.len()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserved_verbs_take_precedence_over_command_dispatch() {
+        // Every latch verb is reserved; a bare tool name (op, gcloud) is not, so
+        // it falls through to the `latch <cmd>` primitive.
+        for v in [
+            "status", "daemon", "pair", "config", "run", "ssh", "shim", "help", "version",
+        ] {
+            assert!(is_reserved_verb(v), "{v} must be a reserved verb");
+        }
+        for c in ["op", "gcloud", "bw", "kubectl", "mytool"] {
+            assert!(!is_reserved_verb(c), "{c} must dispatch as a command");
+        }
+    }
+
+    #[test]
+    fn run_escape_hatch_strips_the_optional_double_dash() {
+        // `latch run -- status ...` runs a tool named `status`, not the verb.
+        let with = vec!["--".to_string(), "status".to_string(), "-l".to_string()];
+        assert_eq!(
+            strip_run_prefix(&with),
+            &["status".to_string(), "-l".to_string()]
+        );
+        // `latch run op read` (no --) is equivalent for a non-colliding name.
+        let without = vec!["op".to_string(), "read".to_string()];
+        assert_eq!(strip_run_prefix(&without), &without[..]);
     }
 }

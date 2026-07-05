@@ -47,6 +47,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::secrets::Token;
+
 // --- RFC 9987 message types -------------------------------------------------
 
 /// Generic failure / refusal. The reply for anything we do not implement.
@@ -233,6 +235,130 @@ pub struct SignRequest<'a> {
     /// (the `ssh`/`git` that connected), for caller-scoped bookkeeping. `None`
     /// if the peer pid could not be read.
     pub caller_pid: Option<i32>,
+}
+
+// --- the pluggable key source (signer) seam ---------------------------------
+
+/// A pluggable SSH key SOURCE. SSH is a distinct integration — its event is a
+/// signature, not an env injection — but the *key source* is as pluggable as the
+/// [`SecretProvider`](crate::provider::SecretProvider) seam is for secrets. Latch
+/// stays the universal phone-gate regardless of where the key lives: the daemon
+/// applies the approval gate, then delegates the key-source-specific signing to
+/// the owning signer here.
+///
+/// Shipping impls:
+/// * [`OpSshSigner`] (the default) — fetch the key from 1Password per signature
+///   via the service account, sign, zeroize. The honest residual: the key is in
+///   daemon RAM for one signature (see the module custody note).
+/// * [`FileSshSigner`] — sign from a local `~/.ssh/id_*` file, for users who do
+///   not keep their keys in 1Password. Proves the seam is real, not op-shaped.
+///
+/// Future impls are additive: a Secure-Enclave-resident signer (v2, key never
+/// leaves hardware) or a proxy-to-another-agent signer plug in here without
+/// touching the wire listener or the phone gate.
+pub trait SshSigner: Send + Sync {
+    /// The identities this source can serve, for `IDENTITIES_ANSWER`.
+    fn identities(&self) -> Vec<ServedIdentity>;
+
+    /// Whether the daemon must decrypt a stored account token before this signer
+    /// can sign (true for [`OpSshSigner`]: the SA token authenticates the fetch;
+    /// false for [`FileSshSigner`]: the key is a local file).
+    fn needs_account(&self) -> bool;
+
+    /// Produce the SSH signature blob (`string algorithm` + `string signature`)
+    /// over `data` with `id`'s key. Called **after** the daemon's phone approval.
+    /// `credential` is the decrypted account token when [`needs_account`] is true,
+    /// else `None`. Returns `None` on any failure (fail closed).
+    ///
+    /// [`needs_account`]: SshSigner::needs_account
+    fn sign(&self, id: &ServedIdentity, data: &[u8], credential: Option<&Token>)
+        -> Option<Vec<u8>>;
+
+    /// True if this signer serves `key_blob` (so the daemon can route a sign
+    /// request to its owning signer).
+    fn owns(&self, key_blob: &[u8]) -> bool {
+        self.identities().iter().any(|i| i.key_blob == key_blob)
+    }
+}
+
+/// The default signer: fetch-per-signature from 1Password via the service
+/// account. Holds the resolved op identities and the `op` binary to shell out to
+/// (`None` uses PATH discovery; tests point it at a fake `op`).
+pub struct OpSshSigner {
+    identities: Vec<ServedIdentity>,
+    op_path: Option<PathBuf>,
+}
+
+impl OpSshSigner {
+    pub fn new(identities: Vec<ServedIdentity>, op_path: Option<PathBuf>) -> Self {
+        Self {
+            identities,
+            op_path,
+        }
+    }
+}
+
+impl SshSigner for OpSshSigner {
+    fn identities(&self) -> Vec<ServedIdentity> {
+        self.identities.clone()
+    }
+
+    fn needs_account(&self) -> bool {
+        true
+    }
+
+    fn sign(
+        &self,
+        id: &ServedIdentity,
+        data: &[u8],
+        credential: Option<&Token>,
+    ) -> Option<Vec<u8>> {
+        let token = credential?;
+        let op = self.op_path.clone().or_else(crate::paths::find_real_op)?;
+        // fetch_and_sign holds the key in a Zeroizing buffer for the one
+        // signature and wipes it (the v1 custody exception; see module docs).
+        fetch_and_sign(&op, token, &id.key_ref, data)
+    }
+}
+
+/// A file-based signer: sign from a local OpenSSH private key file (e.g.
+/// `~/.ssh/id_ed25519`). The second reference impl, for users who do not keep
+/// their SSH keys in 1Password. Needs no account credential.
+///
+/// The private key is read into a [`Zeroizing`] buffer for the one signature and
+/// wiped, matching the op signer's custody discipline; v1 serves unencrypted
+/// ed25519 keys only (a passphrase-encrypted key fails to decode and fails
+/// closed to no signature).
+pub struct FileSshSigner {
+    /// (served identity, private-key file path) pairs.
+    keys: Vec<(ServedIdentity, PathBuf)>,
+}
+
+impl FileSshSigner {
+    pub fn new(keys: Vec<(ServedIdentity, PathBuf)>) -> Self {
+        Self { keys }
+    }
+}
+
+impl SshSigner for FileSshSigner {
+    fn identities(&self) -> Vec<ServedIdentity> {
+        self.keys.iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    fn needs_account(&self) -> bool {
+        false
+    }
+
+    fn sign(
+        &self,
+        id: &ServedIdentity,
+        data: &[u8],
+        _credential: Option<&Token>,
+    ) -> Option<Vec<u8>> {
+        let (_, path) = self.keys.iter().find(|(i, _)| i.key_blob == id.key_blob)?;
+        let pem = Zeroizing::new(std::fs::read(path).ok()?);
+        sign_openssh_ed25519(&pem, data)
+    }
 }
 
 // --- the connection handler -------------------------------------------------
@@ -568,11 +694,29 @@ fn default_field() -> String {
     "private key".to_string()
 }
 
+/// One configured file-based SSH identity on disk: a path to a local OpenSSH
+/// private key (e.g. `~/.ssh/id_ed25519`). The public key is read from the
+/// sibling `<path>.pub` for `IDENTITIES_ANSWER`; the private key is read only at
+/// sign time. This is the [`FileSshSigner`] source — proof the signer seam is
+/// pluggable, not 1Password-bound.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SshFileEntry {
+    /// Path to the OpenSSH private key file. `<path>.pub` must exist.
+    pub path: String,
+    /// Optional comment override; the `.pub` line's own comment is used when empty.
+    #[serde(default)]
+    pub comment: String,
+}
+
 /// The persisted list of served SSH identities, at `~/.latch/ssh-keys.json`.
+/// Two sources: `keys` (fetched from 1Password per signature) and `files` (local
+/// key files). Each becomes a distinct [`SshSigner`] at arm time.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SshKeyConfig {
     #[serde(default)]
     pub keys: Vec<SshKeyEntry>,
+    #[serde(default)]
+    pub files: Vec<SshFileEntry>,
 }
 
 impl SshKeyConfig {
@@ -629,6 +773,25 @@ impl SshKeyConfig {
             })
             .collect()
     }
+
+    /// Resolve every file entry to a `(served identity, private-key path)` pair,
+    /// reading each `<path>.pub` for the public blob. Unparseable / non-ed25519 /
+    /// missing-`.pub` entries are dropped with a stderr note (v1 ed25519 only).
+    pub fn file_keys(&self) -> Vec<(ServedIdentity, PathBuf)> {
+        self.files
+            .iter()
+            .filter_map(|e| match resolve_file_identity(e) {
+                Some(id) => Some((id, PathBuf::from(&e.path))),
+                None => {
+                    eprintln!(
+                        "latch sshagent: skipping file key {} (need an ed25519 key with a sibling .pub)",
+                        e.path
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 /// Parse one config entry's public-key line into a served identity. Returns
@@ -650,6 +813,39 @@ pub fn resolve_identity(e: &SshKeyEntry) -> Option<ServedIdentity> {
         comment,
         key_ref: format!("op://{}/{}/{}", e.vault, e.item, e.field),
         label: e.item.clone(),
+        fingerprint: pk.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
+    })
+}
+
+/// Resolve a file entry's sibling `<path>.pub` into a served identity, without
+/// reading the private key. Returns `None` if the `.pub` is missing/unparseable
+/// or not ed25519 (v1 serves ed25519 only). For a file identity `key_ref` holds
+/// the file path (display only; the [`FileSshSigner`] signs from the file, not an
+/// op reference). Public so `latch ssh add-file` can validate before persisting.
+pub fn resolve_file_identity(e: &SshFileEntry) -> Option<ServedIdentity> {
+    let pub_path = format!("{}.pub", e.path);
+    let line = std::fs::read_to_string(&pub_path).ok()?;
+    let pk = ssh_key::PublicKey::from_openssh(line.trim()).ok()?;
+    if pk.algorithm() != ssh_key::Algorithm::Ed25519 {
+        return None;
+    }
+    let key_blob = pk.to_bytes().ok()?;
+    let comment = if e.comment.is_empty() {
+        pk.comment().to_string()
+    } else {
+        e.comment.clone()
+    };
+    // A readable label from the file stem (e.g. "id_ed25519").
+    let label = Path::new(&e.path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&e.path)
+        .to_string();
+    Some(ServedIdentity {
+        key_blob,
+        comment,
+        key_ref: e.path.clone(),
+        label,
         fingerprint: pk.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
     })
 }
@@ -1197,6 +1393,82 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(stdout.contains("tom@latch-test"), "and its comment");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- the pluggable signer seam -----------------------------------------
+
+    /// Generate an ed25519 key and its served identity with `key_ref`.
+    fn gen_identity(key_ref: &str) -> (ssh_key::PrivateKey, ServedIdentity) {
+        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .unwrap();
+        let pk = key.public_key();
+        let id = ServedIdentity {
+            key_blob: pk.to_bytes().unwrap(),
+            comment: "tom@seam".to_string(),
+            key_ref: key_ref.to_string(),
+            label: "Seam".to_string(),
+            fingerprint: pk.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
+        };
+        (key, id)
+    }
+
+    #[test]
+    fn file_signer_signs_from_a_local_key_and_needs_no_account() {
+        // The second reference signer: sign from a local OpenSSH key file, no
+        // 1Password, no account credential.
+        let (key, id) = gen_identity("/does/not/matter");
+        let dir = std::env::temp_dir().join(format!("latch-filesign-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("id_ed25519");
+        std::fs::write(&path, key.to_openssh(ssh_key::LineEnding::LF).unwrap()).unwrap();
+
+        let signer = FileSshSigner::new(vec![(id.clone(), path.clone())]);
+        assert!(!signer.needs_account(), "a file signer needs no account");
+        assert!(signer.owns(&id.key_blob));
+
+        let data = b"file-signer-challenge";
+        let sig_blob = signer
+            .sign(&id, data, None)
+            .expect("file signer produces a signature");
+        let mut r = Reader::new(&sig_blob);
+        assert_eq!(r.string(), Some(&b"ssh-ed25519"[..]));
+        let raw = r.string().unwrap();
+        verify_ed25519(key.public_key(), data, raw);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn op_signer_fetches_and_signs_and_requires_a_credential() {
+        // The default signer: fetch from 1Password per signature via the SA
+        // token, then sign. Proves the same seam the file signer implements.
+        let (key, id) = gen_identity("op://Engineering/Seam/private key");
+        let pem = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
+        let dir = std::env::temp_dir().join(format!("latch-opsign-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let op = write_fake_op(&dir, "tok-xyz", &pem);
+
+        let signer = OpSshSigner::new(vec![id.clone()], Some(op));
+        assert!(
+            signer.needs_account(),
+            "the op signer needs an account token"
+        );
+
+        let data = b"op-signer-challenge";
+        let token: Token = Zeroizing::new(b"tok-xyz".to_vec());
+        let sig_blob = signer
+            .sign(&id, data, Some(&token))
+            .expect("op signer produces a signature");
+        let mut r = Reader::new(&sig_blob);
+        assert_eq!(r.string(), Some(&b"ssh-ed25519"[..]));
+        let raw = r.string().unwrap();
+        verify_ed25519(key.public_key(), data, raw);
+
+        // Without a credential the op signer fails closed (no key to fetch).
+        assert!(
+            signer.sign(&id, data, None).is_none(),
+            "no credential, no signature"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

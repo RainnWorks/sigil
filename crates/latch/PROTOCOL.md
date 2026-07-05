@@ -20,11 +20,11 @@ operations so a compromised daemon cannot perform them. Therefore:
 - **Over this socket (daemon):** status, doctor, leases (list + revoke), pending
   (+ live subscription), history, lockdown (engage/clear), approve/deny.
 - **CLI-only mutations (the Mac app shells out to `latch … --json`):** account
-  add/rotate/remove, settings get/set, wipe `--force`, mac-approvals
-  `--enable|--phone-only`, shim install, and **pairing** (`latch pair --relay
-  <url> --json`, an NDJSON ceremony stream). These write the keystore / `~/.latch`
-  and so are deliberately not daemon capabilities. Their `--json` shapes are in
-  `JSON.md`.
+  add/rotate/remove, **command config** (`config add|list|remove`), settings
+  get/set, wipe `--force`, mac-approvals `--enable|--phone-only`, shim
+  install/add, and **pairing** (`latch pair --relay <url> --json`, an NDJSON
+  ceremony stream). These write the keystore / `~/.latch` and so are deliberately
+  not daemon capabilities. Their `--json` shapes are in `JSON.md`.
 
 Pairing note: the brief initially placed the pairing ceremony on the socket
 (the daemon owns the relay connection). It is kept CLI-side because completing a
@@ -134,12 +134,16 @@ disconnects. It also re-emits as a periodic keepalive so a dead client is
 detected. Drives the live menubar. The client parses each `event.body` as
 `[PendingJson]` and replaces its view.
 
-### The shim path (not part of the control surface)
+### The run path (not part of the control surface)
 
-`{"kind":"op","argv":[str],"cwd":str}` with the caller's stdout/stderr passed as
-`SCM_RIGHTS` is the secret path: the daemon gates it, then splices the real
-`op` child's stdout to the caller fd. Reply `{"kind":"exit","code":int}`. Clients
-of the control protocol never send this; it is the `op` shim's channel.
+`{"kind":"run","argv":[str],"cwd":str}` with the caller's stdout/stderr passed as
+`SCM_RIGHTS` is the secret path for the `latch <cmd>` primitive (and its shim
+alias / `latch run -- <cmd>`). `argv[0]` is the command name; the daemon looks up
+the command's config, gates it, injects the provider's environment, then splices
+the child's stdout to the caller fd. An *unconfigured* command is refused (a
+non-zero exit with a stderr pointer to `latch config add`), never run ungated.
+Reply `{"kind":"exit","code":int}`. Clients of the control protocol never send
+this; it is the shim / primitive channel.
 
 ## What the Swift `DaemonClient` implements vs. shells out for
 

@@ -30,7 +30,7 @@ use latch_proto::identity::DeviceIdentity;
 use latch_proto::ReplayGuard;
 use latch_proto::{
     mailbox_id, now_ms, ApprovalRequest, ApprovalResponse, Decision as ProtoDecision, Direction,
-    PeerIdentity, Provenance, RiskLevel, Transport,
+    PeerIdentity, Provenance, Transport,
 };
 
 use crate::approve::{ApprovalContext, ApprovalOutcome, Approver, Decision};
@@ -112,7 +112,7 @@ impl RemoteApprover {
                 machine: self.machine.clone(),
                 requested_at: now,
             },
-            risk: RiskLevel::Routine,
+            risk: ctx.risk,
             reason: None,
             expires_at: now + timeout_ms,
             timeout_ms,
@@ -190,7 +190,7 @@ fn hostname() -> String {
 mod tests {
     use super::*;
     use crate::approve::ApprovalContext;
-    use latch_proto::{RequestKind, SecretRef};
+    use latch_proto::{RequestKind, RiskLevel, SecretRef};
 
     #[test]
     fn build_request_is_provider_blind() {
@@ -220,11 +220,17 @@ mod tests {
                 label: ".env".into(),
             }],
             kind: RequestKind::SecretRead,
+            risk: RiskLevel::Elevated,
             ssh: None,
         };
         let req = approver.build_request(&ctx);
         assert_eq!(req.request_id, "req-1");
         assert_eq!(req.kind, RequestKind::SecretRead);
+        assert_eq!(
+            req.risk,
+            RiskLevel::Elevated,
+            "risk is threaded from the context"
+        );
         assert_eq!(req.command, ctx.command);
         assert_eq!(req.secrets, ctx.secret_refs);
         assert_eq!(req.provenance.process_chain, vec!["zsh", "op"]);

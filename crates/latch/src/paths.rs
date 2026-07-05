@@ -54,27 +54,35 @@ fn own_binary() -> Option<PathBuf> {
         .and_then(|p| p.canonicalize().ok())
 }
 
-/// Locate the real `op`: the first `op` on `PATH` that is not our own shim.
+/// Locate the real `<cmd>`: the first `cmd` on `PATH` that is not our own shim.
 ///
-/// The shim symlink canonicalises to this binary, so we skip any candidate
-/// whose real path equals ours. This is what both the shim's exec fallback and
-/// the daemon use to find the tool to run.
-pub fn find_real_op() -> Option<PathBuf> {
+/// A shim alias (`~/.latch/bin/<cmd>`) canonicalises to this binary, so we skip
+/// any candidate whose real path equals ours. This is what both the shim's
+/// exec-fallback (daemon down) and the env-file provider (spawn the real tool)
+/// use to find the underlying binary to run, and it generalizes beyond `op`.
+pub fn find_real(cmd: &str) -> Option<PathBuf> {
     let own = own_binary();
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
-        let cand = dir.join("op");
+        let cand = dir.join(cmd);
         if !is_executable(&cand) {
             continue;
         }
         if let (Some(own), Some(canon)) = (&own, cand.canonicalize().ok()) {
             if &canon == own {
-                continue; // our own shim
+                continue; // our own shim alias
             }
         }
         return Some(cand);
     }
     None
+}
+
+/// Locate the real `op`: [`find_real`] specialised to `op`. Kept as a named
+/// helper because the 1Password provider and the `op`-specific paths reference
+/// it directly.
+pub fn find_real_op() -> Option<PathBuf> {
+    find_real("op")
 }
 
 /// The health of the `op` shim install, as seen from the running binary.

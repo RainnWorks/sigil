@@ -111,6 +111,9 @@ pub struct ApprovalContext {
     pub secret_refs: Vec<latch_proto::SecretRef>,
     /// The display hint the provider assigned (how the approver should render).
     pub kind: latch_proto::RequestKind,
+    /// The risk policy for this request (from the command config, or a provider
+    /// default). Scales the approve friction on the phone; deny is always one tap.
+    pub risk: latch_proto::RiskLevel,
     /// Present for an `ssh_signature` request: the key label, derived
     /// destination, and data-to-sign fingerprint the approver renders. `None`
     /// for secret reads and control requests.
@@ -496,6 +499,7 @@ mod tests {
             command: vec!["op".into(), "read".into()],
             secret_refs: Vec::new(),
             kind: latch_proto::RequestKind::SecretRead,
+            risk: latch_proto::RiskLevel::Routine,
             ssh: None,
         }
     }

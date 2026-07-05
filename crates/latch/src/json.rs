@@ -106,6 +106,19 @@ pub struct AccountJson {
     pub last_used_ms: Option<i64>,
 }
 
+// --- command config --------------------------------------------------------
+
+/// One per-command configuration entry, as `latch config list/add --json` emits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandJson {
+    pub command: String,
+    pub provider: String,
+    pub source: Option<String>,
+    pub account: Option<String>,
+    /// `routine` | `elevated` | `critical`.
+    pub risk: String,
+}
+
 // --- leases ----------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

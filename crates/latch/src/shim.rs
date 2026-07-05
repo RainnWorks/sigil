@@ -1,11 +1,18 @@
-//! Shim mode: the binary invoked as `op`.
+//! The transparent-alias / primitive forwarder.
 //!
-//! A dumb pipe. If the daemon is up, forward argv/cwd and the caller's own
-//! stdout/stderr descriptors to it and mirror the exit code. If the socket is
-//! absent or unreachable, transparently `exec` the real `op` so nothing breaks
-//! when the daemon is off. The shim never parses, retains, or logs output; the
-//! secret bytes flow from the `op` child straight to the descriptors passed
+//! A dumb pipe. Given a command invocation (argv[0] is the command name), if the
+//! daemon is up it forwards argv/cwd and the caller's own stdout/stderr
+//! descriptors to it and mirrors the exit code. If the daemon socket is absent or
+//! unreachable, it transparently `exec`s the real underlying tool so nothing
+//! breaks when the daemon is off. It never parses, retains, or logs output; the
+//! secret bytes flow from the tool's child straight to the descriptors passed
 //! here, never through this process.
+//!
+//! Two entry points funnel here: the transparent PATH shim (a binary named `op`,
+//! `gcloud`, … whose argv[0] stem is the command) and the `latch <cmd>` primitive
+//! (and its `latch run -- <cmd>` escape hatch). Both are thin fronts over the one
+//! [`dispatch`] path; the daemon behind them looks up the command's config and
+//! decides whether it is gated.
 
 use std::ffi::OsString;
 use std::io;
@@ -17,54 +24,63 @@ use std::process::{self, Command};
 use crate::local::{self, Frame, Reply};
 use crate::paths;
 
-/// Entry point for shim mode. Never returns.
-pub fn run() -> ! {
+/// Forward a command invocation to the daemon (which gates it), or, if the daemon
+/// is down, transparently `exec` the real underlying tool. `argv[0]` is the
+/// command name (e.g. `op`), not a path. Never returns.
+///
+/// A protocol-level error while the daemon *is* up fails closed (exit 70) rather
+/// than silently running the tool locally, so a mutating command can never slip
+/// past the gate once one exists. Only a *down* daemon triggers the transparent
+/// exec fallback.
+pub fn dispatch(argv: Vec<String>) -> ! {
     match UnixStream::connect(local::socket_path()) {
-        // Daemon up: forward. On any protocol error we fail closed rather than
-        // silently running `op` locally, to avoid a mutating command slipping
-        // past the approval path once one exists.
-        Ok(stream) => match forward(stream) {
+        Ok(stream) => match forward(stream, &argv) {
             Ok(code) => process::exit(code),
             Err(e) => {
-                eprintln!("op: latch daemon request failed: {e}");
+                let cmd = argv.first().map(String::as_str).unwrap_or("latch");
+                eprintln!("{cmd}: latch daemon request failed: {e}");
                 process::exit(70);
             }
         },
-        // Daemon down: behave exactly like the real `op`.
-        Err(_) => exec_real_op(),
+        // Daemon down: behave exactly like the real underlying tool.
+        Err(_) => exec_real(&argv),
     }
 }
 
-fn forward(mut stream: UnixStream) -> io::Result<i32> {
-    let argv: Vec<String> = std::env::args().collect();
+fn forward(stream: UnixStream, argv: &[String]) -> io::Result<i32> {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let frame = Frame::Op { argv, cwd };
+    let frame = Frame::Run {
+        argv: argv.to_vec(),
+        cwd,
+    };
 
-    // Hand the daemon our real stdout and stderr; `op` writes straight to them.
+    // Hand the daemon our real stdout and stderr; the tool writes straight to them.
     let out = io::stdout();
     let err = io::stderr();
     local::send_frame(&stream, &frame, &[out.as_raw_fd(), err.as_raw_fd()])?;
+    let mut stream = stream;
     match local::recv_reply(&mut stream)? {
         Reply::Exit { code } => Ok(code),
-        // The daemon only ever answers an op frame with an exit code; anything
-        // else is a protocol fault, so fail closed rather than run op locally.
+        // The daemon only ever answers a run frame with an exit code; anything
+        // else is a protocol fault, so fail closed rather than run the tool.
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unexpected reply to op request: {other:?}"),
+            format!("unexpected reply to run request: {other:?}"),
         )),
     }
 }
 
-fn exec_real_op() -> ! {
-    let Some(real) = paths::find_real_op() else {
-        eprintln!("op: no `op` found on PATH (latch shim active, daemon down)");
+fn exec_real(argv: &[String]) -> ! {
+    let cmd = argv.first().map(String::as_str).unwrap_or("");
+    let Some(real) = paths::find_real(cmd) else {
+        eprintln!("{cmd}: no `{cmd}` found on PATH (latch shim active, daemon down)");
         process::exit(127);
     };
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let args: Vec<OsString> = argv.iter().skip(1).map(OsString::from).collect();
     // exec replaces this process on success; the line after only runs on error.
     let err = Command::new(&real).args(args).exec();
-    eprintln!("op: failed to exec {}: {err}", real.display());
+    eprintln!("{cmd}: failed to exec {}: {err}", real.display());
     process::exit(127);
 }

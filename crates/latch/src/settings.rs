@@ -254,8 +254,10 @@ mod tests {
 
     #[test]
     fn merge_json_leaves_absent_keys_untouched() {
-        let mut s = Settings::default();
-        s.mac_approvals = MAC_APPROVALS_PHONE_ONLY.to_string();
+        let mut s = Settings {
+            mac_approvals: MAC_APPROVALS_PHONE_ONLY.to_string(),
+            ..Settings::default()
+        };
         // The GUI writes the five settings fields, not mac_approvals.
         let patch = serde_json::json!({
             "approval_timeout_sec": 90,

@@ -9,6 +9,7 @@
 pub mod approve;
 pub mod audit;
 pub mod cli;
+pub mod command;
 pub mod daemon;
 pub mod factor;
 pub mod json;

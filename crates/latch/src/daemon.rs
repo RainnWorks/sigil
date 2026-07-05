@@ -36,18 +36,19 @@ use crate::approve::{
     ApprovalContext, ApprovalGate, Approver, Decision, DevMode, LocalApprover, NullApprover,
     PendingRegistry,
 };
+use crate::command::{self, CommandStore};
 use crate::factor::{self, Factor};
 use crate::keystore::{self, Keystore};
 use crate::lease::{self, LeaseStore, ProcessTable, SysProcessTable};
 use crate::local::{self, Frame, Reply};
-use crate::paths::{self, ShimStatus};
-use crate::provider::{OpProvider, ProviderRun, SecretProvider};
+use crate::paths::ShimStatus;
+use crate::provider::{ProviderRegistry, ProviderRun};
 use crate::remote::RemoteApprover;
 use crate::secrets::{self, AccountStore};
 use crate::service;
-use crate::sshagent::{self, ServedIdentity, SignRequest, SshBackend};
+use crate::sshagent::{self, ServedIdentity, SignRequest, SshBackend, SshSigner};
 
-use latch_proto::SshChallenge;
+use latch_proto::{RiskLevel, SshChallenge};
 
 use latch_proto::identity::DeviceIdentity;
 use latch_proto::{mailbox_id, PeerIdentity};
@@ -65,20 +66,21 @@ pub struct Core {
     pending: Arc<PendingRegistry>,
     lockdown: AtomicBool,
     proc_table: Box<dyn ProcessTable + Send + Sync>,
-    /// The secret provider: it describes requests, injects the credential, and
-    /// runs the command streaming secrets to the caller. 1Password is provider
-    /// #1; the seam is generic and owns its own tool discovery.
-    provider: Box<dyn SecretProvider>,
+    /// The provider registry: a command's config names a provider by id, and the
+    /// daemon dispatches the run to it. 1Password and env-file ship by default;
+    /// the seam is generic and each provider owns its own tool discovery.
+    providers: ProviderRegistry,
+    /// The per-command configuration: which provider backs each command, what to
+    /// inject, and its risk. Loaded at arm time; `op` resolves by default.
+    commands: CommandStore,
     lease_ttl: Duration,
     /// The approving factor resolved at arm time (residual #1 mitigation).
     factor: Factor,
-    /// SSH identities this daemon serves on the agent socket, resolved from
-    /// `~/.latch/ssh-keys.json` at arm time. Empty means the agent advertises
-    /// no keys (and `ssh-add -l` shows none).
-    ssh_keys: Vec<sshagent::ServedIdentity>,
-    /// The `op` binary the SSH sign path shells out to for the per-signature key
-    /// fetch. `None` uses PATH discovery; tests point it at a fake `op`.
-    ssh_op_path: Option<std::path::PathBuf>,
+    /// The pluggable SSH key sources this daemon serves on the agent socket,
+    /// resolved from `~/.latch/ssh-keys.json` at arm time. Empty means the agent
+    /// advertises no keys (and `ssh-add -l` shows none). Latch is the phone-gate
+    /// regardless of which signer holds the key.
+    ssh_signers: Vec<Box<dyn SshSigner>>,
     /// Audit logging: `Some(retention_days)` appends a metadata-only line per
     /// decision to `history.jsonl` (pruned to the window); `None` disables it.
     /// The real daemon enables it; tests leave it off so they never write to a
@@ -177,13 +179,24 @@ impl Core {
         let factor = factor::resolve(&inputs);
         let gate = build_gate(factor, remote, &keystore, &pending)?;
 
-        // Load the served SSH identities from ~/.latch/ssh-keys.json. A bad
-        // config is logged and treated as "no keys" so the daemon still arms.
-        let ssh_keys = match sshagent::SshKeyConfig::load() {
-            Ok(cfg) => cfg.served_identities(),
+        // Load the served SSH identities from ~/.latch/ssh-keys.json and build a
+        // signer per source (op-fetch + file-based). A bad config is logged and
+        // treated as "no keys" so the daemon still arms.
+        let ssh_signers = match sshagent::SshKeyConfig::load() {
+            Ok(cfg) => build_ssh_signers(&cfg, None),
             Err(e) => {
                 eprintln!("latch daemon: ignoring an unreadable ssh-keys config: {e}");
                 Vec::new()
+            }
+        };
+
+        // Load the per-command config (which provider backs each command). A bad
+        // config is logged and treated as empty (op still resolves by default).
+        let commands = match CommandStore::load() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("latch daemon: ignoring an unreadable command config: {e}");
+                CommandStore::default()
             }
         };
 
@@ -195,11 +208,11 @@ impl Core {
             pending,
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(SysProcessTable),
-            provider: Box::new(OpProvider::new()),
+            providers: ProviderRegistry::with_defaults(),
+            commands,
             lease_ttl: DEFAULT_LEASE_TTL,
             factor,
-            ssh_keys,
-            ssh_op_path: None,
+            ssh_signers,
             audit: Some(
                 crate::settings::Settings::load()
                     .map(|s| s.retention_days)
@@ -281,30 +294,63 @@ fn vault_of_ref(reference: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Build one SSH signer per configured key source: the op-fetch signer for
+/// 1Password-backed keys, and the file signer for local key files. Either may be
+/// empty; together they form the aggregate the agent serves. `op_path` overrides
+/// `op` discovery for the op signer (tests point it at a fake `op`).
+fn build_ssh_signers(
+    cfg: &sshagent::SshKeyConfig,
+    op_path: Option<std::path::PathBuf>,
+) -> Vec<Box<dyn SshSigner>> {
+    let mut signers: Vec<Box<dyn SshSigner>> = Vec::new();
+    let op_ids = cfg.served_identities();
+    if !op_ids.is_empty() {
+        signers.push(Box::new(sshagent::OpSshSigner::new(op_ids, op_path)));
+    }
+    let file_keys = cfg.file_keys();
+    if !file_keys.is_empty() {
+        signers.push(Box::new(sshagent::FileSshSigner::new(file_keys)));
+    }
+    signers
+}
+
 impl SshBackend for Core {
     fn identities(&self) -> Vec<ServedIdentity> {
-        self.ssh_keys.clone()
+        self.ssh_signers
+            .iter()
+            .flat_map(|s| s.identities())
+            .collect()
     }
 
-    /// Gate one SSH signature on the phone and, on approval, fetch the key and
-    /// sign. This is the same approval path as an `op` secret, with two
+    /// Gate one SSH signature on the phone and, on approval, delegate to the
+    /// signer that owns the key. Latch is the phone-gate regardless of key source:
+    /// the gate here is the same approval path as an `op` secret, with two
     /// differences the security review must weigh (see `sshagent` module docs):
-    /// every signature is gated (no lease short-circuit in v1), and the private
-    /// key is briefly in daemon RAM for the one signature.
+    /// every signature is gated (no lease short-circuit in v1), and for the
+    /// op-fetch signer the private key is briefly in daemon RAM for the one
+    /// signature. A file signer sources the key from a local file instead; either
+    /// way the key never reaches the SSH client.
     fn approve_and_sign(&self, req: SignRequest<'_>) -> Option<Vec<u8>> {
         if self.lockdown.load(Ordering::SeqCst) {
             eprintln!("latch daemon: ssh sign refused; latch is locked down");
             return None;
         }
 
-        // Route the account for the key's vault; clone what we need before the
-        // (possibly long) approval wait so the store lock is released.
-        let vault = vault_of_ref(&req.id.key_ref);
-        let (account_label, ciphertext) = {
+        // Route the request to the signer that owns this identity.
+        let signer = self.ssh_signers.iter().find(|s| s.owns(&req.id.key_blob))?;
+
+        // Route the account only when the signer needs a stored credential (the
+        // op-fetch signer); clone what we need before the (possibly long) approval
+        // wait so the store lock is released. A file signer needs no account.
+        let account = if signer.needs_account() {
+            let vault = vault_of_ref(&req.id.key_ref);
             let store = self.accounts.lock().expect("accounts poisoned");
             let acct = store.route(vault.as_deref()).ok()?;
-            (acct.label.clone(), acct.ciphertext().ok()?)
+            Some((acct.label.clone(), acct.ciphertext().ok()?))
+        } else {
+            None
         };
+        let account_label = account.as_ref().map(|(l, _)| l.clone()).unwrap_or_default();
 
         // The approval screen shows a hash of the data to sign, never raw bytes.
         let data_fingerprint = sshagent::sha256_fingerprint(req.data);
@@ -332,6 +378,8 @@ impl SshBackend for Core {
             command: vec!["ssh-sign".to_string(), req.id.label.clone()],
             secret_refs: Vec::new(),
             kind: latch_proto::RequestKind::SshSignature,
+            // A signature is an authentication event: elevated by default.
+            risk: RiskLevel::Elevated,
             ssh: Some(challenge),
         };
 
@@ -340,23 +388,28 @@ impl SshBackend for Core {
             return None;
         }
 
-        // Unwrap the DEK (phone-delivered on approve, else from the keystore),
-        // decrypt the one token, and drop the DEK at once.
-        let dek = match outcome.dek {
-            Some(dek) => dek,
-            None => self
-                .keystore
-                .unwrap_dek(&format!("Sign with {} for {account_label}", req.id.label))
-                .ok()?,
+        // For a signer that needs an account, unwrap the DEK (phone-delivered on
+        // approve, else from the keystore), decrypt the one token, and drop the
+        // DEK at once. The credential is handed to the signer, which holds the key
+        // material for the one signature (op-fetch) or reads it from a file.
+        let credential = match &account {
+            Some((label, ciphertext)) => {
+                let dek = match outcome.dek {
+                    Some(dek) => dek,
+                    None => self
+                        .keystore
+                        .unwrap_dek(&format!("Sign with {} for {label}", req.id.label))
+                        .ok()?,
+                };
+                let token = secrets::decrypt_token(&dek, ciphertext).ok()?;
+                drop(dek);
+                Some(token)
+            }
+            None => None,
         };
-        let token = secrets::decrypt_token(&dek, &ciphertext).ok()?;
-        drop(dek);
 
-        // Fetch the private key per-signature and sign; the key lives only inside
-        // fetch_and_sign, in a Zeroizing buffer wiped when it returns.
-        let op = self.ssh_op_path.clone().or_else(paths::find_real_op)?;
-        let sig = sshagent::fetch_and_sign(&op, &token, &req.id.key_ref, req.data);
-        drop(token); // zeroized here
+        let sig = signer.sign(req.id, req.data, credential.as_ref());
+        drop(credential); // zeroized here (Token is Zeroizing)
         sig
     }
 }
@@ -419,7 +472,7 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
     eprintln!(
         "latch daemon: ssh-agent on {} · {} key(s) served · export SSH_AUTH_SOCK={}",
         ssh_sock.display(),
-        core.ssh_keys.len(),
+        core.identities().len(),
         ssh_sock.display()
     );
 
@@ -504,7 +557,7 @@ fn handle_conn(core: Arc<Core>, mut stream: UnixStream) -> anyhow::Result<()> {
     }
 
     let reply = match frame {
-        Frame::Op { argv, cwd } => {
+        Frame::Run { argv, cwd } => {
             log_request(&argv, &cwd, peer);
             let mut fds = fds.into_iter();
             let stdout = fds.next();
@@ -658,7 +711,7 @@ fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
                     machine: crate::json::hostname(),
                     requested_ms: s.queued_at_ms,
                 },
-                risk: "routine".to_string(),
+                risk: command::risk_str(ctx.risk).to_string(),
                 reason: None,
                 expires_ms: s.queued_at_ms + s.timeout_ms,
                 timeout_ms: s.timeout_ms,
@@ -668,9 +721,18 @@ fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
         .collect()
 }
 
-/// The gated fulfillment path. Returns the exit code to mirror to the shim.
-/// Every failure path here fails closed (exit 1 with a stderr line), so the
-/// shim behaves exactly like a denied real `op`.
+/// The gated fulfillment path for `latch <cmd>` (and the shim alias / `latch run`).
+/// Returns the exit code to mirror to the caller. Every failure path here fails
+/// closed (a non-zero code with a stderr line), so the caller behaves like a
+/// denied invocation.
+///
+/// The command's config selects the provider; the provider decides the injection
+/// shape. `op` (and any provider that [`needs_account`](crate::provider::SecretProvider::needs_account))
+/// routes a 1Password account, unwraps the DEK, decrypts the one token, and
+/// injects it; a direct-injection provider (`env-file`) needs no account and is
+/// gated on every run (no leasing, so resolved values never sit in RAM across a
+/// TTL). An *unconfigured* command is refused with a pointer to `latch config
+/// add`, never run ungated.
 fn fulfill(
     core: &Core,
     argv: &[String],
@@ -680,51 +742,85 @@ fn fulfill(
     stderr: Option<OwnedFd>,
 ) -> i32 {
     if core.lockdown.load(Ordering::SeqCst) {
-        return fail_closed(stderr, "op: latch is locked down; no secrets served\n");
+        return fail_closed(stderr, "latch is locked down; no secrets served\n");
     }
 
-    // Resolve the account for the requested vault. Clone what we need so the
-    // store lock is released before the (possibly long) approval wait.
-    let vault = parse_vault(argv);
-    let (account_label, ciphertext) = {
-        let store = core.accounts.lock().expect("accounts poisoned");
-        match store.route(vault.as_deref()) {
-            Ok(acct) => match acct.ciphertext() {
-                Ok(ct) => (acct.label.clone(), ct),
-                Err(e) => return fail_closed(stderr, &format!("op: latch account error: {e}\n")),
-            },
-            Err(e) => return fail_closed(stderr, &format!("op: latch: {e}\n")),
-        }
+    let Some(cmd) = argv.first() else {
+        return fail_closed(stderr, "latch: empty command\n");
     };
+
+    // Look up the command config. An unconfigured command is refused (never run
+    // ungated) with the exact command to configure it.
+    let Some(cfg) = core.commands.resolve(cmd) else {
+        return fail_closed(
+            stderr,
+            &format!(
+                "latch: '{cmd}' is not configured; Latch will not run it ungated.\n  \
+                 configure it: latch config add {cmd} --provider <id>\n"
+            ),
+        );
+    };
+    let Some(provider) = core.providers.get(&cfg.provider) else {
+        return fail_closed(
+            stderr,
+            &format!(
+                "latch: '{cmd}' names an unknown provider '{}'\n",
+                cfg.provider
+            ),
+        );
+    };
+    let source = cfg.source.as_deref().unwrap_or("");
+    let needs_account = provider.needs_account();
 
     let scope = argv.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
     let caller = lease::walk_ancestry(core.proc_table.as_ref(), peer.unwrap_or(-1));
     let gk = lease::grant_key(&caller, cwd, &scope);
 
-    // A live lease short-circuits the approval.
-    if let Some(token) = core.leases.token_for(&gk, &account_label, &scope) {
-        let refs = core.provider.describe(argv);
-        core.record_audit(
-            &uuid::Uuid::now_v7().to_string(),
-            core.provider.kind(argv),
-            &audit_label(&refs, &scope),
-            &account_label,
-            &caller.provenance(),
-            cwd,
-            "approved",
-            "lease",
-        );
-        return core.provider.run(ProviderRun {
-            command: argv,
-            cwd,
-            credential: &token,
-            stdout,
-            stderr,
-        });
+    // Route the 1Password account only for providers that inject a stored token.
+    // Clone what we need so the store lock is released before the approval wait.
+    let (account_label, ciphertext) = if needs_account {
+        let vault = parse_vault(argv).or_else(|| cfg.account.clone());
+        let store = core.accounts.lock().expect("accounts poisoned");
+        match store.route(vault.as_deref()) {
+            Ok(acct) => match acct.ciphertext() {
+                Ok(ct) => (acct.label.clone(), Some(ct)),
+                Err(e) => return fail_closed(stderr, &format!("latch account error: {e}\n")),
+            },
+            Err(e) => return fail_closed(stderr, &format!("latch: {e}\n")),
+        }
+    } else {
+        (String::new(), None)
+    };
+
+    // A live lease short-circuits the approval — only for account-backed
+    // providers, whose credential is what a lease holds. Direct-injection
+    // providers are gated on every run.
+    if needs_account {
+        if let Some(token) = core.leases.token_for(&gk, &account_label, &scope) {
+            let refs = provider.describe(argv, source);
+            core.record_audit(
+                &uuid::Uuid::now_v7().to_string(),
+                provider.kind(argv),
+                &audit_label(&refs, &scope),
+                &account_label,
+                &caller.provenance(),
+                cwd,
+                "approved",
+                "lease",
+            );
+            return provider.run(ProviderRun {
+                command: argv,
+                cwd,
+                credential: Some(&token),
+                source,
+                stdout,
+                stderr,
+            });
+        }
     }
 
     // The provider describes the request in provider-agnostic terms; the
-    // approver never sees op semantics.
+    // approver never sees provider semantics.
     let ctx = ApprovalContext {
         id: uuid::Uuid::now_v7().to_string(),
         account: account_label.clone(),
@@ -733,8 +829,9 @@ fn fulfill(
         provenance: caller.provenance(),
         cwd: cwd.to_string(),
         command: argv.to_vec(),
-        secret_refs: core.provider.describe(argv),
-        kind: core.provider.kind(argv),
+        secret_refs: provider.describe(argv, source),
+        kind: provider.kind(argv),
+        risk: cfg.risk,
         ssh: None,
     };
     let outcome = core.gate.decide(gk, &ctx);
@@ -750,39 +847,40 @@ fn fulfill(
             "denied",
             "",
         );
-        return fail_closed(stderr, "op: request denied\n");
+        return fail_closed(stderr, "request denied\n");
     }
 
-    // The DEK either arrived with the approval (a paired phone delivered it,
-    // re-sealed to this daemon) or must be unwrapped from the local keystore
-    // (Touch ID on macOS). The remote path is the inert-daemon case: no key at
-    // rest. Decrypt the one token and drop the DEK immediately; both live in
-    // `Zeroizing`, wiped on drop.
-    let dek = match outcome.dek {
-        Some(dek) => dek,
-        None => match core
-            .keystore
-            .unwrap_dek(&format!("Approve {scope} for {account_label}"))
-        {
-            Ok(dek) => dek,
-            Err(e) => {
-                return fail_closed(
-                    stderr,
-                    &format!("op: latch could not unwrap the key: {e}\n"),
-                )
-            }
-        },
+    // Account-backed providers need the decrypted token; direct-injection
+    // providers source their own env and need no credential. The DEK either
+    // arrived with the approval (a paired phone delivered it, re-sealed to this
+    // daemon) or is unwrapped from the local keystore (Touch ID on macOS). Both
+    // live in `Zeroizing`, wiped on drop.
+    let credential = if let Some(ciphertext) = &ciphertext {
+        let dek = match outcome.dek {
+            Some(dek) => dek,
+            None => match core
+                .keystore
+                .unwrap_dek(&format!("Approve {scope} for {account_label}"))
+            {
+                Ok(dek) => dek,
+                Err(e) => {
+                    return fail_closed(stderr, &format!("latch could not unwrap the key: {e}\n"))
+                }
+            },
+        };
+        let token = match secrets::decrypt_token(&dek, ciphertext) {
+            Ok(t) => t,
+            Err(e) => return fail_closed(stderr, &format!("latch token decrypt failed: {e}\n")),
+        };
+        drop(dek);
+        if let Some(ttl) = decision.lease_ttl() {
+            core.leases
+                .grant(gk, &account_label, &scope, token.clone(), ttl);
+        }
+        Some(token)
+    } else {
+        None
     };
-    let token = match secrets::decrypt_token(&dek, &ciphertext) {
-        Ok(t) => t,
-        Err(e) => return fail_closed(stderr, &format!("op: latch token decrypt failed: {e}\n")),
-    };
-    drop(dek);
-
-    if let Some(ttl) = decision.lease_ttl() {
-        core.leases
-            .grant(gk, &account_label, &scope, token.clone(), ttl);
-    }
 
     core.record_audit(
         &ctx.id,
@@ -795,17 +893,19 @@ fn fulfill(
         core.grant_via(),
     );
 
-    // Run through the provider: it injects the credential and streams the
-    // resolved secrets straight to the caller's fds. The daemon never holds a
-    // secret value; it holds only the credential (token), zeroized below.
-    let code = core.provider.run(ProviderRun {
+    // Run through the provider: it injects the credential (op) or the source
+    // env-vars (env-file) and streams output straight to the caller's fds. For
+    // op the daemon holds only the credential; for env-file the resolved values
+    // transit only as the child's spawn env (see the provider module docs).
+    let code = provider.run(ProviderRun {
         command: argv,
         cwd,
-        credential: &token,
+        credential: credential.as_ref(),
+        source,
         stdout,
         stderr,
     });
-    drop(token); // zeroized here; the child holds its own copy in its env
+    drop(credential); // zeroized here (Token is Zeroizing) when present
     code
 }
 
@@ -860,6 +960,7 @@ mod tests {
     use super::*;
     use crate::approve::DevMode;
     use crate::keystore::MemoryKeystore;
+    use crate::provider::{EnvFileProvider, OpProvider};
     use std::io::Read;
     use std::os::fd::{FromRawFd, RawFd};
     use std::path::PathBuf;
@@ -926,11 +1027,13 @@ mod tests {
             pending: pending.clone(),
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
-            provider: Box::new(OpProvider::with_binary(write_fake_op(dir, token, secret))),
+            providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
+                write_fake_op(dir, token, secret),
+            ))]),
+            commands: CommandStore::default(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_keys: Vec::new(),
-            ssh_op_path: None,
+            ssh_signers: Vec::new(),
             audit: None,
         };
         (Arc::new(core), pending)
@@ -1008,13 +1111,13 @@ mod tests {
             pending,
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
-            provider: Box::new(OpProvider::with_binary(write_fake_op(
-                &dir, "tok", "secret-1",
-            ))),
+            providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
+                write_fake_op(&dir, "tok", "secret-1"),
+            ))]),
+            commands: CommandStore::default(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_keys: Vec::new(),
-            ssh_op_path: None,
+            ssh_signers: Vec::new(),
             audit: Some(30),
         };
 
@@ -1267,6 +1370,176 @@ mod tests {
     }
 
     #[test]
+    fn unconfigured_command_is_refused_with_a_config_hint() {
+        // The invocation-model contract: a command with no config is never run
+        // ungated; it fails closed with the exact command to configure it.
+        let dir = tmpdir("unconfigured");
+        let (core, _) = test_core(
+            &dir,
+            "tok",
+            "secret",
+            DevMode::Approve, // op would auto-approve, but gcloud never reaches the gate
+            Duration::from_millis(50),
+        );
+        let (read_end, write_end) = pipe();
+        let (err_r, err_w) = pipe();
+        let argv = vec!["gcloud".into(), "auth".into(), "print-access-token".into()];
+        let code = fulfill(&core, &argv, "", None, Some(write_end), Some(err_w));
+        assert_eq!(code, 1, "an unconfigured command must fail closed");
+        assert_eq!(read_all(read_end), "", "and produce no output");
+        let err = read_all(err_r);
+        assert!(err.contains("not configured"), "err: {err}");
+        assert!(err.contains("latch config add gcloud"), "err: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn env_file_command_runs_gated_and_injects_env() {
+        // The direct-injection provider, end to end through the daemon: a
+        // configured `env-file` command is gated, then the child sees the exact
+        // KEY=VALUEs from the source file, with no account/DEK involved.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("envcmd");
+        let env_path = dir.join("s.env");
+        std::fs::write(&env_path, "TOKEN=abc123\nREGION=eu\n").unwrap();
+        let bindir = dir.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = bindir.join("faketool");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\nprintf 'tok=%s region=%s' \"$TOKEN\" \"$REGION\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let pending = Arc::new(PendingRegistry::new());
+        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+            .with_dev(DevMode::Approve)
+            .with_control_socket(true);
+        let mut commands = CommandStore::default();
+        commands
+            .add(crate::command::CommandConfig {
+                command: "faketool".into(),
+                provider: EnvFileProvider::ID.into(),
+                source: Some(env_path.to_str().unwrap().to_string()),
+                account: None,
+                risk: RiskLevel::Routine,
+            })
+            .unwrap();
+        let core = Arc::new(Core {
+            keystore,
+            accounts: Mutex::new(AccountStore::default()),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(approver)),
+            pending,
+            lockdown: AtomicBool::new(false),
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::with_defaults(),
+            commands,
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::DevInsecure,
+            ssh_signers: Vec::new(),
+            audit: None,
+        });
+
+        let prev = std::env::var_os("PATH");
+        std::env::set_var("PATH", &bindir);
+        let (read_end, write_end) = pipe();
+        let code = fulfill(&core, &["faketool".into()], "", None, Some(write_end), None);
+        match prev {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert_eq!(code, 0);
+        assert_eq!(read_all(read_end), "tok=abc123 region=eu");
+        // A direct-injection provider is never leased (no credential to hold in
+        // RAM across a TTL), even though the decision would allow it.
+        assert_eq!(core.leases.active(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ssh_file_signer_signs_when_gated() {
+        // The pluggable SSH signer seam through the daemon gate: a file-backed
+        // signer (no account) produces a verifiable signature only after the gate
+        // grants, proving Latch is the phone-gate regardless of key source.
+        let dir = tmpdir("ssh-file-signer");
+        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .unwrap();
+        let key_path = dir.join("id_ed25519");
+        std::fs::write(&key_path, key.to_openssh(ssh_key::LineEnding::LF).unwrap()).unwrap();
+        let pk = key.public_key();
+        let id = ServedIdentity {
+            key_blob: pk.to_bytes().unwrap(),
+            comment: "tom@file".into(),
+            key_ref: key_path.to_string_lossy().into_owned(),
+            label: "id_ed25519".into(),
+            fingerprint: pk.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
+        };
+
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let pending = Arc::new(PendingRegistry::new());
+        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+            .with_dev(DevMode::Approve)
+            .with_control_socket(true);
+        let core = Core {
+            keystore,
+            accounts: Mutex::new(AccountStore::default()),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(approver)),
+            pending,
+            lockdown: AtomicBool::new(false),
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::with_defaults(),
+            commands: CommandStore::default(),
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::DevInsecure,
+            ssh_signers: vec![Box::new(sshagent::FileSshSigner::new(vec![(
+                id.clone(),
+                key_path.clone(),
+            )]))],
+            audit: None,
+        };
+
+        // The agent advertises the file identity.
+        assert_eq!(core.identities().len(), 1);
+
+        let host = sshagent::HostContext {
+            host: "(host not bound)".into(),
+        };
+        let data = b"gated-file-sign";
+        let sig_blob = core
+            .approve_and_sign(sshagent::SignRequest {
+                id: &id,
+                data,
+                host: &host,
+                caller_pid: None,
+            })
+            .expect("gated file-signer signature");
+
+        // Parse the SSH signature blob (string algo + string raw_sig) and verify
+        // the raw ed25519 signature against the served public key.
+        fn ssh_string(buf: &[u8], pos: usize) -> (&[u8], usize) {
+            let n =
+                u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+            (&buf[pos + 4..pos + 4 + n], pos + 4 + n)
+        }
+        let (algo, p) = ssh_string(&sig_blob, 0);
+        assert_eq!(algo, b"ssh-ed25519");
+        let (raw, _) = ssh_string(&sig_blob, p);
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        let pk_bytes = pk.key_data().ed25519().expect("ed25519 pubkey").0;
+        let vk = VerifyingKey::from_bytes(&pk_bytes).unwrap();
+        vk.verify(data, &Signature::from_slice(raw).unwrap())
+            .expect("the gated file signature verifies");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn full_loop_over_the_socket_with_local_control_approval() {
         let dir = tmpdir("control");
         let (core, pending) = test_core(
@@ -1282,7 +1555,7 @@ mod tests {
         let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
         local::send_frame(
             &client,
-            &Frame::Op {
+            &Frame::Run {
                 argv,
                 cwd: String::new(),
             },
@@ -1411,11 +1684,13 @@ mod tests {
             pending,
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
-            provider: Box::new(OpProvider::with_binary(write_fake_op(dir, token, secret))),
+            providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
+                write_fake_op(dir, token, secret),
+            ))]),
+            commands: CommandStore::default(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::Phone,
-            ssh_keys: Vec::new(),
-            ssh_op_path: None,
+            ssh_signers: Vec::new(),
             audit: None,
         })
     }
@@ -1467,7 +1742,7 @@ mod tests {
         ];
         local::send_frame(
             &client,
-            &Frame::Op {
+            &Frame::Run {
                 argv,
                 cwd: String::new(),
             },
@@ -1701,7 +1976,7 @@ mod tests {
         ];
         local::send_frame(
             &client,
-            &Frame::Op {
+            &Frame::Run {
                 argv,
                 cwd: String::new(),
             },
@@ -1825,11 +2100,13 @@ mod tests {
             pending,
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
-            provider: Box::new(OpProvider::with_binary(write_fake_op(dir, token, secret))),
+            providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
+                write_fake_op(dir, token, secret),
+            ))]),
+            commands: CommandStore::default(),
             lease_ttl: Duration::from_secs(60),
             factor,
-            ssh_keys: Vec::new(),
-            ssh_op_path: None,
+            ssh_signers: Vec::new(),
             audit: None,
         })
     }
@@ -2037,7 +2314,7 @@ mod tests {
         ];
         local::send_frame(
             &client,
-            &Frame::Op {
+            &Frame::Run {
                 argv,
                 cwd: String::new(),
             },

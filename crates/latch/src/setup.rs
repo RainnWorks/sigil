@@ -22,12 +22,21 @@ const PROFILE_MARKER_END: &str = "# <<< latch shim (managed) <<<";
 /// Install the `op` shim: symlink `~/.latch/bin/op` at the running binary,
 /// replacing any stale link. Returns `(link, target)`.
 pub fn install_shim() -> Result<(PathBuf, PathBuf)> {
+    install_shim_for("op")
+}
+
+/// Install a transparent shim alias for `cmd`: symlink `~/.latch/bin/<cmd>` at
+/// the running binary so a bare `<cmd>` on PATH re-enters as `latch <cmd>`,
+/// replacing any stale link. Returns `(link, target)`. This generalizes the shim
+/// beyond `op` so `latch shim add <cli>` can front any configured command for
+/// callers that cannot be modified.
+pub fn install_shim_for(cmd: &str) -> Result<(PathBuf, PathBuf)> {
     let bindir = paths::shim_bin_dir().context("HOME is not set")?;
     let target = std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .context("resolving the latch binary path")?;
     std::fs::create_dir_all(&bindir).with_context(|| format!("creating {}", bindir.display()))?;
-    let link = bindir.join("op");
+    let link = bindir.join(cmd);
     if link.exists() || link.symlink_metadata().is_ok() {
         let _ = std::fs::remove_file(&link);
     }
