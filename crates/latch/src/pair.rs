@@ -46,14 +46,11 @@ impl PairChannel for latch_relay_client::RendezvousWs {
 }
 
 /// Render a QR payload string as a terminal QR using unicode half-blocks, with a
-/// quiet zone so a phone camera can lock on. Dark modules render as filled
-/// blocks (scannable on a light terminal); a dark-terminal user can invert.
+/// quiet zone so a phone camera can lock on. Delegates to [`crate::qr`], the one
+/// place QR rendering lives, so the pairing QR, `latch qr`, and the PNG output
+/// all come from the same matrix (error-correction Q, 4-module quiet zone).
 pub fn render_qr(data: &str) -> Result<String> {
-    let code = qrcode::QrCode::new(data.as_bytes()).context("encoding the pairing QR")?;
-    Ok(code
-        .render::<qrcode::render::unicode::Dense1x2>()
-        .quiet_zone(true)
-        .build())
+    crate::qr::render_terminal(data)
 }
 
 /// Decode the phone's response line: base64url(JSON) as the softphone and the

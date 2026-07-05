@@ -58,10 +58,11 @@ uuid.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
 # latch-relay-client already provides the daemon WS transport; the softphone is
 # a dev-dep. The pairing rendezvous uses relay-client's raw Rendezvous client.
-# qrcode: render the pairing payload as a scannable QR in the terminal (unicode
-# half-blocks). default-features off drops the `image`/`svg` renderers and their
-# deps; only the pure `render::unicode` string renderer is used, so no image
-# stack enters the single binary.
+# qrcode: encode the module matrix for `latch qr` and the pairing QR.
+# default-features off drops the `image`/`svg` render backends and the whole
+# `image` dependency stack; we use only the matrix (`QrCode::to_colors`) and
+# render it ourselves in `src/qr.rs` (unicode half-blocks, a from-scratch
+# grayscale PNG, and SVG), so no image stack enters the single binary.
 qrcode = { version = "0.14", default-features = false }
 # ssh-key 0.6: decode the `-----BEGIN OPENSSH PRIVATE KEY-----` body the service
 # account hands us, emit the public-key wire blob for IDENTITIES_ANSWER, and sign

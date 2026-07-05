@@ -35,6 +35,7 @@ pub fn run() -> i32 {
         "doctor" => cmd_doctor(),
         "setup" => cmd_setup(&args[1..]),
         "pair" => cmd_pair(&args[1..], json),
+        "qr" => cmd_qr(&args[1..]),
         "unpair" => cmd_unpair(json),
         "start" | "stop" | "restart" => cmd_service(&args[0]),
         "account" => cmd_account(&args[1..], json),
@@ -91,6 +92,7 @@ pub fn is_reserved_verb(cmd: &str) -> bool {
             | "doctor"
             | "setup"
             | "pair"
+            | "qr"
             | "unpair"
             | "start"
             | "stop"
@@ -187,9 +189,13 @@ usage: latch <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
                     paired phone or a hardware biometric it fails closed;
                     --dev-insecure enables local self-approval for dev only.
   doctor            diagnose shim drift, factor, relay, socket, and op
-  pair --relay <url>   pair a phone over the relay (renders a QR)
+  pair --relay <url> [--qr-png <path>]   pair a phone over the relay (renders a
+                    QR; --qr-png also writes the pairing code as a scannable PNG)
   pair list         list paired devices
   unpair            forget the paired phone
+  qr <data>         render <data> as a QR in the terminal; --stdin reads it from
+                    stdin, --png <path> also writes a PNG, --out svg emits SVG,
+                    --scale <n> sets pixels per module (PNG/SVG, default 8)
   start|stop|restart   control the launchd daemon agent
   account add       add a service-account token (reads token from stdin)
   account list      list configured accounts and their vault routing
@@ -853,6 +859,102 @@ fn cmd_pair(args: &[String], json: bool) -> i32 {
     run_pairing(args)
 }
 
+/// `latch qr <data> [--stdin] [--png <path>] [--out svg] [--scale <n>]`: render
+/// arbitrary data as a QR. The terminal (or SVG, with `--out svg`) rendering goes
+/// to stdout; `--png <path>` additionally writes a scannable PNG. Data comes from
+/// the first positional argument, or from stdin with `--stdin` (preferred for
+/// large payloads). Reuses [`crate::qr`], the same renderer the pairing QR uses.
+fn cmd_qr(args: &[String]) -> i32 {
+    let s = Style::stdout();
+    let scale = flag_value(args, "--scale")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(8);
+    let png = flag_value(args, "--png");
+    let svg = matches!(flag_value(args, "--out"), Some("svg"));
+
+    let data = if has_flag(args, "--stdin") {
+        let mut buf = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+            eprintln!("{} reading data from stdin: {e}", s.deny("\u{2717}"));
+            return 1;
+        }
+        // A single trailing newline is the shell's, not the payload's.
+        buf.trim_end_matches(['\r', '\n']).to_string()
+    } else {
+        match qr_positional(args) {
+            Some(d) => d,
+            None => {
+                eprintln!(
+                    "usage: latch qr <data> [--png <path>] [--out svg] [--scale <n>]\n\
+                     \x20      latch qr --stdin [--png <path>]   (read data from stdin)"
+                );
+                return 2;
+            }
+        }
+    };
+    if data.is_empty() {
+        eprintln!("{} no data to encode (empty input)", s.deny("\u{2717}"));
+        return 2;
+    }
+
+    // stdout artifact: SVG on request, otherwise the terminal picture.
+    let rendered = if svg {
+        crate::qr::render_svg(&data, scale)
+    } else {
+        crate::qr::render_terminal(&data)
+    };
+    match rendered {
+        Ok(text) => print!("{text}"),
+        Err(e) => {
+            eprintln!("{} encoding the QR: {e:#}", s.deny("\u{2717}"));
+            return 1;
+        }
+    }
+
+    // --png writes a file in addition to the stdout artifact.
+    if let Some(path) = png {
+        let path = std::path::Path::new(path);
+        if let Err(e) = crate::qr::write_png(&data, path, scale) {
+            eprintln!("{} writing the PNG: {e:#}", s.deny("\u{2717}"));
+            return 1;
+        }
+        match crate::qr::png_side_px(&data, scale) {
+            Ok(side) => eprintln!(
+                "{} wrote {} ({side}x{side} px)",
+                s.ok("\u{2713}"),
+                path.display()
+            ),
+            Err(_) => eprintln!("{} wrote {}", s.ok("\u{2713}"), path.display()),
+        }
+    }
+    0
+}
+
+/// The first non-flag positional argument to `latch qr`, skipping the value-taking
+/// flags (`--png`, `--out`, `--scale`) and their values and any boolean flag. Kept
+/// separate from [`flag_value`] because the QR data is a bare positional, not a
+/// flag value.
+fn qr_positional(args: &[String]) -> Option<String> {
+    const VALUE_FLAGS: [&str; 3] = ["--png", "--out", "--scale"];
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if let Some((flag, _)) = a.split_once('=') {
+            if VALUE_FLAGS.contains(&flag) {
+                continue;
+            }
+        }
+        if VALUE_FLAGS.contains(&a.as_str()) {
+            it.next(); // consume the flag's value
+            continue;
+        }
+        if a.starts_with('-') {
+            continue; // a boolean flag (e.g. --stdin) or an unknown option
+        }
+        return Some(a.clone());
+    }
+    None
+}
+
 /// `latch pair list`: show the persisted pairing. The device name is not
 /// captured by the ceremony, so the JSON form reports a fixed `iPhone` (gap).
 fn pair_list(json: bool) -> i32 {
@@ -919,6 +1021,9 @@ fn run_pairing(args: &[String]) -> i32 {
         return 2;
     };
     let auto_yes = has_flag(args, "--yes") || has_flag(args, "-y");
+    // --qr-png also writes the pairing payload as a scannable PNG, so a remote
+    // operator can be handed an image of the pairing code (not just terminal art).
+    let qr_png = flag_value(args, "--qr-png").map(str::to_string);
 
     if crate::pairing_store::exists() {
         println!(
@@ -958,6 +1063,12 @@ fn run_pairing(args: &[String]) -> i32 {
         println!("{unicode}");
         println!("  {}", s.faint("or paste this pairing code into the app:"));
         println!("  {b64}");
+        if let Some(path) = qr_png.as_deref() {
+            match crate::qr::write_png(b64, std::path::Path::new(path), 8) {
+                Ok(()) => println!("  {}", s.faint(&format!("scannable PNG written to {path}"))),
+                Err(e) => eprintln!("{} writing the pairing QR PNG: {e:#}", s.deny("\u{2717}")),
+            }
+        }
         println!();
         println!("  {}", s.dim("Waiting for the phone to respond..."));
     };
