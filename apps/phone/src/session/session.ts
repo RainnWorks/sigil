@@ -7,6 +7,7 @@
  * authorizing release needs the Face ID gate before `respond` is ever called.
  */
 import {
+  agreementSecretKey,
   type ApprovalRequest,
   type ApprovalResponse,
   type Decision,
@@ -53,7 +54,7 @@ export class LatchSession {
     try {
       request = open<ApprovalRequest>(this.cfg.sodium, envelope, {
         sender: this.cfg.daemonPub,
-        recipientAgreementSecret: this.cfg.phone.agreementSecret,
+        recipientAgreementSecret: agreementSecretKey(this.cfg.sodium, this.cfg.phone),
         guard: this.inboundGuard,
       });
     } catch {

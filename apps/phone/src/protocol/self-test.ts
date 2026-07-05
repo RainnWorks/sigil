@@ -8,7 +8,7 @@
 import { bytesEqual, toHex } from "./bytes";
 import { EnvelopeOpenError, open, seal } from "./envelope";
 import { fingerprintWords, mailboxId } from "./fingerprint";
-import { generateDeviceIdentity, type PeerIdentity, peerIdentity, signingSecretKey } from "./identity";
+import { agreementSecretKey, generateDeviceIdentity, type PeerIdentity, peerIdentity, signingSecretKey } from "./identity";
 import { type PairingPayload, pairingFromQrString, pairingToQrString } from "./pairing";
 import { buildPairingResponseWithNonce, rendezvousMailbox } from "./pairing-handshake";
 import { ReplayGuard } from "./replay";
@@ -44,7 +44,7 @@ async function main(): Promise<void> {
   const guard = new ReplayGuard();
   const got = open<typeof payload>(sodium, env, {
     sender: daemonPub,
-    recipientAgreementSecret: phone.agreementSecret,
+    recipientAgreementSecret: agreementSecretKey(sodium, phone),
     guard,
   });
   ok(got.note === payload.note, "seal/open round trip delivers payload");
@@ -53,7 +53,7 @@ async function main(): Promise<void> {
   try {
     open(sodium, env, {
       sender: daemonPub,
-      recipientAgreementSecret: phone.agreementSecret,
+      recipientAgreementSecret: agreementSecretKey(sodium, phone),
       guard,
     });
     ok(false, "replay rejected");
@@ -71,7 +71,7 @@ async function main(): Promise<void> {
       recipient: phonePub,
     }), {
       sender: impostor,
-      recipientAgreementSecret: phone.agreementSecret,
+      recipientAgreementSecret: agreementSecretKey(sodium, phone),
       guard: new ReplayGuard(),
     });
     ok(false, "forged sender rejected");
@@ -89,7 +89,7 @@ async function main(): Promise<void> {
       recipient: phonePub,
     }), {
       sender: daemonPub,
-      recipientAgreementSecret: stranger.agreementSecret,
+      recipientAgreementSecret: agreementSecretKey(sodium, stranger),
       guard: new ReplayGuard(),
     });
     ok(false, "wrong recipient cannot decrypt");
@@ -109,7 +109,7 @@ async function main(): Promise<void> {
   try {
     open(sodium, tampered, {
       sender: daemonPub,
-      recipientAgreementSecret: phone.agreementSecret,
+      recipientAgreementSecret: agreementSecretKey(sodium, phone),
       guard: new ReplayGuard(),
     });
     ok(false, "tampered ciphertext rejected");

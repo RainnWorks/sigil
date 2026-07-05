@@ -22,6 +22,7 @@ export default function KeysScreen() {
   const router = useRouter();
   const [step, setStep] = useState<Step>("generating");
   const [words, setWords] = useState<string[]>([]);
+  const [errMsg, setErrMsg] = useState<string>("");
 
   useEffect(() => {
     let alive = true;
@@ -31,8 +32,11 @@ export default function KeysScreen() {
         if (!alive) return;
         setWords(c.ownWords);
         setStep("ready");
-      } catch {
-        if (alive) setStep("error");
+      } catch (err) {
+        if (alive) {
+          setErrMsg(err instanceof Error ? err.message : String(err));
+          setStep("error");
+        }
       }
     })();
     return () => {
@@ -72,7 +76,9 @@ export default function KeysScreen() {
           {step === "generating" ? (
             <Mono tone="muted">generating…</Mono>
           ) : step === "error" ? (
-            <Mono tone="deny">could not generate keys on this device</Mono>
+            <Mono tone="deny" selectable style={{ lineHeight: 22 }}>
+              {errMsg || "could not generate keys on this device"}
+            </Mono>
           ) : (
             <Mono size={16} selectable style={{ lineHeight: 24 }}>
               {words.join(" · ")}

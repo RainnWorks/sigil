@@ -13,8 +13,11 @@
  * NEEDS VERIFICATION: react-native-libsodium is a native module and is NOT in
  * Expo Go. It requires a development build (`expo run:ios` / EAS dev client).
  * Confirm the installed version exposes crypto_box_easy, crypto_sign_detached,
- * crypto_sign_seed_keypair, crypto_generichash and crypto_scalarmult_base with
- * the libsodium-wrappers signatures; the seam assumes they match.
+ * crypto_sign_seed_keypair, crypto_generichash and crypto_box_seed_keypair with
+ * the libsodium-wrappers signatures; the seam assumes they match. (Note:
+ * react-native-libsodium does NOT export crypto_scalarmult_base, so the
+ * agreement keypair is derived from a seed via crypto_box_seed_keypair, which
+ * both bindings do export — see identity.ts.)
  *
  * The algorithms this maps onto crates/proto:
  *   crypto_box_easy        = crypto_box crate SalsaBox (X25519 + XSalsa20-Poly1305)
@@ -43,7 +46,13 @@ export interface Sodium {
     secretKey: Uint8Array,
   ): Uint8Array;
   crypto_box_keypair(): SodiumKeyPair;
-  crypto_scalarmult_base(privateKey: Uint8Array): Uint8Array;
+  /**
+   * Derive an X25519 agreement keypair deterministically from a 32-byte seed.
+   * Present in both bindings (unlike crypto_scalarmult_base, which
+   * react-native-libsodium omits), so this is how a stored device identity turns
+   * its persisted seed into a stable public/secret agreement pair.
+   */
+  crypto_box_seed_keypair(seed: Uint8Array): SodiumKeyPair;
 
   crypto_sign_seed_keypair(seed: Uint8Array): SodiumKeyPair;
   crypto_sign_detached(message: Uint8Array, secretKey: Uint8Array): Uint8Array;
@@ -65,6 +74,7 @@ export interface Sodium {
   readonly crypto_box_NONCEBYTES: number;
   readonly crypto_box_PUBLICKEYBYTES: number;
   readonly crypto_box_SECRETKEYBYTES: number;
+  readonly crypto_box_SEEDBYTES: number;
   readonly crypto_sign_SEEDBYTES: number;
 }
 

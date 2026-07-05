@@ -9,6 +9,7 @@
  * crypto is unavailable, seed the store directly instead (see demo.ts).
  */
 import {
+  agreementSecretKey,
   type ApprovalRequest,
   type DeviceIdentity,
   type Envelope,
@@ -73,7 +74,7 @@ export class MockTransport implements Transport {
   async send(e: Envelope): Promise<void> {
     const response = open<ApprovalResponse>(this.cfg.sodium, e, {
       sender: this.cfg.phonePub,
-      recipientAgreementSecret: this.cfg.daemon.agreementSecret,
+      recipientAgreementSecret: agreementSecretKey(this.cfg.sodium, this.cfg.daemon),
       guard: this.inboundGuard,
     });
     // In the real daemon this unwraps the DEK and spawns op; here we just prove

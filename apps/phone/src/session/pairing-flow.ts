@@ -27,6 +27,7 @@ import {
   type Envelope,
   envelopeFromWire,
   type EnvelopeWire,
+  agreementSecretKey,
   fingerprintWords,
   generateDeviceIdentity,
   loadSodium,
@@ -166,7 +167,7 @@ export async function awaitDekDelivery(): Promise<void> {
   // phone. A fresh guard: this is the first (and only) message on this pairing.
   const payload = open<number[]>(s, env, {
     sender: c.scanned.daemon,
-    recipientAgreementSecret: c.phone.agreementSecret,
+    recipientAgreementSecret: agreementSecretKey(s, c.phone),
     guard: new ReplayGuard(),
   });
   const dek = recoverDek(payload);

@@ -42,7 +42,7 @@ export interface StoredPairing {
 
 interface IdentityJson {
   signingSeed: string;
-  agreementSecret: string;
+  agreementSeed: string;
   daemonVerifying: string;
   daemonAgreement: string;
   mailbox: string;
@@ -54,7 +54,7 @@ interface IdentityJson {
 function encodeIdentity(p: StoredPairing): IdentityJson {
   return {
     signingSeed: toBase64(p.phone.signingSeed),
-    agreementSecret: toBase64(p.phone.agreementSecret),
+    agreementSeed: toBase64(p.phone.agreementSeed),
     daemonVerifying: toBase64(p.daemonPub.verifying),
     daemonAgreement: toBase64(p.daemonPub.agreement),
     mailbox: toBase64(p.mailbox),
@@ -68,7 +68,7 @@ function decodeIdentity(j: IdentityJson): StoredPairing {
   return {
     phone: {
       signingSeed: fromBase64(j.signingSeed),
-      agreementSecret: fromBase64(j.agreementSecret),
+      agreementSeed: fromBase64(j.agreementSeed),
     },
     daemonPub: {
       verifying: fromBase64(j.daemonVerifying),
