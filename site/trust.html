@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Latch · the trust model</title>
+<meta name="description" content="The Latch trust model in full: the pairing ceremony, what each party can never see, the enumerated worst case of a malicious relay, and the claim-to-code-to-test philosophy. Written for the skeptical reader.">
+<link rel="stylesheet" href="latch.css">
+</head>
+<body>
+
+<!-- TODO: repo has no remote yet; point every href="#repo" at the GitHub URL once it exists -->
+<nav class="nav">
+  <div class="wrap">
+    <a class="brand" href="index.html">latch<span class="cursor">_</span></a>
+    <div class="nav-links">
+      <a class="opt" href="index.html#how">How it works</a>
+      <a class="opt" href="index.html#layers">Architecture</a>
+      <a href="uses-1password.html">1Password</a>
+      <a href="trust.html" aria-current="page" style="color:var(--ink)">Trust model</a>
+      <a class="repo" href="#repo">Source</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero flush">
+  <div class="wrap-narrow">
+    <p class="kicker" style="margin-bottom:18px"><span class="dot" style="background:var(--cobalt)"></span> The trust model, in full</p>
+    <h1 style="font-size:clamp(1.9rem,1.3rem+2.6vw,2.8rem);line-height:1.08;letter-spacing:-0.03em">Assume the network is hostile. The design already did.</h1>
+    <p class="lede mt-s">This is the long version for the reader who does not take "trust us" for an answer. It states the mechanism, the boundary, and the residue at each layer. It is written about the generic gate, so it holds for any provider; 1Password is simply the first one wired in. Where something is not built yet, it says so.</p>
+  </div>
+</header>
+
+<!-- pairing -->
+<section id="pairing">
+  <div class="wrap-narrow">
+    <div class="sec-head">
+      <h2>Pairing is the root of trust</h2>
+      <p>Everything downstream inherits its security from one in-person moment. There is no server in it.</p>
+    </div>
+    <div class="prose">
+      <p>At pairing, each device mints an Ed25519 signing key and an X25519 agreement key inside its own secure hardware: the Secure Enclave on iPhone, StrongBox or the hardware Keystore on Android, the Keychain and Secure Enclave on the Mac. The private halves never leave that hardware.</p>
+      <p>The public keys cross through a QR code rendered locally on one screen and read by the other camera, then confirmed by a six-word fingerprint that both screens display and you compare by eye. Once confirmed they are pinned forever. From that point every message in both directions is a NaCl-style sealed box (X25519 with XSalsa20-Poly1305) carrying an Ed25519 signature over pinned keys. A compromised network hop can neither read a request nor forge an approval.</p>
+      <p>The unwrap key that decrypts a provider's credentials, a 1Password service-account token today, is delivered to the phone once, at pairing, and then erased from the daemon. Optionally it is enveloped a second time to the Mac's Secure Enclave, which is what makes a local Touch ID approval a real cryptographic factor rather than a bypass. Hardened mode never mints that second envelope, making the phone strictly required.</p>
+    </div>
+    <div class="term plain mt-m">
+<pre><span class="t-dim"># both screens must show the same three words twice</span>
+<span class="t-co">latch pair</span>
+
+  scan the QR on your phone, then confirm the fingerprint:
+
+      <span class="t-brass">tide</span>  <span class="t-brass">·</span>  <span class="t-brass">brass</span>  <span class="t-brass">·</span>  <span class="t-brass">anchor</span>
+
+  <span class="t-ok">✓</span> keys pinned   <span class="t-dim">Tom's iPhone · ed25519 + x25519</span></pre>
+    </div>
+  </div>
+</section>
+
+<!-- what each party sees -->
+<section id="visibility">
+  <div class="wrap">
+    <div class="sec-head">
+      <h2>What each party can never read</h2>
+      <p>The boundary is not a policy. It is what the cryptography structurally allows each party to hold.</p>
+    </div>
+    <div class="tblwrap">
+      <table>
+        <tr><th>Party</th><th>Sees</th><th>Can never see</th></tr>
+        <tr><td><strong>Daemon</strong></td><td>request metadata, ciphertext credentials, the routing table</td><td>a usable credential at rest; the secret bytes in flight, which pass fd to fd</td></tr>
+        <tr><td><strong>Phone</strong></td><td>request context, the unwrap key</td><td>provider credentials, resolved secret values</td></tr>
+        <tr><td><strong>Apple or Google push</strong></td><td>"a pairing has a request" and your signing identity</td><td>reasons, commands, secret names, accounts, keys</td></tr>
+        <tr><td><strong>Network path</strong></td><td>sealed, signed packets between pinned keys</td><td>anything at all; every hop carries only ciphertext it cannot read or forge</td></tr>
+        <tr><td><strong>Calling process</strong></td><td>the one secret it asked for, on stdout, after approval</td><td>anything it did not ask for; anything without an approval</td></tr>
+      </table>
+    </div>
+    <p class="mt-m muted" style="font-size:0.92rem;max-width:66ch">Read the last row honestly. An approved request does deliver that secret to that process. Latch gates release; it does not sandbox the recipient. The defense against a malicious caller is that every fulfillment needs a fresh, out-of-band approval that shows you the process and its working directory before anything is unsealed.</p>
+  </div>
+</section>
+
+<!-- malicious relay worst case -->
+<section id="relay">
+  <div class="wrap-narrow">
+    <div class="sec-head">
+      <h2>The enumerated worst case of a malicious relay</h2>
+      <p>The relay is the one component you might not run yourself, so it gets the harshest treatment: assume it is fully adversarial and owned by someone who wants your secrets.</p>
+    </div>
+    <div class="prose">
+      <p>The relay is a ciphertext mailbox. The daemon connects to it outbound over a WebSocket and the phone reaches it the same way; it stores and forwards opaque envelopes. Because you cannot prove what a remote server runs, the design refuses to depend on its behaviour at all. Unlike a messaging app, it does not even distribute keys: pairing happened out-of-band by QR, so there is no key-exchange step for it to sit in the middle of.</p>
+      <p>Its entire possible behaviour is a short, closed list. Each entry is either harmless or fails closed, and each is enforced in client code you can read and build.</p>
+    </div>
+    <div class="cols mt-m">
+      <div>
+        <h4 style="color:var(--brass)">Everything it can do</h4>
+        <ul class="notes mt-s">
+          <li><b>Deliver.</b> The intended path. Verified end to end anyway.</li>
+          <li><b>Drop or delay.</b> A denial of service. No envelope reaches the phone, so no approval returns, so no secret is released. Fails closed.</li>
+          <li><b>Duplicate or reorder.</b> Single-use request ids and a per-pairing monotonic counter reject the replay; the ephemeral per-request key makes a stale response undecryptable.</li>
+          <li><b>Observe.</b> Mailbox address, message timing, blob sizes. This is the real residue.</li>
+        </ul>
+      </div>
+      <div>
+        <h4 style="color:var(--ok)">Everything it cannot do</h4>
+        <ul class="notes mt-s">
+          <li>Read a request or an approval. Both are sealed to keys it does not hold.</li>
+          <li>Forge either one. Both are signed by a key pinned at pairing.</li>
+          <li>Learn a secret name, account, command, or value.</li>
+          <li>Identify you. It holds two pseudonymous public keys and nothing else: no account, no email, no push token, because the daemon sends pushes directly to Apple or Google.</li>
+        </ul>
+      </div>
+    </div>
+    <p class="mt-m muted" style="font-size:0.92rem;max-width:66ch">The mailbox address is a BLAKE2 hash of the two paired public keys: self-authenticating, squat-proof, and anonymous. The relay's only check, dropping envelopes not signed by one of those two keys, is anti-abuse and never load-bearing. The client verifies everything itself and would be equally safe against a relay that performed no checks at all. Self-host the Worker or the protocol-identical Bun server to keep even the metadata at home.</p>
+  </div>
+</section>
+
+<!-- claim -> code -> test -->
+<section id="proof">
+  <div class="wrap-narrow">
+    <div class="sec-head">
+      <h2>Claim, code, test</h2>
+      <p>A security claim you cannot check is marketing. Latch is built so each one is a line you can follow.</p>
+    </div>
+    <div class="prose">
+      <p>The protocol core lives in <code>crates/proto</code>: the sealed and signed envelope, the pairing and fingerprint logic, the counters, and the mailbox hash. It has no I/O and no platform code, so it is exhaustively testable in isolation. That is where the proof lives too.</p>
+      <p>The repository ships a deliberately hostile relay implementation whose whole job is to attack: it tampers with envelopes, replays old ones, reorders them, forges signatures, truncates ciphertext, and stalls. A client test suite runs the full protocol across that hostile relay and asserts that every attack is rejected and that every failure is closed, never open. Alongside it is a claim map: each sentence of the trust model points at the function that enforces it and the test that exercises the attack it defends against.</p>
+      <p>None of this is aspirational scaffolding. It is the part being built first, because a protocol you cannot attack in CI is a protocol you are only hoping is correct.</p>
+    </div>
+    <div class="claim mt-m">
+      <span class="k">Why client-side and not audited-server</span>
+      <p>An audit tells you what a server ran on the day of the audit. Client-side proof tells you what any server, audited or not, honest or not, is structurally unable to do. Latch chooses the second because it is the only one that survives the server being replaced, compromised, or lying.</p>
+    </div>
+  </div>
+</section>
+
+<!-- threat table -->
+<section id="threats">
+  <div class="wrap">
+    <div class="sec-head">
+      <h2>Threats, answers, and honest residue</h2>
+      <p>Every row states a real attack, the mechanism that answers it, and what remains true even after the answer. The residue column is the point of the table.</p>
+    </div>
+    <div class="tblwrap">
+      <table>
+        <tr><th>Threat</th><th>Answer</th><th>Honest residue</th></tr>
+        <tr><td>Daemon store stolen</td><td>ciphertext without the phone or the Mac enclave</td><td>rotate tokens on suspicion anyway</td></tr>
+        <tr><td>Phone stolen</td><td>keys are enclave-gated; every approve needs a biometric</td><td>remote lockdown from the Mac, re-pair, rotate</td></tr>
+        <tr><td>Malicious process calls the shim</td><td>every fulfillment needs a fresh out-of-band approval showing process and cwd</td><td>an approved request does deliver that secret; Latch gates release, it does not sandbox the recipient</td></tr>
+        <tr><td>Approval replay</td><td>single-use ids, per-pairing counters, a short window, ephemeral per-request keys</td><td>aggressive clock skew rejects valid responses; doctor flags it</td></tr>
+        <tr><td>Push spoofing</td><td>a push only wakes the app; the real request must carry the daemon's pinned signature</td><td>nuisance wake-ups at worst</td></tr>
+        <tr><td>Relay compromised</td><td>sees only sealed envelopes; cannot read, forge, or replay; dropping traffic fails closed</td><td>metadata: pairing id, timing, sizes; self-host to keep even that at home</td></tr>
+        <tr><td>SSH key exposure</td><td>held in daemon memory for one signature, then zeroed</td><td>removed later by enclave-resident keys that never leave hardware</td></tr>
+        <tr><td>Phone lost entirely</td><td>recovery is intentionally a rotation: pair a new phone, rotate every token; old ciphertext dies</td><td>hardened mode makes this the only path, by design</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- residual risks -->
+<section id="residual">
+  <div class="wrap-narrow">
+    <div class="sec-head">
+      <h2>The residual risks, stated plainly</h2>
+      <p>Three things are true that no amount of cryptography removes. A security tool that hid them would be lying.</p>
+    </div>
+    <div class="resid">
+      <div class="r">
+        <div class="h">An approved consumer gets the secret</div>
+        <div class="b">Latch decides whether a secret is released, not what the caller does with it afterward. If you approve a request, that process receives that secret in cleartext on its stdout, exactly as if you had clicked the Mac prompt. The protection is that you saw the process, the directory, and the item first, and that nothing is released without that fresh decision.</div>
+      </div>
+      <div class="r">
+        <div class="h">The relay sees metadata</div>
+        <div class="b">A relay you do not host can observe that some pairing has traffic, when, and roughly how large. It cannot tie that to a name, an email, or an Apple identifier, and it cannot read a byte of content. Self-hosting the relay in your own account removes even the metadata from anyone else's view.</div>
+      </div>
+      <div class="r">
+        <div class="h">Push is the irreducible platform dependency</div>
+        <div class="b">iOS offers no way to remotely wake an app except APNs, and Android none except FCM, so the doorbell is the one piece that must go through a platform vendor, and pushing on iOS requires the paid Developer Program. Apple sees "Approval requested" and nothing more; the informative text is assembled on-device after the app fetches the sealed request down the ladder. If the phone has no path to the Mac at all, requests fail closed: approve at the Mac with Touch ID, or let it time out and fall back to vanilla <code>op</code>. Never a bypass.</div>
+      </div>
+    </div>
+    <p class="mt-l"><a class="btn btn-ghost" href="index.html">Back to the overview</a></p>
+  </div>
+</section>
+
+<!-- footer -->
+<footer class="foot">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div>
+        <span class="brand">latch<span class="cursor">_</span></span>
+        <p class="tag">A personal instrument that gates the secrets your CLIs inject, behind an approval on your phone. 1Password is the first provider; built for one user, the team never knows it exists.</p>
+      </div>
+      <div class="foot-links">
+        <div class="foot-col">
+          <h5>Read</h5>
+          <a href="index.html">Overview</a>
+          <a href="index.html#how">How it works</a>
+          <a href="index.html#transport">Transport ladder</a>
+        </div>
+        <div class="foot-col">
+          <h5>Build</h5>
+          <a href="#repo">Source</a>
+          <a href="#repo">Design brief</a>
+          <a href="index.html#platforms">Platforms</a>
+        </div>
+      </div>
+    </div>
+    <p class="foot-fine">No secret caching. No analytics. No accounts. Everything fails closed.</p>
+  </div>
+</footer>
+
+</body>
+</html>

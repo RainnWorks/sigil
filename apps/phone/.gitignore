@@ -1,0 +1,19 @@
+# dependencies
+node_modules/
+
+# expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# native
+/ios
+/android
+
+# build vectors fetched from the rust proto crate at test time
+src/protocol/__vectors__/*.json
+
+# misc
+*.log
+.DS_Store

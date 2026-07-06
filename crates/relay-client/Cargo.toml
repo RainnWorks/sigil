@@ -1,0 +1,24 @@
+[package]
+name = "latch-relay-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTTP Transport impls for the Latch blind relay (v4): daemon + phone slots, pairing rendezvous"
+
+[lib]
+name = "latch_relay_client"
+path = "src/lib.rs"
+
+[dependencies]
+latch-proto = { path = "../proto" }
+# serde_json: (de)serialize the opaque proto::Envelope and build the small slot
+# request/response JSON bodies the relay carries.
+serde_json.workspace = true
+# serde: derive for the small slot-drain response body ({"envelopes":[...]}).
+serde.workspace = true
+# thiserror: typed relay-client errors mapped onto the Transport seam.
+thiserror.workspace = true
+# reqwest (blocking, rustls): every relay face is pure request/response (POST a
+# slot, GET-drain a slot), so a blocking HTTP client is the right fit and needs
+# no async runtime. rustls-tls keeps the single-binary story (no system TLS).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

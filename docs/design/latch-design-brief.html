@@ -1,0 +1,715 @@
+<title>Sigil · Design Brief</title>
+<style>
+  :root {
+    --bg: oklch(1 0 0);
+    --surface: oklch(0.972 0.004 240);
+    --well: oklch(0.945 0.006 240);
+    --ink: oklch(0.235 0.015 245);
+    --muted: oklch(0.5 0.014 242);
+    --faint: oklch(0.62 0.01 242);
+    --line: oklch(0.885 0.008 240);
+    --cobalt: oklch(0.45 0.086 230);
+    --cobalt-ink: oklch(0.985 0.003 235);
+    --brass: oklch(0.62 0.115 75);
+    --ok: oklch(0.5 0.095 165);
+    --deny: oklch(0.5 0.15 25);
+    --term-bg: oklch(0.175 0.014 245);
+    --term-ink: oklch(0.955 0.006 235);
+    --term-muted: oklch(0.66 0.012 240);
+    --term-line: oklch(0.32 0.016 245);
+    --term-cobalt: oklch(0.7 0.11 232);
+    --term-brass: oklch(0.75 0.115 78);
+    --term-ok: oklch(0.72 0.11 165);
+    --term-deny: oklch(0.68 0.14 25);
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: oklch(0.175 0.014 245);
+      --surface: oklch(0.215 0.015 245);
+      --well: oklch(0.245 0.016 245);
+      --ink: oklch(0.955 0.006 235);
+      --muted: oklch(0.7 0.012 240);
+      --faint: oklch(0.58 0.012 240);
+      --line: oklch(0.3 0.016 245);
+      --cobalt: oklch(0.68 0.115 232);
+      --cobalt-ink: oklch(0.16 0.02 245);
+      --brass: oklch(0.75 0.115 78);
+      --ok: oklch(0.7 0.11 165);
+      --deny: oklch(0.66 0.14 25);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: oklch(0.175 0.014 245);
+    --surface: oklch(0.215 0.015 245);
+    --well: oklch(0.245 0.016 245);
+    --ink: oklch(0.955 0.006 235);
+    --muted: oklch(0.7 0.012 240);
+    --faint: oklch(0.58 0.012 240);
+    --line: oklch(0.3 0.016 245);
+    --cobalt: oklch(0.68 0.115 232);
+    --cobalt-ink: oklch(0.16 0.02 245);
+    --brass: oklch(0.75 0.115 78);
+    --ok: oklch(0.7 0.11 165);
+    --deny: oklch(0.66 0.14 25);
+  }
+  :root[data-theme="light"] {
+    --bg: oklch(1 0 0);
+    --surface: oklch(0.972 0.004 240);
+    --well: oklch(0.945 0.006 240);
+    --ink: oklch(0.235 0.015 245);
+    --muted: oklch(0.5 0.014 242);
+    --faint: oklch(0.62 0.01 242);
+    --line: oklch(0.885 0.008 240);
+    --cobalt: oklch(0.45 0.086 230);
+    --cobalt-ink: oklch(0.985 0.003 235);
+    --brass: oklch(0.62 0.115 75);
+    --ok: oklch(0.5 0.095 165);
+    --deny: oklch(0.5 0.15 25);
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.6;
+    font-size: 16px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1020px; margin: 0 auto; padding: 0 28px 120px; }
+  .prose { max-width: 70ch; }
+  h1, h2, h3, h4 { text-wrap: balance; line-height: 1.2; }
+  h2 { font-size: 1.7rem; margin: 88px 0 8px; letter-spacing: -0.015em; }
+  h3 { font-size: 1.12rem; margin: 44px 0 8px; }
+  h4 { font-size: 0.95rem; margin: 28px 0 6px; }
+  p { margin: 12px 0; color: var(--ink); }
+  .lede { font-size: 1.15rem; color: var(--muted); max-width: 64ch; }
+  a { color: var(--cobalt); }
+  code, .mono { font-family: var(--mono); font-size: 0.88em; }
+  code { background: var(--surface); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 72px 0 0; }
+  strong { font-weight: 640; }
+
+  /* masthead */
+  .mast { padding-top: 84px; }
+  .wordmark { font-family: var(--mono); font-size: 3.4rem; font-weight: 600; letter-spacing: -0.02em; margin: 0; }
+  .wordmark .cursor { color: var(--cobalt); }
+  .defline { font-size: 1.3rem; color: var(--ink); margin: 18px 0 6px; max-width: 30em; text-wrap: balance; }
+  .meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 26px; }
+  .chip {
+    font-family: var(--mono); font-size: 0.76rem; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; white-space: nowrap;
+  }
+  .chip b { color: var(--ink); font-weight: 600; }
+
+  /* status badges */
+  .badge {
+    font-family: var(--mono); font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.09em;
+    border: 1px solid var(--line); border-radius: 5px; padding: 2px 7px; white-space: nowrap; vertical-align: 1px;
+  }
+  .badge.shipped { color: var(--ok); border-color: color-mix(in oklch, var(--ok), transparent 55%); }
+  .badge.progress { color: var(--brass); border-color: color-mix(in oklch, var(--brass), transparent 55%); }
+  .badge.planned { color: var(--faint); }
+  .badge.gated { color: var(--cobalt); border-color: color-mix(in oklch, var(--cobalt), transparent 55%); }
+  h2 .badge, h3 .badge { vertical-align: 4px; margin-left: 8px; }
+
+  /* callout */
+  .claim {
+    border: 1px solid var(--line); border-left: none; border-right: none;
+    padding: 22px 0; margin: 36px 0; max-width: 70ch;
+  }
+  .claim p { margin: 0; font-size: 1.06rem; }
+  .claim .k { font-family: var(--mono); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--cobalt); display:block; margin-bottom: 8px; }
+
+  /* topology / layers */
+  .topo { margin: 32px 0 8px; overflow-x: auto; }
+  .topo-row { display: flex; align-items: stretch; gap: 0; min-width: 820px; }
+  .node {
+    flex: 1; background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px 18px; min-width: 160px;
+  }
+  .node.hero { border-color: var(--cobalt); border-width: 1.5px; }
+  .node .cap { font-family: var(--mono); font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.12em; color: var(--faint); }
+  .node h5 { margin: 3px 0 2px; font-size: 0.98rem; font-weight: 650; }
+  .node .sub { font-family: var(--mono); font-size: 0.72rem; color: var(--muted); margin-bottom: 10px; }
+  .node ul { margin: 0; padding: 0; list-style: none; }
+  .node li { font-size: 0.8rem; color: var(--muted); padding: 4px 0; border-top: 1px solid var(--line); }
+  .node li:first-child { border-top: none; }
+  .node li .b { color: var(--ink); font-weight: 560; }
+  .node li.cant { color: var(--deny); }
+  .node li.cant::before { content: "cannot  "; font-family: var(--mono); font-size: 0.68rem; opacity: 0.75; }
+  .node li.pl { color: var(--faint); }
+  .node li.pl::after { content: " planned"; font-family: var(--mono); font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.08em; opacity: 0.7; }
+  .link { display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 0 6px; min-width: 92px; }
+  .link .arrow { color: var(--faint); font-size: 1.1rem; line-height: 1; }
+  .link .lbl { font-family: var(--mono); font-size: 0.64rem; color: var(--muted); text-align: center; margin-top: 6px; max-width: 110px; }
+  .topo-foot { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+  .topo-foot .chip { font-size: 0.72rem; white-space: normal; }
+  .topo-foot .chip .dot { display: inline-block; width: 7px; height: 7px; border-radius: 99px; margin-right: 6px; vertical-align: 1px; }
+
+  /* flow steps */
+  ol.flow { counter-reset: s; list-style: none; margin: 24px 0; padding: 0; max-width: 76ch; }
+  ol.flow li { counter-increment: s; position: relative; padding: 10px 0 10px 52px; border-top: 1px solid var(--line); }
+  ol.flow li:first-child { border-top: none; }
+  ol.flow li::before {
+    content: counter(s, decimal-leading-zero); position: absolute; left: 0; top: 12px;
+    font-family: var(--mono); font-size: 0.78rem; color: var(--cobalt);
+  }
+  ol.flow .who { font-family: var(--mono); font-size: 0.74rem; color: var(--muted); display: block; }
+
+  /* tables */
+  .tblwrap { overflow-x: auto; margin: 20px 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.88rem; }
+  th { text-align: left; font-weight: 600; font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); padding: 8px 14px 8px 0; border-bottom: 1px solid var(--ink); }
+  td { padding: 9px 14px 9px 0; border-bottom: 1px solid var(--line); vertical-align: top; color: var(--ink); }
+  td.mono, th.mono { font-family: var(--mono); font-size: 0.8rem; white-space: nowrap; }
+  td .dim { color: var(--muted); }
+
+  /* two-col */
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; align-items: start; }
+  @media (max-width: 860px) { .cols { grid-template-columns: 1fr; } }
+
+  /* phone mockup */
+  .stage { display: grid; grid-template-columns: minmax(300px, 380px) 1fr; gap: 48px; align-items: start; margin: 32px 0; }
+  @media (max-width: 860px) { .stage { grid-template-columns: 1fr; } }
+  .phone {
+    background: oklch(0.16 0.014 245); border-radius: 44px; padding: 14px;
+    border: 1px solid oklch(0.32 0.016 245);
+    box-shadow: 0 24px 60px oklch(0.15 0.02 245 / 0.35);
+    max-width: 380px;
+  }
+  .screen { background: oklch(0.19 0.015 245); border-radius: 32px; padding: 24px 20px 20px; color: oklch(0.955 0.006 235); }
+  .sheet-grab { width: 36px; height: 4px; border-radius: 99px; background: oklch(0.38 0.014 245); margin: 0 auto 18px; }
+  .apr-head { display: flex; justify-content: space-between; align-items: center; }
+  .apr-acct { font-family: var(--mono); font-size: 0.8rem; color: oklch(0.72 0.012 240); }
+  .gauge { position: relative; width: 52px; height: 52px; }
+  .gauge svg { transform: rotate(-90deg); }
+  .gauge .t { position: absolute; inset: 0; display: grid; place-items: center; font-family: var(--mono); font-size: 0.68rem; color: var(--term-brass); }
+  .apr-type { display: flex; align-items: center; gap: 8px; margin: 18px 0 14px; font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.16em; color: oklch(0.72 0.012 240); }
+  .apr-type .glyph { color: var(--term-cobalt); letter-spacing: 0; }
+  .well {
+    background: oklch(0.145 0.013 245); border: 1px solid oklch(0.28 0.015 245);
+    border-radius: 14px; padding: 16px; font-family: var(--mono);
+  }
+  .well .ref { font-size: 1.05rem; line-height: 1.5; word-break: break-all; color: oklch(0.62 0.012 240); }
+  .well .ref b { color: oklch(0.97 0.005 235); font-weight: 600; }
+  .well .ref .sep { color: oklch(0.45 0.012 240); }
+  .prov { margin: 16px 0 6px; font-family: var(--mono); font-size: 0.74rem; }
+  .prov div { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-top: 1px solid oklch(0.27 0.014 245); }
+  .prov .k { color: oklch(0.58 0.012 240); }
+  .prov .v { color: oklch(0.88 0.008 238); text-align: right; }
+  .risk { display: flex; gap: 8px; align-items: baseline; margin: 14px 2px 18px; font-size: 0.78rem; color: var(--term-brass); }
+  .risk::before { content: ""; width: 7px; height: 7px; border-radius: 99px; background: var(--term-brass); align-self: center; flex: none; }
+  .slide {
+    background: oklch(0.42 0.1 231); border-radius: 999px; height: 56px;
+    display: flex; align-items: center; padding: 5px; position: relative; overflow: hidden;
+  }
+  .slide .knob { width: 46px; height: 46px; border-radius: 99px; background: oklch(0.97 0.004 235); color: oklch(0.42 0.1 231); display: grid; place-items: center; font-size: 1.1rem; flex: none; }
+  .slide .lbl { flex: 1; text-align: center; color: oklch(0.97 0.004 235); font-size: 0.95rem; font-weight: 500; padding-right: 46px; }
+  .denybtn { margin-top: 12px; text-align: center; padding: 13px; border-radius: 999px; border: 1px solid oklch(0.5 0.12 25 / 0.65); color: oklch(0.74 0.13 25); font-size: 0.95rem; }
+  .mock-cap { font-size: 0.8rem; color: var(--muted); margin-top: 14px; max-width: 40ch; }
+
+  /* risk ladder */
+  .ladder { margin: 18px 0; }
+  .ladder .rung { display: grid; grid-template-columns: 100px 1fr 170px; gap: 16px; padding: 12px 0; border-top: 1px solid var(--line); font-size: 0.86rem; align-items: baseline; }
+  .ladder .rung:first-child { border-top: 1px solid var(--ink); }
+  .ladder .lv { font-family: var(--mono); font-size: 0.76rem; }
+  .ladder .act { font-family: var(--mono); font-size: 0.76rem; color: var(--muted); text-align: right; }
+  @media (max-width: 640px) { .ladder .rung { grid-template-columns: 90px 1fr; } .ladder .act { grid-column: 2; text-align: left; } }
+
+  /* menubar states */
+  .mb-states { display: flex; gap: 12px; flex-wrap: wrap; margin: 18px 0; }
+  .mb {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; min-width: 150px; flex: 1;
+  }
+  .mb .glyph { font-size: 1.25rem; line-height: 1; }
+  .mb .nm { font-weight: 600; font-size: 0.85rem; margin-top: 8px; }
+  .mb .ds { font-size: 0.76rem; color: var(--muted); }
+
+  /* terminal */
+  .term {
+    background: var(--term-bg); color: var(--term-ink); border-radius: 12px;
+    border: 1px solid oklch(0.28 0.016 245);
+    font-family: var(--mono); font-size: 0.8rem; line-height: 1.7;
+    padding: 18px 22px; overflow-x: auto; margin: 20px 0;
+  }
+  .term pre { margin: 0; }
+  .t-dim { color: var(--term-muted); }
+  .t-faint { color: oklch(0.5 0.012 240); }
+  .t-co { color: var(--term-cobalt); }
+  .t-ok { color: var(--term-ok); }
+  .t-brass { color: var(--term-brass); }
+  .t-deny { color: var(--term-deny); }
+  .t-ink { color: var(--term-ink); }
+
+  /* swatches */
+  .swatches { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin: 20px 0; }
+  .sw { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .sw .c { height: 64px; }
+  .sw .i { padding: 10px 12px; }
+  .sw .n { font-weight: 600; font-size: 0.82rem; }
+  .sw .v { font-family: var(--mono); font-size: 0.68rem; color: var(--muted); }
+
+  /* phasing */
+  .phases { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin: 24px 0; }
+  @media (max-width: 860px) { .phases { grid-template-columns: 1fr; } }
+  .phase { border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; background: var(--surface); }
+  .phase.now { border-color: var(--ok); }
+  .phase h4 { margin: 0 0 2px; }
+  .phase .goal { font-size: 0.8rem; margin-bottom: 12px; font-weight: 550; }
+  .phase.now .goal { color: var(--ok); }
+  .phase ul { margin: 0; padding-left: 18px; font-size: 0.84rem; color: var(--ink); }
+  .phase li { margin: 5px 0; }
+  .phase .cut { font-size: 0.76rem; color: var(--muted); margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+
+  /* footnote list */
+  .notes { font-size: 0.88rem; color: var(--muted); max-width: 76ch; }
+  .notes li { margin: 8px 0; }
+
+  .toc { display: flex; flex-wrap: wrap; gap: 8px 20px; margin: 30px 0 0; font-size: 0.85rem; }
+  .toc a { color: var(--muted); text-decoration: none; border-bottom: 1px solid var(--line); padding-bottom: 1px; }
+  .toc a:hover { color: var(--cobalt); border-color: var(--cobalt); }
+</style>
+
+<div class="wrap">
+
+<header class="mast">
+  <h1 class="wordmark">sigil<span class="cursor">_</span></h1>
+  <p class="defline">Gated environment-variable injection for any CLI.</p>
+  <p class="lede">Intercept a command, get one approval on your phone, inject the approved credentials into that command's environment, run it, stream its output back. 1Password is the first provider, not the product. Built for one user; the team it draws secrets from never knows it exists.</p>
+  <div class="meta">
+    <span class="chip">core · <b>generic gated-exec engine</b></span>
+    <span class="chip">integrations · <b>shim · latch &lt;cmd&gt; · ssh-agent</b></span>
+    <span class="chip">providers · <b>1Password today</b></span>
+    <span class="chip">daemon + CLI · <b>one Rust binary</b></span>
+    <span class="chip">transport · <b>E2E · direct first, blind relay fallback</b></span>
+  </div>
+  <nav class="toc">
+    <a href="#why">Why</a>
+    <a href="#layers">Three layers</a>
+    <a href="#invoke">Invocation</a>
+    <a href="#roundtrip">A request, end to end</a>
+    <a href="#approve">Approval</a>
+    <a href="#providers">Providers</a>
+    <a href="#ssh">SSH</a>
+    <a href="#trust">Trust model</a>
+    <a href="#surfaces">Surfaces</a>
+    <a href="#state">Build state</a>
+    <a href="#language">Design language</a>
+    <a href="#decisions">Decisions</a>
+  </nav>
+</header>
+
+<h2 id="why">Why this exists</h2>
+<div class="prose">
+  <p>A secret lives behind a local gate. To read it, a tool pops a biometric prompt on the Mac; every SSH connection through the 1Password agent does the same. Away from the desk, those prompts sit unanswered and everything behind them stalls: agents block, dev servers refuse to start, SSH hangs until you are physically back at the machine.</p>
+  <p>Sigil moves the gate to your phone. The insight that keeps that safe rather than merely convenient is that Sigil is not really an <em>op</em> tool at all. It is a generic engine: given a command, it gets one phone approval, injects the approved credentials into that command's environment, runs it, and streams the output back. What secret source sits behind the injection, and how a command reaches Sigil in the first place, are both pluggable. 1Password is simply the source that shipped first.</p>
+  <p>Two properties make phone approval safe:</p>
+</div>
+
+<div class="claim">
+  <span class="k">The core property</span>
+  <p><strong>The daemon at rest cannot produce a single secret.</strong> Provider credentials sit encrypted under a key the Mac does not hold. The unwrap key lives on the phone, sealed behind Face ID, and is delivered fresh inside each approval. Approving is not permission; it is the missing half of the cryptography. A stolen laptop, powered off, yields ciphertext and nothing else.</p>
+</div>
+
+<div class="prose">
+  <p>The second property: <strong>secret values never enter the daemon's memory.</strong> The daemon injects a <em>credential</em> into a child process (for 1Password, a service-account token, itself a credential and not a resolved secret) and splices that child's stdout and stderr onto the caller's own file descriptors. The resolved secret streams from the child straight to the caller; the daemon brokers the release without ever holding the value. This shapes the whole provider contract, so no future provider can quietly break it.</p>
+</div>
+
+<h2 id="layers">The three layers <span class="badge shipped">core shipped</span></h2>
+<div class="prose">
+  <p>Everything Sigil does decomposes into three layers with a hard seam between each. This is the spine of the design: adding "Sigil for X" is always one of three moves, never a rewrite.</p>
+</div>
+
+<div class="topo">
+  <div class="topo-row">
+    <div class="node">
+      <div class="cap">Layer 2 · Integrations</div>
+      <h5>How a request enters</h5>
+      <div class="sub">frontends</div>
+      <ul>
+        <li><span class="b">latch &lt;cmd&gt;</span> the primitive <span class="badge shipped">shipped</span></li>
+        <li><span class="b">the shim</span> a named-CLI alias</li>
+        <li><span class="b">latch run --</span> the escape hatch <span class="badge shipped">shipped</span></li>
+        <li><span class="b">ssh-agent</span> gated signatures</li>
+      </ul>
+    </div>
+    <div class="link"><span class="arrow">&rarr;</span><span class="lbl">argv · cwd · caller fds<br>over a 0600 socket</span></div>
+    <div class="node hero">
+      <div class="cap">Layer 1 · Core</div>
+      <h5>The gated-exec engine</h5>
+      <div class="sub">Rust · knows no op, no ssh</div>
+      <ul>
+        <li>pairing · phone approval · leases</li>
+        <li>transport · keystore · sealed protocol</li>
+        <li>risk scoring · audit · lockdown</li>
+        <li class="cant">produce a secret while at rest</li>
+        <li class="cant">read the secret bytes it brokers</li>
+      </ul>
+    </div>
+    <div class="link"><span class="arrow">&rarr;</span><span class="lbl">inject credential<br>into child env</span></div>
+    <div class="node">
+      <div class="cap">Layer 3 · Providers</div>
+      <h5>Where secrets come from</h5>
+      <div class="sub">backends · SecretProvider seam</div>
+      <ul>
+        <li><span class="b">1Password</span> via op + SA token</li>
+        <li><span class="b">env-file / static</span> (reference impl)</li>
+        <li class="pl">bitwarden</li>
+        <li class="pl">aws-vault · doppler</li>
+      </ul>
+    </div>
+  </div>
+  <div class="topo-foot">
+    <span class="chip"><span class="dot" style="background:var(--cobalt)"></span><b>the approver is provider-blind</b> · it decrypts an opaque request, shows caller and command and a display-only kind hint, returns approve or deny plus the re-wrapped key; it contains zero op logic</span>
+    <span class="chip"><span class="dot" style="background:var(--ok)"></span><b>one seam per extension</b> · shim a CLI (config), add a SecretProvider (a trait impl), or add an Integration</span>
+  </div>
+</div>
+
+<div class="cols">
+  <div>
+    <h4>Layer 1 · Core</h4>
+    <p style="max-width:48ch">The generic machine. Its whole job is: gate a command on a phone, then inject the approved environment into it and run it. It carries the pairing handshake, the sealed and signed protocol, leases, the transport ladder, the keystore seam, risk scoring, the audit log, and lockdown. It has no concept of 1Password or SSH. The protocol types it seals to the phone name no provider: a request carries the raw argv, a list of opaque secret references, and a display hint, never a vault or a field.</p>
+  </div>
+  <div>
+    <h4>Layer 2 · Integrations</h4>
+    <p style="max-width:48ch">How a request enters the core. <code>latch &lt;cmd&gt;</code> is the primitive; the transparent PATH shim is a thin alias to it; the SSH agent is a distinct integration whose event is a signature rather than an injection. Each integration's only job is to turn some external trigger into a core request and hand back the result.</p>
+    <h4 style="margin-top:24px">Layer 3 · Providers</h4>
+    <p style="max-width:48ch">Where the secrets come from, behind the <code>SecretProvider</code> trait. A provider parses its own reference syntax for the readout, and injects its credential so the child resolves and streams its own secrets. It never returns a value to the daemon. 1Password ships as provider #1; a direct-injection <code>env-file</code> provider ships as #2 (the reference impl that proves the seam is not op-shaped), and the id-keyed provider registry that dispatches between them is built.</p>
+  </div>
+</div>
+
+<h2 id="invoke">The invocation model <span class="badge shipped">shipped</span></h2>
+<div class="prose">
+  <p>The primary primitive is <code>latch &lt;cmd&gt; [args]</code>. You run <code>latch op read op://...</code> or <code>latch gcloud ...</code>: Sigil looks up the configuration for that command, and if it is configured it pings the phone, injects the configured environment on approval, runs the command, and streams the output. If the command has no configuration, Sigil refuses and tells you to add one. It never runs an unconfigured command ungated, because a silent pass-through would be false security.</p>
+  <p>Reserved <code>latch</code> verbs (<code>status</code>, <code>pair</code>, <code>daemon</code>, and the rest) always win, so <code>latch run -- &lt;cmd&gt;</code> is the unambiguous escape hatch for a command that collides with a verb.</p>
+</div>
+
+<div class="cols">
+  <div>
+    <h4>The shim is now a thin alias <span class="badge shipped">shipped</span></h4>
+    <p style="max-width:48ch">A binary named <code>op</code> (or <code>gcloud</code>, or <code>bw</code>) placed first on PATH exists only for callers that cannot be modified: a launcher that shells out to a bare <code>op item get</code>, a <code>git</code> that reaches the SSH agent, an AI agent that only knows the real command's name. The shim's entire job is to rewrite <code>op ...</code> into <code>latch op ...</code> and forward. It is a transparent alias to the primitive, not a second code path.</p>
+    <p style="max-width:48ch">The shim is config-driven: <code>latch shim add &lt;cmd&gt;</code> drops a transparent alias binary for any configured command, and every alias (and the <code>latch &lt;cmd&gt;</code> primitive, and <code>latch run --</code>) forwards the same <code>run</code> frame to the daemon, which looks up the command config and gates it. The <code>op</code> alias is the same code path as any other, not a special case.</p>
+  </div>
+  <div>
+    <h4>Fail-safe fallback <span class="badge shipped">shipped</span></h4>
+    <p style="max-width:48ch">When the daemon is down, the shim transparently execs the real underlying tool, so nothing breaks when Sigil is off. When the daemon is up but a request errors at the protocol level, the shim fails closed rather than silently running the tool locally, so a mutating command can never slip past the gate once one exists.</p>
+    <div class="term" style="margin-top:16px"><pre><span class="t-faint">$</span> <span class="t-co">latch</span> op read <span class="t-ink">"op://Engineering/.env/DATABASE_URL"</span>
+<span class="t-dim">   latch</span> <span class="t-brass">&#9720; awaiting approval</span>  <span class="t-dim">Tom's iPhone &middot; 0:53</span>
+<span class="t-dim">   latch</span> <span class="t-ok">&#10003; approved</span>  <span class="t-dim">6.1s &middot; streaming</span>
+postgres://<span class="t-faint">&hellip;</span></pre></div>
+  </div>
+</div>
+
+<h2 id="roundtrip">A request, end to end</h2>
+<div class="prose">
+  <p>The round-trip is provider-agnostic. Nothing in it knows the request is about 1Password; swap the provider and every step below is unchanged.</p>
+</div>
+
+<ol class="flow">
+  <li><span class="who">caller &rarr; integration</span> A command arrives, whether typed as <code>latch op read ...</code>, intercepted by the shim, or driven by the SSH agent. The integration forwards the argv, the working directory, and the caller's own stdout and stderr descriptors over the local socket.</li>
+  <li><span class="who">core</span> The daemon asks the configured provider to <em>describe</em> the command into opaque secret references for the readout, loads the matching account's <em>encrypted</em> credential, computes a risk level, and deposits a signed, sealed request into the phone's relay mailbox slot, alongside the phone's registered push token. The relay reads that token once, rings a content-free doorbell push to Apple on the daemon's behalf, and forgets it.</li>
+  <li><span class="who">phone</span> A fixed "Approval requested" alert arrives, nothing more; the phone drains the sealed request waiting for it at the relay.</li>
+  <li><span class="who">you</span> Glance: which command, which references, which process, from which directory, how long until it expires. Approve with Face ID, or deny with one tap, always.</li>
+  <li><span class="who">phone &rarr; core</span> On approve, Face ID unlocks the Secure Enclave key, the unwrap key is sealed to this response inside the audited envelope, and the signed response returns over the same connection. Replay-proof: single-use request id, monotonic per-pairing counter, 90-second window.</li>
+  <li><span class="who">core</span> The daemon unwraps the key, decrypts the one credential, and hands it to the provider's <code>run</code>, which spawns the child with the credential in its environment and splices the child's stdout onto the caller's descriptor. The daemon zeroizes the key and credential and writes an audit entry: names and metadata, never values.</li>
+  <li><span class="who">caller</span> Receives the output exactly as if the local prompt had been approved. On deny or timeout the integration fails closed with a clear stderr line.</li>
+</ol>
+
+<h3>Leases: approve once, cover the session <span class="badge shipped">shipped</span></h3>
+<div class="prose">
+  <p>One dev session can fire dozens of gated calls, and the callers cannot be changed; they think they are running the real tool. So the caller's identity is derived instead: the daemon reads the true peer pid from the socket, walks the ancestor chain kernel-side, and resolves each ancestor to its executable and code-signing identity (never raw pids, which recycle). The hash of that chain plus the project root plus the requested scope is the <strong>grant key</strong>. The daemon verifies all of it itself; a client's claims about its own ancestry are ignored.</p>
+  <p>Approving "for this session" turns the approval into a <strong>lease</strong>: the unwrapped credential is held in RAM only, scoped to that grant key, account, and scope, until the TTL expires, then zeroed. A lease is a leased capability, not a policy flag; the daemon still cannot serve anything outside it without the phone. Lockdown, deny-and-block, restart, or expiry kill a lease instantly, and the phone lists every active lease with a countdown and one-tap revoke.</p>
+  <p>Spam is handled before it reaches you: requests with an identical grant key arriving while one is pending coalesce behind it, so one decision settles the whole burst; pushes collapse to a count; per-caller rate limits back-pressure anything pathological. Honest limit: a process-tree key reduces fatigue, it does not upgrade the security boundary; same-user malware could imitate a caller during a live lease window, which is exactly why leases are triple-scoped, TTL-bound, and memory-only, and cannot widen their own scope.</p>
+</div>
+
+<h2 id="approve">The approval is the interaction</h2>
+<div class="prose">
+  <p>Everything above converges on one screen. Friction on that screen scales with risk; refusing never does.</p>
+</div>
+
+<div class="stage">
+  <div>
+    <div class="phone"><div class="screen">
+      <div class="sheet-grab"></div>
+      <div class="apr-head">
+        <span class="apr-acct">Rowm work</span>
+        <span class="gauge">
+          <svg width="52" height="52" viewBox="0 0 52 52">
+            <circle cx="26" cy="26" r="22" fill="none" stroke="oklch(0.3 0.016 245)" stroke-width="3.5"/>
+            <circle cx="26" cy="26" r="22" fill="none" stroke="oklch(0.75 0.115 78)" stroke-width="3.5"
+              stroke-linecap="round" stroke-dasharray="138.2" stroke-dashoffset="47"/>
+          </svg>
+          <span class="t">0:41</span>
+        </span>
+      </div>
+      <div class="apr-type"><span class="glyph">&#9111;</span> READ SECRET</div>
+      <div class="well">
+        <div class="ref">op:// <span class="sep">/</span> Rowm <span class="sep">/</span> <b>AWS-prod</b> <span class="sep">/</span> access-key</div>
+      </div>
+      <div class="prov">
+        <div><span class="k">process</span><span class="v">zsh &rsaquo; claude &rsaquo; op read</span></div>
+        <div><span class="k">cwd</span><span class="v">~/Projects/rowm-api</span></div>
+        <div><span class="k">machine</span><span class="v">studio.local</span></div>
+        <div><span class="k">when</span><span class="v">just now</span></div>
+      </div>
+      <div class="risk">Production vault. First request from this process.</div>
+      <div class="slide"><span class="knob">&rsaquo;</span><span class="lbl">Slide to approve</span></div>
+      <div class="denybtn">Deny</div>
+    </div></div>
+    <p class="mock-cap">The approval sheet at elevated risk: brass gauge counting to expiry, the readout well leading with the reference label, provenance in mono, slide instead of tap. The well renders provider-supplied display segments; the phone never parses what the reference means.</p>
+  </div>
+  <div>
+    <h3 style="margin-top:0">Friction scales with risk; deny never does</h3>
+    <p style="max-width:46ch">The daemon computes risk from source sensitivity, process novelty, and target. Risk changes exactly one thing: the shape of the approve control. Deny is always a single calm tap, because refusing must never be harder than allowing.</p>
+    <div class="ladder">
+      <div class="rung"><span class="lv" style="color:var(--cobalt)">routine</span><span>Known process, low-sensitivity source</span><span class="act">tap to approve</span></div>
+      <div class="rung"><span class="lv" style="color:var(--brass)">elevated</span><span>Production source, or a process seen for the first time, with one reason line</span><span class="act">slide to approve</span></div>
+      <div class="rung"><span class="lv" style="color:var(--deny)">critical</span><span>Signature to a production host, bulk reads</span><span class="act">hold to approve</span></div>
+    </div>
+    <p style="max-width:46ch">Every approve additionally passes Face ID: the Secure Enclave will not release the unwrap key without it, so a stolen unlocked phone still cannot approve. Long-press deny offers "Deny and block this process for 1 hour." An SSH request swaps the readout well for key label, host, and challenge fingerprint, the two things worth verifying.</p>
+    <h4>The rest of the app <span class="badge shipped">shipped</span></h4>
+    <div class="tblwrap"><table>
+      <tr><td class="mono">home</td><td>armed state at a glance: <span class="dim">Armed &middot; studio.local connected &middot; 2 accounts</span>, last decision, lockdown control</td></tr>
+      <tr><td class="mono">history</td><td>dense reverse-chron audit mirror; decision-colored rows; swipe to block a process; searchable. Never stores values.</td></tr>
+      <tr><td class="mono">accounts</td><td>credential health per account: <span class="dim">healthy &middot; rotate &middot; expires in 6d</span>, last used</td></tr>
+      <tr><td class="mono">leases</td><td>active grants with live TTL countdowns, one-tap revoke: <span class="dim">launcher &middot; Engineering/.env, 41m left</span></td></tr>
+      <tr><td class="mono">lockdown</td><td>hold-to-seal. Denies everything pending, refuses everything new, until Face ID plus hold releases it.</td></tr>
+    </table></div>
+  </div>
+</div>
+
+<h2 id="providers">Providers: where secrets come from</h2>
+<div class="prose">
+  <p>A provider is a Rust trait with four responsibilities: give a stable id, produce a display hint for a command, describe a command into opaque references for the readout, and run the command with its credential injected so the child streams its own secrets. It never hands a resolved value back to the daemon; that shape is deliberate, so the memory invariant cannot be broken by a careless provider.</p>
+</div>
+
+<div class="tblwrap"><table>
+  <tr><th>Provider</th><th>Credential injected</th><th>Status</th></tr>
+  <tr><td class="mono">1password</td><td>service-account token &rarr; <code>OP_SERVICE_ACCOUNT_TOKEN</code>; the <code>op</code> child resolves <code>op://</code> references and streams them</td><td><span class="badge shipped">shipped &amp; tested</span></td></tr>
+  <tr><td class="mono">env-file</td><td>a static file of key/value pairs; the reference implementation that proves the seam is real, not op-shaped</td><td><span class="badge shipped">shipped</span></td></tr>
+  <tr><td class="mono">bitwarden</td><td><code>bw</code> session credential</td><td><span class="badge planned">planned</span></td></tr>
+  <tr><td class="mono">aws-vault &middot; doppler</td><td>each an impl of the same trait</td><td><span class="badge planned">planned</span></td></tr>
+</table></div>
+
+<div class="prose">
+  <p>"Sigil for 1Password" is a use-case page, not the product. The provider registry and a second reference provider are the concrete next step: a second live provider is what turns "the seam is designed" into "the seam is proven." Until then, 1Password is the sole shipping provider and the trait is exercised only by it plus test fakes.</p>
+</div>
+
+<h2 id="ssh">SSH is a distinct integration <span class="badge shipped">agent shipped</span></h2>
+<div class="prose">
+  <p>SSH does not fit the injection model: the event is a <em>signature</em> over a challenge, not an environment full of secrets. So it is a separate integration on the same core. Sigil implements the SSH agent protocol (RFC 9987) itself, advertises your keys, and gates every signature through the identical sealed approval loop. You point <code>SSH_AUTH_SOCK</code> at Sigil's socket; from then on <code>git push</code> and <code>ssh</code> transparently ask the phone. <code>ssh-add -l</code> against the running daemon already lists the served key with its real fingerprint.</p>
+  <p>Where the private key comes from is a <strong>pluggable signer</strong>, exactly like a SecretProvider is a pluggable secret source. Sigil is the universal phone-gate regardless of how you hold keys.</p>
+</div>
+
+<div class="tblwrap"><table>
+  <tr><th>Signer</th><th>What it does</th><th>Status</th></tr>
+  <tr><td>1Password-fetch <span class="dim">(default)</span></td><td><code>op read ...?ssh-format=openssh</code> per signature into a <code>Zeroizing</code> buffer, decode, sign with <code>ed25519-dalek</code>, zeroize. The key is in daemon RAM for one signature.</td><td><span class="badge shipped">shipped &amp; tested</span></td></tr>
+  <tr><td>SE-resident</td><td>key minted in and never leaving the Secure Enclave; signing happens in hardware. Removes the RAM exposure entirely.</td><td><span class="badge planned">planned (v2)</span></td></tr>
+  <tr><td>file-based</td><td>a plain <code>~/.ssh/id_*</code>, for users not managing keys in 1Password.</td><td><span class="badge planned">planned</span></td></tr>
+  <tr><td>proxy</td><td>forward the signature to another agent.</td><td><span class="badge planned">planned</span></td></tr>
+</table></div>
+
+<h4>The honest three-way trade</h4>
+<div class="prose">
+  <p>You cannot have all three of these at once. Pick two.</p>
+</div>
+<div class="tblwrap"><table>
+  <tr><th>Approach</th><th>1Password-managed</th><th>Key never touches Sigil</th><th>Works remotely</th></tr>
+  <tr><td>1Password-fetch <span class="dim">(Sigil default)</span></td><td><span class="t-ok" style="color:var(--ok)">yes</span></td><td><span style="color:var(--deny)">no</span> <span class="dim">(RAM, one signature)</span></td><td><span style="color:var(--ok)">yes</span></td></tr>
+  <tr><td>SE-resident / file signer</td><td><span style="color:var(--deny)">no</span></td><td><span style="color:var(--ok)">yes</span></td><td><span style="color:var(--ok)">yes</span></td></tr>
+  <tr><td>1Password desktop agent</td><td><span style="color:var(--ok)">yes</span></td><td><span style="color:var(--ok)">yes</span></td><td><span style="color:var(--deny)">no</span> <span class="dim">(local biometric)</span></td></tr>
+</table></div>
+<div class="prose">
+  <p>The default gives the first and third: keys stay 1Password-managed and signing works while you are away, at the cost of the key transiting daemon RAM for one signature. That transit is the design's most honest residual, and the reason the v2 SE-resident signer exists. Proxying the 1Password desktop agent does not help, because its local biometric popup is the exact wall Sigil exists to escape. There is no protocol hostname in an SSH signature; the destination shown on the phone is a best-effort reverse lookup of the <code>session-bind</code> host key against <code>known_hosts</code>, falling back to the host-key fingerprint, never fabricated.</p>
+</div>
+
+<h2 id="trust">Trust model</h2>
+
+<h3>Pairing is the root of trust <span class="badge shipped">shipped &middot; 30 MITM proofs</span></h3>
+<div class="prose">
+  <p>At pairing each device mints Ed25519 signing and X25519 agreement keys inside its own secure hardware. The Mac renders a QR on its own screen; the phone reads it with its camera. That optical channel is authenticated by physics, not cryptography: no network hop sits between a screen and a lens. The QR carries the daemon's real keys plus a 256-bit one-time secret, so only the real phone learns the secret, and the phone's network reply is authenticated by proving possession of it. A network attacker who never saw the QR cannot forge an acceptable reply, so it cannot pass off its own key as the phone's.</p>
+  <p>A six-word fingerprint read off both screens is the human backstop, computed over the two now-pinned identities: if the daemon ever pinned an attacker's key, the words diverge and the human sees it. Authorizing a pair takes three separate gates, in order: physical presence at the Mac (the QR exists only on its own screen), the six-word SAS comparison above, and only then a fresh Touch ID prompt at the Mac's Secure Enclave, the sole way the DEK can be unwrapped. Declining the SAS bails out before any biometric is even requested, and a same-UID process that only manages to script the SAS confirmation still cannot finish a pairing, because it has no way to satisfy the Enclave's own hardware gate. Once unwrapped, the key is sealed to the phone's pinned key and immediately erased from the daemon; from then on it arrives per-approval from the phone. The whole handshake ships with a hostile-MITM suite of roughly thirty adversarial tests that swap keys, flip tag bits, replay across pairings, skew clocks, and starve the one-time secret, each asserting the handshake fails closed. An independent security review of the SAS-confirm gate, the Secure Enclave DEK wrap, and their ordering found the pairing-security unit sound at the code level: there is no path that delivers the DEK without both a genuine SAS gate and a fresh Enclave-gated biometric (see <code>docs/security-claims.md</code>).</p>
+</div>
+
+<div class="tblwrap"><table>
+  <tr><th>Threat</th><th>Answer</th><th>Honest residual</th></tr>
+  <tr><td>Daemon store stolen (cold disk)</td><td>ciphertext without the phone or Mac enclave; the daemon private identity is in the login Keychain, so a powered-off disk reveals no key material</td><td>rotate credentials on suspicion anyway</td></tr>
+  <tr><td>Live same-UID compromise</td><td>the unwrap key still never releases without a fresh hardware-gated tap, so nothing is served automatically</td><td>a live attacker holding the signing key can originate a request with chosen provenance; the phone's last defense is a human declining a request they did not initiate</td></tr>
+  <tr><td>Phone stolen</td><td>keys are enclave-gated; every approve needs Face ID</td><td>remote lockdown from the Mac, re-pair, rotate</td></tr>
+  <tr><td>Malicious process calls an integration</td><td>every fulfillment needs a fresh out-of-band approval showing process and cwd</td><td>an approved request does deliver that secret; Sigil gates release, it does not sandbox the recipient</td></tr>
+  <tr><td>Approval replay</td><td>single-use ids, per-pairing counters, 90s window, sealed per-response ephemeral keys</td><td>aggressive clock skew rejects valid responses; doctor flags it</td></tr>
+  <tr><td>Relay compromised</td><td>sees only sealed envelopes plus a transient, per-deposit push token; cannot read, forge, or replay; dropping traffic fails closed</td><td>metadata: mailbox hash, timing, sizes; can flood a known mailbox (bounded, rate-limited DoS) or ring a stolen push token with content-free doorbell noise (nuisance only, never a secret or an approval); self-host to keep even that at home</td></tr>
+  <tr><td>SSH key exposure</td><td>default signer: in daemon RAM for one signature, then zeroed</td><td>a compromise at that instant leaks durable signing power, not one signature; removed by the v2 enclave-resident signer</td></tr>
+  <tr><td>Phone lost entirely</td><td>recovery is intentionally a rotation: pair a new phone, rotate every credential; old ciphertext dies</td><td>hardened mode makes this the only path, by design</td></tr>
+</table></div>
+
+<h3>The factor policy: what actually gates a request <span class="badge shipped">shipped</span></h3>
+<div class="prose">
+  <p>An earlier review found that the local control socket was same-UID forgeable: a rogue process running as you could send an approve frame and self-approve, which is exactly the adversary Sigil exists to stop. That finding is closed. At arm time the daemon now resolves an explicit approving factor, in strict order:</p>
+</div>
+<div class="ladder">
+  <div class="rung"><span class="lv" style="color:var(--ok)">phone</span><span>A paired phone reachable over a transport. Its sealed, signed approval a same-UID peer cannot forge. The real shipping gate.</span><span class="act">preferred</span></div>
+  <div class="rung"><span class="lv" style="color:var(--cobalt)">biometric</span><span>A verified hardware Secure Enclave keystore. The unwrap is the biometric.</span><span class="act">fallback</span></div>
+  <div class="rung"><span class="lv" style="color:var(--deny)">fail closed</span><span>Neither of the above: the daemon arms so status and pairing work, but refuses every gated request. Never silently self-approvable.</span><span class="act">default</span></div>
+</div>
+<div class="prose">
+  <p>The old control-socket self-approval and a dev auto-approve exist only under an explicit <code>--dev-insecure</code> switch, which prints a loud multi-line warning naming the same-UID risk on every start. A real factor always wins over the dev path, so passing the flag on a properly paired daemon does not weaken it.</p>
+</div>
+
+<h3>The transport ladder <span class="badge shipped">real relay proven e2e</span></h3>
+<div class="prose">
+  <p>The transport was never meant to be the security layer: every message on every rung is the same sealed, signed envelope between keys pinned at pairing, so the phone and the daemon can accept whichever rung answers first, identically. The design is direct-first with a blind relay fallback, not a mesh VPN, but only the fallback is built today: every remote approval currently goes over rung 3.</p>
+</div>
+<div class="ladder">
+  <div class="rung"><span class="lv" style="color:var(--cobalt)">1 · LAN</span><span>At home the app would find the daemon over Bonjour: zero infrastructure, zero third parties. Not yet built: no mDNS discovery or direct socket exists, so a LAN request still routes through the relay below.</span><span class="act">planned</span></div>
+  <div class="rung"><span class="lv" style="color:var(--cobalt)">2 · owned endpoint</span><span>A DDNS name, static IP, or IPv6 address with one forwarded port, so unauthenticated bytes would drop on the first frame. Optional purism; CGNAT blocks it. Not yet built: no DDNS client or direct transport exists.</span><span class="act">planned</span></div>
+  <div class="rung"><span class="lv" style="color:var(--brass)">3 · blind relay</span><span>A short-lived mailbox: the daemon and phone each deposit and drain opaque envelopes over plain HTTP, in per-mailbox to-phone / to-daemon slots held only in the relay's own process memory (a Durable Object instance, or a Bun Map), never written to disk. Each envelope expires after 180 seconds and is deleted the moment it is read (drain-on-read), so nothing outlives the gap between a deposit and the other side's next poll: no queue, no persisted counter, zero storage at rest. On a phone-bound deposit the relay also rings a content-free APNs doorbell, so the wake-up needs no held connection either. Self-host a small Cloudflare Worker in your own account (or run the Bun variant), or use a shared instance; the trust surface is identical. The daemon reaches this rung over plain outbound HTTP, so it needs no port forwarding and works from any network.</span><span class="act">HTTP mailbox</span></div>
+</div>
+<div class="prose">
+  <p><strong>Proving the relay powerless.</strong> You cannot prove what a remote server runs, so the proof is client-side: the relay is given no role that requires trust. Unlike a prekey server, it does not even distribute keys; pairing is out-of-band by QR, so there is no man-in-the-middle surface at all. Its complete possible behavior is enumerable (deliver, drop, delay, duplicate, observe sizes and timing) and every entry is neutralized in client code anyone can read and build. The repo ships the evidence: a deliberately hostile relay that tampers, replays, forges, reorders, and stalls, with a client suite of fourteen attacks that must each be rejected and fail closed, plus a map from every security claim to the code enforcing it and the test exercising it. That whole loop is proven end-to-end over the real Bun relay, including recovery after the relay restarts mid-flight: nothing is held in a live connection to lose.</p>
+  <p><strong>Blind by construction; anonymous with one exception.</strong> The relay has no accounts. A mailbox address is a hash of the two paired public keys: the relay holds only that hash, never the keys, and never parses the envelopes it carries, so it cannot even attempt to read them. Anti-abuse is purely structural: a size cap, a per-mailbox rate limit, and the 180-second drain-on-read TTL above, so nothing queues past the next poll. Invariant #3 is honestly relaxed here: the one irreducible centralization is now the push doorbell, and the relay runs it, not the daemon. Sigil ships one app to many phones behind one Apple developer identity, and no user's Mac can be trusted to hold the publisher's APNs signing key, so the relay holds that one key and, once per deposit, the depositing phone's push token, just long enough to ring Apple and forget it; the token is never persisted and never leaves that one request. Apple sees a fixed "Approval requested" alert and nothing else: no caller, no command, no account, no reason. An independent security review confirmed the crypto still holds despite this: the relay's new powers let it ring a doorbell, and at worst spam one with content-free noise, but they do not let it read a secret, forge an approval, or learn an outcome (see <code>docs/security-claims.md</code>). If the phone has no path to the relay at all, requests fail closed: approve at the Mac with Touch ID, or let it time out. Never a bypass.</p>
+</div>
+
+<h2 id="surfaces">The surfaces</h2>
+<div class="prose">
+  <p>Three renderers over one core. The daemon is the single source of truth; the clients never read its store directly.</p>
+</div>
+
+<h3>The machine interface <span class="badge progress">in progress</span></h3>
+<div class="prose">
+  <p>The daemon's control socket is the single machine API. The Mac app speaks it directly for live state, runtime control, and event streams, so the CLI and the Mac app are two renderers of one protocol rather than two separate interfaces. Deliberately, this API is read-and-control only. Keystore and configuration <em>mutations</em> (account add, rotate, remove; settings; wipe) stay least-privilege and CLI-only, because the network-exposed daemon must never be able to mutate keys or config. The protocol and its <code>PROTOCOL.md</code> spec are being built now; the Mac app currently runs against a mock pending its socket client.</p>
+</div>
+
+<div class="cols">
+  <div>
+    <h3>iOS <span class="badge shipped">shipped</span></h3>
+    <p style="max-width:48ch">Expo SDK 57 on React Native 0.86, with <code>@expo/ui</code> rendering real SwiftUI primitives, Liquid Glass on iOS 26, and native tabs. Dark-first: approvals happen on the couch, in bed, at a bar. The approval sheet, the real pairing rendezvous, and the real relay transport are built and verified end-to-end against the live Rust daemon, with the wire format byte-parity-locked to Rust through shared test vectors and <code>react-native-libsodium</code> for the crypto.</p>
+    <h3 style="margin-top:28px">Terminal <span class="badge shipped">shipped</span></h3>
+    <p style="max-width:48ch">The <code>latch</code> CLI carries the same restraint as the apps: aligned columns, one cobalt accent, semantic green, brass, and rust, mono symbols, no banners. Respects <code>NO_COLOR</code> and non-TTY. It is a thin client of the daemon, plus the least-privilege mutations that never leave the CLI.</p>
+  </div>
+  <div>
+    <h3>Mac <span class="badge progress">builds; socket client pending</span></h3>
+    <p style="max-width:48ch">Native SwiftUI with Liquid Glass throughout (the material is GA in the macOS 26.2 SDK), built clean on Xcode 26.3 and Swift 6.2.4 against the macOS 26 SDK. Six sidebar sections plus a menubar item: the configurator is the setup-and-admin surface, the menubar is the pulse. It compiles and runs today against a mock; wiring its <code>DaemonClient</code> to the real control protocol is the pending step, blocked on that protocol landing.</p>
+    <div class="mb-states">
+      <div class="mb"><span class="glyph" style="color:var(--faint)">&#9676;</span><div class="nm">Idle</div><div class="ds">daemon down or unpaired, dotted outline</div></div>
+      <div class="mb"><span class="glyph" style="color:var(--cobalt)">&#9670;</span><div class="nm">Armed</div><div class="ds">solid latch, requests will route</div></div>
+      <div class="mb"><span class="glyph" style="color:var(--brass)">&#9670;&middot;</span><div class="nm">Pending</div><div class="ds">brass corner dot, one gentle pulse</div></div>
+      <div class="mb"><span class="glyph" style="color:var(--deny)">&#8856;</span><div class="nm">Locked</div><div class="ds">barred silhouette until unsealed</div></div>
+    </div>
+  </div>
+</div>
+
+<div class="term"><pre><span class="t-co">latch</span> <span class="t-faint">&middot;</span> <span class="t-ok">armed</span>
+
+  <span class="t-dim">daemon</span>      <span class="t-ok">&#9679;</span> running        <span class="t-dim">pid 4821 &middot; 2d 14h</span>
+  <span class="t-dim">phone</span>       <span class="t-ok">&#9679;</span> Tom's iPhone   <span class="t-dim">direct &middot; last seen 12s ago</span>
+  <span class="t-dim">factor</span>      <span class="t-ok">&#10003;</span> paired phone   <span class="t-dim">sealed remote approval</span>
+  <span class="t-dim">ssh-agent</span>   <span class="t-ok">&#10003;</span> SSH_AUTH_SOCK  <span class="t-dim">1 key served (ed25519)</span>
+
+  <span class="t-dim">accounts</span>
+    Rowm work     <span class="t-dim">1password</span>   <span class="t-ok">token healthy</span>    <span class="t-dim">used 4m ago</span>
+    Personal      <span class="t-dim">1password</span>   <span class="t-brass">rotate in 6d</span>     <span class="t-dim">used 2d ago</span>
+
+  <span class="t-dim">today</span>       12 approved <span class="t-faint">&middot;</span> 1 denied <span class="t-faint">&middot;</span> 0 expired</pre></div>
+
+<h2 id="state">Build state</h2>
+<div class="prose">
+  <p>An honest ledger, separating what is committed and tested from what is designed but not yet built. Roughly two hundred Rust tests are green across the workspace; the counts and claims below map to <code>docs/security-claims.md</code>, which ties each claim to its enforcing code and its proving test.</p>
+</div>
+
+<h3>Shipped and tested <span class="badge shipped">committed</span></h3>
+<div class="tblwrap"><table>
+  <tr><th>Area</th><th>What is proven</th></tr>
+  <tr><td>Sealed protocol</td><td>the sealed and signed envelope with a single-use id, monotonic counter, and 90s replay window; any field tamper breaks the signature</td></tr>
+  <tr><td>Pairing</td><td>the full handshake: optical QR, secret-authenticated return channel, six-word SAS, unwrap-key delivery only after SAS confirmation and a fresh Secure Enclave Touch ID gate, with roughly thirty adversarial MITM proofs plus an independent review of the ordering</td></tr>
+  <tr><td>Approval loop</td><td>the gated round-trip with fd passthrough: secret bytes reach the caller's fd, never the daemon; deny and timeout deliver no secret</td></tr>
+  <tr><td>Leases</td><td>daemon-verified caller fingerprints, triple-scoped RAM-only grants, coalescing, TTL purge, lockdown clears all</td></tr>
+  <tr><td>Factor policy</td><td>phone &gt; biometric &gt; fail-closed; the dev path is behind <code>--dev-insecure</code> with a loud warning; the same-UID self-approval finding is closed</td></tr>
+  <tr><td>Provider seam</td><td>the <code>SecretProvider</code> trait with 1Password as provider #1; the protocol carries no op-specific field names</td></tr>
+  <tr><td>Transport</td><td>the v4 relay transport: daemon and phone both deposit and drain opaque envelopes over plain HTTP, proven cross-process end-to-end over the real Bun relay, including recovery after a relay restart</td></tr>
+  <tr><td>Persistence</td><td>the daemon auto-arms with the phone factor; no unwrap key on disk; inert-at-rest proven; a half-broken pairing surfaces loudly</td></tr>
+  <tr><td>SSH agent</td><td>RFC 9987, phone-gated, ed25519, default 1Password-fetch signer; real <code>ssh-add -l</code> against the running daemon works</td></tr>
+  <tr><td>Blind relay</td><td>Cloudflare Worker plus Bun variant; opaque key-hash mailboxes held in memory only (180s TTL, drain-on-read, zero at-rest storage); never parses an envelope; the hostile-relay suite of fourteen attacks all rejected; the relay also rings the publisher APNs doorbell</td></tr>
+  <tr><td>iOS approver</td><td>Expo 57 / RN 0.86: approval sheet, real pairing rendezvous, real relay transport, byte-parity-locked to Rust, verified against the live daemon</td></tr>
+  <tr><td>Mac configurator</td><td>SwiftUI plus Liquid Glass, six tabs and a menubar; builds clean on Xcode 26.3 / Swift 6.2.4 / macOS 26 SDK; runs on a mock</td></tr>
+</table></div>
+
+<h3>Planned and in progress <span class="badge progress">next</span></h3>
+<div class="tblwrap"><table>
+  <tr><th>Work</th><th>State</th></tr>
+  <tr><td>The daemon control protocol plus <code>PROTOCOL.md</code>, the single machine API</td><td><span class="badge progress">in progress</span></td></tr>
+  <tr><td>The Mac app's socket <code>DaemonClient</code> against that protocol</td><td><span class="badge planned">planned</span></td></tr>
+  <tr><td>The generalization: config-driven multi-CLI shim, the <code>latch &lt;cmd&gt;</code> primitive, the provider registry with a second reference provider, <code>latch run</code>, SSH pluggable signer</td><td><span class="badge shipped">shipped</span></td></tr>
+  <tr><td>The P-256 Secure Enclave DEK wrap: real biometric-gated key wrap/unwrap, implemented and independently reviewed sound at the code level; wiring it fully through the pairing ceremony end-to-end is device-gated (see below)</td><td><span class="badge progress">in progress</span></td></tr>
+  <tr><td>Account-add sealing under the phone-held unwrap key</td><td><span class="badge planned">planned</span></td></tr>
+  <tr><td>SDK-hygiene pass on the phone app</td><td><span class="badge planned">planned</span></td></tr>
+  <tr><td>Direct transport rungs 1 and 2: LAN/Bonjour discovery and an owned-endpoint/DDNS path, so a reachable phone can skip the relay entirely</td><td><span class="badge planned">planned</span></td></tr>
+  <tr><td>v2: SE-resident SSH keys, Apple Watch approver, self-hostable relay (Headscale-style)</td><td><span class="badge planned">later</span></td></tr>
+</table></div>
+
+<h3>Device-gated: needs Tom at the Mac</h3>
+<ul class="notes">
+  <li>Secure Enclave, Touch ID, and Keychain round-trips (the biometric factor returns <code>NeedsVerification</code> until exercised on real hardware).</li>
+  <li>On-device pairing and libsodium byte-parity against the Rust vectors on the phone.</li>
+  <li>The codesign cdhash as the caller code identity (interim implementation hashes the executable bytes).</li>
+  <li>Kernel peer-pid and ancestry reads on hardware (logic is exercised via injected pids in tests).</li>
+  <li>A full <code>git push</code> or <code>ssh -T git@github.com</code> producing an approved signature GitHub accepts, once a real key item and a paired daemon are in place.</li>
+</ul>
+
+<h2 id="language">Design language</h2>
+<div class="prose">
+  <p>Mood: a harbor master's station at dusk. Cobalt water going to ink, one brass dial catching the last light. The identity budget is deliberately four items on native foundations: an accent, an icon set, three state colors, a voice. No logo system, no marketing register. Structure belongs to the platform; brand rides on top as a tint.</p>
+</div>
+
+<div class="swatches">
+  <div class="sw"><div class="c" style="background:oklch(0.45 0.086 230)"></div><div class="i"><div class="n">Cobalt</div><div class="v">accent &middot; app tint<br>oklch(0.45 0.086 230)</div></div></div>
+  <div class="sw"><div class="c" style="background:oklch(0.62 0.115 75)"></div><div class="i"><div class="n">Brass</div><div class="v">pending &middot; the gauge<br>oklch(0.62 0.115 75)</div></div></div>
+  <div class="sw"><div class="c" style="background:oklch(0.5 0.095 165)"></div><div class="i"><div class="n">Sea green</div><div class="v">approved<br>oklch(0.5 0.095 165)</div></div></div>
+  <div class="sw"><div class="c" style="background:oklch(0.5 0.15 25)"></div><div class="i"><div class="n">Oxidized rust</div><div class="v">denied &middot; lockdown<br>oklch(0.5 0.15 25)</div></div></div>
+  <div class="sw"><div class="c" style="background:oklch(0.175 0.014 245)"></div><div class="i"><div class="n">Ink</div><div class="v">terminal ground<br>oklch(0.175 0.014 245)</div></div></div>
+</div>
+
+<div class="cols">
+  <div>
+    <h4>Type and shape</h4>
+    <p style="max-width:46ch">SF Pro for UI voice via Dynamic Type; SF Mono for content voice: paths, fingerprints, process chains, timestamps, all tabular. No display face; the wordmark is lowercase mono. Native squircle control shapes everywhere; the single bespoke control is the full-radius approve capsule, because it is the most important interaction in the product.</p>
+    <h4>Motion</h4>
+    <p style="max-width:46ch">Platform motion plus exactly three custom movements: the brass gauge depleting (a real clock), the finger-driven approve track, and the commit haptic with a symbol change. Lockdown gets one weightier seal from cobalt to rust. Reduced motion collapses the gauge to a numeric countdown. No confetti, ever.</p>
+  </div>
+  <div>
+    <h4>Voice</h4>
+    <div class="tblwrap"><table>
+      <tr><td class="mono dim">push</td><td>"Approval requested" <span class="dim">(nothing more until unlocked)</span></td></tr>
+      <tr><td class="mono dim">approve</td><td>"Approved. Secret delivered."</td></tr>
+      <tr><td class="mono dim">timeout</td><td>"Request expired. No secret was delivered."</td></tr>
+      <tr><td class="mono dim">lockdown</td><td>"Locked down. No requests will be served."</td></tr>
+      <tr><td class="mono dim">phone gone</td><td>"Phone unreachable. No secrets can be unsealed until it reconnects."</td></tr>
+      <tr><td class="mono dim">pairing</td><td>"Confirm both devices show: tide &middot; brass &middot; anchor"</td></tr>
+    </table></div>
+    <p style="max-width:46ch">Calm, terse, factual. It is your own tool talking to you: no fear, no "you're protected", no exclamation marks. The cliches were audited out deliberately: no shields, no hacker green, no glowing padlocks, no AI purple; deny is framed as the easy safe default rather than an alarm.</p>
+  </div>
+</div>
+
+<h2 id="decisions">Decisions log</h2>
+<ul class="notes">
+  <li><strong>Sigil is any-CLI, not an op tool.</strong> The core is a generic gated-exec-with-injection engine; 1Password is provider #1. Three layers (core, integrations, providers) with a hard seam each, so "Sigil for X" is a config, a provider impl, or an integration, never a rewrite.</li>
+  <li><strong><code>latch &lt;cmd&gt;</code> is the primitive; the shim is a thin alias.</strong> Look up config for a command, gate it, inject its env, run it; refuse an unconfigured command rather than run it ungated. The transparent shim collapses to rewriting <code>op ...</code> into <code>latch op ...</code>, existing only for callers that cannot be modified.</li>
+  <li><strong>Name: Sigil</strong> (binary and crates stay <code>latch</code>). A sigil is a sealed mark that authorizes: the phone seals an approval, and the six-word SAS is the mark's attestation, the thing a human actually checks before trusting it. Every user-facing surface says Sigil; the CLI you type and the internal crates keep the name <code>latch</code> underneath.</li>
+  <li><strong>No secret caching.</strong> Live per-approval reads, so rotation is instant and the source stays locked. The startup-cache model was rejected.</li>
+  <li><strong>Secret values never enter daemon memory.</strong> The provider trait injects a credential and streams the child's output to the caller's fds; it is deliberately not a <code>fetch() -&gt; bytes</code> shape, so a provider cannot break the invariant.</li>
+  <li><strong>The unwrap key lives only on the phone.</strong> Delivered once at pairing after SAS, optionally enveloped a second time to the Mac Secure Enclave, then erased from the daemon; it returns per-approval. This makes the daemon inert at rest.</li>
+  <li><strong>The factor policy closes the self-approval finding.</strong> Phone &gt; biometric &gt; fail-closed; the control-socket and dev auto-approve exist only under a loud <code>--dev-insecure</code> switch, and a real factor always wins over it.</li>
+  <li><strong>SSH is a distinct integration with a pluggable signer.</strong> Default is 1Password-fetch (key in RAM one signature, the honest residual); SE-resident, file, and proxy signers follow. The three-way trade is documented, not hidden.</li>
+  <li><strong>Transport ladder, direct first.</strong> LAN, then an owned endpoint, then a blind relay carrying only sealed envelopes over plain HTTP deposit and drain. This is not a mesh VPN. The relay rings the content-free APNs doorbell on the daemon's behalf, using the one publisher key it holds; the daemon never talks to Apple itself, and the relay sees a device push token only transiently, per deposit, never stored.</li>
+  <li><strong>Trust is proven client-side, and invariant #3 is honestly relaxed.</strong> The relay is blind (key-hash mailboxes, no accounts, never parses an envelope) and holds no key-distribution role, but the v4 doorbell gives it one narrow new power: the shared publisher push key plus a transient per-deposit push token. An independent review confirmed this still cannot read a secret, forge an approval, or learn an outcome; its remaining powerlessness is demonstrated by a hostile-relay suite in the repo rather than asserted.</li>
+  <li><strong>The control socket is the single machine API.</strong> The Mac app and CLI are two renderers of it. Keystore and config mutations stay CLI-only and least-privilege, because the network-exposed daemon must never be able to mutate keys or config.</li>
+  <li><strong>Stack.</strong> Phone is one Expo codebase (SwiftUI on iOS today, Compose on Android later). Mac is pure SwiftUI with Liquid Glass. Daemon and CLI are one Rust workspace built to a single release binary around half a megabyte, no runtime to install.</li>
+</ul>
+
+<hr>
+<p style="font-family:var(--mono); font-size:0.72rem; color:var(--faint); margin-top:20px;">sigil &middot; design brief &middot; the any-CLI reframe, grounded in the built state &middot; July 2026</p>
+
+</div>

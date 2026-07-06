@@ -1,0 +1,998 @@
+<title>Latch · How the security works</title>
+<style>
+  :root {
+    --bg: oklch(1 0 0);
+    --surface: oklch(0.972 0.004 240);
+    --well: oklch(0.945 0.006 240);
+    --ink: oklch(0.235 0.015 245);
+    --muted: oklch(0.5 0.014 242);
+    --faint: oklch(0.62 0.01 242);
+    --line: oklch(0.885 0.008 240);
+    --line-strong: oklch(0.78 0.01 242);
+    --cobalt: oklch(0.45 0.086 230);
+    --cobalt-ink: oklch(0.985 0.003 235);
+    --brass: oklch(0.62 0.115 75);
+    --ok: oklch(0.5 0.095 165);
+    --deny: oklch(0.5 0.15 25);
+    --cobalt-fill: color-mix(in oklch, var(--cobalt) 10%, transparent);
+    --brass-fill: color-mix(in oklch, var(--brass) 12%, transparent);
+    --ok-fill: color-mix(in oklch, var(--ok) 12%, transparent);
+    --deny-fill: color-mix(in oklch, var(--deny) 10%, transparent);
+    --shadow: 0 1px 2px oklch(0.4 0.02 245 / 0.05), 0 12px 34px oklch(0.4 0.03 245 / 0.07);
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: oklch(0.165 0.014 245);
+      --surface: oklch(0.205 0.015 245);
+      --well: oklch(0.238 0.016 245);
+      --ink: oklch(0.955 0.006 235);
+      --muted: oklch(0.7 0.012 240);
+      --faint: oklch(0.56 0.012 240);
+      --line: oklch(0.3 0.016 245);
+      --line-strong: oklch(0.4 0.018 245);
+      --cobalt: oklch(0.72 0.11 232);
+      --cobalt-ink: oklch(0.16 0.02 245);
+      --brass: oklch(0.77 0.115 78);
+      --ok: oklch(0.72 0.11 165);
+      --deny: oklch(0.68 0.14 25);
+      --shadow: 0 1px 2px oklch(0 0 0 / 0.3), 0 16px 40px oklch(0 0 0 / 0.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: oklch(0.165 0.014 245);
+    --surface: oklch(0.205 0.015 245);
+    --well: oklch(0.238 0.016 245);
+    --ink: oklch(0.955 0.006 235);
+    --muted: oklch(0.7 0.012 240);
+    --faint: oklch(0.56 0.012 240);
+    --line: oklch(0.3 0.016 245);
+    --line-strong: oklch(0.4 0.018 245);
+    --cobalt: oklch(0.72 0.11 232);
+    --cobalt-ink: oklch(0.16 0.02 245);
+    --brass: oklch(0.77 0.115 78);
+    --ok: oklch(0.72 0.11 165);
+    --deny: oklch(0.68 0.14 25);
+    --shadow: 0 1px 2px oklch(0 0 0 / 0.3), 0 16px 40px oklch(0 0 0 / 0.35);
+  }
+  :root[data-theme="light"] {
+    --bg: oklch(1 0 0);
+    --surface: oklch(0.972 0.004 240);
+    --well: oklch(0.945 0.006 240);
+    --ink: oklch(0.235 0.015 245);
+    --muted: oklch(0.5 0.014 242);
+    --faint: oklch(0.62 0.01 242);
+    --line: oklch(0.885 0.008 240);
+    --line-strong: oklch(0.78 0.01 242);
+    --cobalt: oklch(0.45 0.086 230);
+    --cobalt-ink: oklch(0.985 0.003 235);
+    --brass: oklch(0.62 0.115 75);
+    --ok: oklch(0.5 0.095 165);
+    --deny: oklch(0.5 0.15 25);
+    --shadow: 0 1px 2px oklch(0.4 0.02 245 / 0.05), 0 12px 34px oklch(0.4 0.03 245 / 0.07);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.62;
+    font-size: 17px;
+    margin: 0;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 0 26px 140px; }
+  .col { max-width: 65ch; }
+  h1, h2, h3 { text-wrap: balance; line-height: 1.12; }
+  p { margin: 0 0 16px; }
+  .col p:last-child { margin-bottom: 0; }
+  strong { font-weight: 640; }
+  em { font-style: italic; }
+  a { color: var(--cobalt); text-underline-offset: 3px; }
+  code, .m { font-family: var(--mono); font-size: 0.86em; }
+  code {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 5px; padding: 1px 5px; color: var(--ink);
+  }
+  :focus-visible { outline: 2.5px solid var(--cobalt); outline-offset: 3px; border-radius: 3px; }
+
+  .eyebrow {
+    font-family: var(--mono); font-size: 0.72rem; text-transform: uppercase;
+    letter-spacing: 0.16em; color: var(--cobalt); margin: 0;
+  }
+
+  /* hero */
+  .hero { padding: 92px 0 34px; }
+  .hero .kicker {
+    font-family: var(--mono); font-size: 0.74rem; text-transform: uppercase;
+    letter-spacing: 0.2em; color: var(--faint);
+    display: inline-flex; align-items: center; gap: 10px;
+  }
+  .hero .kicker .mark { color: var(--cobalt); font-weight: 600; letter-spacing: -0.02em; text-transform: none; font-size: 0.9rem; }
+  .hero h1 {
+    font-size: clamp(2.3rem, 6.2vw, 3.9rem); font-weight: 660;
+    letter-spacing: -0.028em; margin: 26px 0 0; max-width: 17ch;
+  }
+  .hero h1 .warm { color: var(--brass); }
+  .hero .lede {
+    font-size: clamp(1.14rem, 2.4vw, 1.36rem); color: var(--muted);
+    margin: 22px 0 0; max-width: 52ch; line-height: 1.5;
+  }
+  .hero-art { margin: 44px 0 8px; }
+  .hero-note {
+    font-family: var(--mono); font-size: 0.76rem; color: var(--faint);
+    letter-spacing: 0.02em; margin-top: 20px; display: flex; gap: 8px; align-items: center;
+  }
+  .hero-note::before { content: ""; width: 22px; height: 1px; background: var(--line-strong); }
+
+  /* orientation strip */
+  .arc {
+    margin: 40px 0 8px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+    padding: 26px 0; display: grid; grid-template-columns: 1fr 1fr; gap: 30px 48px;
+  }
+  @media (max-width: 680px) { .arc { grid-template-columns: 1fr; gap: 22px; } }
+  .arc h2 { font-size: 1.1rem; margin: 0 0 4px; font-weight: 620; }
+  .arc p { font-size: 0.96rem; color: var(--muted); margin: 0; max-width: 46ch; }
+  .arc .lbl {
+    font-family: var(--mono); font-size: 0.68rem; text-transform: uppercase;
+    letter-spacing: 0.14em; color: var(--faint); display: block; margin-bottom: 8px;
+  }
+
+  /* chapters */
+  .chapter { padding: 74px 0 0; }
+  .ch-head { display: flex; align-items: baseline; gap: 14px; margin-bottom: 14px; }
+  .ch-num {
+    font-family: var(--mono); font-size: 1.15rem; color: var(--cobalt);
+    font-weight: 500; letter-spacing: 0.02em; font-variant-numeric: tabular-nums;
+  }
+  .chapter h2 {
+    font-size: clamp(1.55rem, 3.4vw, 2.15rem); font-weight: 640;
+    letter-spacing: -0.02em; margin: 4px 0 18px; max-width: 20ch;
+  }
+  .lead { font-size: 1.12rem; color: var(--ink); max-width: 62ch; }
+  .prose { max-width: 65ch; }
+  .prose p { color: color-mix(in oklch, var(--ink) 88%, var(--muted)); }
+  .prose .aside {
+    border-left: 2px solid var(--cobalt); padding: 2px 0 2px 18px; margin: 22px 0;
+    color: var(--muted); font-size: 0.98rem;
+  }
+
+  /* plates (diagram frames) */
+  figure.plate { margin: 34px 0 6px; }
+  .plate-frame {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 16px; padding: 30px 30px 26px; box-shadow: var(--shadow);
+  }
+  .plate-scroll { overflow-x: auto; }
+  figure.plate figcaption {
+    font-family: var(--mono); font-size: 0.78rem; color: var(--muted);
+    margin-top: 14px; line-height: 1.5; max-width: 68ch;
+  }
+  figure.plate figcaption b { color: var(--ink); font-weight: 600; }
+  .plate-title {
+    font-family: var(--mono); font-size: 0.68rem; text-transform: uppercase;
+    letter-spacing: 0.15em; color: var(--faint); margin: 0 0 20px;
+  }
+  svg { display: block; max-width: 100%; height: auto; }
+
+  /* svg schematic classes */
+  .s-line { stroke: var(--line-strong); fill: none; stroke-width: 1.6; }
+  .s-line-2 { stroke: var(--line-strong); fill: none; stroke-width: 1.6; stroke-dasharray: 5 5; }
+  .s-card { fill: var(--bg); stroke: var(--line-strong); stroke-width: 1.6; }
+  .s-well { fill: var(--well); stroke: var(--line); stroke-width: 1.4; }
+  .s-cobalt { stroke: var(--cobalt); fill: none; stroke-width: 1.8; }
+  .s-cobalt-f { fill: var(--cobalt-fill); stroke: var(--cobalt); stroke-width: 1.6; }
+  .s-brass { stroke: var(--brass); fill: none; stroke-width: 1.8; }
+  .s-brass-f { fill: var(--brass-fill); stroke: var(--brass); stroke-width: 1.6; }
+  .s-ok { stroke: var(--ok); fill: none; stroke-width: 1.8; }
+  .s-ok-f { fill: var(--ok-fill); stroke: var(--ok); stroke-width: 1.6; }
+  .s-deny { stroke: var(--deny); fill: none; stroke-width: 1.8; }
+  .s-deny-f { fill: var(--deny-fill); stroke: var(--deny); stroke-width: 1.6; }
+  .t-ink { fill: var(--ink); font-family: var(--sans); }
+  .t-mut { fill: var(--muted); font-family: var(--mono); }
+  .t-faint { fill: var(--faint); font-family: var(--mono); }
+  .t-cobalt { fill: var(--cobalt); font-family: var(--mono); }
+  .t-brass { fill: var(--brass); font-family: var(--mono); }
+  .t-ok { fill: var(--ok); font-family: var(--mono); }
+  .t-deny { fill: var(--deny); font-family: var(--mono); }
+  .lbl-cap { font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; }
+  .lbl-sm { font-size: 12.5px; }
+  .lbl-md { font-size: 14px; font-weight: 560; }
+  .lbl-mono { font-family: var(--mono); font-size: 12px; }
+
+  /* toggle control */
+  .seg {
+    display: inline-flex; background: var(--well); border: 1px solid var(--line);
+    border-radius: 999px; padding: 4px; gap: 4px; margin: 0 0 22px;
+  }
+  .seg button {
+    font-family: var(--mono); font-size: 0.76rem; letter-spacing: 0.03em;
+    border: 0; background: transparent; color: var(--muted);
+    padding: 7px 16px; border-radius: 999px; cursor: pointer; transition: none;
+  }
+  .seg button[aria-pressed="true"] { background: var(--cobalt); color: var(--cobalt-ink); font-weight: 560; }
+  .toggle-pane { display: none; }
+  .toggle-pane.on { display: block; }
+
+  /* per-request flow */
+  .flow-track {
+    display: flex; align-items: stretch; gap: 0; overflow-x: auto;
+    padding: 6px 2px 16px; scroll-behavior: smooth;
+  }
+  .station {
+    flex: 0 0 auto; width: 132px; text-align: left; cursor: pointer;
+    background: var(--bg); border: 1.5px solid var(--line);
+    border-radius: 12px; padding: 12px 12px 13px; color: var(--muted);
+    font-family: var(--sans); display: flex; flex-direction: column; gap: 9px;
+  }
+  .station .st-ico { width: 26px; height: 26px; color: var(--faint); }
+  .station .st-n { font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.1em; color: var(--faint); }
+  .station .st-t { font-size: 0.8rem; line-height: 1.28; color: var(--muted); font-weight: 520; }
+  .station[aria-pressed="true"] {
+    border-color: var(--cobalt); background: var(--cobalt-fill); color: var(--ink);
+    box-shadow: 0 0 0 1px var(--cobalt);
+  }
+  .station[aria-pressed="true"] .st-ico { color: var(--cobalt); }
+  .station[aria-pressed="true"] .st-t { color: var(--ink); }
+  .station.wipe[aria-pressed="true"] {
+    border-color: var(--ok); background: var(--ok-fill); box-shadow: 0 0 0 1px var(--ok);
+  }
+  .station.wipe[aria-pressed="true"] .st-ico { color: var(--ok); }
+  .conn { flex: 0 0 auto; align-self: center; width: 20px; height: 1.6px; background: var(--line-strong); margin: 0 -1px; }
+  .flow-cap {
+    background: var(--well); border: 1px solid var(--line); border-radius: 12px;
+    padding: 18px 20px; margin-top: 6px; min-height: 92px;
+  }
+  .flow-cap .fc-step { font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--cobalt); }
+  .flow-cap h4 { margin: 6px 0 6px; font-size: 1.02rem; font-weight: 620; }
+  .flow-cap p { margin: 0; font-size: 0.95rem; color: var(--muted); max-width: 62ch; }
+  .flow-controls { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
+  .flow-controls button {
+    font-family: var(--mono); font-size: 0.78rem; border: 1px solid var(--line);
+    background: var(--bg); color: var(--ink); padding: 8px 16px; border-radius: 8px; cursor: pointer;
+  }
+  .flow-controls button:hover { border-color: var(--cobalt); color: var(--cobalt); }
+  .flow-controls .count { font-family: var(--mono); font-size: 0.76rem; color: var(--faint); font-variant-numeric: tabular-nums; }
+
+  /* guarantee + limit cards */
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 30px 0 6px; }
+  @media (max-width: 680px) { .cards { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 14px; padding: 20px 22px; display: flex; gap: 15px; align-items: flex-start;
+  }
+  .card .ico { flex: 0 0 auto; width: 26px; height: 26px; margin-top: 2px; }
+  .card h4 { margin: 0 0 5px; font-size: 1rem; font-weight: 620; }
+  .card p { margin: 0; font-size: 0.92rem; color: var(--muted); }
+  .card.good { border-left: 3px solid var(--ok); }
+  .card.good .ico { color: var(--ok); }
+  .card.limit { border-left: 3px solid var(--deny); background: color-mix(in oklch, var(--surface) 88%, var(--deny-fill)); }
+  .card.limit .ico { color: var(--deny); }
+
+  .reassure {
+    margin: 26px 0 0; border: 1px solid var(--line); background: var(--well);
+    border-radius: 14px; padding: 22px 24px; display: flex; gap: 16px; align-items: flex-start;
+  }
+  .reassure .ico { flex: 0 0 auto; width: 28px; height: 28px; color: var(--cobalt); margin-top: 1px; }
+  .reassure p { margin: 0; max-width: 60ch; }
+  .reassure strong { color: var(--ink); }
+
+  /* closing */
+  .closing { margin-top: 84px; border-top: 1px solid var(--line); padding-top: 34px; }
+  .closing .eyebrow { margin-bottom: 12px; }
+  .closing h2 { font-size: 1.5rem; font-weight: 640; margin: 0 0 14px; letter-spacing: -0.015em; }
+  .closing p { color: var(--muted); max-width: 60ch; }
+  .glossary { margin-top: 40px; display: grid; grid-template-columns: 1fr 1fr; gap: 4px 40px; }
+  @media (max-width: 680px) { .glossary { grid-template-columns: 1fr; } }
+  .glossary dt { font-family: var(--mono); font-size: 0.82rem; color: var(--cobalt); margin-top: 16px; }
+  .glossary dd { margin: 4px 0 0; font-size: 0.92rem; color: var(--muted); }
+  .footline {
+    font-family: var(--mono); font-size: 0.72rem; color: var(--faint);
+    margin-top: 54px; padding-top: 20px; border-top: 1px solid var(--line);
+  }
+
+  /* reveal */
+  .reveal { opacity: 0; transform: translateY(16px); transition: opacity 0.7s ease, transform 0.7s ease; }
+  .reveal.in { opacity: 1; transform: none; }
+  @media (prefers-reduced-motion: reduce) {
+    .reveal { opacity: 1; transform: none; transition: none; }
+    .flow-track { scroll-behavior: auto; }
+    .hero-draw { animation: none !important; stroke-dashoffset: 0 !important; }
+    * { animation: none !important; }
+  }
+
+  @keyframes drawIn { to { stroke-dashoffset: 0; } }
+  @keyframes slideL { from { transform: translateX(-26px); opacity: 0; } to { transform: none; opacity: 1; } }
+  @keyframes slideR { from { transform: translateX(26px); opacity: 0; } to { transform: none; opacity: 1; } }
+  .halfL { animation: slideL 1s cubic-bezier(0.22,0.61,0.36,1) 0.15s both; }
+  .halfR { animation: slideR 1s cubic-bezier(0.22,0.61,0.36,1) 0.15s both; }
+  .hero-draw { stroke-dasharray: 320; stroke-dashoffset: 320; animation: drawIn 1.4s ease 0.5s forwards; }
+</style>
+
+<!-- icon sprite -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="i-tool" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/>
+    </symbol>
+    <symbol id="i-mac" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M2 20h20"/><path d="M9 16l-.6 4M15 16l.6 4"/>
+    </symbol>
+    <symbol id="i-envelope" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3.5 6.5l8.5 6 8.5-6"/><circle cx="18.5" cy="17" r="2.4" fill="currentColor" stroke="none" opacity="0.5"/>
+    </symbol>
+    <symbol id="i-relay" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="3"/><path d="M6.5 6.5a8 8 0 000 11M17.5 6.5a8 8 0 010 11M4 4a11 11 0 000 16M20 4a11 11 0 010 16"/>
+    </symbol>
+    <symbol id="i-phone" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="6" y="2.5" width="12" height="19" rx="2.5"/><path d="M10.5 5.2h3"/>
+    </symbol>
+    <symbol id="i-face" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 8V6.5A2.5 2.5 0 016.5 4H8M16 4h1.5A2.5 2.5 0 0120 6.5V8M20 16v1.5a2.5 2.5 0 01-2.5 2.5H16M8 20H6.5A2.5 2.5 0 014 17.5V16"/>
+      <path d="M9 10v1.5M15 10v1.5M12 10v3l-1 1M9.5 15.5a3.5 3 0 005 0"/>
+    </symbol>
+    <symbol id="i-vault" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="12" cy="12" r="4"/><path d="M12 8v-1M12 17v-1M8 12h1M15 12h1"/>
+    </symbol>
+    <symbol id="i-combine" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 7h6l2 2M4 17h6l2-2"/><circle cx="17" cy="12" r="3.5"/><path d="M12 12h1.5"/>
+    </symbol>
+    <symbol id="i-wipe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 12a8 8 0 108-8"/><path d="M4 5v4h4"/><path d="M15 12l-6 0"/>
+    </symbol>
+    <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="9"/><path d="M8 12.5l2.5 2.5L16 9.5"/>
+    </symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 3.5L21 19H3z"/><path d="M12 10v4M12 16.6v.1"/>
+    </symbol>
+    <symbol id="i-hand" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M9 20l-1.5-9M12 20V9M15 20l1-9M18 15V11a1.5 1.5 0 00-3 0"/><path d="M6 13l-1.5-2a1.4 1.4 0 012.3-1.6L9 12"/>
+    </symbol>
+  </defs>
+</svg>
+
+<div class="wrap">
+
+  <!-- ===================== HERO ===================== -->
+  <header class="hero">
+    <span class="kicker"><span class="mark">latch_</span> · How the security works</span>
+    <h1>Two halves. One lock. <span class="warm">Neither half can open it alone.</span></h1>
+    <p class="lede">A plain-language tour of how Latch lets you approve a secret from your phone, and why even a hijacked Mac cannot help itself to one. No prior knowledge assumed.</p>
+
+    <div class="hero-art" aria-hidden="true">
+      <svg viewBox="0 0 640 200" role="img" width="640" height="200">
+        <!-- lock body -->
+        <rect x="270" y="92" width="100" height="82" rx="12" class="s-card"/>
+        <path d="M287 92 v-16 a33 33 0 0 1 66 0 v16" class="s-cobalt hero-draw"/>
+        <circle cx="320" cy="126" r="9" class="s-cobalt-f"/>
+        <rect x="316" y="132" width="8" height="20" rx="4" class="s-cobalt-f"/>
+        <!-- left half key -->
+        <g class="halfL">
+          <line x1="120" y1="133" x2="250" y2="133" class="s-line"/>
+          <circle cx="120" cy="133" r="20" class="s-well"/>
+          <circle cx="120" cy="133" r="8" class="s-line"/>
+          <rect x="232" y="126" width="7" height="14" rx="2" class="s-line" fill="var(--surface)"/>
+          <text x="120" y="176" text-anchor="middle" class="t-mut lbl-mono">Mac's half</text>
+        </g>
+        <!-- right half key -->
+        <g class="halfR">
+          <line x1="390" y1="133" x2="520" y2="133" class="s-line"/>
+          <circle cx="520" cy="133" r="20" class="s-well"/>
+          <circle cx="520" cy="133" r="8" class="s-line"/>
+          <rect x="401" y="126" width="7" height="14" rx="2" class="s-line" fill="var(--surface)"/>
+          <text x="520" y="176" text-anchor="middle" class="t-mut lbl-mono">Phone's half</text>
+          <text x="520" y="60" text-anchor="middle" class="t-faint lbl-mono">sealed in a chip</text>
+          <path d="M500 66 q20 14 20 44" class="s-line-2"/>
+        </g>
+      </svg>
+    </div>
+    <p class="hero-note">Read top to bottom. Each idea is built from the one before it.</p>
+  </header>
+
+  <div class="arc reveal">
+    <div>
+      <span class="lbl">What Latch is</span>
+      <h2>Your secrets, approved from your pocket</h2>
+      <p>Passwords and access tokens live locked on your Mac. Latch lets you approve their use from your phone while keeping them locked to everyone else, including a Mac that has been taken over.</p>
+    </div>
+    <div>
+      <span class="lbl">Where we are going</span>
+      <h2>From padlocks to a split key</h2>
+      <p>We start with what a key even is, build up to a lock that needs two halves to open, and finish with the one honest limit that no design can remove.</p>
+    </div>
+  </div>
+
+  <!-- ===================== 01 THE PROBLEM ===================== -->
+  <section class="chapter reveal">
+    <div class="ch-head"><span class="ch-num">01</span><p class="eyebrow">The problem</p></div>
+    <h2>A secret you cannot reach, and a Mac you cannot fully trust</h2>
+    <div class="prose">
+      <p class="lead">Think of a secret as a key to something valuable: a password, or an access token that lets a tool talk to 1Password, a database, or a server.</p>
+      <p>Today that secret lives on your Mac, locked behind your fingerprint. Every time a tool wants it, your Mac asks you to press the sensor to unlock it. That works beautifully when you are sitting at the machine. It falls apart in two ways.</p>
+      <p><strong>You are not always there.</strong> When you step away, the fingerprint prompt just sits there waiting. The tool that needed the secret stalls: an assistant stops mid task, a server refuses to start, a connection hangs, all because nobody is present to press the sensor.</p>
+      <p><strong>Worse, the Mac itself could be turned against you.</strong> If a piece of malware sneaks onto your Mac, it is standing right next to the locked secret. The moment that secret is unlocked, malware nearby could try to grab it.</p>
+      <p>So we want two things at once, and they pull in opposite directions. We want to <em>approve from your phone</em> when you are away. And we want it so that <em>even a compromised Mac cannot unlock a secret by itself</em>, no matter what is running on it.</p>
+    </div>
+
+    <figure class="plate reveal">
+      <div class="plate-frame plate-scroll">
+        <p class="plate-title">The bind we have to solve</p>
+        <svg viewBox="0 0 720 240" role="img" width="720" height="240" aria-label="A Mac holds a locked secret. When you are away the fingerprint prompt waits unanswered, and malware on the Mac reaches toward the secret.">
+          <!-- Mac -->
+          <rect x="250" y="70" width="220" height="120" rx="10" class="s-card"/>
+          <text x="360" y="60" text-anchor="middle" class="t-faint lbl-cap">your mac</text>
+          <!-- locked secret inside -->
+          <rect x="300" y="104" width="52" height="46" rx="8" class="s-cobalt-f"/>
+          <path d="M309 104 v-9 a17 17 0 0 1 34 0 v9" class="s-cobalt"/>
+          <text x="326" y="172" text-anchor="middle" class="t-cobalt lbl-mono">the secret</text>
+          <!-- fingerprint gate -->
+          <g>
+            <circle cx="410" cy="126" r="21" class="s-well"/>
+            <path d="M410 116 a10 10 0 0 1 10 10 M410 120 a6 6 0 0 1 6 6 M403 126 a7 7 0 0 1 14 0 M410 126 v6" class="s-line"/>
+            <text x="410" y="172" text-anchor="middle" class="t-mut lbl-mono">needs a tap</text>
+          </g>
+          <!-- you, away -->
+          <g opacity="0.85">
+            <circle cx="70" cy="112" r="15" class="s-line-2"/>
+            <path d="M48 160 a22 26 0 0 1 44 0" class="s-line-2"/>
+            <text x="70" y="192" text-anchor="middle" class="t-faint lbl-mono">you, away</text>
+          </g>
+          <line x1="96" y1="128" x2="238" y2="128" class="s-line-2"/>
+          <text x="167" y="118" text-anchor="middle" class="t-faint lbl-mono">prompt waits</text>
+          <!-- malware -->
+          <g>
+            <use href="#i-hand" x="556" y="112" width="34" height="34" class="s-deny" style="color:var(--deny)"/>
+            <text x="600" y="120" text-anchor="middle" class="t-deny lbl-mono">malware</text>
+            <text x="600" y="136" text-anchor="middle" class="t-deny lbl-mono">on the mac</text>
+          </g>
+          <path d="M556 128 C 520 128 500 128 474 128" class="s-deny" stroke-dasharray="5 5"/>
+          <path d="M482 122 l-9 6 9 6" class="s-deny"/>
+        </svg>
+      </div>
+      <figcaption>The prompt waits when you are away. And a hostile program already on the Mac sits right beside the secret. Latch has to answer both without weakening either.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ===================== 02 KEYS 101 ===================== -->
+  <section class="chapter reveal">
+    <div class="ch-head"><span class="ch-num">02</span><p class="eyebrow">The one bit of cryptography you need</p></div>
+    <h2>Padlocks, keys, and locked boxes</h2>
+    <div class="prose">
+      <p class="lead">Everything that follows rests on two simple ideas. If you get these two, you get the whole design.</p>
+      <p><strong>Idea one: a key that comes in a matched pair.</strong> Imagine a special padlock and the single key that opens it. You can hand out copies of the open padlock to anyone. They can snap it shut on a box, but they cannot open it back up. Only you, holding the one key, can. The padlock you share is called your <em>public key</em>. The key you keep is your <em>private key</em>. Sharing the padlock gives nothing away, because a padlock cannot be run backwards into its key.</p>
+      <p>This lets two people who have only ever exchanged padlocks send each other locked boxes that nobody in between can open.</p>
+      <p><strong>Idea two: turning a secret into a locked box.</strong> <em>Encryption</em> is a machine that takes something readable, like <code>postgres://admin:hunter2@db</code>, plus a key, and scrambles it into meaningless noise. Without the right key the noise stays noise, forever. Feed the key back in and the exact original comes out. A stolen locked box is just gibberish to whoever holds it.</p>
+      <p class="aside">That is the entire toolkit. A padlock anyone can click shut but only you can open, and a way to scramble a secret into noise that only the right key unscrambles. Hold onto both.</p>
+    </div>
+
+    <figure class="plate reveal">
+      <div class="plate-frame plate-scroll">
+        <p class="plate-title">The two ideas, side by side</p>
+        <svg viewBox="0 0 720 260" role="img" width="720" height="260" aria-label="Left: a public padlock anyone can shut, opened only by the private key. Right: encryption scrambles a readable secret into noise that only the key restores.">
+          <!-- divider -->
+          <line x1="360" y1="30" x2="360" y2="230" class="s-line" stroke-dasharray="3 6"/>
+          <text x="180" y="34" text-anchor="middle" class="t-faint lbl-cap">a matched pair</text>
+          <text x="540" y="34" text-anchor="middle" class="t-faint lbl-cap">a locked box</text>
+
+          <!-- LEFT: padlock + key -->
+          <g>
+            <rect x="96" y="96" width="78" height="66" rx="10" class="s-cobalt-f"/>
+            <path d="M110 96 v-13 a25 25 0 0 1 50 0 v13" class="s-cobalt"/>
+            <text x="135" y="184" text-anchor="middle" class="t-cobalt lbl-mono">public key</text>
+            <text x="135" y="200" text-anchor="middle" class="t-faint lbl-mono">anyone can shut</text>
+            <!-- key -->
+            <g>
+              <circle cx="250" cy="129" r="17" class="s-brass-f"/>
+              <circle cx="250" cy="129" r="6" class="s-brass"/>
+              <line x1="267" y1="129" x2="300" y2="129" class="s-brass"/>
+              <line x1="294" y1="129" x2="294" y2="139" class="s-brass"/>
+              <line x1="300" y1="129" x2="300" y2="141" class="s-brass"/>
+              <text x="275" y="184" text-anchor="middle" class="t-brass lbl-mono">private key</text>
+              <text x="275" y="200" text-anchor="middle" class="t-faint lbl-mono">only you open</text>
+            </g>
+          </g>
+
+          <!-- RIGHT: encryption -->
+          <g>
+            <rect x="404" y="112" width="96" height="34" rx="6" class="s-well"/>
+            <text x="452" y="133" text-anchor="middle" class="t-ink lbl-mono" font-size="11">postgres://...</text>
+            <text x="452" y="166" text-anchor="middle" class="t-faint lbl-mono">readable</text>
+            <!-- machine -->
+            <path d="M508 129 h34" class="s-line"/>
+            <path d="M536 123 l8 6 -8 6" class="s-line"/>
+            <circle cx="560" cy="129" r="16" class="s-cobalt"/>
+            <use href="#i-vault" x="549" y="118" width="22" height="22" class="s-cobalt" style="color:var(--cobalt)"/>
+            <path d="M578 129 h34" class="s-line"/>
+            <path d="M606 123 l8 6 -8 6" class="s-line"/>
+            <text x="560" y="166" text-anchor="middle" class="t-cobalt lbl-mono">encrypt</text>
+            <!-- output noise -->
+            <rect x="620" y="112" width="70" height="34" rx="6" class="s-cobalt-f"/>
+            <text x="655" y="133" text-anchor="middle" class="t-mut lbl-mono" font-size="11">a8f3 1c9e</text>
+            <text x="655" y="166" text-anchor="middle" class="t-faint lbl-mono">noise</text>
+          </g>
+        </svg>
+      </div>
+      <figcaption>On the left, a <b>public padlock</b> anyone can close and only the <b>private key</b> can reopen. On the right, <b>encryption</b> turns a readable secret into noise, reversible only with the key.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ===================== 03 PAIRING ===================== -->
+  <section class="chapter reveal">
+    <div class="ch-head"><span class="ch-num">03</span><p class="eyebrow">The root of trust</p></div>
+    <h2>Meeting in person, so no imposter can slip in</h2>
+    <div class="prose">
+      <p class="lead">Before your Mac and phone can trade locked boxes, each has to be certain it holds the other's real padlock, and not a fake one swapped in by someone in the middle.</p>
+      <p>Latch solves this the way two people would in real life: they meet face to face once. Your Mac shows a <strong>QR code</strong> on its screen. Your phone reads it with its camera. That hop, from a screen to a lens, has no internet in it. Nobody on the network can reach in between a screen and a camera pointed at it. So it is a trustworthy way to hand over the Mac's real padlock.</p>
+      <p>The phone sends its own padlock back over the network. Now here is the danger. The network is a crowd of strangers. Someone could intercept the phone's reply and substitute their own padlock, tricking the Mac into trusting the wrong device. This is called a <em>person in the middle</em>.</p>
+      <p><strong>The six words are how you catch that.</strong> Once both devices think they have swapped padlocks, each independently boils the two padlocks it holds down to six short, memorable words, and shows them on screen. If an imposter slipped a fake padlock into the exchange, the two devices are holding different sets of padlocks, so their six words <em>will not match</em>. You read the words off both screens. If they agree, no imposter got in. If they differ, you stop. The check is that simple, and that is the point: a mismatch is loud and a human cannot miss it.</p>
+    </div>
+
+    <figure class="plate reveal">
+      <div class="plate-frame plate-scroll">
+        <p class="plate-title">The pairing handshake</p>
+        <svg viewBox="0 0 720 300" role="img" width="720" height="300" aria-label="The Mac shows a QR code the phone scans optically, they exchange public padlocks over the network, and both display six words which the human confirms match.">
+          <!-- Mac -->
+          <rect x="40" y="70" width="150" height="104" rx="8" class="s-card"/>
+          <text x="115" y="60" text-anchor="middle" class="t-faint lbl-cap">mac screen</text>
+          <!-- QR -->
+          <g transform="translate(90,96)">
+            <rect x="0" y="0" width="50" height="50" rx="3" class="s-well"/>
+            <rect x="6" y="6" width="12" height="12" class="s-cobalt-f"/>
+            <rect x="32" y="6" width="12" height="12" class="s-cobalt-f"/>
+            <rect x="6" y="32" width="12" height="12" class="s-cobalt-f"/>
+            <rect x="24" y="24" width="6" height="6" fill="var(--cobalt)"/>
+            <rect x="34" y="30" width="5" height="5" fill="var(--cobalt)"/>
+            <rect x="30" y="38" width="5" height="5" fill="var(--cobalt)"/>
+          </g>
+          <!-- optical scan -->
+          <path d="M192 118 h96" class="s-cobalt"/>
+          <path d="M282 112 l8 6 -8 6" class="s-cobalt"/>
+          <text x="240" y="106" text-anchor="middle" class="t-cobalt lbl-mono">camera</text>
+          <text x="240" y="140" text-anchor="middle" class="t-faint lbl-mono">no network</text>
+          <text x="240" y="154" text-anchor="middle" class="t-faint lbl-mono">in this hop</text>
+          <!-- Phone -->
+          <rect x="296" y="60" width="74" height="124" rx="12" class="s-card"/>
+          <text x="333" y="200" text-anchor="middle" class="t-faint lbl-cap">phone</text>
+          <use href="#i-phone" x="318" y="98" width="30" height="30" class="s-line" style="color:var(--muted)"/>
+
+          <!-- padlock swap over network -->
+          <g>
+            <path d="M376 96 C 440 76 470 76 520 96" class="s-line-2"/>
+            <path d="M513 90 l9 6 -6 9" class="s-line-2"/>
+            <text x="448" y="70" text-anchor="middle" class="t-faint lbl-mono">phone padlock -&gt;</text>
+            <path d="M520 150 C 470 170 440 170 376 150" class="s-line-2"/>
+            <path d="M384 144 l-9 6 6 9" class="s-line-2"/>
+            <text x="448" y="182" text-anchor="middle" class="t-faint lbl-mono">&lt;- mac padlock</text>
+            <rect x="512" y="104" width="90" height="40" rx="8" class="s-well"/>
+            <text x="557" y="122" text-anchor="middle" class="t-mut lbl-mono">the network</text>
+            <text x="557" y="136" text-anchor="middle" class="t-faint lbl-mono">a crowd of strangers</text>
+          </g>
+
+          <!-- six words -->
+          <g transform="translate(0,222)">
+            <text x="115" y="0" text-anchor="middle" class="t-faint lbl-cap">mac shows</text>
+            <rect x="34" y="12" width="162" height="34" rx="8" class="s-ok-f"/>
+            <text x="115" y="34" text-anchor="middle" class="t-ok lbl-mono" font-size="12.5">tide · brass · anchor</text>
+
+            <text x="333" y="0" text-anchor="middle" class="t-faint lbl-cap">phone shows</text>
+            <rect x="252" y="12" width="162" height="34" rx="8" class="s-ok-f"/>
+            <text x="333" y="34" text-anchor="middle" class="t-ok lbl-mono" font-size="12.5">tide · brass · anchor</text>
+
+            <use href="#i-check" x="470" y="15" width="28" height="28" class="s-ok" style="color:var(--ok)"/>
+            <text x="590" y="26" text-anchor="middle" class="t-ok lbl-mono">they match</text>
+            <text x="590" y="42" text-anchor="middle" class="t-faint lbl-mono">no imposter got in</text>
+          </g>
+        </svg>
+      </div>
+      <figcaption>The QR moves the Mac's padlock <b>optically</b>, where no attacker can interpose. The <b>six words</b> are the human backstop: if a fake padlock were swapped in over the network, the words on the two screens would disagree.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ===================== 04 SPLIT KEY ===================== -->
+  <section class="chapter reveal">
+    <div class="ch-head"><span class="ch-num">04</span><p class="eyebrow">The big idea</p></div>
+    <h2>One lock that needs two half-keys</h2>
+    <div class="prose">
+      <p class="lead">Here is the move that makes a compromised Mac safe. The lock on your secret is not opened by a single key. It is opened only when two separate half-keys are brought together.</p>
+      <p>One half is held by your <strong>Mac</strong>. The other half lives <strong>only inside a special security chip in your phone</strong>, called the Secure Enclave. Think of that chip as a sealed vault with no door: things can be computed inside it, but the half-key it guards can never come out. Not to an app, not to you, not to anyone who steals the phone.</p>
+      <p>Neither half opens anything on its own. The Mac's half alone is useless. The phone's half alone is useless. Only combined do they form the key that unscrambles the secret. This is why a Mac riddled with malware still cannot unlock a secret by itself: it is holding half of a key, and half a key opens nothing.</p>
+      <p>Compare it to the older, simpler approach, where a single whole key does the unlocking. Steal that one key once and you can open every secret, forever, with no one the wiser. Splitting the key removes that single point of failure entirely. Use the toggle to see the difference.</p>
+    </div>
+
+    <figure class="plate reveal">
+      <div class="plate-frame">
+        <p class="plate-title">One whole key, or two halves</p>
+        <div class="seg" role="group" aria-label="Compare a single key with a split key">
+          <button id="keyBtnOne" aria-pressed="false" data-pane="one">One whole key</button>
+          <button id="keyBtnTwo" aria-pressed="true" data-pane="two">Two halves (Latch)</button>
+        </div>
+
+        <div class="toggle-pane" id="paneOne">
+          <div class="plate-scroll">
+            <svg viewBox="0 0 660 210" role="img" width="660" height="210" aria-label="A single whole key opens the lock. If that one key is stolen, every secret is exposed.">
+              <circle cx="120" cy="105" r="26" class="s-deny-f"/>
+              <circle cx="120" cy="105" r="9" class="s-deny"/>
+              <line x1="146" y1="105" x2="220" y2="105" class="s-deny"/>
+              <line x1="206" y1="105" x2="206" y2="120" class="s-deny"/>
+              <line x1="216" y1="105" x2="216" y2="123" class="s-deny"/>
+              <text x="120" y="162" text-anchor="middle" class="t-deny lbl-mono">one whole key</text>
+              <path d="M232 105 h40" class="s-line"/><path d="M266 99 l8 6 -8 6" class="s-line"/>
+              <rect x="286" y="72" width="70" height="66" rx="10" class="s-well"/>
+              <path d="M300 72 v-12 a21 21 0 0 1 42 0 v12" class="s-line"/>
+              <circle cx="321" cy="102" r="7" class="s-deny-f"/>
+              <text x="321" y="162" text-anchor="middle" class="t-mut lbl-mono">opens</text>
+              <path d="M368 105 h40" class="s-line"/><path d="M402 99 l8 6 -8 6" class="s-line"/>
+              <use href="#i-hand" x="430" y="60" width="30" height="30" class="s-deny" style="color:var(--deny)"/>
+              <text x="530" y="86" text-anchor="middle" class="t-deny lbl-mono">stolen once</text>
+              <text x="530" y="104" text-anchor="middle" class="t-deny lbl-mono">= every secret,</text>
+              <text x="530" y="122" text-anchor="middle" class="t-deny lbl-mono">forever</text>
+            </svg>
+          </div>
+          <figcaption style="margin-top:16px">The risk of a single key: one theft, at any moment, hands over everything with no further approval ever needed.</figcaption>
+        </div>
+
+        <div class="toggle-pane on" id="paneTwo">
+          <div class="plate-scroll">
+            <svg viewBox="0 0 660 250" role="img" width="660" height="250" aria-label="Two half-keys, one on the Mac and one sealed in the phone's chip. Neither alone opens the lock. Combined, they do.">
+              <!-- Mac half -->
+              <g>
+                <circle cx="96" cy="70" r="20" class="s-well"/>
+                <circle cx="96" cy="70" r="7" class="s-line"/>
+                <rect x="114" y="63" width="34" height="14" rx="2" class="s-cobalt-f"/>
+                <text x="110" y="112" text-anchor="middle" class="t-cobalt lbl-mono">Mac's half</text>
+                <text x="110" y="128" text-anchor="middle" class="t-faint lbl-mono">in Mac memory</text>
+              </g>
+              <!-- Phone half in vault -->
+              <g>
+                <rect x="52" y="158" width="120" height="66" rx="10" class="s-brass" fill="var(--brass-fill)"/>
+                <text x="112" y="150" text-anchor="middle" class="t-faint lbl-cap">phone's vault</text>
+                <circle cx="88" cy="191" r="15" class="s-well"/>
+                <circle cx="88" cy="191" r="6" class="s-line"/>
+                <rect x="103" y="185" width="26" height="12" rx="2" class="s-brass-f"/>
+                <text x="140" y="188" class="t-brass lbl-mono" font-size="11">never</text>
+                <text x="140" y="202" class="t-brass lbl-mono" font-size="11">leaves</text>
+              </g>
+              <!-- neither alone -->
+              <g>
+                <path d="M158 78 C 230 84 250 96 286 118" class="s-line-2"/>
+                <path d="M172 196 C 240 190 250 150 286 130" class="s-line-2"/>
+                <circle cx="300" cy="124" r="15" class="s-deny"/>
+                <path d="M293 117 l14 14 M307 117 l-14 14" class="s-deny"/>
+                <text x="300" y="160" text-anchor="middle" class="t-deny lbl-mono">half a key</text>
+                <text x="300" y="176" text-anchor="middle" class="t-deny lbl-mono">opens nothing</text>
+              </g>
+              <!-- combined -->
+              <g>
+                <text x="470" y="52" text-anchor="middle" class="t-faint lbl-cap">only when combined</text>
+                <use href="#i-combine" x="366" y="96" width="34" height="34" class="s-ok" style="color:var(--ok)"/>
+                <path d="M406 118 h34" class="s-line"/><path d="M434 112 l8 6 -8 6" class="s-line"/>
+                <rect x="452" y="86" width="72" height="66" rx="10" class="s-ok-f"/>
+                <path d="M467 86 v-12 a21 21 0 0 1 42 0 v12" class="s-ok"/>
+                <circle cx="488" cy="116" r="8" class="s-ok"/>
+                <rect x="484" y="122" width="8" height="16" rx="4" class="s-ok"/>
+                <text x="488" y="176" text-anchor="middle" class="t-ok lbl-mono">the secret</text>
+                <text x="488" y="192" text-anchor="middle" class="t-ok lbl-mono">opens</text>
+              </g>
+            </svg>
+          </div>
+          <figcaption style="margin-top:16px">Two independent halves. The Mac holds one in its memory; the phone's chip holds the other and <b>never lets it out</b>. Alone, each is worthless. Together, they open the one secret.</figcaption>
+        </div>
+      </div>
+    </figure>
+  </section>
+
+  <!-- ===================== 05 PER-REQUEST UNLOCK ===================== -->
+  <section class="chapter reveal">
+    <div class="ch-head"><span class="ch-num">05</span><p class="eyebrow">The heart of it</p></div>
+    <h2>Your face makes the key, fresh, every single time</h2>
+    <div class="prose">
+      <p class="lead">There is no master key sitting anywhere waiting to be used. Each time a tool needs a secret, the unlock is created from scratch, and your face is what creates it.</p>
+      <p>When a tool asks for a secret, your Mac computes its own half and then asks your phone for the other half. Your phone shows you exactly what is being requested. When you approve with <strong>Face ID</strong>, and only then, the sealed chip computes its half <em>for that one request</em>. That half travels back, the Mac combines the two halves into the key, unscrambles the secret for that single command, and then immediately wipes it from memory.</p>
+      <p>Nothing lingers. The two halves for this request cannot be reused for the next one. The next request starts the whole dance over: a new ask, a new glance, a new tap of your face, a new half computed fresh in the chip. Approving is not flipping a permission switch. Your face is literally supplying a missing piece of the math, once, for this exact command.</p>
+      <p>Step through it below.</p>
+    </div>
+
+    <figure class="plate reveal">
+      <div class="plate-frame">
+        <p class="plate-title">One request, start to finish</p>
+        <div class="flow-track" id="flowTrack" role="group" aria-label="The eight stages of one secret request. Select a stage to read what happens.">
+          <button class="station" data-step="0" aria-pressed="true"><svg class="st-ico"><use href="#i-tool"/></svg><span class="st-n">01</span><span class="st-t">A tool asks for a secret</span></button>
+          <span class="conn" aria-hidden="true"></span>
+          <button class="station" data-step="1" aria-pressed="false"><svg class="st-ico"><use href="#i-envelope"/></svg><span class="st-n">02</span><span class="st-t">Mac seals a request</span></button>
+          <span class="conn" aria-hidden="true"></span>
+          <button class="station" data-step="2" aria-pressed="false"><svg class="st-ico"><use href="#i-relay"/></svg><span class="st-n">03</span><span class="st-t">A blind relay carries it</span></button>
+          <span class="conn" aria-hidden="true"></span>
+          <button class="station" data-step="3" aria-pressed="false"><svg class="st-ico"><use href="#i-phone"/></svg><span class="st-n">04</span><span class="st-t">Phone checks it is genuine</span></button>
+          <span class="conn" aria-hidden="true"></span>
+          <button class="station" data-step="4" aria-pressed="false"><svg class="st-ico"><use href="#i-face"/></svg><span class="st-n">05</span><span class="st-t">Face ID wakes the vault</span></button>
+          <span class="conn" aria-hidden="true"></span>
+          <button class="station" data-step="5" aria-pressed="false"><svg class="st-ico"><use href="#i-envelope"/></svg><span class="st-n">06</span><span class="st-t">The half returns, sealed</span></button>
+          <span class="conn" aria-hidden="true"></span>
+          <button class="station" data-step="6" aria-pressed="false"><svg class="st-ico"><use href="#i-combine"/></svg><span class="st-n">07</span><span class="st-t">Mac combines both halves</span></button>
+          <span class="conn" aria-hidden="true"></span>
+          <button class="station wipe" data-step="7" aria-pressed="false"><svg class="st-ico"><use href="#i-wipe"/></svg><span class="st-n">08</span><span class="st-t">Used once, then wiped</span></button>
+        </div>
+
+        <div class="flow-cap" aria-live="polite">
+          <span class="fc-step" id="fcStep">Stage 01</span>
+          <h4 id="fcTitle">A tool asks for a secret</h4>
+          <p id="fcText">On your Mac, some tool needs a secret to do its job, maybe to read a password or connect to a server. Instead of prompting you at the machine, Latch begins a request bound to this exact command.</p>
+        </div>
+        <div class="flow-controls">
+          <button id="flowPrev">Back</button>
+          <span class="count" id="flowCount">1 / 8</span>
+          <button id="flowNext">Next</button>
+        </div>
+      </div>
+      <figcaption>Every stage happens for this one command. No half-key, and no unscrambled secret, survives past the wipe at the end.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ===================== 06 PHONE NEVER SEES SECRET ===================== -->
+  <section class="chapter reveal">
+    <div class="ch-head"><span class="ch-num">06</span><p class="eyebrow">A subtle, important point</p></div>
+    <h2>Your phone never sees the secret itself</h2>
+    <div class="prose">
+      <p class="lead">It is natural to assume the secret travels to your phone for approval. It does not. The phone never receives the password, the token, or the unscrambled value. Not once.</p>
+      <p>What the phone receives is more like a math puzzle: a meaningless number tied to this request. Inside its sealed vault, the phone does one calculation with its half-key and that number, and sends back the answer, which is just another number. That answer is the phone's half of the unlock. The actual secret stays on the Mac the entire time, and the combining happens there.</p>
+      <p>So even if your phone were completely taken over, the attacker would find no secrets on it to steal. There are none there. The phone is a hand that turns half of a lock. It never holds what is behind the lock.</p>
+    </div>
+
+    <figure class="plate reveal">
+      <div class="plate-frame plate-scroll">
+        <p class="plate-title">What actually crosses to the phone</p>
+        <svg viewBox="0 0 720 236" role="img" width="720" height="236" aria-label="The Mac sends the phone only a meaningless number. The phone's vault computes an answer number and returns it. The secret itself never leaves the Mac.">
+          <!-- Mac -->
+          <rect x="40" y="64" width="150" height="120" rx="9" class="s-card"/>
+          <text x="115" y="54" text-anchor="middle" class="t-faint lbl-cap">mac</text>
+          <rect x="66" y="96" width="46" height="42" rx="7" class="s-cobalt-f"/>
+          <path d="M74 96 v-8 a15 15 0 0 1 30 0 v8" class="s-cobalt"/>
+          <text x="89" y="158" text-anchor="middle" class="t-cobalt lbl-mono" font-size="11">the secret</text>
+          <text x="89" y="172" text-anchor="middle" class="t-faint lbl-mono" font-size="11">stays here</text>
+
+          <!-- send number -->
+          <path d="M196 100 h150" class="s-line"/><path d="M340 94 l8 6 -8 6" class="s-line"/>
+          <rect x="214" y="80" width="116" height="24" rx="6" class="s-well"/>
+          <text x="272" y="97" text-anchor="middle" class="t-mut lbl-mono" font-size="11">a puzzle number</text>
+
+          <!-- return number -->
+          <path d="M346 150 h-150" class="s-line"/><path d="M204 144 l-8 6 8 6" class="s-line"/>
+          <rect x="214" y="130" width="116" height="24" rx="6" class="s-ok-f"/>
+          <text x="272" y="147" text-anchor="middle" class="t-ok lbl-mono" font-size="11">the answer number</text>
+
+          <!-- Phone -->
+          <rect x="354" y="52" width="120" height="144" rx="14" class="s-card"/>
+          <text x="414" y="212" text-anchor="middle" class="t-faint lbl-cap">phone</text>
+          <rect x="372" y="86" width="84" height="66" rx="9" class="s-brass" fill="var(--brass-fill)"/>
+          <text x="414" y="102" text-anchor="middle" class="t-faint lbl-mono" font-size="10">sealed vault</text>
+          <use href="#i-combine" x="398" y="112" width="32" height="32" class="s-brass" style="color:var(--brass)"/>
+          <text x="414" y="168" text-anchor="middle" class="t-brass lbl-mono" font-size="10.5">does the math,</text>
+          <text x="414" y="181" text-anchor="middle" class="t-brass lbl-mono" font-size="10.5">holds no secret</text>
+
+          <!-- secret crossed out on phone side -->
+          <g transform="translate(534,92)">
+            <rect x="0" y="0" width="150" height="52" rx="9" class="s-well"/>
+            <rect x="18" y="12" width="26" height="24" rx="5" class="s-line" fill="var(--surface)"/>
+            <text x="98" y="24" text-anchor="middle" class="t-faint lbl-mono" font-size="10.5">the secret is</text>
+            <text x="98" y="38" text-anchor="middle" class="t-faint lbl-mono" font-size="10.5">never sent here</text>
+            <line x1="10" y1="46" x2="140" y2="6" class="s-deny"/>
+          </g>
+          <text x="609" y="168" text-anchor="middle" class="t-deny lbl-mono" font-size="11">nothing to steal</text>
+        </svg>
+      </div>
+      <figcaption>Only numbers cross the gap. The phone turns a <b>puzzle number</b> into an <b>answer number</b> using its half-key. The secret value itself never leaves the Mac, so a hijacked phone has nothing to give up.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ===================== 07 BLIND MESSENGER ===================== -->
+  <section class="chapter reveal">
+    <div class="ch-head"><span class="ch-num">07</span><p class="eyebrow">Making it work over the internet</p></div>
+    <h2>A postman who cannot read the mail, or forge it</h2>
+    <div class="prose">
+      <p class="lead">When you are away from home, your Mac and phone are not on the same network. Their messages have to travel through a middleman server called a relay. The trick is to need no trust in that middleman at all.</p>
+      <p>Every message between the two is a <strong>sealed envelope</strong>. It is locked with the recipient's padlock, so only the true recipient can open it, and it carries a tamper-proof <strong>wax seal</strong>, a signature that proves it genuinely came from the other device and was not altered. The relay carries these envelopes back and forth and that is all it can do.</p>
+      <p>It cannot read what is inside, because it lacks the key. It cannot forge a message, because it cannot fake the seal. It cannot secretly resend an old envelope to trick a device, because each one is stamped for single use within a short time window. The relay is a postman who ferries locked mail he can neither open nor counterfeit. This is exactly what lets Latch work from anywhere without you having to trust the server in the middle.</p>
+    </div>
+
+    <figure class="plate reveal">
+      <div class="plate-frame plate-scroll">
+        <p class="plate-title">The relay, in the middle, blind</p>
+        <svg viewBox="0 0 720 220" role="img" width="720" height="220" aria-label="The Mac and phone exchange sealed, signed envelopes through a relay server that cannot read, forge, or replay them.">
+          <!-- Mac -->
+          <rect x="40" y="80" width="120" height="90" rx="8" class="s-card"/>
+          <use href="#i-mac" x="78" y="104" width="44" height="44" class="s-line" style="color:var(--muted)"/>
+          <text x="100" y="188" text-anchor="middle" class="t-faint lbl-cap">your mac</text>
+          <!-- relay -->
+          <circle cx="360" cy="110" r="46" class="s-well"/>
+          <use href="#i-relay" x="336" y="86" width="48" height="48" class="s-brass" style="color:var(--brass)"/>
+          <text x="360" y="184" text-anchor="middle" class="t-faint lbl-cap">the relay</text>
+          <!-- blindfold marks -->
+          <path d="M344 100 l10 6 M376 100 l-10 6" class="s-deny"/>
+          <!-- Phone -->
+          <rect x="560" y="72" width="86" height="106" rx="12" class="s-card"/>
+          <use href="#i-phone" x="588" y="102" width="30" height="30" class="s-line" style="color:var(--muted)"/>
+          <text x="603" y="192" text-anchor="middle" class="t-faint lbl-cap">your phone</text>
+
+          <!-- envelope left to relay -->
+          <g>
+            <rect x="176" y="94" width="128" height="34" rx="5" class="s-cobalt-f"/>
+            <path d="M180 98 l60 22 60 -22" class="s-cobalt"/>
+            <circle cx="292" cy="121" r="6" class="s-brass-f"/>
+            <text x="240" y="150" text-anchor="middle" class="t-faint lbl-mono" font-size="10.5">sealed + stamped</text>
+          </g>
+          <!-- envelope relay to phone -->
+          <g>
+            <rect x="416" y="94" width="128" height="34" rx="5" class="s-cobalt-f"/>
+            <path d="M420 98 l60 22 60 -22" class="s-cobalt"/>
+            <circle cx="532" cy="121" r="6" class="s-brass-f"/>
+          </g>
+        </svg>
+      </div>
+      <figcaption>The relay sees only <b>opaque sealed envelopes</b>. It cannot read them (no key), cannot forge them (no seal), and cannot replay them (each is single-use). No trust in the middleman is required.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ===================== 08 GUARANTEES ===================== -->
+  <section class="chapter reveal">
+    <div class="ch-head"><span class="ch-num">08</span><p class="eyebrow">Putting it together</p></div>
+    <h2>What all of this actually guarantees</h2>
+    <div class="prose">
+      <p class="lead">Four plain promises fall out of the split key, the sealed chip, and the blind relay.</p>
+    </div>
+    <div class="cards reveal">
+      <div class="card good">
+        <svg class="ico"><use href="#i-check"/></svg>
+        <div><h4>Approve from anywhere</h4><p>You answer requests from your phone whether you are at your desk, on the couch, or in another city. The work no longer stalls waiting for you to be physically present.</p></div>
+      </div>
+      <div class="card good">
+        <svg class="ico"><use href="#i-check"/></svg>
+        <div><h4>A stolen, powered-off Mac is gibberish</h4><p>At rest the Mac holds only scrambled secrets and one useless half-key. Without the phone's half, there is nothing to unscramble. A thief with your laptop gets noise.</p></div>
+      </div>
+      <div class="card good">
+        <svg class="ico"><use href="#i-check"/></svg>
+        <div><h4>A hijacked Mac cannot help itself</h4><p>Malware on the Mac holds only half a key. It cannot produce a secret on its own; it can only ask your phone, which needs your face for every single answer.</p></div>
+      </div>
+      <div class="card good">
+        <svg class="ico"><use href="#i-check"/></svg>
+        <div><h4>The phone knows nothing about your secrets</h4><p>The phone only ever does a piece of math with a number. It never receives, stores, or displays the secret value, so a compromised phone has nothing to leak.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== 09 LIMITS ===================== -->
+  <section class="chapter reveal">
+    <div class="ch-head"><span class="ch-num">09</span><p class="eyebrow">Told straight</p></div>
+    <h2>The honest limits, not hidden</h2>
+    <div class="prose">
+      <p class="lead">No design is magic, and pretending otherwise would be the real security flaw. Here are the two limits Latch does not remove, explained plainly.</p>
+    </div>
+    <div class="cards reveal">
+      <div class="card limit">
+        <svg class="ico"><use href="#i-alert"/></svg>
+        <div><h4>One brief moment in the open</h4><p>When a tool finally runs, it genuinely needs the secret to do its job, so for that instant the secret exists unscrambled on the Mac. This is unavoidable: a secret nobody can ever read is a secret nobody can ever use. Latch keeps that window as short as physically possible and wipes it immediately after.</p></div>
+      </div>
+      <div class="card limit">
+        <svg class="ico"><use href="#i-alert"/></svg>
+        <div><h4>An approved request does deliver that secret</h4><p>If someone has fully taken over your Mac and, at that same moment, you approve a request on your phone, that one secret is used for that one command. Latch gates the release; it cannot police what an already-approved command then does with it.</p></div>
+      </div>
+    </div>
+
+    <div class="reassure reveal">
+      <svg class="ico"><use href="#i-face"/></svg>
+      <p><strong>Which is why your attention is the real last line of defence.</strong> Your phone shows you exactly what is being asked, from which program, on which machine, before you approve. If a request appears that you did not expect or did not start, declining it is the whole defence, and declining is always a single calm tap. Latch is built so that the safe choice is the easy one.</p>
+    </div>
+  </section>
+
+  <!-- ===================== CLOSING ===================== -->
+  <section class="closing reveal">
+    <p class="eyebrow">The shape of it</p>
+    <h2>Cryptography doing the work, not a promise</h2>
+    <p>Notice what Latch never asks you to trust: not the network, not the relay server, not even the Mac by itself. The safety does not rest on a company keeping a promise or a server behaving. It rests on the plain fact that half a key opens nothing, and that the phone's half is created fresh, by your face, only for the request in front of you.</p>
+
+    <dl class="glossary">
+      <dt>Public key (padlock)</dt>
+      <dd>A lock you can hand out freely. Anyone can click it shut; only your private key reopens it.</dd>
+      <dt>Private key</dt>
+      <dd>The one key that opens your padlock. You keep it and never share it.</dd>
+      <dt>Encryption</dt>
+      <dd>Scrambling a readable secret into noise that only the right key can turn back.</dd>
+      <dt>Secure Enclave</dt>
+      <dd>A sealed chip in your phone. It can compute with its half-key, but the half-key can never leave it.</dd>
+      <dt>Split key (two halves)</dt>
+      <dd>A lock that opens only when the Mac's half and the phone's half are combined. Neither alone works.</dd>
+      <dt>Blind relay</dt>
+      <dd>A middleman server that only ferries sealed envelopes. It cannot read, forge, or resend them.</dd>
+    </dl>
+
+    <p class="footline">latch · how the security works · a plain-language explainer of the per-request, two-half design · July 2026</p>
+  </section>
+
+</div>
+
+<script>
+  (function () {
+    var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    /* scroll reveal */
+    var reveals = Array.prototype.slice.call(document.querySelectorAll(".reveal"));
+    if (reduce || !("IntersectionObserver" in window)) {
+      reveals.forEach(function (el) { el.classList.add("in"); });
+    } else {
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+          if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); }
+        });
+      }, { rootMargin: "0px 0px -8% 0px", threshold: 0.08 });
+      reveals.forEach(function (el) { io.observe(el); });
+    }
+
+    /* split-key toggle */
+    var btnOne = document.getElementById("keyBtnOne");
+    var btnTwo = document.getElementById("keyBtnTwo");
+    var paneOne = document.getElementById("paneOne");
+    var paneTwo = document.getElementById("paneTwo");
+    function setKey(which) {
+      var one = which === "one";
+      btnOne.setAttribute("aria-pressed", one ? "true" : "false");
+      btnTwo.setAttribute("aria-pressed", one ? "false" : "true");
+      paneOne.classList.toggle("on", one);
+      paneTwo.classList.toggle("on", !one);
+    }
+    btnOne.addEventListener("click", function () { setKey("one"); });
+    btnTwo.addEventListener("click", function () { setKey("two"); });
+
+    /* per-request step-through */
+    var steps = [
+      { s: "Stage 01", t: "A tool asks for a secret",
+        p: "On your Mac, some tool needs a secret to do its job, maybe to read a password or connect to a server. Instead of prompting you at the machine, Latch begins a request bound to this exact command." },
+      { s: "Stage 02", t: "The Mac seals a request",
+        p: "The Mac works out its own half-key, then packs a request into a sealed, signed envelope addressed to your phone. Inside is the puzzle number the phone will answer, never the secret itself." },
+      { s: "Stage 03", t: "A blind relay carries it",
+        p: "If you are away, the envelope travels through a relay server. The relay cannot read it, forge it, or resend it. It only ferries the locked envelope onward to your phone." },
+      { s: "Stage 04", t: "Your phone checks it is genuine",
+        p: "Before doing anything, the phone verifies the envelope truly came from your paired Mac and has not been seen before. Only a real, fresh, unaltered request gets any further. A forged one is dropped." },
+      { s: "Stage 05", t: "Face ID wakes the vault",
+        p: "The phone shows you the command and what it wants. When you approve with Face ID, and only then, the sealed chip computes its half-key answer for this one request. No face, no answer." },
+      { s: "Stage 06", t: "The half returns, sealed",
+        p: "The phone's answer, just a number, travels back inside its own sealed, single-use envelope. It is tied to this exact request, so it is useless for any other." },
+      { s: "Stage 07", t: "The Mac combines both halves",
+        p: "The Mac now has both halves. It combines them into the one key, and uses it to unscramble the secret for this single command. This is the only moment a full key exists, and only in memory." },
+      { s: "Stage 08", t: "Used once, then wiped",
+        p: "The secret is handed to the command that needed it, and the key and both halves are immediately erased from memory. The next request must start the whole dance again, with a fresh tap of your face." }
+    ];
+    var track = document.getElementById("flowTrack");
+    var stations = Array.prototype.slice.call(track.querySelectorAll(".station"));
+    var fcStep = document.getElementById("fcStep");
+    var fcTitle = document.getElementById("fcTitle");
+    var fcText = document.getElementById("fcText");
+    var count = document.getElementById("flowCount");
+    var cur = 0;
+
+    function render(i) {
+      cur = i;
+      stations.forEach(function (b, idx) { b.setAttribute("aria-pressed", idx === i ? "true" : "false"); });
+      fcStep.textContent = steps[i].s;
+      fcTitle.textContent = steps[i].t;
+      fcText.textContent = steps[i].p;
+      count.textContent = (i + 1) + " / " + steps.length;
+      var active = stations[i];
+      if (active && active.scrollIntoView) {
+        active.scrollIntoView({ block: "nearest", inline: "center", behavior: reduce ? "auto" : "smooth" });
+      }
+    }
+    stations.forEach(function (b, idx) {
+      b.addEventListener("click", function () { render(idx); });
+    });
+    document.getElementById("flowPrev").addEventListener("click", function () {
+      render((cur - 1 + steps.length) % steps.length);
+    });
+    document.getElementById("flowNext").addEventListener("click", function () {
+      render((cur + 1) % steps.length);
+    });
+    render(0);
+  })();
+</script>

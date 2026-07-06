@@ -1,0 +1,245 @@
+name: release
+
+# Tag-triggered: `git tag v0.2.0 && git push origin v0.2.0`. Every publishing
+# job below is gated on the secret(s) it needs (see docs/RELEASE.md for the
+# full checklist), so this workflow is safe to merge before any secret exists:
+# a job whose secret is missing logs a warning and no-ops its remaining steps
+# (still reports success, never failure), and the jobs that need no secret
+# (the CLI build) still run and still produce a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the GitHub Release, upload assets
+  packages: write # push the relay image to GHCR
+
+jobs:
+  # ---------------------------------------------------------------------
+  # CLI: cross-compiled `latch` + `latch-config`, tarball + sha256 per arch.
+  # No secrets needed - always runs.
+  # ---------------------------------------------------------------------
+  rust-cli:
+    name: cli (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/release/package-cli.sh ${{ matrix.target }} ${{ github.ref_name }} dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Combine both archs' checksums into one file and render the (unpublished)
+  # Homebrew formula. Always runs; depends only on rust-cli.
+  cli-release-assets:
+    name: cli (checksums + homebrew formula)
+    needs: rust-cli
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          path: dist
+          merge-multiple: true
+      - name: combined checksums
+        run: |
+          cd dist
+          cat ./*.sha256 > SHA256SUMS.txt
+      - name: render homebrew formula (unpublished - see docs/RELEASE.md)
+        run: |
+          ./scripts/release/render-homebrew-formula.sh \
+            "${{ github.ref_name }}" "${{ github.repository }}" dist/sigil.rb dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-release-assets
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/SHA256SUMS.txt
+            dist/sigil.rb
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # iOS: Sigil -> TestFlight. Needs the Rainnworks App Store Connect API key.
+  # ---------------------------------------------------------------------
+  ios:
+    name: ios (TestFlight)
+    runs-on: macos-latest
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+      IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+    steps:
+      # Step (not job) `if:` cannot read the `secrets` context directly (a
+      # GitHub Actions restriction - actionlint flags it); the job-level
+      # `env:` block above mirrors each secret so steps gate on `env.*`
+      # instead.
+      - name: skip if secrets are not configured yet
+        if: ${{ env.ASC_API_KEY_P8 == '' }}
+        run: |
+          echo "::warning::ASC_API_KEY_P8 not set - skipping the iOS TestFlight upload. See docs/RELEASE.md."
+          exit 0
+      - uses: actions/checkout@v4
+        if: ${{ env.ASC_API_KEY_P8 != '' }}
+      - uses: ruby/setup-ruby@v1
+        if: ${{ env.ASC_API_KEY_P8 != '' }}
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: fastlane
+      - uses: oven-sh/setup-bun@v2
+        if: ${{ env.ASC_API_KEY_P8 != '' }}
+      - name: bun install
+        if: ${{ env.ASC_API_KEY_P8 != '' }}
+        working-directory: apps/phone
+        run: bun install --frozen-lockfile
+      # apps/phone/ios is gitignored (Expo CNG, see apps/phone/.gitignore) -
+      # regenerate the native project fresh from app.json for every release.
+      - name: expo prebuild
+        if: ${{ env.ASC_API_KEY_P8 != '' }}
+        working-directory: apps/phone
+        run: bunx expo prebuild -p ios
+      - name: pod install
+        if: ${{ env.ASC_API_KEY_P8 != '' }}
+        working-directory: apps/phone/ios
+        run: pod install
+      - name: fastlane ios beta
+        if: ${{ env.ASC_API_KEY_P8 != '' }}
+        run: bundle exec fastlane ios beta
+        working-directory: fastlane
+
+  # ---------------------------------------------------------------------
+  # macOS: Latch configurator -> notarized, stapled DMG. Needs its own ASC
+  # API key (see fastlane/Fastfile's comment: separate team from iOS until
+  # #35 migrates the Mac identity to Rainnworks).
+  # ---------------------------------------------------------------------
+  mac:
+    name: mac (notarized DMG)
+    runs-on: macos-latest
+    env:
+      MAC_ASC_KEY_ID: ${{ secrets.MAC_ASC_KEY_ID }}
+      MAC_ASC_ISSUER_ID: ${{ secrets.MAC_ASC_ISSUER_ID }}
+      MAC_ASC_API_KEY_P8: ${{ secrets.MAC_ASC_API_KEY_P8 }}
+      MAC_TEAM_ID: ${{ secrets.MAC_TEAM_ID }}
+    steps:
+      - name: skip if secrets are not configured yet
+        if: ${{ env.MAC_ASC_API_KEY_P8 == '' }}
+        run: |
+          echo "::warning::MAC_ASC_API_KEY_P8 not set - skipping the macOS build/notarize. See docs/RELEASE.md."
+          exit 0
+      - uses: actions/checkout@v4
+        if: ${{ env.MAC_ASC_API_KEY_P8 != '' }}
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ env.MAC_ASC_API_KEY_P8 != '' }}
+      - uses: ruby/setup-ruby@v1
+        if: ${{ env.MAC_ASC_API_KEY_P8 != '' }}
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: fastlane
+      - name: brew install xcodegen
+        if: ${{ env.MAC_ASC_API_KEY_P8 != '' }}
+        run: brew install xcodegen
+      - name: fastlane mac release
+        if: ${{ env.MAC_ASC_API_KEY_P8 != '' }}
+        run: bundle exec fastlane mac release
+        working-directory: fastlane
+      - uses: actions/upload-artifact@v4
+        if: ${{ env.MAC_ASC_API_KEY_P8 != '' }}
+        with:
+          name: mac-dmg
+          path: build/mac/Latch.dmg
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # Relay: Cloudflare Worker deploy. Needs CLOUDFLARE_API_TOKEN.
+  # ---------------------------------------------------------------------
+  relay-deploy:
+    name: relay (wrangler deploy)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relay
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: skip if secrets are not configured yet
+        if: ${{ env.CLOUDFLARE_API_TOKEN == '' }}
+        run: |
+          echo "::warning::CLOUDFLARE_API_TOKEN not set - skipping the Worker deploy. See docs/RELEASE.md and relay/DEPLOY.md."
+          exit 0
+      - uses: actions/checkout@v4
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
+      - uses: actions/setup-node@v4
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
+        with:
+          node-version: 22
+      - run: npm ci
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
+      - name: wrangler deploy
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
+        run: npx wrangler deploy
+
+  # ---------------------------------------------------------------------
+  # Relay: Docker image -> GHCR. Only needs the built-in GITHUB_TOKEN
+  # (packages: write, granted above), so this always runs on a tag.
+  # ---------------------------------------------------------------------
+  relay-docker:
+    name: relay (docker -> ghcr)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: lowercase the image owner (GHCR requires it)
+        id: owner
+        run: echo "lower=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: relay
+          push: true
+          tags: |
+            ghcr.io/${{ steps.owner.outputs.lower }}/sigil-relay:${{ github.ref_name }}
+            ghcr.io/${{ steps.owner.outputs.lower }}/sigil-relay:latest
+
+  # ---------------------------------------------------------------------
+  # Publish the GitHub Release once whatever above ran settles. `ios`, `mac`,
+  # and `relay-deploy` report *success* even when their secret is missing
+  # (they early-exit a step with a warning rather than failing the job - see
+  # each job's first step), so `needs` is satisfied either way; `!cancelled()`
+  # just makes sure a genuine failure elsewhere still stops the release.
+  # ---------------------------------------------------------------------
+  github-release:
+    name: github release
+    needs: [cli-release-assets, ios, mac, relay-deploy, relay-docker]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: cli-release-assets
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        continue-on-error: true # absent when the mac job was skipped
+        with:
+          name: mac-dmg
+          path: release-assets
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true

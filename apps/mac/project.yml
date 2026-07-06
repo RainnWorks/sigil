@@ -1,0 +1,43 @@
+# xcodegen spec for the Latch Mac app.
+#
+# Why xcodegen over a raw Swift Package: a menubar + configurator app needs an
+# app *bundle* (Info.plist with LSUIElement, an entitlements file for the Secure
+# Enclave / keychain-access-group, a MenuBarExtra agent app) that SwiftPM's
+# executable target cannot express. project.yml is a small, reviewable, in-repo
+# source of truth that regenerates the .xcodeproj deterministically:
+#   cd apps/mac && xcodegen generate
+name: Latch
+options:
+  bundleIdPrefix: co.rowm.latch
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+  defaultConfig: Debug
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    PRODUCT_NAME: Latch
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_HARDENED_RUNTIME: YES
+    GENERATE_INFOPLIST_FILE: NO
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: YES
+    GCC_TREAT_WARNINGS_AS_ERRORS: YES
+targets:
+  Latch:
+    type: application
+    platform: macOS
+    sources:
+      - path: Latch
+        excludes:
+          - "**/*.md"
+    settings:
+      base:
+        INFOPLIST_FILE: Latch/App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Latch/App/Latch.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: co.rowm.latch
+        CODE_SIGN_STYLE: Automatic
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+        ENABLE_PREVIEWS: YES

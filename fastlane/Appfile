@@ -1,0 +1,6 @@
+# Deliberately near-empty. This repo builds two unrelated Apple targets under
+# two different bundle ids (and, until #35 lands, two different Apple
+# Developer teams: the iOS app is already on Rainnworks, the macOS app is
+# still on the old Rowm LTD team) — a single global app_identifier/team_id
+# pair here would be wrong for one of them. Each lane in Fastfile sets its own
+# bundle id and team id explicitly instead.

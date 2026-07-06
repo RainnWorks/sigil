@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sigil relay</title>
+<meta name="description" content="A blind mailbox for remote approvals. It moves sealed envelopes it cannot open, addressed by hashes it cannot reverse. Safe to run wide open, because there is nothing here to protect.">
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #121519;
+    --ink: #e8ebee;
+    --muted: #8b949e;
+    --faint: #5b636c;
+    --line: #22272e;
+    --accent: #7dd3c0;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: radial-gradient(1200px 600px at 50% -10%, #14181d 0%, var(--bg) 55%);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+  }
+  .wrap { max-width: 40rem; margin: 0 auto; padding: 6rem 1.5rem 4rem; }
+  .mark {
+    width: 40px; height: 40px; border: 1.5px solid var(--accent);
+    border-radius: 9px; display: grid; place-items: center;
+    color: var(--accent); font-family: var(--mono); font-size: 1.15rem;
+    box-shadow: 0 0 24px -8px var(--accent); margin-bottom: 1.75rem;
+  }
+  h1 {
+    font-family: var(--mono); font-size: 1.6rem; font-weight: 600;
+    letter-spacing: -0.01em; margin: 0 0 0.35rem;
+  }
+  h1 .cursor { color: var(--accent); font-weight: 400; }
+  .tag { color: var(--muted); font-size: 1.05rem; margin: 0 0 2.5rem; }
+  p { color: #cdd3d9; margin: 0 0 1.15rem; }
+  p.lead { font-size: 1.08rem; }
+  strong { color: var(--ink); font-weight: 600; }
+  .rule { height: 1px; background: var(--line); border: 0; margin: 2.5rem 0; }
+  h2 {
+    font-family: var(--mono); font-size: 0.78rem; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint);
+    margin: 0 0 1rem;
+  }
+  .cards { display: grid; gap: 0.9rem; grid-template-columns: 1fr 1fr; }
+  @media (max-width: 34rem) { .cards { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 1.1rem 1.15rem;
+  }
+  .card h3 { margin: 0 0 0.35rem; font-size: 0.95rem; }
+  .card p { color: var(--muted); font-size: 0.9rem; margin: 0 0 0.75rem; }
+  .card .host { color: var(--accent); font-family: var(--mono); font-size: 0.85rem; }
+  code, pre {
+    font-family: var(--mono); font-size: 0.82rem;
+    background: #0c0f12; border: 1px solid var(--line); border-radius: 7px;
+  }
+  code { padding: 0.12rem 0.4rem; color: #cdd3d9; }
+  pre { padding: 0.7rem 0.8rem; margin: 0; overflow-x: auto; color: #cdd3d9; }
+  footer {
+    margin-top: 3.5rem; padding-top: 1.5rem; border-top: 1px solid var(--line);
+    color: var(--faint); font-size: 0.85rem;
+    display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap;
+  }
+  footer a { color: var(--muted); text-decoration: none; }
+  footer a:hover { color: var(--ink); }
+</style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="mark" aria-hidden="true">&#9670;</div>
+    <h1>sigil relay<span class="cursor">_</span></h1>
+    <p class="tag">A blind mailbox for remote approvals.</p>
+
+    <p class="lead">This is a relay for <strong>Sigil</strong>, the instrument that gates
+    your command-line secrets behind a tap on your phone.</p>
+
+    <p>It is deliberately powerless. It moves <strong>sealed envelopes it cannot
+    open</strong>, addressed by hashes it cannot reverse. It never sees a secret, a
+    command, an account, or who you are. It stores nothing: a message lives in
+    memory only long enough to hand it to the other side, then it is gone.</p>
+
+    <p>That is why it is safe to run wide open. <strong>No accounts, no passwords,
+    nothing to configure or trust</strong>, because there is nothing here to protect.
+    The security is in the sealing, not the server.</p>
+
+    <hr class="rule">
+
+    <h2>Reach it</h2>
+    <div class="cards">
+      <div class="card">
+        <h3>Use this one</h3>
+        <p>The free default, run by Rainnworks. Nothing to set up.</p>
+        <span class="host">relay.rainn.works</span>
+      </div>
+      <div class="card">
+        <h3>Run your own</h3>
+        <p>The whole relay is one stateless worker. Point Sigil at it.</p>
+        <pre>docker run -p 8787:8787 ghcr.io/rainnworks/sigil-relay:latest</pre>
+      </div>
+    </div>
+
+    <footer>
+      <span>Sigil, by Rainnworks</span>
+      <a href="https://github.com/rainnworks/sigil">Source and self-host guide</a>
+    </footer>
+  </main>
+</body>
+</html>
