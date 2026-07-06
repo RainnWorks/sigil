@@ -44,7 +44,7 @@ push would need a per-user Apple developer certificate, which a free,
 many-user product can't ask users for. So **the relay itself signs and sends
 the APNs doorbell**, using one Rainnworks-held key shared by every mailbox
 (`shared/push.ts`, ported from what used to be the daemon's
-`crates/latch/src/apns.rs`). The daemon carries zero Apple secret.
+`crates/sigil/src/apns.rs`). The daemon carries zero Apple secret.
 
 **v5 (this build)** replaces v4's instant-return GET with long-poll: an empty
 slot holds the request open instead of returning `{"envelopes":[]}` right
@@ -71,7 +71,7 @@ persisted; the key lives only as a platform secret (`wrangler secret put
 APNS_KEY_P8` / an env var or a 0600 file for Bun), never in a mailbox's data.
 What is unchanged: the relay still cannot read a secret, forge an approval, or
 learn an outcome — every envelope stays opaque, sealed end to end by
-`crates/proto`, and the push body is fixed and generic (`"Approval
+`crates/sigil-proto`, and the push body is fixed and generic (`"Approval
 requested"`, no caller, command, account, or reason). The residual is a
 real one: compromise of the relay's process (not just its traffic) now also
 exposes one shared APNs signing key and momentary access to whichever push

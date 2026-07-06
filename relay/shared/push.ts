@@ -1,6 +1,6 @@
 // The APNs push "doorbell": a content-free notification the relay sends on the
 // PUBLISHER's behalf to wake a paired phone so it drains the real, sealed
-// request waiting for it. Ported from crates/latch/src/apns.rs (which used to
+// request waiting for it. Ported from crates/sigil/src/apns.rs (which used to
 // live on the daemon) to here, because the ES256 signing key is a publisher
 // secret: Sigil is a free, many-user product with one shared relay, and no
 // user's Mac can be trusted to hold Rainnworks' APNs key. The relay is the one
@@ -22,7 +22,7 @@ const APNS_TOPIC = "works.rainn.sigil";
 const APNS_TEAM_ID = "53W966FBFP";
 const APNS_KEY_ID = "5PCK76SDBA";
 
-/** Refresh the JWT before Apple's ~60 minute cap; see crates/latch/src/apns.rs
+/** Refresh the JWT before Apple's ~60 minute cap; see crates/sigil/src/apns.rs
  * for why ~50 minutes is the sweet spot. */
 const JWT_REFRESH_MS = 50 * 60 * 1000;
 /** How long a single APNs POST may take before giving up (fail-open). */

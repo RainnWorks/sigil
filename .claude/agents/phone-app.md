@@ -16,7 +16,7 @@ You are the mobile engineer for Latch. You own `apps/phone`: the approver app, w
 - Risk scales the approve control only: routine = tap, elevated = slide, critical = hold 1.5s with ring fill. Native haptics on commit. Reduced-motion collapses the gauge to a numeric countdown.
 - Push is a content-free doorbell ("Approval requested" + opaque ids). The notification service extension (iOS) / FCM data handler (Android) fetches the sealed request down the transport ladder (LAN → owned endpoint → relay) and rewrites the notification on-device. Notification actions never approve by themselves.
 - Request-read key vs approval key split: displaying request metadata is passcode-tier; authorizing release is biometric-tier. Keep the two paths separate in code.
-- All protocol logic (envelope open/seal, signature verify, counters, fingerprint words) must byte-match `crates/proto`; test vectors are exported from the Rust crate, and the JS/TS implementation must pass them in CI. Never hand-roll crypto; use libsodium bindings.
+- All protocol logic (envelope open/seal, signature verify, counters, fingerprint words) must byte-match `crates/sigil-proto`; test vectors are exported from the Rust crate, and the JS/TS implementation must pass them in CI. Never hand-roll crypto; use libsodium bindings.
 - History mirrors the daemon audit log locally (SQLite), stores names and metadata, never values.
 
 ## Definition of done
