@@ -91,7 +91,10 @@ export function ApprovalSheet({
         setGateNote(
           outcome === "refused"
             ? "Face ID did not pass. Nothing was approved."
-            : "Couldn't send that. Nothing was approved.",
+            : // Neutral about cause (a local seal error or an unreachable relay are
+              // indistinguishable here and both fail closed); never a claim about
+              // the Mac, and never mislabeling a pre-network fault as a send.
+              "That didn't go through. Nothing was approved.",
         );
         return;
       }
