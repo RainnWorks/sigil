@@ -1,4 +1,4 @@
-# Latch approver (apps/phone)
+# Sigil approver (apps/phone)
 
 The phone is the product's second factor: it holds the device identity keys and
 the DEK wrap, and it never sees a service-account token or a secret value. One

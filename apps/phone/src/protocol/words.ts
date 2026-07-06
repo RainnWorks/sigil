@@ -1,6 +1,6 @@
 /**
  * The 256-word fingerprint list. MUST stay byte-identical to `WORDS` in
- * crates/proto/src/fingerprint.rs; the six-word pairing checksum is derived by
+ * crates/sigil-proto/src/fingerprint.rs; the six-word pairing checksum is derived by
  * indexing this list with hash bytes, so any divergence makes two honest
  * devices read different words and the ceremony fails closed. Guarded by a
  * shared test vector (see vectors.contract.ts).

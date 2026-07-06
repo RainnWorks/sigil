@@ -31,7 +31,7 @@ export interface SessionConfig {
   transport: Transport;
 }
 
-export class LatchSession {
+export class SigilSession {
   private readonly inboundGuard = new ReplayGuard();
   private outboundCounter = 0;
   private unsubscribe: (() => void) | null = null;

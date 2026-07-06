@@ -1,7 +1,7 @@
 /**
  * The live session controller: the single place the app arms the real transport
  * and dispatches decisions over it. It ties together the keystore (the stored
- * pairing), the {@link PhoneRelay} transport, and the {@link LatchSession} crypto.
+ * pairing), the {@link PhoneRelay} transport, and the {@link SigilSession} crypto.
  *
  * Two tiers, kept apart exactly as the keystore stores them:
  *   - Arming is a read-path action: it loads the passcode-tier identity, starts
@@ -27,14 +27,14 @@ import {
   toBase64,
 } from "@/src/protocol";
 
-import { computePartial, isSecureEnclaveAvailable } from "@/modules/latch-se";
+import { computePartial, isSecureEnclaveAvailable } from "@/modules/sigil-se";
 import { store } from "@/src/state/store";
 import { PhoneRelay } from "@/src/transport/phone-relay";
-import { LatchSession } from "./session";
+import { SigilSession } from "./session";
 import { clearPairing, loadDek, loadPairing, type StoredPairing } from "./keystore";
 
 interface Live {
-  session: LatchSession;
+  session: SigilSession;
   transport: PhoneRelay;
 }
 
@@ -63,7 +63,7 @@ export async function armLiveSession(): Promise<boolean> {
     base: pairing.relayBase,
     mailbox: pairing.mailbox,
   });
-  const session = new LatchSession({
+  const session = new SigilSession({
     sodium,
     phone: pairing.phone,
     daemonPub: pairing.daemonPub,

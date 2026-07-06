@@ -1,4 +1,4 @@
-// The phone half of Latch v2 threshold decryption: a non-exportable P-256
+// The phone half of Sigil v2 threshold decryption: a non-exportable P-256
 // key-agreement key `f` resident in the Secure Enclave, gated by the current
 // biometric set (Face ID). The private scalar never leaves the enclave; the only
 // value that ever exits is a per-request ECDH partial `Z_F = x(f·E)`, which the
@@ -19,7 +19,7 @@ import Security
 /// itself enclave-wrapped, so it is not usable off this device and reveals no
 /// scalar. The biometric gate lives on the SE key's own access control, enforced
 /// at key-agreement time, not on this keychain item.
-private let kLatchSeService = "co.rowm.latch.se.share"
+private let kSigilSeService = "works.rainn.sigil.se.share"
 
 // MARK: - Errors (mapped to JS promise rejections with stable codes)
 
@@ -65,9 +65,9 @@ internal final class KeychainException: GenericException<OSStatus> {
 
 // MARK: - Module
 
-public final class LatchSeModule: Module {
+public final class SigilSeModule: Module {
   public func definition() -> ModuleDefinition {
-    Name("LatchSe")
+    Name("SigilSe")
 
     // Whether this device has a usable Secure Enclave. False on the Simulator, so
     // the JS layer can fail loudly rather than mint a phantom share.
@@ -174,7 +174,7 @@ public final class LatchSeModule: Module {
 private func baseQuery(_ keyId: String) -> [String: Any] {
   [
     kSecClass as String: kSecClassGenericPassword,
-    kSecAttrService as String: kLatchSeService,
+    kSecAttrService as String: kSigilSeService,
     kSecAttrAccount as String: keyId,
   ]
 }

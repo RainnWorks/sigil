@@ -27,8 +27,8 @@ import {
   toBase64,
 } from "@/src/protocol";
 
-const IDENTITY_KEY = "latch.pairing.identity";
-const DEK_KEY = "latch.pairing.dek";
+const IDENTITY_KEY = "sigil.pairing.identity";
+const DEK_KEY = "sigil.pairing.dek";
 
 /** The passcode-tier record: everything needed to read (not release). */
 export interface StoredPairing {

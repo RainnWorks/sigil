@@ -1,5 +1,5 @@
 /**
- * Device identities, mirroring crates/proto/src/identity.rs.
+ * Device identities, mirroring crates/sigil-proto/src/identity.rs.
  *
  * A device holds an Ed25519 signing key and an X25519 agreement key. On a real
  * phone the private halves live in the Secure Enclave and never surface here;

@@ -1,6 +1,6 @@
 /**
  * The approval request/response payloads: the plaintext that rides *inside* a
- * sealed envelope. This byte-matches crates/proto/src/request.rs (camelCase
+ * sealed envelope. This byte-matches crates/sigil-proto/src/request.rs (camelCase
  * serde on the Rust side); keep the two in lockstep.
  *
  * **Provider-agnostic by design.** The daemon's core is generic: "run this

@@ -1,9 +1,9 @@
 /**
- * The pairing ceremony driver: the phone half of crates/proto's handshake, run
+ * The pairing ceremony driver: the phone half of crates/sigil-proto's handshake, run
  * over the real blind-relay rendezvous. One module holds the in-progress state so
  * the crypto and the screens that drive it stay together.
  *
- * The ceremony, matching docs/design/pairing.md and crates/latch/src/pair.rs:
+ * The ceremony, matching docs/design/pairing.md and crates/sigil/src/pair.rs:
  *   1. scan       - decode the QR, reject a stale one, mint this phone's identity,
  *                   pin the daemon, derive the six SAS words and the rendezvous
  *                   mailbox (the bootstrap channel keyed by daemon id + secret).
@@ -49,13 +49,13 @@ import {
   type Sodium,
 } from "@/src/protocol";
 import { RelayMailbox, relayBaseFromEndpoints } from "@/src/transport/relay-http";
-import { generateShareKey, isSecureEnclaveAvailable } from "@/modules/latch-se";
+import { generateShareKey, isSecureEnclaveAvailable } from "@/modules/sigil-se";
 import { armLiveSession } from "./controller";
 import { savePairing } from "./keystore";
 
 /**
  * The SE share key id. FIXED, and must equal the daemon's `DEFAULT_SE_KEY_ID`
- * ("phone-se.v2", crates/latch/src/threshold.rs): the Mac assigns this id locally
+ * ("phone-se.v2", crates/sigil/src/threshold.rs): the Mac assigns this id locally
  * at pairing and echoes it in every per-request `ThresholdChallenge.seKeyId`, so
  * the phone must store `f` under exactly this id or `computePartial` cannot
  * reload it. Re-pairing overwrites `f` under the same id (recovery = rotation).

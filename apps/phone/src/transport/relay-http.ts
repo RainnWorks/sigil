@@ -51,7 +51,7 @@ export function normalizeRelayBase(url: string): string {
 
 /**
  * Pick the relay endpoint from a QR's endpoint list and normalize it. The daemon
- * carries its relay URL in `endpoints` (crates/latch/src/pair.rs sets
+ * carries its relay URL in `endpoints` (crates/sigil/src/pair.rs sets
  * `endpoints = [relay_url]`); a richer QR may also list `lan://` / `https://ddns`
  * rungs, so select the first http(s)/ws(s) entry. Throws if none is present.
  */

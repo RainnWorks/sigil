@@ -1,5 +1,5 @@
 /**
- * The pairing QR payload, mirroring crates/proto/src/pairing.rs. The Mac renders
+ * The pairing QR payload, mirroring crates/sigil-proto/src/pairing.rs. The Mac renders
  * this into a QR; the phone scans it, pins `daemon`, and opens a channel. The
  * JSON shape matches the Rust `serde_json` form (byte arrays as number arrays,
  * the one-time secret as a 32-number array) and is base64url-encoded without

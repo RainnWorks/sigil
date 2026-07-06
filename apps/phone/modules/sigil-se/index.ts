@@ -1,8 +1,8 @@
 /**
- * The JS face of the Latch Secure Enclave module. It exposes the phone's v2
+ * The JS face of the Sigil Secure Enclave module. It exposes the phone's v2
  * threshold share `f`: a non-exportable P-256 key-agreement key minted in the
  * Secure Enclave under Face ID, whose only output is a per-request partial
- * `Z_F = x(f·E)`. See ios/LatchSeModule.swift and docs/design/threshold-v2.md.
+ * `Z_F = x(f·E)`. See ios/SigilSeModule.swift and docs/design/threshold-v2.md.
  *
  * The native module is iOS-only (the Secure Enclave). On a platform or a build
  * where it is not linked, `requireNativeModule` throws at load; callers gate on
@@ -10,7 +10,7 @@
  */
 import { requireNativeModule } from "expo-modules-core";
 
-interface LatchSeNative {
+interface SigilSeNative {
   isAvailable(): boolean;
   hasShareKey(keyId: string): boolean;
   generateShareKey(keyId: string): Promise<string>;
@@ -18,11 +18,11 @@ interface LatchSeNative {
   deleteShareKey(keyId: string): void;
 }
 
-let cached: LatchSeNative | null = null;
+let cached: SigilSeNative | null = null;
 
 /** Resolve the native module lazily so a missing link surfaces at call sites. */
-function native(): LatchSeNative {
-  if (!cached) cached = requireNativeModule<LatchSeNative>("LatchSe");
+function native(): SigilSeNative {
+  if (!cached) cached = requireNativeModule<SigilSeNative>("SigilSe");
   return cached;
 }
 

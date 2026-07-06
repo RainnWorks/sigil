@@ -1,10 +1,10 @@
 Pod::Spec.new do |s|
-  s.name           = 'LatchSe'
+  s.name           = 'SigilSe'
   s.version        = '1.0.0'
-  s.summary        = 'Latch Secure Enclave P-256 key-agreement (threshold v2 phone share).'
+  s.summary        = 'Sigil Secure Enclave P-256 key-agreement (threshold v2 phone share).'
   s.description    = 'The phone half of the v2 threshold: a non-exportable Secure Enclave P-256 KeyAgreement key f, minted under Face ID, that emits only x(f·E) per request. The private scalar never leaves the enclave.'
-  s.author         = 'Latch'
-  s.homepage       = 'https://rowm.co'
+  s.author         = 'Sigil'
+  s.homepage       = 'https://rainn.works'
   s.license        = { :type => 'MIT' }
   s.platforms      = { :ios => '16.4' }
   s.swift_version  = '5.9'

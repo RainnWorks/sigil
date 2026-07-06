@@ -1,5 +1,5 @@
 /**
- * Replay protection, mirroring crates/proto/src/replay.rs. One guard tracks one
+ * Replay protection, mirroring crates/sigil-proto/src/replay.rs. One guard tracks one
  * pairing in one direction. Three gates must all pass before an authentic
  * envelope is accepted: freshness (timestamp within the window), single use
  * (unseen request id), and a strictly-advancing per-pairing counter. On any

@@ -23,7 +23,7 @@ type Listener = () => void;
  * the REAL empty state and hydrates the stored pairing from the keystore; only an
  * explicit dev flag replaces that with the canned demo data.
  */
-export const DEMO = process.env.EXPO_PUBLIC_LATCH_DEMO === "1";
+export const DEMO = process.env.EXPO_PUBLIC_SIGIL_DEMO === "1";
 
 function initialState(): AppState {
   return DEMO ? demoInitialState() : emptyInitialState();
