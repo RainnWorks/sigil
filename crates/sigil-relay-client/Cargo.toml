@@ -10,7 +10,7 @@ name = "sigil_relay_client"
 path = "src/lib.rs"
 
 [dependencies]
-sigil-proto = { path = "../proto" }
+sigil-proto = { path = "../sigil-proto" }
 # serde_json: (de)serialize the opaque proto::Envelope and build the small slot
 # request/response JSON bodies the relay carries.
 serde_json.workspace = true

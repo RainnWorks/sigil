@@ -37,10 +37,10 @@ name = "sigil-config"
 path = "src/bin/sigil-config.rs"
 
 [dependencies]
-sigil-proto = { path = "../proto" }
+sigil-proto = { path = "../sigil-proto" }
 # sigil-relay-client: the daemon's outbound-WebSocket Transport to the blind
 # relay, wired behind the phone approving factor at arm time.
-sigil-relay-client = { path = "../relay-client" }
+sigil-relay-client = { path = "../sigil-relay-client" }
 serde.workspace = true
 serde_json.workspace = true
 # anyhow only at the binary edge, per house rules.
@@ -95,7 +95,7 @@ sha2 = "0.10"
 # sigil-softphone: the reference approver, used by the remote e2e integration
 # test to stand in for a paired phone. Dev-only; never linked into the daemon.
 [dev-dependencies]
-sigil-softphone = { path = "../softphone" }
+sigil-softphone = { path = "../sigil-softphone" }
 # ed25519-dalek: cryptographically verify the agent's SSH signatures in tests
 # (raw ed25519 over the challenge), against the served public key. Already in the
 # tree via ssh-key/proto; a dev-dep so it never adds to the shipped binary.

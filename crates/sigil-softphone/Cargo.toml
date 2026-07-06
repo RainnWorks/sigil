@@ -16,7 +16,7 @@ name = "sigil-softphone"
 path = "src/main.rs"
 
 [dependencies]
-sigil-proto = { path = "../proto" }
+sigil-proto = { path = "../sigil-proto" }
 # thiserror: typed library errors across the proto seams (pairing, envelope,
 # transport). anyhow only at the binary edge, per house rules.
 thiserror.workspace = true
