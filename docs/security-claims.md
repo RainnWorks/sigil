@@ -454,6 +454,20 @@ binary, disagreeing with `ProxyStatus.real` (which uses `alias_target`, correct)
 Display-only; no execution/security impact. Recommend `find_real` exclude against
 `alias_target()` (or both) for correct post-split diagnostics.
 
+**RESOLVED (`0fc85a9`).** Both notes landed and are verified sound. `find_real`
+now delegates to a testable pure core `find_real_in(cmd, path, own, alias_target,
+proxy_dir)` that applies **rule 2** (skip any candidate whose parent dir
+canonicalises to the proxy dir — so a non-symlink executable planted in
+`~/.latch/bin` is excluded, closing the daemon-up credential-injection corner and
+making the hard-copy-in-proxy-dir case resolve to the real tool instead of
+fail-closed-looping) **and rule 1 against both `own_binary()` and
+`alias_target()`** (so from `latch-config` the alias is excluded and `list`/`doctor`
+`.real` agrees with `ProxyStatus.real`). Proven by
+`paths::find_real_skips_a_non_symlink_planted_in_the_proxy_dir` and
+`find_real_excludes_via_own_and_alias_target`; the design doc's rule 1/2 wording
+was aligned so code and brief agree. Note A/B closed; §18 is now sound with no
+open recommendations.
+
 ---
 
 ## Residuals (honest limits)
