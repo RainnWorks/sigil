@@ -1,8 +1,8 @@
 //  DaemonClient.swift
 //  The seam between the app and the daemon. Everything the GUI does must also be
 //  possible headless via the `sigil` CLI, so this protocol is deliberately a
-//  thin mirror of the CLI verbs (crates/latch/src/cli.rs) and the local control
-//  protocol (crates/latch/src/local.rs Frame/Reply).
+//  thin mirror of the CLI verbs (crates/sigil/src/cli.rs) and the local control
+//  protocol (crates/sigil/src/local.rs Frame/Reply).
 //
 //  Two implementations exist, mirroring how the phone app shipped a mock
 //  transport alongside the real one:

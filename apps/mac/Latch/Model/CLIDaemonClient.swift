@@ -4,7 +4,7 @@
 //  mutations that the least-privilege split (PROTOCOL.md) keeps out of the daemon
 //  — account add/rotate/remove + list, settings, wipe, mac-approvals, shim
 //  install, unpair, and the pairing NDJSON ceremony. Those `--json` shapes are
-//  specified in crates/latch/JSON.md.
+//  specified in crates/sigil/JSON.md.
 //
 //  It still conforms to the full DaemonClient (its status/doctor/leases/history/
 //  pending/control verbs shell out too) so it remains a usable headless client on
@@ -385,7 +385,7 @@ private final class PairingStdin: @unchecked Sendable {
 private struct ControlDTO: Decodable { let ok: Bool; let lines: [String] }
 
 // Shared with SocketDaemonClient: the socket's Reply.json bodies are these exact
-// shapes (crates/latch/src/json.rs), so they are decoded in one place only.
+// shapes (crates/sigil/src/json.rs), so they are decoded in one place only.
 struct StatusDTO: Decodable {
     struct Shim: Decodable { let kind: String; let path: String?; let issue: String? }
     struct Op: Decodable { let found: Bool; let path: String? }
@@ -431,7 +431,7 @@ private struct AccountDTO: Decodable {
 }
 
 /// `sigil-config source list --json`: the generic source shape
-/// (crates/latch/src/config.rs `Source`). Only the env-file entries turn into
+/// (crates/sigil/src/config.rs `Source`). Only the env-file entries turn into
 /// an `Account` here; 1Password sources are the separate credential store
 /// decoded by `AccountDTO` above, so a `provider: "1password"` source (if one
 /// ever exists here too) is not double-counted.

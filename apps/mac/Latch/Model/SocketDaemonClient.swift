@@ -6,7 +6,7 @@
 //
 //  There is one interface, two renderers: this client is the second socket client
 //  alongside the human `sigil` CLI. The wire is the Frame/Reply protocol in
-//  crates/latch/src/local.rs; the json bodies are the DTOs in crates/latch/src/
+//  crates/sigil/src/local.rs; the json bodies are the DTOs in crates/sigil/src/
 //  json.rs, decoded here by the same structs CLIDaemonClient uses (StatusDTO,
 //  CheckDTO, LeaseDTO, HistoryDTO, PendingDTO — shared, not duplicated).
 //
@@ -216,7 +216,7 @@ struct SocketDaemonClient: DaemonClient {
 
     // MARK: - Frame encoding / reply decoding
 
-    /// A request frame. Tagged by `kind` on the wire (crates/latch/src/local.rs).
+    /// A request frame. Tagged by `kind` on the wire (crates/sigil/src/local.rs).
     private enum Frame {
         case status, doctor, leaseList, pending, history, subscribePending
         case lockdown(clear: Bool)

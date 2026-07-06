@@ -1,6 +1,6 @@
 //  Domain.swift
 //  App-facing domain types. These mirror the phone app's src/domain/types.ts and
-//  the daemon's local protocol (crates/latch/src/local.rs, daemon.rs, lease.rs)
+//  the daemon's local protocol (crates/sigil/src/local.rs, daemon.rs, lease.rs)
 //  so both surfaces speak one vocabulary. The Mac stores names and metadata,
 //  never secret values.
 
@@ -100,7 +100,7 @@ enum ArmState: Equatable, Sendable {
 enum TokenHealth: String, Sendable { case healthy, rotate, expiring }
 
 /// A configured secret source's provider. The daemon's provider registry
-/// (crates/latch/src/provider.rs) is built to take more without changing this
+/// (crates/sigil/src/provider.rs) is built to take more without changing this
 /// shape; 1Password is provider #1, not the product, so this list is not
 /// exhaustive on principle. Two ship today.
 enum SourceProvider: String, Sendable, Equatable, CaseIterable, Identifiable {
@@ -117,7 +117,7 @@ enum SourceProvider: String, Sendable, Equatable, CaseIterable, Identifiable {
 }
 
 /// One configured secret source. Mirrors the CLI's own `Source` shape
-/// (crates/latch/src/config.rs): one struct, provider-specific fields present
+/// (crates/sigil/src/config.rs): one struct, provider-specific fields present
 /// or absent depending on `provider`, rather than a separate type per
 /// provider. 1Password sources carry a stored credential (vaults, health,
 /// rotation); env-file sources carry a file path and none of that, since there
