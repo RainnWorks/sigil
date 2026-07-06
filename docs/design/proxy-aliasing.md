@@ -98,18 +98,22 @@ Two independent guards, defence in depth:
 the real binary from `PATH` while excluding the proxy. Two exclusion rules,
 either sufficient:
 
-1. Skip any candidate whose canonical path equals `current_exe()` (the running
-   multicall binary). Every alias is a **symlink** to it, so `canonicalize`
-   resolves the alias to our binary and excludes it in any directory. This is
-   *upgrade-proof*: it compares against the binary actually running, so a
-   rebuilt/moved Latch still excludes its own aliases. (`canonicalize` resolves
-   symlinks, not hard links: a hard *copy* of the binary planted under a
-   command's name is not caught here, only by rule 2 if it is inside the proxy
-   dir, or by the depth fuse otherwise. That is an exotic case; the real aliases
-   are always symlinks.)
+1. Skip any candidate whose canonical path equals a Latch binary an alias points
+   at: the running binary (`current_exe()`) **or** the sibling `latch` runtime
+   the manager installs aliases at (`proxy::alias_target()`). Every alias is a
+   **symlink** to the runtime, so `canonicalize` resolves it and excludes it in
+   any directory. Excluding both is *upgrade-proof* (compares against the binary
+   actually running) and keeps resolution correct when `find_real` is called from
+   the `latch-config` binary, where `current_exe()` is the manager, not the
+   runtime the alias targets. (`canonicalize` resolves symlinks, not hard links,
+   so a hard *copy* of the binary is not caught here; rule 2 catches it.)
 2. Skip any candidate inside the proxy directory (`~/.latch/bin`) outright. This
-   also catches a future non-symlink alias (a script, or a hard copy of the
-   binary) that rule 1 would miss.
+   catches a non-symlink alias (a script, or a hard copy of the binary) that
+   rule 1 cannot see. **Both rules live in the resolver `find_real`**, not only
+   in the diagnostic `ProxyStatus`: without rule 2 in the resolver, a same-UID
+   non-latch executable planted in the proxy dir would be spawned by the
+   daemon-up path *with the injected credential* (this was sec-review-1 Finding A;
+   fixed).
 
 Re-resolving at **run time** (not trusting a path recorded at add time) means a
 brew/asdf/mise upgrade that moves the real binary still works.

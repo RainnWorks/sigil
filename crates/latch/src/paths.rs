@@ -54,23 +54,60 @@ fn own_binary() -> Option<PathBuf> {
         .and_then(|p| p.canonicalize().ok())
 }
 
-/// Locate the real `<cmd>`: the first `cmd` on `PATH` that is not our own shim.
+/// Locate the real `<cmd>`: the first `cmd` on `PATH` that is not one of our
+/// proxy aliases. This is the resolver that actually chooses what to `exec`
+/// (daemon-down) or spawn (daemon-up, WITH an injected credential), so getting
+/// its exclusion right is security-relevant: a candidate mistaken for the real
+/// tool would be run with the approved secret.
 ///
-/// A shim alias (`~/.latch/bin/<cmd>`) canonicalises to this binary, so we skip
-/// any candidate whose real path equals ours. This is what both the shim's
-/// exec-fallback (daemon down) and the env-file provider (spawn the real tool)
-/// use to find the underlying binary to run, and it generalizes beyond `op`.
+/// Two independent exclusion rules, either sufficient (the design doc's "hard
+/// problem 1(a)"):
+///   1. the candidate canonicalises to a Latch binary an alias points at (the
+///      running binary, or the sibling `latch` runtime the manager installs
+///      aliases at). Catches a symlink alias in any directory.
+///   2. the candidate lives inside the proxy dir (`~/.latch/bin`). Catches a
+///      NON-symlink alias too (a script, or a hard copy of the binary) that
+///      canonicalisation cannot see. Without this, a same-UID-planted non-latch
+///      executable in the proxy dir would be spawned with the injected token
+///      (sec-review-1 Finding A); it also keeps `list`/`doctor` diagnostics
+///      correct when called from the `latch-config` binary (Finding B).
 pub fn find_real(cmd: &str) -> Option<PathBuf> {
-    let own = own_binary();
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+    find_real_in(
+        cmd,
+        std::env::var_os("PATH").as_deref(),
+        own_binary(),
+        crate::proxy::alias_target(),
+        shim_bin_dir().and_then(|d| d.canonicalize().ok()),
+    )
+}
+
+/// The pure core of [`find_real`]: everything reads from the explicit inputs plus
+/// the filesystem, so tests drive it with synthetic dirs and no process-global
+/// env mutation. `own`/`alias_target` are canonical Latch-binary paths to
+/// exclude (rule 1); `proxy_dir` is the canonical `~/.latch/bin` (rule 2).
+fn find_real_in(
+    cmd: &str,
+    path: Option<&std::ffi::OsStr>,
+    own: Option<PathBuf>,
+    alias_target: Option<PathBuf>,
+    proxy_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path?) {
         let cand = dir.join(cmd);
         if !is_executable(&cand) {
             continue;
         }
-        if let (Some(own), Some(canon)) = (&own, cand.canonicalize().ok()) {
-            if &canon == own {
-                continue; // our own shim alias
+        // Rule 2: anything resident in the proxy dir is ours, symlink or not.
+        if let (Some(pd), Ok(parent)) = (&proxy_dir, dir.canonicalize()) {
+            if &parent == pd {
+                continue;
+            }
+        }
+        // Rule 1: an alias symlink living outside the proxy dir resolves to a
+        // Latch binary; exclude both the running binary and the alias target.
+        if let Ok(canon) = cand.canonicalize() {
+            if own.as_ref() == Some(&canon) || alias_target.as_ref() == Some(&canon) {
+                continue;
             }
         }
         return Some(cand);
@@ -267,6 +304,80 @@ mod tests {
 
     fn path_of(dirs: &[&Path]) -> OsString {
         std::env::join_paths(dirs.iter().map(|d| d.to_path_buf())).unwrap()
+    }
+
+    /// Write an executable stub named `name` into `dir`.
+    fn exe_in(dir: &Path, name: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, "#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[test]
+    fn find_real_skips_a_non_symlink_planted_in_the_proxy_dir() {
+        // sec-review-1 Finding A: a NON-symlink executable resident in the proxy
+        // dir under a tool's name must NOT be resolved as the real tool (the
+        // daemon-up path would otherwise spawn it WITH the injected credential).
+        // Rule 1 (canonicalisation) cannot see it; rule 2 (inside the proxy dir)
+        // must.
+        let root = tmp("findreal-planted");
+        let proxy_dir = root.join("bin");
+        exe_in(&proxy_dir, "op"); // a plain script, not a symlink to latch
+        let real_dir = root.join("real");
+        let real = exe_in(&real_dir, "op");
+
+        // Proxy dir FIRST on PATH: rule 2 must skip it and fall through to real.
+        let path = path_of(&[&proxy_dir, &real_dir]);
+        let got = find_real_in(
+            "op",
+            Some(path.as_os_str()),
+            None,
+            None,
+            proxy_dir.canonicalize().ok(),
+        );
+        assert_eq!(
+            got.and_then(|p| p.canonicalize().ok()),
+            real.canonicalize().ok(),
+            "the real op must win over a non-symlink planted in the proxy dir"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn find_real_excludes_via_own_and_alias_target() {
+        // Rule 1: a symlink alias OUTSIDE the proxy dir resolves to a Latch
+        // binary. From latch-config, `own` is the manager but the alias points at
+        // the sibling runtime (alias_target); excluding both is what keeps
+        // resolution and diagnostics correct (Finding B).
+        let root = tmp("findreal-alias");
+        let runtime = exe_in(&root, "latch"); // stand-in runtime binary
+        let runtime = runtime.canonicalize().unwrap();
+        let manager = exe_in(&root, "latch-config").canonicalize().unwrap();
+
+        // A stray alias symlink to the runtime, in a dir on PATH (not the proxy
+        // dir), plus the real op after it.
+        let stray = root.join("stray");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::os::unix::fs::symlink(&runtime, stray.join("op")).unwrap();
+        let real = exe_in(&root.join("real"), "op");
+
+        let path = path_of(&[&stray, &root.join("real")]);
+        // Called "from latch-config": own = manager, alias_target = runtime.
+        let got = find_real_in(
+            "op",
+            Some(path.as_os_str()),
+            Some(manager),
+            Some(runtime),
+            None,
+        );
+        assert_eq!(
+            got.and_then(|p| p.canonicalize().ok()),
+            real.canonicalize().ok(),
+            "a stray alias to the runtime must be excluded even when own != runtime"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
