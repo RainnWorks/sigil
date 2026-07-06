@@ -86,8 +86,13 @@ as the ceremony progresses:
 { "event": "paired", "name": str, "sas_words": [str], "relay_url": str, "paired_ms": int }
 { "event": "failed", "reason": str }
 ```
-The SAS is auto-confirmed once its event is emitted (the stream is one-way; the
-human confirms on the phone, as the interactive `--yes` does).
+After the `sas` event, the process **blocks on one line of stdin**: it reads
+until newline and proceeds (seals + sends the DEK) only if that line is
+`confirm` (case-insensitive). Anything else, or stdin closing (EOF), fails the
+ceremony closed and emits `{"event":"failed",...}` without ever sending the
+DEK. The GUI writes `confirm\n` to the child's stdin after the human taps
+"match" having compared the six words on both screens — this is the real MITM
+backstop, so it must gate on an actual tap, never be sent automatically.
 
 ## Known gaps vs. the DTO fields
 

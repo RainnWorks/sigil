@@ -200,7 +200,7 @@ fn emit_local_control(result: &ControlResult) -> i32 {
 
 fn print_help() {
     println!(
-        "latch {VERSION} — remote-approval instrument: gate any CLI on your phone
+        "latch {VERSION} \u{b7} remote-approval instrument: gate any CLI on your phone
 
 usage: latch <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
        latch <verb>            a reserved runtime verb (below)
@@ -253,7 +253,7 @@ socket queries the human CLI renders."
 /// Help for the `latch-config` management binary.
 fn print_config_help() {
     println!(
-        "latch-config {VERSION} — Latch configuration management
+        "latch-config {VERSION} \u{b7} Latch configuration management
 
 usage: latch-config <cmd> [args...]   author rules/sources, manage accounts
 
@@ -1062,7 +1062,7 @@ fn cmd_doctor() -> i32 {
                 "  {} {}  {}",
                 s.ok("\u{2713}"),
                 c.label,
-                s.dim(&format!("\u{2014} {}", c.hint))
+                s.dim(&format!("\u{b7} {}", c.hint))
             );
         } else {
             ok &= check(&s, c.ok, &c.label, &c.hint);
@@ -1088,7 +1088,7 @@ fn check(s: &Style, ok: bool, label: &str, hint: &str) -> bool {
     if ok || hint.is_empty() {
         println!("  {glyph} {label}");
     } else {
-        println!("  {glyph} {label}  {}", s.dim(&format!("— {hint}")));
+        println!("  {glyph} {label}  {}", s.dim(&format!("\u{b7} {hint}")));
     }
     ok
 }
@@ -1339,7 +1339,9 @@ fn run_pairing(args: &[String]) -> i32 {
 
     let opts = crate::pair::CeremonyOpts {
         relay_url: relay.clone(),
-        response_timeout: std::time::Duration::from_secs(180),
+        // Kept in lockstep with proto::PAIRING_SECRET_TTL_MS (see pairing.rs);
+        // the QR must not outlive the secret backing it.
+        response_timeout: std::time::Duration::from_secs(600),
         flush_grace: std::time::Duration::from_millis(750),
         now: &latch_proto::now_ms,
         make_channel: &mut make_channel,
@@ -1379,8 +1381,13 @@ fn run_pairing(args: &[String]) -> i32 {
 
 /// `latch pair --relay <url> --json`: run the ceremony, streaming NDJSON events
 /// (`qr`, `sas`, `paired`, `failed`) one object per line so the GUI renders it
-/// live. The SAS is auto-confirmed once emitted: the JSON stream is one-way, so
-/// the human confirms on the phone, exactly as the interactive `--yes` does.
+/// live. After the `sas` event this BLOCKS on one line of stdin: the DEK is
+/// only sealed and sent once that line reads `confirm` (case-insensitive),
+/// which the GUI writes to our stdin after the human taps "match" having
+/// compared the six words on both screens. Anything else, or stdin closing
+/// (EOF, e.g. the app quit), aborts the ceremony without ever sending the DEK.
+/// This is the real MITM backstop; auto-confirming here would seal and hand the
+/// DEK to whoever answered the QR before a human ever looked at the words.
 fn run_pairing_json(args: &[String]) -> i32 {
     let relay = flag_value(args, "--relay")
         .map(str::to_string)
@@ -1421,13 +1428,24 @@ fn run_pairing_json(args: &[String]) -> i32 {
     };
     let mut confirm = |words: &[&'static str; 6]| -> bool {
         emit_ndjson(&serde_json::json!({ "event": "sas", "words": words.to_vec() }));
-        true
+        // Block here: the DEK must not be sealed and sent until a real human
+        // has compared the six words on both screens and confirmed. The GUI
+        // writes "confirm\n" to our stdin after the tap; anything else (or the
+        // pipe closing) fails the ceremony closed instead of leaking the DEK.
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) => false,
+            Ok(_) => line.trim().eq_ignore_ascii_case("confirm"),
+            Err(_) => false,
+        }
     };
     let mut make_channel = |mailbox: [u8; 32]| crate::pair::relay_channel(&relay, mailbox);
 
     let opts = crate::pair::CeremonyOpts {
         relay_url: relay.clone(),
-        response_timeout: std::time::Duration::from_secs(180),
+        // Kept in lockstep with proto::PAIRING_SECRET_TTL_MS (see pairing.rs);
+        // the QR must not outlive the secret backing it.
+        response_timeout: std::time::Duration::from_secs(600),
         flush_grace: std::time::Duration::from_millis(750),
         now: &latch_proto::now_ms,
         make_channel: &mut make_channel,
