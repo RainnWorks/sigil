@@ -146,13 +146,44 @@ after a disconnect but *before* the reconnect's long-poll re-attaches, that
 deposit is still handed to the (already-abandoned) orphan and is genuinely
 lost for that one delivery, not merely delayed — confirmed by direct testing
 against `wrangler dev` (see the module comment above `longPoll` in
-`shared/protocol.ts` for the exact mechanism). This is bounded (one lost
-delivery per unlucky disconnect, never a permanent stall) and something
-client-side retry/resend should account for regardless of anything this
-relay does, but it is a real residual, not a hypothetical one, and it has not
-been verified whether Cloudflare's actual edge network handles incoming
-`AbortSignal` differently from local `wrangler dev` — that would either
-close this residual entirely or confirm it holds in production too.
+`shared/protocol.ts` for the exact mechanism).
+
+#### KNOWN ISSUE: Worker/DO disconnect-orphan race (bounded, fail-closed, needs real-edge verification)
+
+- **What**: an incoming request's `AbortSignal` does not reliably fire when
+  a long-poll GET is forwarded through a Durable Object. A disconnect landing
+  in the gap before the client's reconnect re-attaches loses that one
+  delivery to the orphaned waiter.
+- **Blast radius, why this is an acceptable documented interim rather than a
+  blocker**: the daemon and phone each deposit/respond once per exchange,
+  with no higher-level resend today, so a lost delivery here is genuinely
+  lost for that message — but every path is **fail-closed**. A lost
+  `to-phone` deposit means the phone never sees the approval request, the
+  daemon's own round-trip times out, and the gated command is **denied**. A
+  lost `to-daemon` response means the daemon times out waiting and the
+  command is **denied**. Worst case is one extra user-visible retry of the
+  whole operation; there is no path from this residual to a wrong approval
+  or a leaked secret.
+- **Scope: Worker only.** The Bun variant almost certainly does not share
+  this: there is no Durable Object forwarding a request signal through an
+  internal hop, so `req.signal` there is the same object the whole way from
+  Bun's own HTTP server to the handler. This has not been separately proven
+  the way the Worker case has, but the mechanism that causes the Worker gap
+  (signal loss across a DO's internal request-forwarding boundary) simply
+  does not exist in the Bun path.
+- **Still open**: whether local `wrangler dev` differs from Cloudflare's real
+  edge network here has not been verified — no live account was available
+  from this environment. This is tasked for the actual Cloudflare deploy
+  step: deploy, then drive a real disconnect (e.g. kill wifi mid-long-poll)
+  and check whether the abort fires against the real edge. That either
+  closes this residual entirely or confirms it holds in production too.
+- **Candidate mitigation, if it reproduces on real edge**: have the daemon
+  re-deposit its `to-phone` request idempotently until it sees a response
+  (rather than depositing once and only waiting), since the phone's replay
+  guard already dedupes a duplicate by request id — this would paper over
+  exactly the gap this section describes without changing the relay itself.
+  Deliberately not built speculatively against what may be a local-only
+  simulation artifact; revisit only if real-edge testing confirms the gap.
 
 ### Limits (in `shared/protocol.ts`)
 
