@@ -123,7 +123,20 @@ struct CLIDaemonClient: DaemonClient {
                 if p.terminationStatus == 0 {
                     cont.resume(returning: out)
                 } else {
-                    cont.resume(throwing: DaemonError.cli(err.isEmpty ? "\(binary.lastPathComponent) exited \(p.terminationStatus)" : err.trimmingCharacters(in: .whitespacesAndNewlines)))
+                    // Some refusals (`wipe` without --force, `source remove` on
+                    // a name a rule still references) print a normal control
+                    // body - {"ok":false,"lines":[...]} - to STDOUT rather than
+                    // stderr, with the non-zero exit standing in for "did not
+                    // happen." Prefer that real reason over the generic
+                    // fallback whenever stdout actually decodes as one; this is
+                    // the one seam every CLI-driven error surface goes through,
+                    // so fixing it here (rather than per call site) covers
+                    // every refusal shaped like this at once.
+                    if let dto = try? JSONDecoder().decode(ControlDTO.self, from: out), !dto.ok {
+                        cont.resume(throwing: DaemonError.cli(dto.lines.joined(separator: "; ")))
+                    } else {
+                        cont.resume(throwing: DaemonError.cli(err.isEmpty ? "\(binary.lastPathComponent) exited \(p.terminationStatus)" : err.trimmingCharacters(in: .whitespacesAndNewlines)))
+                    }
                 }
             }
             do { try proc.run() }
@@ -224,12 +237,10 @@ struct CLIDaemonClient: DaemonClient {
         case .onePassword:
             _ = try await runConfig(["account", "remove", "--id", account.id, "--json"])
         case .envFile:
-            // Known gap, not new here: `source remove` reports "a rule still
-            // references it" as an ok:false JSON body on stdout with a
-            // non-zero exit; `execute()` throws on the exit code first, so
-            // that reason is currently lost in favor of a generic "latch-
-            // config exited 1". Same systemic run()-exit-code-vs-stdout-JSON
-            // mismatch flagged in the wipe/binary-split pass, not fixed here.
+            // A refusal here (e.g. "a rule still references it") comes back
+            // as an ok:false control body on stdout with a non-zero exit;
+            // execute() now surfaces that reason directly (see execute()'s
+            // terminationHandler) rather than a generic exit-code message.
             _ = try await runConfig(["source", "remove", account.id, "--json"])
         }
     }
