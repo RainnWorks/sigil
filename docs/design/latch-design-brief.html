@@ -561,11 +561,11 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
 
 <h3>The transport ladder <span class="badge shipped">real relay proven e2e</span></h3>
 <div class="prose">
-  <p>The transport was never the security layer: every message on every rung is the same sealed, signed envelope between keys pinned at pairing. So the phone and the notification extension try rungs in order, and the daemon accepts any of them identically. This is direct-first with a blind relay fallback, not a mesh VPN.</p>
+  <p>The transport was never meant to be the security layer: every message on every rung is the same sealed, signed envelope between keys pinned at pairing, so the phone and the daemon can accept whichever rung answers first, identically. The design is direct-first with a blind relay fallback, not a mesh VPN, but only the fallback is built today: every remote approval currently goes over rung 3.</p>
 </div>
 <div class="ladder">
-  <div class="rung"><span class="lv" style="color:var(--cobalt)">1 · LAN</span><span>At home the app finds the daemon over Bonjour. Zero infrastructure, zero third parties.</span><span class="act">direct</span></div>
-  <div class="rung"><span class="lv" style="color:var(--cobalt)">2 · owned endpoint</span><span>A DDNS name, static IP, or IPv6 address with one forwarded port. Safe to expose: unauthenticated bytes drop on the first frame. Optional purism; CGNAT blocks it.</span><span class="act">direct</span></div>
+  <div class="rung"><span class="lv" style="color:var(--cobalt)">1 · LAN</span><span>At home the app would find the daemon over Bonjour: zero infrastructure, zero third parties. Not yet built: no mDNS discovery or direct socket exists, so a LAN request still routes through the relay below.</span><span class="act">planned</span></div>
+  <div class="rung"><span class="lv" style="color:var(--cobalt)">2 · owned endpoint</span><span>A DDNS name, static IP, or IPv6 address with one forwarded port, so unauthenticated bytes would drop on the first frame. Optional purism; CGNAT blocks it. Not yet built: no DDNS client or direct transport exists.</span><span class="act">planned</span></div>
   <div class="rung"><span class="lv" style="color:var(--brass)">3 · blind relay</span><span>A short-lived mailbox: the daemon and phone each deposit and drain opaque envelopes over plain HTTP, in per-mailbox to-phone / to-daemon slots held only in the relay's own process memory (a Durable Object instance, or a Bun Map), never written to disk. Each envelope expires after 180 seconds and is deleted the moment it is read (drain-on-read), so nothing outlives the gap between a deposit and the other side's next poll: no queue, no persisted counter, zero storage at rest. On a phone-bound deposit the relay also rings a content-free APNs doorbell, so the wake-up needs no held connection either. Self-host a small Cloudflare Worker in your own account (or run the Bun variant), or use a shared instance; the trust surface is identical. The daemon reaches this rung over plain outbound HTTP, so it needs no port forwarding and works from any network.</span><span class="act">HTTP mailbox</span></div>
 </div>
 <div class="prose">
@@ -646,6 +646,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
   <tr><td>The P-256 Secure Enclave DEK wrap: real biometric-gated key wrap/unwrap, implemented and independently reviewed sound at the code level; wiring it fully through the pairing ceremony end-to-end is device-gated (see below)</td><td><span class="badge progress">in progress</span></td></tr>
   <tr><td>Account-add sealing under the phone-held unwrap key</td><td><span class="badge planned">planned</span></td></tr>
   <tr><td>SDK-hygiene pass on the phone app</td><td><span class="badge planned">planned</span></td></tr>
+  <tr><td>Direct transport rungs 1 and 2: LAN/Bonjour discovery and an owned-endpoint/DDNS path, so a reachable phone can skip the relay entirely</td><td><span class="badge planned">planned</span></td></tr>
   <tr><td>v2: SE-resident SSH keys, Apple Watch approver, self-hostable relay (Headscale-style)</td><td><span class="badge planned">later</span></td></tr>
 </table></div>
 
