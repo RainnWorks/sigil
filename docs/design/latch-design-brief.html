@@ -1,4 +1,4 @@
-<title>Latch · Design Brief</title>
+<title>Sigil · Design Brief</title>
 <style>
   :root {
     --bg: oklch(1 0 0);
@@ -305,7 +305,7 @@
 <h2 id="why">Why this exists</h2>
 <div class="prose">
   <p>A secret lives behind a local gate. To read it, a tool pops a biometric prompt on the Mac; every SSH connection through the 1Password agent does the same. Away from the desk, those prompts sit unanswered and everything behind them stalls: agents block, dev servers refuse to start, SSH hangs until you are physically back at the machine.</p>
-  <p>Latch moves the gate to your phone. The insight that keeps that safe rather than merely convenient is that Latch is not really an <em>op</em> tool at all. It is a generic engine: given a command, it gets one phone approval, injects the approved credentials into that command's environment, runs it, and streams the output back. What secret source sits behind the injection, and how a command reaches Latch in the first place, are both pluggable. 1Password is simply the source that shipped first.</p>
+  <p>Sigil moves the gate to your phone. The insight that keeps that safe rather than merely convenient is that Sigil is not really an <em>op</em> tool at all. It is a generic engine: given a command, it gets one phone approval, injects the approved credentials into that command's environment, runs it, and streams the output back. What secret source sits behind the injection, and how a command reaches Sigil in the first place, are both pluggable. 1Password is simply the source that shipped first.</p>
   <p>Two properties make phone approval safe:</p>
 </div>
 
@@ -320,7 +320,7 @@
 
 <h2 id="layers">The three layers <span class="badge shipped">core shipped</span></h2>
 <div class="prose">
-  <p>Everything Latch does decomposes into three layers with a hard seam between each. This is the spine of the design: adding "Latch for X" is always one of three moves, never a rewrite.</p>
+  <p>Everything Sigil does decomposes into three layers with a hard seam between each. This is the spine of the design: adding "Sigil for X" is always one of three moves, never a rewrite.</p>
 </div>
 
 <div class="topo">
@@ -383,7 +383,7 @@
 
 <h2 id="invoke">The invocation model <span class="badge shipped">shipped</span></h2>
 <div class="prose">
-  <p>The primary primitive is <code>latch &lt;cmd&gt; [args]</code>. You run <code>latch op read op://...</code> or <code>latch gcloud ...</code>: Latch looks up the configuration for that command, and if it is configured it pings the phone, injects the configured environment on approval, runs the command, and streams the output. If the command has no configuration, Latch refuses and tells you to add one. It never runs an unconfigured command ungated, because a silent pass-through would be false security.</p>
+  <p>The primary primitive is <code>latch &lt;cmd&gt; [args]</code>. You run <code>latch op read op://...</code> or <code>latch gcloud ...</code>: Sigil looks up the configuration for that command, and if it is configured it pings the phone, injects the configured environment on approval, runs the command, and streams the output. If the command has no configuration, Sigil refuses and tells you to add one. It never runs an unconfigured command ungated, because a silent pass-through would be false security.</p>
   <p>Reserved <code>latch</code> verbs (<code>status</code>, <code>pair</code>, <code>daemon</code>, and the rest) always win, so <code>latch run -- &lt;cmd&gt;</code> is the unambiguous escape hatch for a command that collides with a verb.</p>
 </div>
 
@@ -395,7 +395,7 @@
   </div>
   <div>
     <h4>Fail-safe fallback <span class="badge shipped">shipped</span></h4>
-    <p style="max-width:48ch">When the daemon is down, the shim transparently execs the real underlying tool, so nothing breaks when Latch is off. When the daemon is up but a request errors at the protocol level, the shim fails closed rather than silently running the tool locally, so a mutating command can never slip past the gate once one exists.</p>
+    <p style="max-width:48ch">When the daemon is down, the shim transparently execs the real underlying tool, so nothing breaks when Sigil is off. When the daemon is up but a request errors at the protocol level, the shim fails closed rather than silently running the tool locally, so a mutating command can never slip past the gate once one exists.</p>
     <div class="term" style="margin-top:16px"><pre><span class="t-faint">$</span> <span class="t-co">latch</span> op read <span class="t-ink">"op://Engineering/.env/DATABASE_URL"</span>
 <span class="t-dim">   latch</span> <span class="t-brass">&#9720; awaiting approval</span>  <span class="t-dim">Tom's iPhone &middot; 0:53</span>
 <span class="t-dim">   latch</span> <span class="t-ok">&#10003; approved</span>  <span class="t-dim">6.1s &middot; streaming</span>
@@ -410,8 +410,8 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
 
 <ol class="flow">
   <li><span class="who">caller &rarr; integration</span> A command arrives, whether typed as <code>latch op read ...</code>, intercepted by the shim, or driven by the SSH agent. The integration forwards the argv, the working directory, and the caller's own stdout and stderr descriptors over the local socket.</li>
-  <li><span class="who">core</span> The daemon asks the configured provider to <em>describe</em> the command into opaque secret references for the readout, loads the matching account's <em>encrypted</em> credential, computes a risk level, and queues a signed, sealed request for the phone. It fires a content-free push in parallel.</li>
-  <li><span class="who">phone</span> The notification arrives; a service extension reaches the Mac down the transport ladder, pulls the sealed request, and rewrites the notification body on-device, so the push provider only ever carried "Approval requested."</li>
+  <li><span class="who">core</span> The daemon asks the configured provider to <em>describe</em> the command into opaque secret references for the readout, loads the matching account's <em>encrypted</em> credential, computes a risk level, and deposits a signed, sealed request into the phone's relay mailbox slot, alongside the phone's registered push token. The relay reads that token once, rings a content-free doorbell push to Apple on the daemon's behalf, and forgets it.</li>
+  <li><span class="who">phone</span> A fixed "Approval requested" alert arrives, nothing more; the phone drains the sealed request waiting for it at the relay.</li>
   <li><span class="who">you</span> Glance: which command, which references, which process, from which directory, how long until it expires. Approve with Face ID, or deny with one tap, always.</li>
   <li><span class="who">phone &rarr; core</span> On approve, Face ID unlocks the Secure Enclave key, the unwrap key is sealed to this response inside the audited envelope, and the signed response returns over the same connection. Replay-proof: single-use request id, monotonic per-pairing counter, 90-second window.</li>
   <li><span class="who">core</span> The daemon unwraps the key, decrypts the one credential, and hands it to the provider's <code>run</code>, which spawns the child with the credential in its environment and splices the child's stdout onto the caller's descriptor. The daemon zeroizes the key and credential and writes an audit entry: names and metadata, never values.</li>
@@ -495,13 +495,13 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
 </table></div>
 
 <div class="prose">
-  <p>"Latch for 1Password" is a use-case page, not the product. The provider registry and a second reference provider are the concrete next step: a second live provider is what turns "the seam is designed" into "the seam is proven." Until then, 1Password is the sole shipping provider and the trait is exercised only by it plus test fakes.</p>
+  <p>"Sigil for 1Password" is a use-case page, not the product. The provider registry and a second reference provider are the concrete next step: a second live provider is what turns "the seam is designed" into "the seam is proven." Until then, 1Password is the sole shipping provider and the trait is exercised only by it plus test fakes.</p>
 </div>
 
 <h2 id="ssh">SSH is a distinct integration <span class="badge shipped">agent shipped</span></h2>
 <div class="prose">
-  <p>SSH does not fit the injection model: the event is a <em>signature</em> over a challenge, not an environment full of secrets. So it is a separate integration on the same core. Latch implements the SSH agent protocol (RFC 9987) itself, advertises your keys, and gates every signature through the identical sealed approval loop. You point <code>SSH_AUTH_SOCK</code> at Latch's socket; from then on <code>git push</code> and <code>ssh</code> transparently ask the phone. <code>ssh-add -l</code> against the running daemon already lists the served key with its real fingerprint.</p>
-  <p>Where the private key comes from is a <strong>pluggable signer</strong>, exactly like a SecretProvider is a pluggable secret source. Latch is the universal phone-gate regardless of how you hold keys.</p>
+  <p>SSH does not fit the injection model: the event is a <em>signature</em> over a challenge, not an environment full of secrets. So it is a separate integration on the same core. Sigil implements the SSH agent protocol (RFC 9987) itself, advertises your keys, and gates every signature through the identical sealed approval loop. You point <code>SSH_AUTH_SOCK</code> at Sigil's socket; from then on <code>git push</code> and <code>ssh</code> transparently ask the phone. <code>ssh-add -l</code> against the running daemon already lists the served key with its real fingerprint.</p>
+  <p>Where the private key comes from is a <strong>pluggable signer</strong>, exactly like a SecretProvider is a pluggable secret source. Sigil is the universal phone-gate regardless of how you hold keys.</p>
 </div>
 
 <div class="tblwrap"><table>
@@ -517,13 +517,13 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
   <p>You cannot have all three of these at once. Pick two.</p>
 </div>
 <div class="tblwrap"><table>
-  <tr><th>Approach</th><th>1Password-managed</th><th>Key never touches Latch</th><th>Works remotely</th></tr>
-  <tr><td>1Password-fetch <span class="dim">(Latch default)</span></td><td><span class="t-ok" style="color:var(--ok)">yes</span></td><td><span style="color:var(--deny)">no</span> <span class="dim">(RAM, one signature)</span></td><td><span style="color:var(--ok)">yes</span></td></tr>
+  <tr><th>Approach</th><th>1Password-managed</th><th>Key never touches Sigil</th><th>Works remotely</th></tr>
+  <tr><td>1Password-fetch <span class="dim">(Sigil default)</span></td><td><span class="t-ok" style="color:var(--ok)">yes</span></td><td><span style="color:var(--deny)">no</span> <span class="dim">(RAM, one signature)</span></td><td><span style="color:var(--ok)">yes</span></td></tr>
   <tr><td>SE-resident / file signer</td><td><span style="color:var(--deny)">no</span></td><td><span style="color:var(--ok)">yes</span></td><td><span style="color:var(--ok)">yes</span></td></tr>
   <tr><td>1Password desktop agent</td><td><span style="color:var(--ok)">yes</span></td><td><span style="color:var(--ok)">yes</span></td><td><span style="color:var(--deny)">no</span> <span class="dim">(local biometric)</span></td></tr>
 </table></div>
 <div class="prose">
-  <p>The default gives the first and third: keys stay 1Password-managed and signing works while you are away, at the cost of the key transiting daemon RAM for one signature. That transit is the design's most honest residual, and the reason the v2 SE-resident signer exists. Proxying the 1Password desktop agent does not help, because its local biometric popup is the exact wall Latch exists to escape. There is no protocol hostname in an SSH signature; the destination shown on the phone is a best-effort reverse lookup of the <code>session-bind</code> host key against <code>known_hosts</code>, falling back to the host-key fingerprint, never fabricated.</p>
+  <p>The default gives the first and third: keys stay 1Password-managed and signing works while you are away, at the cost of the key transiting daemon RAM for one signature. That transit is the design's most honest residual, and the reason the v2 SE-resident signer exists. Proxying the 1Password desktop agent does not help, because its local biometric popup is the exact wall Sigil exists to escape. There is no protocol hostname in an SSH signature; the destination shown on the phone is a best-effort reverse lookup of the <code>session-bind</code> host key against <code>known_hosts</code>, falling back to the host-key fingerprint, never fabricated.</p>
 </div>
 
 <h2 id="trust">Trust model</h2>
@@ -531,7 +531,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
 <h3>Pairing is the root of trust <span class="badge shipped">shipped &middot; 30 MITM proofs</span></h3>
 <div class="prose">
   <p>At pairing each device mints Ed25519 signing and X25519 agreement keys inside its own secure hardware. The Mac renders a QR on its own screen; the phone reads it with its camera. That optical channel is authenticated by physics, not cryptography: no network hop sits between a screen and a lens. The QR carries the daemon's real keys plus a 256-bit one-time secret, so only the real phone learns the secret, and the phone's network reply is authenticated by proving possession of it. A network attacker who never saw the QR cannot forge an acceptable reply, so it cannot pass off its own key as the phone's.</p>
-  <p>A six-word fingerprint read off both screens is the human backstop, computed over the two now-pinned identities: if the daemon ever pinned an attacker's key, the words diverge and the human sees it. Only after that confirmation is the unwrap key delivered, sealed to the phone's pinned key, and then erased from the daemon. From then on the key arrives per-approval from the phone. The whole handshake ships with a hostile-MITM suite of roughly thirty adversarial tests that swap keys, flip tag bits, replay across pairings, skew clocks, and starve the one-time secret, each asserting the handshake fails closed.</p>
+  <p>A six-word fingerprint read off both screens is the human backstop, computed over the two now-pinned identities: if the daemon ever pinned an attacker's key, the words diverge and the human sees it. Authorizing a pair takes three separate gates, in order: physical presence at the Mac (the QR exists only on its own screen), the six-word SAS comparison above, and only then a fresh Touch ID prompt at the Mac's Secure Enclave, the sole way the DEK can be unwrapped. Declining the SAS bails out before any biometric is even requested, and a same-UID process that only manages to script the SAS confirmation still cannot finish a pairing, because it has no way to satisfy the Enclave's own hardware gate. Once unwrapped, the key is sealed to the phone's pinned key and immediately erased from the daemon; from then on it arrives per-approval from the phone. The whole handshake ships with a hostile-MITM suite of roughly thirty adversarial tests that swap keys, flip tag bits, replay across pairings, skew clocks, and starve the one-time secret, each asserting the handshake fails closed. An independent security review of the SAS-confirm gate, the Secure Enclave DEK wrap, and their ordering found the pairing-security unit sound at the code level: there is no path that delivers the DEK without both a genuine SAS gate and a fresh Enclave-gated biometric (see <code>docs/security-claims.md</code>).</p>
 </div>
 
 <div class="tblwrap"><table>
@@ -539,16 +539,16 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
   <tr><td>Daemon store stolen (cold disk)</td><td>ciphertext without the phone or Mac enclave; the daemon private identity is in the login Keychain, so a powered-off disk reveals no key material</td><td>rotate credentials on suspicion anyway</td></tr>
   <tr><td>Live same-UID compromise</td><td>the unwrap key still never releases without a fresh hardware-gated tap, so nothing is served automatically</td><td>a live attacker holding the signing key can originate a request with chosen provenance; the phone's last defense is a human declining a request they did not initiate</td></tr>
   <tr><td>Phone stolen</td><td>keys are enclave-gated; every approve needs Face ID</td><td>remote lockdown from the Mac, re-pair, rotate</td></tr>
-  <tr><td>Malicious process calls an integration</td><td>every fulfillment needs a fresh out-of-band approval showing process and cwd</td><td>an approved request does deliver that secret; Latch gates release, it does not sandbox the recipient</td></tr>
+  <tr><td>Malicious process calls an integration</td><td>every fulfillment needs a fresh out-of-band approval showing process and cwd</td><td>an approved request does deliver that secret; Sigil gates release, it does not sandbox the recipient</td></tr>
   <tr><td>Approval replay</td><td>single-use ids, per-pairing counters, 90s window, sealed per-response ephemeral keys</td><td>aggressive clock skew rejects valid responses; doctor flags it</td></tr>
-  <tr><td>Relay compromised</td><td>sees only sealed envelopes; cannot read, forge, or replay; dropping traffic fails closed</td><td>metadata: mailbox hash, timing, sizes; can flood a known mailbox (bounded, rate-limited DoS); self-host to keep even that at home</td></tr>
+  <tr><td>Relay compromised</td><td>sees only sealed envelopes plus a transient, per-deposit push token; cannot read, forge, or replay; dropping traffic fails closed</td><td>metadata: mailbox hash, timing, sizes; can flood a known mailbox (bounded, rate-limited DoS) or ring a stolen push token with content-free doorbell noise (nuisance only, never a secret or an approval); self-host to keep even that at home</td></tr>
   <tr><td>SSH key exposure</td><td>default signer: in daemon RAM for one signature, then zeroed</td><td>a compromise at that instant leaks durable signing power, not one signature; removed by the v2 enclave-resident signer</td></tr>
   <tr><td>Phone lost entirely</td><td>recovery is intentionally a rotation: pair a new phone, rotate every credential; old ciphertext dies</td><td>hardened mode makes this the only path, by design</td></tr>
 </table></div>
 
 <h3>The factor policy: what actually gates a request <span class="badge shipped">shipped</span></h3>
 <div class="prose">
-  <p>An earlier review found that the local control socket was same-UID forgeable: a rogue process running as you could send an approve frame and self-approve, which is exactly the adversary Latch exists to stop. That finding is closed. At arm time the daemon now resolves an explicit approving factor, in strict order:</p>
+  <p>An earlier review found that the local control socket was same-UID forgeable: a rogue process running as you could send an approve frame and self-approve, which is exactly the adversary Sigil exists to stop. That finding is closed. At arm time the daemon now resolves an explicit approving factor, in strict order:</p>
 </div>
 <div class="ladder">
   <div class="rung"><span class="lv" style="color:var(--ok)">phone</span><span>A paired phone reachable over a transport. Its sealed, signed approval a same-UID peer cannot forge. The real shipping gate.</span><span class="act">preferred</span></div>
@@ -566,11 +566,11 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
 <div class="ladder">
   <div class="rung"><span class="lv" style="color:var(--cobalt)">1 · LAN</span><span>At home the app finds the daemon over Bonjour. Zero infrastructure, zero third parties.</span><span class="act">direct</span></div>
   <div class="rung"><span class="lv" style="color:var(--cobalt)">2 · owned endpoint</span><span>A DDNS name, static IP, or IPv6 address with one forwarded port. Safe to expose: unauthenticated bytes drop on the first frame. Optional purism; CGNAT blocks it.</span><span class="act">direct</span></div>
-  <div class="rung"><span class="lv" style="color:var(--brass)">3 · blind relay</span><span>A ciphertext mailbox that stores and forwards opaque envelopes it can neither read, forge, nor replay. Self-host a small Cloudflare Worker in your own account (or run the Bun variant), or use a shared instance; the trust surface is identical. The daemon connects outbound over WebSocket, so this rung needs no port forwarding and works from any network.</span><span class="act">store &amp; forward</span></div>
+  <div class="rung"><span class="lv" style="color:var(--brass)">3 · blind relay</span><span>A short-lived mailbox: the daemon and phone each deposit and drain opaque envelopes over plain HTTP, in per-mailbox to-phone / to-daemon slots held only in the relay's own process memory (a Durable Object instance, or a Bun Map), never written to disk. Each envelope expires after 180 seconds and is deleted the moment it is read (drain-on-read), so nothing outlives the gap between a deposit and the other side's next poll: no queue, no persisted counter, zero storage at rest. On a phone-bound deposit the relay also rings a content-free APNs doorbell, so the wake-up needs no held connection either. Self-host a small Cloudflare Worker in your own account (or run the Bun variant), or use a shared instance; the trust surface is identical. The daemon reaches this rung over plain outbound HTTP, so it needs no port forwarding and works from any network.</span><span class="act">HTTP mailbox</span></div>
 </div>
 <div class="prose">
-  <p><strong>Proving the relay powerless.</strong> You cannot prove what a remote server runs, so the proof is client-side: the relay is given no role that requires trust. Unlike a prekey server, it does not even distribute keys; pairing is out-of-band by QR, so there is no man-in-the-middle surface at all. Its complete possible behavior is enumerable (deliver, drop, delay, duplicate, observe sizes and timing) and every entry is neutralized in client code anyone can read and build. The repo ships the evidence: a deliberately hostile relay that tampers, replays, forges, reorders, and stalls, with a client suite of fourteen attacks that must each be rejected and fail closed, plus a map from every security claim to the code enforcing it and the test exercising it. That whole loop is now proven end-to-end over the real Bun relay, including reconnect after the relay bounces.</p>
-  <p><strong>Anonymous by construction.</strong> The relay has no accounts. A mailbox address is a hash of the two paired public keys: the relay holds only that hash, never the keys, and never parses the envelopes it carries, so it cannot even attempt to read them. Anti-abuse is purely structural: bounded per-mailbox queues, a size cap, and rate limits. The one irreducible centralization is the push doorbell: iOS offers no way to remotely wake an app except APNs, and the daemon sends that push directly to Apple, so the relay never sees a device token. Apple sees "Approval requested" and nothing more; the informative text is assembled on-device by a service extension that fetches down the same ladder. If the phone has no path to the Mac at all, requests fail closed: approve at the Mac with Touch ID, or let it time out. Never a bypass.</p>
+  <p><strong>Proving the relay powerless.</strong> You cannot prove what a remote server runs, so the proof is client-side: the relay is given no role that requires trust. Unlike a prekey server, it does not even distribute keys; pairing is out-of-band by QR, so there is no man-in-the-middle surface at all. Its complete possible behavior is enumerable (deliver, drop, delay, duplicate, observe sizes and timing) and every entry is neutralized in client code anyone can read and build. The repo ships the evidence: a deliberately hostile relay that tampers, replays, forges, reorders, and stalls, with a client suite of fourteen attacks that must each be rejected and fail closed, plus a map from every security claim to the code enforcing it and the test exercising it. That whole loop is proven end-to-end over the real Bun relay, including recovery after the relay restarts mid-flight: nothing is held in a live connection to lose.</p>
+  <p><strong>Blind by construction; anonymous with one exception.</strong> The relay has no accounts. A mailbox address is a hash of the two paired public keys: the relay holds only that hash, never the keys, and never parses the envelopes it carries, so it cannot even attempt to read them. Anti-abuse is purely structural: a size cap, a per-mailbox rate limit, and the 180-second drain-on-read TTL above, so nothing queues past the next poll. Invariant #3 is honestly relaxed here: the one irreducible centralization is now the push doorbell, and the relay runs it, not the daemon. Sigil ships one app to many phones behind one Apple developer identity, and no user's Mac can be trusted to hold the publisher's APNs signing key, so the relay holds that one key and, once per deposit, the depositing phone's push token, just long enough to ring Apple and forget it; the token is never persisted and never leaves that one request. Apple sees a fixed "Approval requested" alert and nothing else: no caller, no command, no account, no reason. An independent security review confirmed the crypto still holds despite this: the relay's new powers let it ring a doorbell, and at worst spam one with content-free noise, but they do not let it read a secret, forge an approval, or learn an outcome (see <code>docs/security-claims.md</code>). If the phone has no path to the relay at all, requests fail closed: approve at the Mac with Touch ID, or let it time out. Never a bypass.</p>
 </div>
 
 <h2 id="surfaces">The surfaces</h2>
@@ -624,15 +624,15 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
 <div class="tblwrap"><table>
   <tr><th>Area</th><th>What is proven</th></tr>
   <tr><td>Sealed protocol</td><td>the sealed and signed envelope with a single-use id, monotonic counter, and 90s replay window; any field tamper breaks the signature</td></tr>
-  <tr><td>Pairing</td><td>the full handshake: optical QR, secret-authenticated return channel, six-word SAS, unwrap-key delivery only after confirmation, with roughly thirty adversarial MITM proofs</td></tr>
+  <tr><td>Pairing</td><td>the full handshake: optical QR, secret-authenticated return channel, six-word SAS, unwrap-key delivery only after SAS confirmation and a fresh Secure Enclave Touch ID gate, with roughly thirty adversarial MITM proofs plus an independent review of the ordering</td></tr>
   <tr><td>Approval loop</td><td>the gated round-trip with fd passthrough: secret bytes reach the caller's fd, never the daemon; deny and timeout deliver no secret</td></tr>
   <tr><td>Leases</td><td>daemon-verified caller fingerprints, triple-scoped RAM-only grants, coalescing, TTL purge, lockdown clears all</td></tr>
   <tr><td>Factor policy</td><td>phone &gt; biometric &gt; fail-closed; the dev path is behind <code>--dev-insecure</code> with a loud warning; the same-UID self-approval finding is closed</td></tr>
   <tr><td>Provider seam</td><td>the <code>SecretProvider</code> trait with 1Password as provider #1; the protocol carries no op-specific field names</td></tr>
-  <tr><td>Transport</td><td>the real relay transport (daemon WebSocket plus phone HTTPS over the blind relay), proven cross-process end-to-end over the real Bun relay, including reconnect after a bounce</td></tr>
+  <tr><td>Transport</td><td>the v4 relay transport: daemon and phone both deposit and drain opaque envelopes over plain HTTP, proven cross-process end-to-end over the real Bun relay, including recovery after a relay restart</td></tr>
   <tr><td>Persistence</td><td>the daemon auto-arms with the phone factor; no unwrap key on disk; inert-at-rest proven; a half-broken pairing surfaces loudly</td></tr>
   <tr><td>SSH agent</td><td>RFC 9987, phone-gated, ed25519, default 1Password-fetch signer; real <code>ssh-add -l</code> against the running daemon works</td></tr>
-  <tr><td>Blind relay</td><td>Cloudflare Worker plus Bun variant; opaque key-hash mailboxes; never parses an envelope; the hostile-relay suite of fourteen attacks all rejected</td></tr>
+  <tr><td>Blind relay</td><td>Cloudflare Worker plus Bun variant; opaque key-hash mailboxes held in memory only (180s TTL, drain-on-read, zero at-rest storage); never parses an envelope; the hostile-relay suite of fourteen attacks all rejected; the relay also rings the publisher APNs doorbell</td></tr>
   <tr><td>iOS approver</td><td>Expo 57 / RN 0.86: approval sheet, real pairing rendezvous, real relay transport, byte-parity-locked to Rust, verified against the live daemon</td></tr>
   <tr><td>Mac configurator</td><td>SwiftUI plus Liquid Glass, six tabs and a menubar; builds clean on Xcode 26.3 / Swift 6.2.4 / macOS 26 SDK; runs on a mock</td></tr>
 </table></div>
@@ -643,7 +643,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
   <tr><td>The daemon control protocol plus <code>PROTOCOL.md</code>, the single machine API</td><td><span class="badge progress">in progress</span></td></tr>
   <tr><td>The Mac app's socket <code>DaemonClient</code> against that protocol</td><td><span class="badge planned">planned</span></td></tr>
   <tr><td>The generalization: config-driven multi-CLI shim, the <code>latch &lt;cmd&gt;</code> primitive, the provider registry with a second reference provider, <code>latch run</code>, SSH pluggable signer</td><td><span class="badge shipped">shipped</span></td></tr>
-  <tr><td>The P-256 Secure-Enclave key-wrap fix: the SE is P-256-only and cannot hold the X25519 key the Mac local-approval envelope assumed</td><td><span class="badge planned">planned</span></td></tr>
+  <tr><td>The P-256 Secure Enclave DEK wrap: real biometric-gated key wrap/unwrap, implemented and independently reviewed sound at the code level; wiring it fully through the pairing ceremony end-to-end is device-gated (see below)</td><td><span class="badge progress">in progress</span></td></tr>
   <tr><td>Account-add sealing under the phone-held unwrap key</td><td><span class="badge planned">planned</span></td></tr>
   <tr><td>SDK-hygiene pass on the phone app</td><td><span class="badge planned">planned</span></td></tr>
   <tr><td>v2: SE-resident SSH keys, Apple Watch approver, self-hostable relay (Headscale-style)</td><td><span class="badge planned">later</span></td></tr>
@@ -694,21 +694,21 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
 
 <h2 id="decisions">Decisions log</h2>
 <ul class="notes">
-  <li><strong>Latch is any-CLI, not an op tool.</strong> The core is a generic gated-exec-with-injection engine; 1Password is provider #1. Three layers (core, integrations, providers) with a hard seam each, so "Latch for X" is a config, a provider impl, or an integration, never a rewrite.</li>
+  <li><strong>Sigil is any-CLI, not an op tool.</strong> The core is a generic gated-exec-with-injection engine; 1Password is provider #1. Three layers (core, integrations, providers) with a hard seam each, so "Sigil for X" is a config, a provider impl, or an integration, never a rewrite.</li>
   <li><strong><code>latch &lt;cmd&gt;</code> is the primitive; the shim is a thin alias.</strong> Look up config for a command, gate it, inject its env, run it; refuse an unconfigured command rather than run it ungated. The transparent shim collapses to rewriting <code>op ...</code> into <code>latch op ...</code>, existing only for callers that cannot be modified.</li>
-  <li><strong>Name: Latch</strong> (binary <code>latch</code>). The name is the interaction: a request is latched, approving lifts it, lockdown dead-latches.</li>
+  <li><strong>Name: Sigil</strong> (binary and crates stay <code>latch</code>). A sigil is a sealed mark that authorizes: the phone seals an approval, and the six-word SAS is the mark's attestation, the thing a human actually checks before trusting it. Every user-facing surface says Sigil; the CLI you type and the internal crates keep the name <code>latch</code> underneath.</li>
   <li><strong>No secret caching.</strong> Live per-approval reads, so rotation is instant and the source stays locked. The startup-cache model was rejected.</li>
   <li><strong>Secret values never enter daemon memory.</strong> The provider trait injects a credential and streams the child's output to the caller's fds; it is deliberately not a <code>fetch() -&gt; bytes</code> shape, so a provider cannot break the invariant.</li>
   <li><strong>The unwrap key lives only on the phone.</strong> Delivered once at pairing after SAS, optionally enveloped a second time to the Mac Secure Enclave, then erased from the daemon; it returns per-approval. This makes the daemon inert at rest.</li>
   <li><strong>The factor policy closes the self-approval finding.</strong> Phone &gt; biometric &gt; fail-closed; the control-socket and dev auto-approve exist only under a loud <code>--dev-insecure</code> switch, and a real factor always wins over it.</li>
   <li><strong>SSH is a distinct integration with a pluggable signer.</strong> Default is 1Password-fetch (key in RAM one signature, the honest residual); SE-resident, file, and proxy signers follow. The three-way trade is documented, not hidden.</li>
-  <li><strong>Transport ladder, direct first.</strong> LAN, then an owned endpoint, then a blind relay carrying only sealed envelopes. This is not a mesh VPN. The daemon sends its own content-free APNs doorbell directly, so no server sees a device token.</li>
-  <li><strong>Trust is proven client-side.</strong> The relay is anonymous (key-hash mailboxes, no accounts), holds no key-distribution role, never parses an envelope, and its powerlessness is demonstrated by a hostile-relay suite in the repo rather than asserted.</li>
+  <li><strong>Transport ladder, direct first.</strong> LAN, then an owned endpoint, then a blind relay carrying only sealed envelopes over plain HTTP deposit and drain. This is not a mesh VPN. The relay rings the content-free APNs doorbell on the daemon's behalf, using the one publisher key it holds; the daemon never talks to Apple itself, and the relay sees a device push token only transiently, per deposit, never stored.</li>
+  <li><strong>Trust is proven client-side, and invariant #3 is honestly relaxed.</strong> The relay is blind (key-hash mailboxes, no accounts, never parses an envelope) and holds no key-distribution role, but the v4 doorbell gives it one narrow new power: the shared publisher push key plus a transient per-deposit push token. An independent review confirmed this still cannot read a secret, forge an approval, or learn an outcome; its remaining powerlessness is demonstrated by a hostile-relay suite in the repo rather than asserted.</li>
   <li><strong>The control socket is the single machine API.</strong> The Mac app and CLI are two renderers of it. Keystore and config mutations stay CLI-only and least-privilege, because the network-exposed daemon must never be able to mutate keys or config.</li>
   <li><strong>Stack.</strong> Phone is one Expo codebase (SwiftUI on iOS today, Compose on Android later). Mac is pure SwiftUI with Liquid Glass. Daemon and CLI are one Rust workspace built to a single release binary around half a megabyte, no runtime to install.</li>
 </ul>
 
 <hr>
-<p style="font-family:var(--mono); font-size:0.72rem; color:var(--faint); margin-top:20px;">latch &middot; design brief &middot; the any-CLI reframe, grounded in the built state &middot; July 2026</p>
+<p style="font-family:var(--mono); font-size:0.72rem; color:var(--faint); margin-top:20px;">sigil &middot; design brief &middot; the any-CLI reframe, grounded in the built state &middot; July 2026</p>
 
 </div>
