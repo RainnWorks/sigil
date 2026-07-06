@@ -21,6 +21,7 @@ import {
   fromBase64,
   loadSodium,
   peerIdentity,
+  type PushRegisterMessage,
   shapeEcdh,
   type Sodium,
   toBase64,
@@ -108,6 +109,39 @@ export async function unpair(): Promise<void> {
   disarmLiveSession();
   await clearPairing();
   store.clearPairingState();
+}
+
+export type PushRegisterOutcome = "sent" | "no-session" | "error";
+
+/**
+ * Hand this device's current APNs token to the daemon over the live session
+ * (see {@link PushRegisterMessage}). Called once after arming and again on
+ * every token rotation (`src/lib/push.ts`). Content-free: the daemon learns
+ * only a token to wake this phone, nothing about pending requests. Fails
+ * closed to a no-op when unarmed; the relay poll remains the backstop either
+ * way, so a failed registration never blocks an approval.
+ */
+export async function sendPushRegister(token: string): Promise<PushRegisterOutcome> {
+  if (!live) return "no-session";
+  try {
+    await live.session.sendToDaemon<PushRegisterMessage>({
+      type: "pushRegister",
+      token,
+      platform: "apns",
+    });
+    return "sent";
+  } catch {
+    return "error";
+  }
+}
+
+/**
+ * Force an immediate relay drain outside the backstop cadence, e.g. right
+ * after a notification tap, so the approval sheet does not wait out the 30s
+ * poll interval. A no-op when unarmed.
+ */
+export async function nudgeTransport(): Promise<void> {
+  await live?.transport.pollNow();
 }
 
 export type ApproveOutcome = "sent" | "refused" | "no-session" | "error";

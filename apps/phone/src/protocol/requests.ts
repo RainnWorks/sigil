@@ -168,3 +168,23 @@ export interface ApprovalResponse {
   block?: { process: string; durationMs: number } | null;
   decidedAt: number;
 }
+
+/**
+ * Phone -> daemon push-token registration. Sealed over the live session like
+ * any other envelope payload, but outside the request/response flow: it is
+ * not part of the pairing ceremony's SAS transcript, and it carries no
+ * request id. `type` is the discriminant that lets the daemon tell this
+ * apart from an `ApprovalResponse` arriving in the same envelope slot. Sent
+ * once after arming and again on every APNs token rotation.
+ *
+ * Content-free by design: this is the only thing the daemon learns about
+ * this phone's push channel. `platform` is fixed to `"apns"` today; a future
+ * Android/FCM doorbell would add a distinct platform value, never overload
+ * this one.
+ */
+export interface PushRegisterMessage {
+  type: "pushRegister";
+  /** The APNs device token, lowercase hex. */
+  token: string;
+  platform: "apns";
+}

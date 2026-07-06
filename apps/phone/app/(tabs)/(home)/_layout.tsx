@@ -16,7 +16,7 @@ export default function HomeStack() {
         headerTitleStyle: { color: p.label },
       }}
     >
-      <Stack.Screen name="index" options={{ title: "Latch" }} />
+      <Stack.Screen name="index" options={{ title: "Sigil" }} />
     </Stack>
   );
 }

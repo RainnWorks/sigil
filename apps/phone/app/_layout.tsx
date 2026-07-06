@@ -9,6 +9,7 @@ import { StatusBar } from "expo-status-bar";
 import { paletteFor } from "@/theme/tokens";
 import { DEMO, store, useSelector } from "@/src/state/store";
 import { armLiveSession } from "@/src/session/controller";
+import { registerPushToken, watchNotificationTaps, watchPushTokenRotation } from "@/src/lib/push";
 import {
   demoReadRequest,
   demoRoutineRequest,
@@ -39,8 +40,12 @@ export default function RootLayout() {
     // Boot from the REAL state: if this phone has a stored pairing, arm the relay
     // session (which reflects `paired` into the store); if not, stay unpaired.
     // `hydrated` gates the routing below so we don't flash the pairing flow before
-    // the keystore has been read.
-    void armLiveSession().finally(() => setHydrated(true));
+    // the keystore has been read. Once armed, hand the daemon this device's push
+    // token so it can wake this phone through APNs instead of the relay poll.
+    void armLiveSession().then((armed) => {
+      setHydrated(true);
+      if (armed) void registerPushToken();
+    });
 
     // Demo seed is OFF unless the explicit dev flag is set, so no Release build
     // ever shows canned pending requests. Exercises the same crypto path as real.
@@ -52,6 +57,18 @@ export default function RootLayout() {
         demoRoutineRequest(),
       ]);
     }
+  }, []);
+
+  useEffect(() => {
+    // Re-register on every token rotation, and wake (arm + drain) on a tap,
+    // whether the app was foregrounded, backgrounded, or launched by the tap.
+    // Both are safe no-ops while unarmed.
+    const offRotation = watchPushTokenRotation();
+    const offTaps = watchNotificationTaps();
+    return () => {
+      offRotation();
+      offTaps();
+    };
   }, []);
 
   useEffect(() => {

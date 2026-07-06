@@ -8,6 +8,11 @@
  * `send` POSTs the envelope's JSON to `POST /submit`. The security layer is the
  * envelope, never the transport: this moves ciphertext only, exactly as the mock
  * does, so the same {@link LatchSession} rides either one unchanged.
+ *
+ * The APNs push doorbell (`src/lib/push.ts`) is the primary wake now; this loop
+ * is a 30s backstop for whenever push is denied, delayed, or absent. A tapped
+ * notification calls {@link PhoneRelay.pollNow} to drain immediately instead of
+ * waiting out the backstop interval.
  */
 import {
   type Envelope,
@@ -19,8 +24,12 @@ import { type ConnectionRung } from "@/src/domain/types";
 import { RelayMailbox, sleep } from "./relay-http";
 import { type Transport, type TransportStatus } from "./transport";
 
-/** Delay between empty `/pending` polls, trading latency for request volume. */
-const POLL_INTERVAL_MS = 800;
+/**
+ * Delay between empty `/pending` polls. Push is the primary wake, so this is a
+ * backstop cadence, not the latency budget: 30s trades a little worst-case
+ * delay (when push is unavailable) for a lot less request volume.
+ */
+const POLL_INTERVAL_MS = 30_000;
 
 export interface PhoneRelayConfig {
   /** Relay base URL (http(s) or ws(s); normalized internally). */
@@ -78,6 +87,22 @@ export class PhoneRelay implements Transport {
   async send(e: Envelope): Promise<void> {
     const wire = JSON.stringify(envelopeToWire(e));
     await this.mailbox.submit(wire);
+  }
+
+  /**
+   * Force one drain right now, outside the backstop cadence. Used to react to a
+   * tapped push notification without waiting up to `pollIntervalMs`. A no-op
+   * before `start()` or after `stop()`.
+   */
+  async pollNow(): Promise<void> {
+    if (!this.running) return;
+    try {
+      await this.drainOnce();
+    } catch {
+      // Same fail-closed handling as the loop: a transient error just means
+      // the next backstop tick (or the next tap) tries again.
+      this.connected = false;
+    }
   }
 
   /** Drain `/pending`, decode, and fan out. One malformed entry is dropped, not fatal. */

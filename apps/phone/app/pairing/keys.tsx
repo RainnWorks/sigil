@@ -62,7 +62,7 @@ export default function KeysScreen() {
           This phone is the key
         </Sans>
         <Sans size={16} tone="muted" style={{ lineHeight: 24 }}>
-          Latch just generated a signing key and an agreement key inside this phone&apos;s secure
+          Sigil just generated a signing key and an agreement key inside this phone&apos;s secure
           hardware. The private halves never leave it. Your Mac holds only ciphertext; approving is
           the missing half of the cryptography, not a permission flag.
         </Sans>

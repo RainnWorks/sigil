@@ -10,7 +10,7 @@ import { acceptScan, PairingExpiredError } from "@/src/session/pairing-flow";
 
 /**
  * QR scan: the camera reads the daemon's pairing QR (a base64url PairingPayload).
- * A malformed or non-Latch QR is ignored; the scanner keeps looking.
+ * A malformed or non-Sigil QR is ignored; the scanner keeps looking.
  */
 export default function ScanScreen() {
   const p = useTheme();
@@ -30,7 +30,7 @@ export default function ScanScreen() {
           Camera access
         </Sans>
         <Sans size={15} tone="muted">
-          Latch uses the camera once, to scan the pairing QR shown on your Mac.
+          Sigil uses the camera once, to scan the pairing QR shown on your Mac.
         </Sans>
         <Pressable
           onPress={requestPermission}
@@ -61,7 +61,7 @@ export default function ScanScreen() {
       setError(
         e instanceof PairingExpiredError
           ? "That QR has expired. Generate a fresh one on your Mac."
-          : "That QR is not a Latch pairing code.",
+          : "That QR is not a Sigil pairing code.",
       );
     }
   }

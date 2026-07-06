@@ -107,10 +107,34 @@ export function setSodium(s: Sodium): void {
  * so the pure-JS test binding never enters the app bundle.
  */
 export async function loadSodium(): Promise<Sodium> {
-  if (cached) return cached;
+  if (cached) {
+    installGetRandomValues(cached);
+    return cached;
+  }
   const mod = await import("react-native-libsodium");
   const s = (mod as { default?: unknown }).default ?? mod;
   await (s as { ready: Promise<void> }).ready;
   cached = s as unknown as Sodium;
+  installGetRandomValues(cached);
   return cached;
+}
+
+/**
+ * React Native has no Web Crypto, so `crypto.getRandomValues` is undefined and
+ * anything that reaches for it (e.g. `uuid`'s v7, used for the envelope
+ * requestId) throws. Back it with libsodium's CSPRNG so those callers work. The
+ * shipping fix is the react-native-get-random-values native polyfill at app
+ * entry; this is the equivalent, dependency-free and sourced from the same RNG.
+ */
+function installGetRandomValues(s: Sodium): void {
+  const g = globalThis as unknown as { crypto?: { getRandomValues?: unknown } };
+  if (g.crypto?.getRandomValues) return;
+  g.crypto = g.crypto ?? {};
+  (g.crypto as { getRandomValues: (a: ArrayBufferView) => ArrayBufferView }).getRandomValues = (
+    a: ArrayBufferView,
+  ): ArrayBufferView => {
+    const bytes = s.randombytes_buf(a.byteLength);
+    new Uint8Array(a.buffer, a.byteOffset, a.byteLength).set(bytes);
+    return a;
+  };
 }

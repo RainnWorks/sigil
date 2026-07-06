@@ -81,7 +81,21 @@ export class LatchSession {
       decidedAt: Date.now(),
       ...extras,
     };
-    const envelope = seal(this.cfg.sodium, response, {
+    await this.sealAndSend(response);
+  }
+
+  /**
+   * Seal and send an arbitrary tagged payload toward the daemon outside the
+   * request/response flow (e.g. {@link PushRegisterMessage}). Shares the
+   * outbound counter and pairing id with `respond`, so both ride the same
+   * per-direction replay sequence.
+   */
+  async sendToDaemon<T>(payload: T): Promise<void> {
+    await this.sealAndSend(payload);
+  }
+
+  private async sealAndSend<T>(payload: T): Promise<void> {
+    const envelope = seal(this.cfg.sodium, payload, {
       pairingId: this.cfg.pairingId,
       counter: ++this.outboundCounter,
       senderSigningSecret: signingSecretKey(this.cfg.sodium, this.cfg.phone),
