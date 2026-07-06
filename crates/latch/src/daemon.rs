@@ -579,7 +579,11 @@ fn handle_conn(core: Arc<Core>, mut stream: UnixStream) -> anyhow::Result<()> {
     }
 
     let reply = match frame {
-        Frame::Run { argv, cwd } => {
+        Frame::Run {
+            argv,
+            cwd,
+            proxy_depth,
+        } => {
             log_request(&argv, &cwd, peer);
             // The shim passes the caller's own stdin, stdout, stderr in that
             // order (SCM_RIGHTS). The daemon only splices them to the child; it
@@ -589,7 +593,7 @@ fn handle_conn(core: Arc<Core>, mut stream: UnixStream) -> anyhow::Result<()> {
             let stdout = fds.next();
             let stderr = fds.next();
             Reply::Exit {
-                code: fulfill(&core, &argv, &cwd, peer, stdin, stdout, stderr),
+                code: fulfill(&core, &argv, &cwd, peer, proxy_depth, stdin, stdout, stderr),
             }
         }
         Frame::Approve { id, lease } => {
@@ -759,11 +763,13 @@ fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
 /// gated on every run (no leasing, so resolved values never sit in RAM across a
 /// TTL). An *unconfigured* command is refused with a pointer to `latch-config
 /// add`, never run ungated.
+#[allow(clippy::too_many_arguments)]
 fn fulfill(
     core: &Core,
     argv: &[String],
     cwd: &str,
     peer: Option<i32>,
+    proxy_depth: u32,
     stdin: Option<OwnedFd>,
     stdout: Option<OwnedFd>,
     stderr: Option<OwnedFd>,
@@ -771,6 +777,19 @@ fn fulfill(
     if core.lockdown.load(Ordering::SeqCst) {
         return fail_closed(stderr, "latch is locked down; no secrets served\n");
     }
+
+    // Proxy recursion fuse: the caller's depth reached us over the socket (the
+    // daemon has no other view of it). If it is already at the limit, a runaway
+    // alias -> daemon -> tool -> alias loop is in progress; fail closed rather
+    // than spawn another level.
+    if proxy_depth >= crate::proxy::MAX_DEPTH {
+        return fail_closed(
+            stderr,
+            "latch: proxy recursion limit reached; refusing to run (loop?)\n",
+        );
+    }
+    // The depth the spawned child (and anything it re-invokes) will carry.
+    let child_depth = proxy_depth.saturating_add(1);
 
     let Some(cmd) = argv.first() else {
         return fail_closed(stderr, "latch: empty command\n");
@@ -881,6 +900,7 @@ fn fulfill(
                 stdin,
                 stdout,
                 stderr,
+                proxy_depth: child_depth,
             });
         }
     }
@@ -1020,6 +1040,7 @@ fn fulfill(
         stdin,
         stdout,
         stderr,
+        proxy_depth: child_depth,
     });
     drop(credential); // zeroized here (Token is Zeroizing) when present
     code
@@ -1274,7 +1295,7 @@ mod tests {
             "op://Engineering/.env/password".into(),
         ];
         // Empty cwd: the fake op runs in the test's own directory (a real path).
-        let code = fulfill(&core, &argv, "", None, None, Some(write_end), None);
+        let code = fulfill(&core, &argv, "", None, 0, None, Some(write_end), None);
         assert_eq!(code, 0);
         assert_eq!(read_all(read_end), "known-secret-42");
         // No lease was requested, so none is held.
@@ -1328,7 +1349,7 @@ mod tests {
         ];
         // Empty cwd: the fake op runs in the test's own directory (a real path).
         assert_eq!(
-            fulfill(&core, &argv, "", None, None, Some(write_end), None),
+            fulfill(&core, &argv, "", None, 0, None, Some(write_end), None),
             0
         );
         assert_eq!(read_all(read_end), "secret-1");
@@ -1466,7 +1487,7 @@ mod tests {
         let (_r, w) = pipe();
         let worker = std::thread::spawn(move || {
             let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
-            fulfill(&park_core, &argv, "", None, None, Some(w), None)
+            fulfill(&park_core, &argv, "", None, 0, None, Some(w), None)
         });
 
         // A subsequent event carries the parked request.
@@ -1518,14 +1539,14 @@ mod tests {
         let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
         // First request approves and leases.
         let (r1, w1) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, None, Some(w1), None), 0);
+        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w1), None), 0);
         assert_eq!(read_all(r1), "secret-A");
         assert_eq!(core.leases.active(), 1);
 
         // With a live lease the second identical request must be served from the
         // lease, not a fresh approval.
         let (r2, w2) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, None, Some(w2), None), 0);
+        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w2), None), 0);
         assert_eq!(read_all(r2), "secret-A");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1545,7 +1566,16 @@ mod tests {
         let (read_end, write_end) = pipe();
         let (err_r, err_w) = pipe();
         let argv = vec!["op".into(), "read".into(), "op://Engineering/x".into()];
-        let code = fulfill(&core, &argv, "/p", None, None, Some(write_end), Some(err_w));
+        let code = fulfill(
+            &core,
+            &argv,
+            "/p",
+            None,
+            0,
+            None,
+            Some(write_end),
+            Some(err_w),
+        );
         assert_eq!(code, 1, "deny must fail closed");
         assert_eq!(read_all(read_end), "", "no secret on a denied request");
         assert!(read_all(err_r).contains("denied"));
@@ -1567,7 +1597,7 @@ mod tests {
         let (read_end, write_end) = pipe();
         let argv = vec!["op".into(), "read".into(), "op://Engineering/x".into()];
         assert_eq!(
-            fulfill(&core, &argv, "/p", None, None, Some(write_end), None),
+            fulfill(&core, &argv, "/p", None, 0, None, Some(write_end), None),
             1
         );
         assert_eq!(read_all(read_end), "");
@@ -1589,7 +1619,16 @@ mod tests {
         let (read_end, write_end) = pipe();
         let (err_r, err_w) = pipe();
         let argv = vec!["gcloud".into(), "auth".into(), "print-access-token".into()];
-        let code = fulfill(&core, &argv, "", None, None, Some(write_end), Some(err_w));
+        let code = fulfill(
+            &core,
+            &argv,
+            "",
+            None,
+            0,
+            None,
+            Some(write_end),
+            Some(err_w),
+        );
         assert_eq!(code, 1, "an unconfigured command must fail closed");
         assert_eq!(read_all(read_end), "", "and produce no output");
         let err = read_all(err_r);
@@ -1656,6 +1695,7 @@ mod tests {
             &["faketool".into()],
             "",
             None,
+            0,
             None,
             Some(write_end),
             None,
@@ -1737,6 +1777,7 @@ mod tests {
             &["faketool".into()],
             "",
             None,
+            0,
             Some(in_r),
             Some(out_w),
             None,
@@ -1749,6 +1790,97 @@ mod tests {
 
         assert_eq!(code, 0);
         assert_eq!(read_all(out_r), "stdin=hello-from-caller");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn proxy_depth_is_incremented_on_the_child_and_fuses_at_the_limit() {
+        // The recursion fuse: the spawned child carries LATCH_PROXY_DEPTH =
+        // caller_depth + 1, and a caller already at the limit is refused before a
+        // child is spawned. Prove both with an env-file faketool that echoes the
+        // depth env it received.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("proxy-depth");
+        let env_path = dir.join("s.env");
+        std::fs::write(&env_path, "MARK=ok\n").unwrap();
+        let bindir = dir.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = bindir.join("faketool");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\nprintf 'depth=%s' \"$LATCH_PROXY_DEPTH\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let pending = Arc::new(PendingRegistry::new());
+        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+            .with_dev(DevMode::Approve)
+            .with_control_socket(true);
+        let core = Arc::new(Core {
+            keystore,
+            accounts: Mutex::new(AccountStore::default()),
+            threshold: Mutex::new(Default::default()),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(approver)),
+            pending,
+            lockdown: AtomicBool::new(false),
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::with_defaults(),
+            config: env_file_config("faketool", env_path.to_str().unwrap()),
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::DevInsecure,
+            ssh_signers: Vec::new(),
+            audit: None,
+        });
+
+        let prev = std::env::var_os("PATH");
+        let mut search = vec![bindir.clone()];
+        if let Some(p) = &prev {
+            search.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
+
+        // A caller at depth 5: the child must see 6.
+        let (out_r, out_w) = pipe();
+        let code = fulfill(
+            &core,
+            &["faketool".into()],
+            "",
+            None,
+            5,
+            None,
+            Some(out_w),
+            None,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(read_all(out_r), "depth=6");
+
+        // A caller already at the limit is refused before any child spawns.
+        let (fuse_r, fuse_w) = pipe();
+        let (err_r, err_w) = pipe();
+        let fused = fulfill(
+            &core,
+            &["faketool".into()],
+            "",
+            None,
+            crate::proxy::MAX_DEPTH,
+            None,
+            Some(fuse_w),
+            Some(err_w),
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert_eq!(fused, 1, "at the recursion limit the run must fail closed");
+        assert_eq!(read_all(fuse_r), "", "a fused run produces no output");
+        assert!(read_all(err_r).contains("recursion limit"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1849,6 +1981,7 @@ mod tests {
             &Frame::Run {
                 argv,
                 cwd: String::new(),
+                proxy_depth: 0,
             },
             &[std::io::stdin().as_raw_fd(), write_end.as_raw_fd()],
         )
@@ -2037,6 +2170,7 @@ mod tests {
             &Frame::Run {
                 argv,
                 cwd: String::new(),
+                proxy_depth: 0,
             },
             &[
                 std::io::stdin().as_raw_fd(),
@@ -2100,7 +2234,16 @@ mod tests {
             "read".into(),
             "op://Engineering/.env/password".into(),
         ];
-        let code = fulfill(&core, &argv, "", None, None, Some(write_end), Some(err_w));
+        let code = fulfill(
+            &core,
+            &argv,
+            "",
+            None,
+            0,
+            None,
+            Some(write_end),
+            Some(err_w),
+        );
 
         assert_eq!(code, 1, "a remote denial must fail closed");
         assert_eq!(read_all(read_end), "", "no secret on a denied request");
@@ -2235,6 +2378,7 @@ mod tests {
             &Frame::Run {
                 argv,
                 cwd: String::new(),
+                proxy_depth: 0,
             },
             &[
                 std::io::stdin().as_raw_fd(),
@@ -2299,7 +2443,16 @@ mod tests {
             "read".into(),
             "op://Engineering/.env/password".into(),
         ];
-        let code = fulfill(&core, &argv, "", None, None, Some(write_end), Some(err_w));
+        let code = fulfill(
+            &core,
+            &argv,
+            "",
+            None,
+            0,
+            None,
+            Some(write_end),
+            Some(err_w),
+        );
         assert_eq!(code, 1, "a v2 denial must fail closed");
         assert_eq!(read_all(read_end), "", "no secret on a denied v2 request");
         assert!(read_all(err_r).contains("denied"));
@@ -2396,7 +2549,10 @@ mod tests {
             "Engineering".into(),
             "op://Engineering/x".into(),
         ];
-        assert_eq!(fulfill(&core, &v2_argv, "", None, None, Some(w2), None), 0);
+        assert_eq!(
+            fulfill(&core, &v2_argv, "", None, 0, None, Some(w2), None),
+            0
+        );
         assert_eq!(
             read_all(r2),
             "v2-token",
@@ -2412,7 +2568,10 @@ mod tests {
             "Legacy".into(),
             "op://Legacy/x".into(),
         ];
-        assert_eq!(fulfill(&core, &v1_argv, "", None, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &v1_argv, "", None, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "v1-token", "v1 vault must use the DEK path");
 
         shutdown.store(true, Ordering::SeqCst);
@@ -2590,6 +2749,7 @@ mod tests {
             &Frame::Run {
                 argv,
                 cwd: String::new(),
+                proxy_depth: 0,
             },
             &[
                 std::io::stdin().as_raw_fd(),
@@ -2688,7 +2848,7 @@ mod tests {
             "read".into(),
             "op://Engineering/.env/password".into(),
         ];
-        let code = fulfill(&core, &argv, "", None, None, Some(write_end), None);
+        let code = fulfill(&core, &argv, "", None, 0, None, Some(write_end), None);
 
         assert_eq!(code, 0, "the loop must complete after a relay bounce");
         assert_eq!(read_all(read_end), "bounce-secret-55");
@@ -2743,7 +2903,16 @@ mod tests {
         let (read_end, write_end) = pipe();
         let (err_r, err_w) = pipe();
         let argv = vec!["op".into(), "read".into(), "op://Engineering/x".into()];
-        let code = fulfill(&core, &argv, "/p", None, None, Some(write_end), Some(err_w));
+        let code = fulfill(
+            &core,
+            &argv,
+            "/p",
+            None,
+            0,
+            None,
+            Some(write_end),
+            Some(err_w),
+        );
 
         assert_eq!(code, 1, "a daemon with no factor must fail closed");
         assert_eq!(read_all(read_end), "", "no secret without a real factor");
@@ -2944,6 +3113,7 @@ mod tests {
             &Frame::Run {
                 argv,
                 cwd: String::new(),
+                proxy_depth: 0,
             },
             &[std::io::stdin().as_raw_fd(), write_end.as_raw_fd()],
         )
@@ -3123,6 +3293,7 @@ mod tests {
             &["faketool".into()],
             "",
             None,
+            0,
             None,
             Some(write_end),
             None,

@@ -76,6 +76,10 @@ pub struct ProviderRun<'a> {
     pub stdout: Option<OwnedFd>,
     /// The caller's stderr, wired straight to the child.
     pub stderr: Option<OwnedFd>,
+    /// The value to set `LATCH_PROXY_DEPTH` to on the spawned child: the caller's
+    /// proxy depth + 1. A tool the child re-invokes through a Latch alias sees
+    /// this and the alias's own fuse bounds the chain (see [`crate::proxy`]).
+    pub proxy_depth: u32,
 }
 
 /// A pluggable source of secrets. See the module docs for the memory invariant
@@ -234,6 +238,10 @@ impl SecretProvider for OpProvider {
                 return 1;
             }
         }
+        // The proxy recursion fuse: the child (and anything it re-invokes through
+        // a Latch alias) carries the incremented depth so the alias's own guard
+        // can bound a runaway loop. Harmless to a non-proxied tool.
+        cmd.env(crate::proxy::DEPTH_ENV, run.proxy_depth.to_string());
         if let Some(fd) = run.stdin {
             cmd.stdin(Stdio::from(fd));
         }
@@ -361,6 +369,10 @@ impl SecretProvider for EnvFileProvider {
         for (k, v) in vars.iter() {
             cmd.env(k, v);
         }
+        // The proxy recursion fuse: the child (and anything it re-invokes through
+        // a Latch alias) carries the incremented depth so the alias's own guard
+        // can bound a runaway loop. Harmless to a non-proxied tool.
+        cmd.env(crate::proxy::DEPTH_ENV, run.proxy_depth.to_string());
         if let Some(fd) = run.stdin {
             cmd.stdin(Stdio::from(fd));
         }
@@ -573,6 +585,7 @@ mod tests {
             cwd: "",
             credential: Some(&credential),
             source: "",
+            proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
             stderr: None,
@@ -625,6 +638,7 @@ mod tests {
             cwd: "",
             credential: None,
             source: env_path.to_str().unwrap(),
+            proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
             stderr: None,
@@ -674,6 +688,7 @@ mod tests {
             cwd: "",
             credential: None,
             source: env_path.to_str().unwrap(),
+            proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
             stderr: None,

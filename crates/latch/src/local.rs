@@ -58,7 +58,16 @@ pub enum Frame {
     /// descriptors ride alongside as SCM_RIGHTS (in that order). The daemon looks
     /// up the command config, gates it, injects the provider's environment, and
     /// runs it with those descriptors spliced to the child — it never reads them.
-    Run { argv: Vec<String>, cwd: String },
+    ///
+    /// `proxy_depth` is the caller's `LATCH_PROXY_DEPTH` (0 when unset), carried so
+    /// the daemon can spawn the tool child at depth+1 and fail closed past the
+    /// proxy recursion limit — the daemon has no other view of the caller's depth.
+    Run {
+        argv: Vec<String>,
+        cwd: String,
+        #[serde(default)]
+        proxy_depth: u32,
+    },
     /// The full status report (armed state, factor, shim drift, relay, counts,
     /// lockdown). Returns [`Reply::Json`] of a `StatusJson`.
     Status,
@@ -272,6 +281,7 @@ mod tests {
         let frame = Frame::Run {
             argv: vec!["op".into(), "read".into()],
             cwd: "/work".into(),
+            proxy_depth: 0,
         };
         send_frame(&shim, &frame, &[write_end.as_raw_fd()]).unwrap();
         drop(write_end);

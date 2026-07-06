@@ -67,6 +67,9 @@ fn forward(stream: UnixStream, argv: &[String]) -> io::Result<i32> {
     let frame = Frame::Run {
         argv: argv.to_vec(),
         cwd,
+        // Carry our own proxy depth so the daemon spawns the tool child at
+        // depth+1; the alias's own fuse plus this bound a runaway proxy loop.
+        proxy_depth: crate::proxy::current_depth(),
     };
 
     // Hand the daemon our real stdin, stdout, and stderr (in that order); the
