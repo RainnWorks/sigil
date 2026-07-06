@@ -1,16 +1,21 @@
 //! [`PhoneRelay`]: the approver's HTTP [`Transport`] to the v4 stateless relay.
 //!
 //! The phone has no inbound connection; it deposits and drains. `send(ToDaemon)`
-//! POSTs `/mailbox/{id}/to-daemon`; `recv(ToPhone)` short-polls
-//! `GET /mailbox/{id}/to-phone` (drain-on-read), buffering the batch and
-//! returning one envelope per call so the [`Transport`] contract is preserved.
+//! POSTs `/mailbox/{id}/to-daemon`; `recv(ToPhone)` long-polls
+//! `GET /mailbox/{id}/to-phone`: the relay HOLDS an empty request open
+//! server-side (up to its own ~25s hold) rather than answering empty
+//! immediately, so the client just issues the next GET the instant one
+//! returns -- no client-side sleep between polls. Buffers the drained batch
+//! and returns one envelope per call so the [`Transport`] contract is
+//! preserved.
 //!
 //! Used by the reference softphone in the end-to-end tests; the real iOS approver
 //! speaks the same wire from TypeScript. Blocking is deliberate: the approver's
 //! serve loop is one thread doing one round trip at a time. A transient poll
-//! error (network blip, a 5xx) is retried with backoff inside `recv` rather
+//! ERROR (network blip, a 5xx) is retried with backoff inside `recv` rather
 //! than dropping the turn outright; only running out the deadline with
-//! nothing received fails closed.
+//! nothing received fails closed. An empty long-poll return (the relay's
+//! hold simply elapsed) is NOT an error and never engages the backoff.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -22,8 +27,10 @@ use latch_proto::{Direction, Transport, TransportError};
 use crate::http::{HttpMailbox, Slot};
 use crate::wire;
 
-/// Delay between empty `to-phone` polls, trading latency for request volume.
-const POLL_INTERVAL: Duration = Duration::from_millis(2000);
+/// Initial backoff after a transient poll error (network blip, a 5xx); the
+/// relay's own long-poll hold does the "wait for real work" job now, so this
+/// only paces retries of actual failures, not the empty-slot common case.
+const ERROR_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
 
 /// Ceiling on the backoff after consecutive transient poll errors, so a
 /// prolonged relay outage still polls often enough to catch it recovering
@@ -35,7 +42,7 @@ pub struct PhoneRelay {
     http: HttpMailbox,
     /// Envelopes drained from `to-phone` but not yet returned by `recv`.
     buffer: Mutex<VecDeque<Envelope>>,
-    poll_interval: Duration,
+    error_backoff_initial: Duration,
 }
 
 impl PhoneRelay {
@@ -45,13 +52,13 @@ impl PhoneRelay {
         Ok(Self {
             http: HttpMailbox::new(base, mailbox)?,
             buffer: Mutex::new(VecDeque::new()),
-            poll_interval: POLL_INTERVAL,
+            error_backoff_initial: ERROR_BACKOFF_INITIAL,
         })
     }
 
-    /// Override the empty-poll delay (tests use a short one).
+    /// Override the initial error-retry backoff (tests use a short one).
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
-        self.poll_interval = interval;
+        self.error_backoff_initial = interval;
         self
     }
 
@@ -106,18 +113,8 @@ impl Transport for PhoneRelay {
             ));
         }
         let deadline = Instant::now() + timeout;
-        let mut backoff = self.poll_interval;
+        let mut backoff = self.error_backoff_initial;
         loop {
-            if let Some(env) = self.pop_buffered()? {
-                return Ok(Some(env));
-            }
-            // Same discipline as `DaemonRelay::recv`: a transient poll error
-            // retries with backoff up to the deadline instead of dropping the
-            // turn on the first blip.
-            match self.poll_to_phone() {
-                Ok(()) => backoff = self.poll_interval,
-                Err(e) => eprintln!("latch relay: to-phone poll failed, retrying: {e}"),
-            }
             if let Some(env) = self.pop_buffered()? {
                 return Ok(Some(env));
             }
@@ -125,8 +122,28 @@ impl Transport for PhoneRelay {
             if remaining.is_zero() {
                 return Ok(None);
             }
-            std::thread::sleep(backoff.min(remaining));
-            backoff = (backoff * 2).min(MAX_POLL_BACKOFF);
+            // Same discipline as `DaemonRelay::recv`: `poll_to_phone` now
+            // long-polls (the GET itself is the wait), so a transient poll
+            // ERROR retries with backoff up to the deadline instead of
+            // dropping the turn on the first blip, while an empty return
+            // (the hold elapsed, nothing yet) just re-issues immediately.
+            match self.poll_to_phone() {
+                Ok(()) => {
+                    backoff = self.error_backoff_initial;
+                    if let Some(env) = self.pop_buffered()? {
+                        return Ok(Some(env));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("latch relay: to-phone poll failed, retrying: {e}");
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(backoff.min(remaining));
+                    backoff = (backoff * 2).min(MAX_POLL_BACKOFF);
+                }
+            }
         }
     }
 }

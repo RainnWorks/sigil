@@ -12,16 +12,17 @@
 //!
 //! Direction is role-fixed, mirroring the steady state: the daemon side sends
 //! toward the phone (`to-phone`) and receives from the phone (`to-daemon`); the
-//! phone side is the mirror. Blocking, like the rest of the ceremony.
+//! phone side is the mirror. Blocking, like the rest of the ceremony. `recv`
+//! long-polls just like the steady-state transports: an empty slot holds the
+//! GET open server-side (up to the relay's own ~25s hold) rather than
+//! answering empty immediately, so this client re-issues the next GET the
+//! instant one returns rather than sleeping a fixed interval first.
 
 use std::time::{Duration, Instant};
 
 use latch_proto::TransportError;
 
 use crate::http::{HttpMailbox, Slot};
-
-/// Delay between empty rendezvous polls.
-const POLL_INTERVAL: Duration = Duration::from_millis(2000);
 
 /// A blocking client for one rendezvous mailbox, fixed to one party's direction
 /// pair (send toward the peer, receive from the peer).
@@ -57,7 +58,11 @@ impl Rendezvous {
 
     /// Poll until one payload arrives or `timeout` elapses. Returns the first
     /// payload, or `None` on timeout. If a single drain returns several the extras
-    /// are dropped: the ceremony is strictly one message per direction.
+    /// are dropped: the ceremony is strictly one message per direction. Each
+    /// `drain` is itself a long-poll GET (the relay holds an empty slot open
+    /// server-side rather than answering empty immediately), so an empty
+    /// result just means "the hold elapsed, nothing yet" -- re-issue at once,
+    /// no client-side sleep.
     pub fn recv(&self, timeout: Duration) -> Result<Option<String>, TransportError> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -69,7 +74,6 @@ impl Rendezvous {
             if remaining.is_zero() {
                 return Ok(None);
             }
-            std::thread::sleep(POLL_INTERVAL.min(remaining));
         }
     }
 }

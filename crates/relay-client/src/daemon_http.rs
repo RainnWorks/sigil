@@ -1,6 +1,6 @@
 //! [`DaemonRelay`]: the daemon's HTTP [`Transport`] to the v4 stateless relay.
 //!
-//! The daemon deposits a sealed request toward the phone and short-polls for the
+//! The daemon deposits a sealed request toward the phone and long-polls for the
 //! phone's sealed reply. There is no held socket and no daemon-side buffer: the
 //! relay holds the deposited request in memory for a short TTL (evicted on read),
 //! so a single POST is enough and the daemon only polls while it is actually
@@ -10,13 +10,19 @@
 //!   and, when the phone has registered one, its push token as a [`PushHint`].
 //!   The RELAY (not the daemon) rings the doorbell with that token and forgets
 //!   it; the daemon holds no Apple secret and signs nothing.
-//! * `recv(ToDaemon)` short-polls `GET /mailbox/{id}/to-daemon`, buffering the
-//!   drained batch and returning one envelope per call. This slot also carries an
-//!   unsolicited `PushRegister`; the caller demultiplexes it.
+//! * `recv(ToDaemon)` long-polls `GET /mailbox/{id}/to-daemon`: the relay HOLDS
+//!   an empty request open server-side (up to its own ~25s hold) rather than
+//!   answering empty immediately, so the client just issues the next GET the
+//!   instant one returns -- no client-side sleep between polls, no idle-poll
+//!   volume, and the doorbell is genuinely the wakeup rather than racing a
+//!   fixed interval. This slot also carries an unsolicited `PushRegister`; the
+//!   caller demultiplexes it.
 //!
 //! A transient poll error (network blip, a 5xx) is retried with backoff inside
 //! `recv` rather than failing the round trip outright; only running out the
 //! deadline with nothing received fails closed, exactly as the design intends.
+//! An empty long-poll return (the relay's hold simply elapsed) is NOT an error
+//! and never engages the backoff -- it just means "re-issue".
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -28,8 +34,10 @@ use latch_proto::{Direction, PushHint, Transport, TransportError};
 use crate::http::{HttpMailbox, Slot};
 use crate::wire;
 
-/// Delay between empty `to-daemon` polls, trading latency for request volume.
-const POLL_INTERVAL: Duration = Duration::from_millis(2000);
+/// Initial backoff after a transient poll error (network blip, a 5xx); the
+/// relay's own long-poll hold does the "wait for real work" job now, so this
+/// only paces retries of actual failures, not the empty-slot common case.
+const ERROR_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
 
 /// Ceiling on the backoff after consecutive transient poll errors, so a
 /// prolonged relay outage still polls often enough to catch it recovering
@@ -42,7 +50,7 @@ pub struct DaemonRelay {
     http: HttpMailbox,
     /// Envelopes drained from `to-daemon` but not yet returned by `recv`.
     buffer: Mutex<VecDeque<Envelope>>,
-    poll_interval: Duration,
+    error_backoff_initial: Duration,
 }
 
 impl DaemonRelay {
@@ -53,7 +61,7 @@ impl DaemonRelay {
             mailbox,
             http: HttpMailbox::new(base, mailbox)?,
             buffer: Mutex::new(VecDeque::new()),
-            poll_interval: POLL_INTERVAL,
+            error_backoff_initial: ERROR_BACKOFF_INITIAL,
         })
     }
 
@@ -62,9 +70,9 @@ impl DaemonRelay {
         self.mailbox
     }
 
-    /// Override the empty-poll delay (tests use a short one).
+    /// Override the initial error-retry backoff (tests use a short one).
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
-        self.poll_interval = interval;
+        self.error_backoff_initial = interval;
         self
     }
 
@@ -128,20 +136,8 @@ impl Transport for DaemonRelay {
             ));
         }
         let deadline = Instant::now() + timeout;
-        let mut backoff = self.poll_interval;
+        let mut backoff = self.error_backoff_initial;
         loop {
-            if let Some(env) = self.pop_buffered()? {
-                return Ok(Some(env));
-            }
-            // A transient poll error (network blip, a 5xx) must not deny a
-            // legitimate approval outright: retry with backoff up to the
-            // deadline. Only a genuine timeout (nothing arrives by then)
-            // fails closed; `pop_buffered`'s own error (a poisoned mutex) is
-            // the one thing here that is never going to resolve by retrying.
-            match self.poll_to_daemon() {
-                Ok(()) => backoff = self.poll_interval,
-                Err(e) => eprintln!("latch relay: to-daemon poll failed, retrying: {e}"),
-            }
             if let Some(env) = self.pop_buffered()? {
                 return Ok(Some(env));
             }
@@ -149,8 +145,35 @@ impl Transport for DaemonRelay {
             if remaining.is_zero() {
                 return Ok(None);
             }
-            std::thread::sleep(backoff.min(remaining));
-            backoff = (backoff * 2).min(MAX_POLL_BACKOFF);
+            // `poll_to_daemon` now long-polls: the relay holds an empty
+            // request open server-side (up to its own ~25s) rather than
+            // answering empty immediately, so this GET itself is the wait.
+            // A transient poll ERROR (network blip, a 5xx) must not deny a
+            // legitimate approval outright: retry with backoff up to the
+            // deadline. An empty return is not an error -- it is just the
+            // hold elapsing with nothing yet -- and re-issues immediately,
+            // no sleep, since the relay already did the waiting.
+            match self.poll_to_daemon() {
+                Ok(()) => {
+                    backoff = self.error_backoff_initial;
+                    if let Some(env) = self.pop_buffered()? {
+                        return Ok(Some(env));
+                    }
+                    // Empty long-poll: go straight back to the top and issue
+                    // the next GET. `pop_buffered`'s own error (a poisoned
+                    // mutex) is the one thing here that is never going to
+                    // resolve by retrying, hence the early `?` above.
+                }
+                Err(e) => {
+                    eprintln!("latch relay: to-daemon poll failed, retrying: {e}");
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(backoff.min(remaining));
+                    backoff = (backoff * 2).min(MAX_POLL_BACKOFF);
+                }
+            }
         }
     }
 }

@@ -19,9 +19,12 @@ use latch_proto::{PushHint, TransportError};
 
 use crate::mailbox_hex;
 
-/// Per-request HTTP timeout. A slot GET returns immediately with whatever is
-/// buffered (not a long-poll), so this only bounds a stalled connection.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per-request HTTP timeout. A slot GET now long-polls: an empty slot holds
+/// the request open server-side for up to the relay's ~25s hold before
+/// returning empty, rather than replying immediately. This must clear that
+/// hold with slack, or the client would time out (and error) requests the
+/// relay was about to legitimately answer empty; 35s gives 10s of margin.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Ceiling on a drained slot's response body. An honest relay bounds a
 /// mailbox to `MAX_QUEUE` (32) envelopes of at most `MAX_ENVELOPE_BYTES`
