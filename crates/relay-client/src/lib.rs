@@ -78,15 +78,62 @@ pub(crate) mod wire {
         serde_json::json!({ "t": "send", "env": env_wire }).to_string()
     }
 
-    /// If `msg` is a relay -> daemon `deliver` frame, return its opaque `env`
-    /// string; otherwise `None` (an `ack`, `err`, keepalive, or garbage). Mirrors
-    /// `FRAME.deliver` / `parseSend` on the relay side.
-    pub fn parse_deliver(msg: &str) -> Option<String> {
-        let v: serde_json::Value = serde_json::from_str(msg).ok()?;
-        if v.get("t")?.as_str()? != "deliver" {
-            return None;
+    /// The daemon's `pong` reply to a relay `ping` keepalive.
+    pub fn pong_frame() -> String {
+        serde_json::json!({ "t": "pong" }).to_string()
+    }
+
+    /// A relay -> daemon frame, classified for the stateless (v3) wire. The relay
+    /// no longer buffers: it forwards live, tells us when it could not (`nopeer`),
+    /// and reports the peer's connect/drop so we can stream a held request at the
+    /// right moment. Anything unrecognized is [`InFrame::Other`] and ignored.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum InFrame {
+        /// A sealed envelope forwarded from the peer; carries the opaque `env`.
+        Deliver(String),
+        /// Our last `send` had no peer connected to receive it: hold and retry.
+        NoPeer,
+        /// The peer attached; flush anything held for it.
+        PeerAttached,
+        /// The peer dropped; keep holding until it returns or the request expires.
+        PeerDetached,
+        /// A keepalive ping; reply with [`pong_frame`].
+        Ping,
+        /// An ack, pong, or anything the sync API does not act on.
+        Other,
+    }
+
+    /// Classify a relay -> daemon text frame. Fail-safe: malformed JSON or an
+    /// unknown tag is [`InFrame::Other`], never an error (the relay is untrusted
+    /// and a bad frame must not derail the pump).
+    pub fn parse_frame(msg: &str) -> InFrame {
+        let v: serde_json::Value = match serde_json::from_str(msg) {
+            Ok(v) => v,
+            Err(_) => return InFrame::Other,
+        };
+        match v.get("t").and_then(serde_json::Value::as_str) {
+            Some("deliver") => match v.get("env").and_then(serde_json::Value::as_str) {
+                Some(env) => InFrame::Deliver(env.to_string()),
+                None => InFrame::Other,
+            },
+            Some("nopeer") => InFrame::NoPeer,
+            Some("peer") => match v.get("state").and_then(serde_json::Value::as_str) {
+                Some("attached") => InFrame::PeerAttached,
+                Some("detached") => InFrame::PeerDetached,
+                _ => InFrame::Other,
+            },
+            Some("ping") => InFrame::Ping,
+            _ => InFrame::Other,
         }
-        v.get("env")?.as_str().map(str::to_string)
+    }
+
+    /// If `msg` is a relay -> daemon `deliver` frame, return its opaque `env`
+    /// string; otherwise `None`. Retained as a thin helper over [`parse_frame`].
+    pub fn parse_deliver(msg: &str) -> Option<String> {
+        match parse_frame(msg) {
+            InFrame::Deliver(env) => Some(env),
+            _ => None,
+        }
     }
 }
 
@@ -123,6 +170,34 @@ mod tests {
         assert_eq!(wire::parse_deliver(&frame), None); // send, not deliver
         assert_eq!(wire::parse_deliver(r#"{"t":"ack","depth":1}"#), None);
         assert_eq!(wire::parse_deliver("not json"), None);
+    }
+
+    #[test]
+    fn parse_frame_classifies_the_stateless_wire() {
+        use wire::InFrame;
+        assert_eq!(
+            wire::parse_frame(r#"{"t":"deliver","env":"opaque"}"#),
+            InFrame::Deliver("opaque".into())
+        );
+        assert_eq!(wire::parse_frame(r#"{"t":"nopeer"}"#), InFrame::NoPeer);
+        assert_eq!(
+            wire::parse_frame(r#"{"t":"peer","state":"attached"}"#),
+            InFrame::PeerAttached
+        );
+        assert_eq!(
+            wire::parse_frame(r#"{"t":"peer","state":"detached"}"#),
+            InFrame::PeerDetached
+        );
+        assert_eq!(wire::parse_frame(r#"{"t":"ping"}"#), InFrame::Ping);
+        // Unknown tags, a peer frame with no/bad state, and garbage are all Other.
+        assert_eq!(
+            wire::parse_frame(r#"{"t":"ack","depth":1}"#),
+            InFrame::Other
+        );
+        assert_eq!(wire::parse_frame(r#"{"t":"peer"}"#), InFrame::Other);
+        assert_eq!(wire::parse_frame("not json"), InFrame::Other);
+        // A deliver frame missing its env is not a half-parsed Deliver.
+        assert_eq!(wire::parse_frame(r#"{"t":"deliver"}"#), InFrame::Other);
     }
 
     #[test]
