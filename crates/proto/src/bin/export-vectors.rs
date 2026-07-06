@@ -29,6 +29,13 @@
 //!     base `E` in, the derived token key `K` and AES-256-GCM `token_ct` out, for
 //!     both `ecdh_algo` shapes, so the phone's TS combiner is locked to this Rust
 //!     one (`threshold.rs`).
+//!   * `pairingTranscript` — the v2 pairing confirmation transcript and MAC
+//!     (`pairing.rs`'s `pairing_transcript`/`confirmation_tag`): fixed daemon/
+//!     phone identities, endpoints, timestamp, and nonce in (a v1 case with no
+//!     `se_share_pub` and a v2 case with one), the expected transcript and tag
+//!     out, so the phone's TS transcript builder is locked to this Rust one —
+//!     the piece that was NOT locked when the `seSharePub`/`se_share_pub`
+//!     camelCase wire mismatch shipped.
 
 use std::path::PathBuf;
 
@@ -175,6 +182,66 @@ fn pairing_qr_vectors() -> Vec<Value> {
         "createdAt": created_at,
         "expected": payload.to_qr_string().expect("qr encode"),
     })]
+}
+
+/// pairingTranscript: the v2 pairing confirmation transcript and MAC
+/// (`pairing.rs`'s `pairing_transcript`/`confirmation_tag`, exported via
+/// `pairing_confirmation_vector` since production never needs a fixed nonce).
+/// Locks the exact construction the phone's TS mirror
+/// (`pairingTranscript`/`deriveSubkey`/`confirmationTag` in
+/// `pairing-handshake.ts`) must reproduce byte-for-byte, INCLUDING the
+/// `se_share_pub` (v2 threshold share) case: this is the piece that was not
+/// locked when the `seSharePub`/`se_share_pub` camelCase wire mismatch
+/// shipped, so nothing caught two sides computing different transcripts until
+/// a real device did.
+fn pairing_transcript_vectors() -> Vec<Value> {
+    let secret = PairingSecret(fixed32(50));
+    let daemon = PeerIdentity {
+        verifying: fixed32(100),
+        agreement: fixed32(101),
+    };
+    let endpoints = vec![
+        "lan://latch.local:4823".to_string(),
+        "https://tide.example.net:4823".to_string(),
+    ];
+    let created_at = 1_720_000_000_000u64;
+    let phone = PeerIdentity {
+        verifying: fixed32(150),
+        agreement: fixed32(151),
+    };
+    let nonce = fixed32(60);
+    // Same fixed share used by `combiner_vectors`'s pattern, new seed: a
+    // deterministic on-curve P-256 X9.63 point, standard base64.
+    let se_share = fixed_share(0x44);
+    let se_share_b64 = {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        STANDARD.encode(se_share.public_point().as_x963())
+    };
+
+    [
+        ("v1-no-share", None),
+        ("v2-with-se-share", Some(se_share_b64.as_str())),
+    ]
+    .into_iter()
+    .map(|(name, share)| {
+        let (transcript, tag) = latch_proto::pairing_confirmation_vector(
+            &secret, &daemon, &endpoints, created_at, &phone, &nonce, share,
+        );
+        json!({
+            "name": name,
+            "secret": hex(secret.as_bytes()),
+            "daemon": peer_json(&daemon),
+            "endpoints": endpoints,
+            "createdAt": created_at,
+            "phone": peer_json(&phone),
+            "nonce": hex(&nonce),
+            "seSharePub": share,
+            "expectedTranscript": hex(&transcript),
+            "expectedTag": hex(&tag),
+        })
+    })
+    .collect()
 }
 
 /// open: real sealed envelopes plus expected plaintext or error.
@@ -395,6 +462,7 @@ fn main() {
         "open": open_vectors(),
         "replay": replay_vectors(),
         "combiner": combiner_vectors(),
+        "pairingTranscript": pairing_transcript_vectors(),
     });
 
     let out = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

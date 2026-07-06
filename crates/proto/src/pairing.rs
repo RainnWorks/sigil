@@ -228,6 +228,34 @@ fn confirmation_tag(k_confirm: &[u8; 32], transcript: &[u8; 32]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
+/// Compute the confirmation transcript and tag for FIXED inputs, including a
+/// caller-supplied `nonce` (production always mints a fresh CSPRNG one via
+/// [`PairingResponse::create`]/[`PairingResponse::create_with_share`], so this
+/// path is never used for a real pairing). Exists solely so `export-vectors`
+/// (and the phone's TS mirror, `pairingTranscript`/`deriveSubkey`/
+/// `confirmationTag` in `pairing-handshake.ts`) can pin this exact
+/// construction byte-for-byte across languages: fixed inputs in, the same
+/// transcript and tag out, every time, on both sides. This is the piece that
+/// was NOT locked when the `seSharePub`/`se_share_pub` camelCase wire mismatch
+/// shipped -- the daemon and phone each computed a transcript the other could
+/// not reproduce, and nothing caught it before a real device did.
+///
+/// Returns `(transcript, tag)`.
+pub fn pairing_confirmation_vector(
+    secret: &PairingSecret,
+    daemon: &PeerIdentity,
+    endpoints: &[String],
+    created_at: u64,
+    phone: &PeerIdentity,
+    nonce: &[u8; 32],
+    se_share_pub: Option<&str>,
+) -> ([u8; 32], [u8; 32]) {
+    let k_confirm = derive_subkey(secret, SUBKEY_CONFIRM_LABEL);
+    let transcript = pairing_transcript(daemon, endpoints, created_at, phone, nonce, se_share_pub);
+    let tag = confirmation_tag(&k_confirm, &transcript);
+    (transcript, tag)
+}
+
 /// Decode and on-curve-validate a phone threshold share `F` (standard base64 of
 /// the 65-byte ANSI X9.63 uncompressed P-256 point). Rejects wrong lengths and
 /// off-curve/twist points via the shared [`crate::threshold::P256Point`]
@@ -1233,5 +1261,129 @@ mod tests {
         let sealed = daemon.wrap_dek_for_se_p256(&dek, &se_pub).unwrap();
         let recovered = unwrap_dek_p256(&sealed, &se_secret).unwrap();
         assert_eq!(recovered.as_bytes(), dek.as_bytes());
+    }
+
+    // --- confirmation transcript known-answer vectors -----------------------
+    //
+    // Pins `pairing_transcript`/`confirmation_tag` (via the exported
+    // `pairing_confirmation_vector` seam) byte-for-byte over fixed inputs, so a
+    // future change to either side's field ordering, length-prefixing, or
+    // domain string is caught here rather than only by an end-to-end pairing
+    // over real devices -- which is how the `seSharePub`/`se_share_pub`
+    // camelCase wire mismatch shipped. `export-vectors` emits the same two
+    // cases (v1, no share; v2, with `se_share_pub`) for the phone's TS mirror
+    // to reproduce.
+
+    fn fixed_peer(seed: u8) -> PeerIdentity {
+        PeerIdentity {
+            verifying: fixed32(seed),
+            agreement: fixed32(seed.wrapping_add(1)),
+        }
+    }
+
+    /// A deterministic 32-byte pattern from a seed, matching `export-vectors`'s
+    /// helper of the same name so the two stay trivially comparable.
+    fn fixed32(seed: u8) -> [u8; 32] {
+        std::array::from_fn(|i| seed.wrapping_add(i as u8).wrapping_mul(7).wrapping_add(1))
+    }
+
+    /// A deterministic, on-curve P-256 X9.63 point (standard base64), for a
+    /// realistic `se_share_pub` value. `pairing_transcript` only ever hashes
+    /// this as opaque string bytes -- on-curve validation happens elsewhere,
+    /// at pin time -- but a real-shaped value keeps the vector honest.
+    fn fixed_se_share_b64() -> String {
+        use crate::threshold::MacShare;
+        use base64::engine::general_purpose::STANDARD;
+        let bytes: [u8; 32] =
+            std::array::from_fn(|i| (0x44u8).wrapping_add(i as u8).wrapping_mul(3) | 1);
+        let share =
+            MacShare::from_scalar_bytes(&bytes).expect("fixed seed is a valid P-256 scalar");
+        STANDARD.encode(share.public_point().as_x963())
+    }
+
+    fn hex32(bytes: &[u8; 32]) -> String {
+        let mut s = String::with_capacity(64);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    #[test]
+    fn pairing_confirmation_transcript_matches_the_known_answer_v1() {
+        let secret = PairingSecret(fixed32(50));
+        let daemon = fixed_peer(100);
+        let endpoints = vec![
+            "lan://latch.local:4823".to_string(),
+            "https://tide.example.net:4823".to_string(),
+        ];
+        let phone = fixed_peer(150);
+        let nonce = fixed32(60);
+
+        let (transcript, tag) = pairing_confirmation_vector(
+            &secret,
+            &daemon,
+            &endpoints,
+            1_720_000_000_000,
+            &phone,
+            &nonce,
+            None,
+        );
+
+        assert_eq!(
+            hex32(&transcript),
+            "220b0509dc40bd9b16138e28a5fce5eb5a8c2d7aa8e31aec604e55a691ab3229"
+        );
+        assert_eq!(
+            hex32(&tag),
+            "b45431db69921ba821d8cb1e9ae216ed152bb79aeffe54d2c3c963ba7fd54d35"
+        );
+    }
+
+    #[test]
+    fn pairing_confirmation_transcript_matches_the_known_answer_v2_with_se_share() {
+        let secret = PairingSecret(fixed32(50));
+        let daemon = fixed_peer(100);
+        let endpoints = vec![
+            "lan://latch.local:4823".to_string(),
+            "https://tide.example.net:4823".to_string(),
+        ];
+        let phone = fixed_peer(150);
+        let nonce = fixed32(60);
+        let se_share = fixed_se_share_b64();
+
+        let (transcript, tag) = pairing_confirmation_vector(
+            &secret,
+            &daemon,
+            &endpoints,
+            1_720_000_000_000,
+            &phone,
+            &nonce,
+            Some(&se_share),
+        );
+
+        // With a share bound in, both the transcript and the tag must differ
+        // from the v1 (no-share) case above -- proof `se_share_pub` actually
+        // changes what gets signed, not just that the field exists.
+        let (v1_transcript, v1_tag) = pairing_confirmation_vector(
+            &secret,
+            &daemon,
+            &endpoints,
+            1_720_000_000_000,
+            &phone,
+            &nonce,
+            None,
+        );
+        assert_ne!(transcript, v1_transcript);
+        assert_ne!(tag, v1_tag);
+
+        assert_eq!(
+            hex32(&transcript),
+            "be21a2c8e3a44e7885e34aa4f4a01089a3c8504b622e9a76aa80206cc220210c"
+        );
+        assert_eq!(
+            hex32(&tag),
+            "4e4ee41e8258419c059f82617e302d5d0967dff04c9f8a346058ec0675479ddf"
+        );
     }
 }
