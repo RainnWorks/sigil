@@ -1,7 +1,7 @@
 # latch
 
 Personal remote-approval instrument for 1Password secrets. Single user (Tom),
-never a team product. The design brief at `docs/design/latch-design-brief.html`
+never a team product. The design brief at `docs/design/sigil-design-brief.html`
 is the constitution; when code and brief disagree, either fix the code or
 update the brief in the same change, never let them drift.
 

@@ -553,7 +553,7 @@ These are real and deliberately surfaced, not defects hidden.
 6. **Metadata at the relay.** The relay learns that two anonymous mailbox
    parties exchange envelopes, and the sizes/timing of those envelopes. This is
    inherent to any store-and-forward transport and is the accepted trust surface
-   (`docs/design/latch-design-brief.html`, Trust model).
+   (`docs/design/sigil-design-brief.html`, Trust model).
 
 7. **The "inert at rest" claim is strong for cold-disk theft, weaker for live
    same-UID compromise.** Cold-disk theft yields only `pairing.json` (public);

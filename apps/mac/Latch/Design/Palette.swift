@@ -4,7 +4,7 @@
 //  brief's "harbor at dusk" oklch values, converted once to sRGB here so the
 //  source of truth stays the brief.
 //
-//  oklch -> sRGB (D65) conversions, from docs/design/latch-design-brief.html:
+//  oklch -> sRGB (D65) conversions, from docs/design/sigil-design-brief.html:
 //    cobalt   oklch(0.45 0.086 230)  -> rgb(11, 93, 124)   #0B5D7C
 //    brass    oklch(0.72 0.11  75)   -> rgb(205, 154, 80)  #CD9A50
 //    seagreen oklch(0.56 0.095 165)  -> rgb(50, 134, 102)  #328666

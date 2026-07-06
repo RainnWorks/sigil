@@ -1,7 +1,7 @@
 # Auto-aliasing proxy: transparent, anonymous CLI interception
 
 Status: design (rust-core / proxy-shim, 2026-07-06). Implements task #40.
-Constitution: `docs/design/latch-design-brief.html` and the INVOCATION MODEL /
+Constitution: `docs/design/sigil-design-brief.html` and the INVOCATION MODEL /
 ANY-CLI PIVOT notes. Companion: `docs/design/config-rule-engine.md` (config-cli
 owns the rule engine this proxy gates through).
 

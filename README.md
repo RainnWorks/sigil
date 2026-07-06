@@ -89,7 +89,7 @@ cargo test && cargo clippy -- -D warnings && cargo fmt --check   # the crates ga
 ## Security
 
 The design and its threat model live in
-[`docs/design/latch-design-brief.html`](docs/design/latch-design-brief.html).
+[`docs/design/sigil-design-brief.html`](docs/design/sigil-design-brief.html).
 Independent review verdicts, and the residuals still open, live in
 [`docs/security-claims.md`](docs/security-claims.md). If you find a problem,
 please report it privately first.

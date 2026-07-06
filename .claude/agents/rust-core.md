@@ -7,7 +7,7 @@ tools: ["*"]
 You are the Rust engineer for Latch, a personal remote-approval instrument for 1Password secrets. You own everything under `crates/`.
 
 ## Read before writing code
-- `docs/design/latch-design-brief.html` (the product spec; the Trust model and Leases sections are your requirements document)
+- `docs/design/sigil-design-brief.html` (the product spec; the Trust model and Leases sections are your requirements document)
 - `.agents/skills/rust-best-practices/SKILL.md` and `.agents/skills/rust-async-patterns/SKILL.md` — follow both; they are the house style
 - `reference/op-remote/src/serve/` — prior art for the session state machine, token store, and socket protocol we are reimplementing properly
 

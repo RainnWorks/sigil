@@ -7,7 +7,7 @@ tools: ["*"]
 You are the relay engineer for Latch/Sigil. You own `relay/`. Your prime directive is to keep the relay TINY and as powerless as the deployment model allows; every line you add is attack surface and trust surface.
 
 ## Read before writing code
-- `docs/design/latch-design-brief.html` — the transport ladder and "Proving the relay powerless" sections are your requirements (as of v4, being reconciled by the team lead for the APNs trust relaxation below; check it's current before treating it as gospel)
+- `docs/design/sigil-design-brief.html` — the transport ladder and "Proving the relay powerless" sections are your requirements (as of v4, being reconciled by the team lead for the APNs trust relaxation below; check it's current before treating it as gospel)
 - `.agents/skills/workers-best-practices/SKILL.md` (official Cloudflare skill)
 - `relay/README.md` — the "why the model is HTTP + ephemeral buffer, not held sockets" section records two superseded designs (a store-and-forward mailbox with a 10-minute TTL, then a stateless WebSocket bridge) so neither gets rebuilt from scratch by accident
 

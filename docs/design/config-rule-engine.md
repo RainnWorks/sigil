@@ -2,7 +2,7 @@
 
 Status: design + first implementation increment (rust-core, 2026-07-06).
 Supersedes the per-command `CommandStore` (`commands.json`) with a
-rule/source model. Constitution: `docs/design/latch-design-brief.html` and the
+rule/source model. Constitution: `docs/design/sigil-design-brief.html` and the
 ANY-CLI PIVOT / INVOCATION MODEL notes in the project memory.
 
 ## Why

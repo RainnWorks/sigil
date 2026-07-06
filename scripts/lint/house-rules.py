@@ -45,7 +45,7 @@ TARGETS = [
     ("relay/bun", "**/*.ts", "c"),
     ("relay/shared", "**/*.ts", "c"),
     ("site", "*.html", "html"),
-    ("docs/design", "latch-design-brief.html", "html"),
+    ("docs/design", "sigil-design-brief.html", "html"),
 ]
 
 # Paths (substring match, POSIX-style) that are never product surface: tests,
