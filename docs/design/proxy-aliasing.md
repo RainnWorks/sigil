@@ -283,6 +283,18 @@ is preserved. For behavioural indistinguishability:
   during approval is observable. These are enumerated for the security-reviewer;
   none is load-bearing for any invariant. A future `--quiet` could strip the
   Latch word from the fault path.
+- **The proxy is not a containment boundary (crucial).** A caller that controls
+  its own environment can bypass the gate entirely, by design: the real binary is
+  never moved or modified (see "never clobber"), so the caller can invoke it by
+  absolute path, prepend its real directory ahead of `~/.latch/bin`, or unset
+  `PATH` interception. The proxy's job is only to make an **unmodified,
+  non-hostile** caller (an agent, a launcher, `git`) transit Latch; it is **not**
+  a sandbox and does **not** trap a caller that is trying to avoid the gate. The
+  real security boundary is the daemon + phone approval for requests that **do**
+  transit Latch, plus the daemon-verified caller identity on those requests.
+  `proxy doctor`'s "real precedes the proxy on PATH" check is a **convenience for
+  the operator** (spot an accidental bypass), never a control against a hostile
+  caller. Nothing here is claimed to prevent PATH-order bypass.
 
 ## CLI surface
 
@@ -369,15 +381,16 @@ Open coordination points (sent to config-cli):
    must update that call.)
 3. **Proxy dir + PATH ownership.** `~/.latch/bin` stays the single proxy dir and
    the PATH story lives in my proxy module, not duplicated in the config CLI.
-4. **Two daemon-side gaps config-cli owns** (it owns the `daemon.rs` Run handler;
-   see the transparency and recursion sections):
-   - splice the **caller's stdin** to the tool child's stdin, so interactive
-     tools work. **MUST preserve invariant #2** (secret bytes never enter daemon
-     memory): stdin splices caller-fd -> child-fd by the same fd-passing
-     discipline as stdout, with the daemon never reading or buffering it. This is
-     invariant-adjacent and needs an **independent security-reviewer pass**.
-   - set `LATCH_PROXY_DEPTH = n+1` on daemon-spawned tool children, so the
-     up-path recursion fuse is bounded.
+4. **Two daemon-side gaps config-cli owned (both LANDED)**:
+   - [landed `538fd70`] splice the **caller's stdin** to the tool child's stdin.
+     **Preserves invariant #2**: stdin splices caller-fd -> child-fd by the same
+     fd-passing discipline as stdout, the daemon never reading or buffering it.
+     Still on the security-reviewer's list (invariant-adjacent).
+   - [landed `65d75d2`] `proxy_depth` on `Frame::Run`: the shim sends its
+     `current_depth()`; the daemon refuses before spawning if `proxy_depth >=
+     MAX_DEPTH` and otherwise spawns the child with `LATCH_PROXY_DEPTH =
+     proxy_depth + 1`, so the up-path fuse is bounded (my alias-entry
+     `depth_exceeded()` is the belt).
 
 ## Security notes (for the security-reviewer, not self-certified)
 
@@ -390,10 +403,17 @@ PATH manipulation and binary resolution are a hijack surface. Points to review:
   a symlink chain, a `PATH` containing the proxy dir twice, a real binary that is
   itself a symlink into the proxy dir, a `<cmd>` copy (not symlink) of the Latch
   binary planted in the proxy dir.
-- **Order drift is a gate bypass**, not cosmetic: a real binary before the proxy
-  on PATH routes an intercepted command ungated. doctor must treat it as an
-  error, and the daemon's startup shim-check already warns on it for `op`;
-  generalise that to every configured alias.
+- **Order drift is a gate bypass for the honest path, not a control against a
+  hostile caller.** A real binary before the proxy on `PATH` routes an
+  *unmodified* caller's command ungated; `doctor` flags it and the startup
+  shim-check warns, as an operator convenience. But a caller that *wants* to skip
+  the gate always can (invoke the real binary by path, reorder its own `PATH`,
+  unset it) because the real binary is deliberately never moved (see
+  "no-clobber"). The proxy is **not a containment boundary**; do not review it as
+  one. The security boundary is the daemon + phone gate + daemon-verified caller
+  identity for requests that actually transit Latch. This is the same fact as
+  "anonymity is best-effort" seen from the gating side, and it is documented as a
+  residual, not claimed as prevented.
 - **The env-guard bound (40)** is a liveness fuse, not a security control; it
   must never be the thing standing between a loop and a gate.
 - **The stdin splice** (config-cli-owned) is the one proxy change that touches an
