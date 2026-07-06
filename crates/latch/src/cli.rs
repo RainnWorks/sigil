@@ -1291,10 +1291,11 @@ fn run_pairing(args: &[String]) -> i32 {
     }
 
     let ks = keystore::for_host();
-    // Provision (idempotently) and unwrap the keystore DEK so the ceremony
-    // delivers the SAME key `latch account add` seals tokens under. A first-time
-    // pair provisions it; a later account add reuses it (ensure_dek never
-    // regenerates an existing DEK).
+    // Provision (idempotently) the keystore DEK now, so a first-time pair fails
+    // fast if provisioning itself is broken; a later account add reuses it
+    // (ensure_dek never regenerates an existing DEK). This is a public-key-only
+    // operation on a Secure Enclave keystore (no Touch ID yet); the actual
+    // unwrap happens later, gated on the SAS confirm below.
     if let Err(e) = ks.ensure_dek() {
         eprintln!(
             "{} provisioning the DEK: {}\n  (detail: {e})",
@@ -1303,16 +1304,13 @@ fn run_pairing(args: &[String]) -> i32 {
         );
         return 1;
     }
-    let dek = match ks.unwrap_dek("Deliver the encryption key to your phone during pairing") {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!(
-                "{} unwrapping the DEK: {}\n  (detail: {e})",
-                s.deny("\u{2717}"),
-                keystore::dek_error_hint(&e)
-            );
-            return 1;
-        }
+    // Unwraps the SAME key `latch account add` seals tokens under. Called by
+    // `run_ceremony` only after the human confirms the SAS, never before: on a
+    // Secure Enclave keystore that is where Touch ID fires, so the biometric
+    // gates authorizing this specific confirmed device.
+    let mut unwrap_dek = || -> anyhow::Result<crate::secrets::Dek> {
+        ks.unwrap_dek("Deliver the encryption key to your phone during pairing")
+            .map_err(|e| anyhow::anyhow!("{}\n  (detail: {e})", keystore::dek_error_hint(&e)))
     };
     let daemon_identity = DeviceIdentity::generate();
 
@@ -1367,7 +1365,7 @@ fn run_pairing(args: &[String]) -> i32 {
         make_channel: &mut make_channel,
         present_qr: &mut present_qr,
         confirm_sas: &mut confirm,
-        dek: &dek,
+        unwrap_dek: &mut unwrap_dek,
     };
 
     let new_pairing = match crate::pair::run_ceremony(daemon_identity, opts) {
@@ -1423,7 +1421,9 @@ fn run_pairing_json(args: &[String]) -> i32 {
     let ks = keystore::for_host();
     // Same key discipline as the interactive path: the ceremony delivers the
     // keystore DEK that `latch account add` seals tokens under, provisioned
-    // idempotently here so a first-time pair still arms the daemon.
+    // idempotently here so a first-time pair still arms the daemon. This is a
+    // public-key-only operation on a Secure Enclave keystore (no Touch ID
+    // yet); the actual unwrap happens later, gated on the SAS confirm below.
     if let Err(e) = ks.ensure_dek() {
         emit_ndjson(&serde_json::json!({
             "event": "failed",
@@ -1433,15 +1433,13 @@ fn run_pairing_json(args: &[String]) -> i32 {
         }));
         return 1;
     }
-    let dek = match ks.unwrap_dek("Deliver the encryption key to your phone during pairing") {
-        Ok(d) => d,
-        Err(e) => {
-            emit_ndjson(&serde_json::json!({
-                "event": "failed",
-                "reason": format!("unwrapping the DEK: {}", keystore::dek_error_hint(&e))
-            }));
-            return 1;
-        }
+    // Unwraps the SAME key `latch account add` seals tokens under. Called by
+    // `run_ceremony` only after the human writes "confirm" below, never
+    // before: on a Secure Enclave keystore that is where Touch ID fires, so
+    // the biometric gates authorizing this specific confirmed device.
+    let mut unwrap_dek = || -> anyhow::Result<crate::secrets::Dek> {
+        ks.unwrap_dek("Deliver the encryption key to your phone during pairing")
+            .map_err(|e| anyhow::anyhow!("{}\n  (detail: {e})", keystore::dek_error_hint(&e)))
     };
     let daemon_identity = DeviceIdentity::generate();
 
@@ -1473,7 +1471,7 @@ fn run_pairing_json(args: &[String]) -> i32 {
         make_channel: &mut make_channel,
         present_qr: &mut present_qr,
         confirm_sas: &mut confirm,
-        dek: &dek,
+        unwrap_dek: &mut unwrap_dek,
     };
 
     match crate::pair::run_ceremony(daemon_identity, opts) {

@@ -88,17 +88,23 @@ pub struct CeremonyOpts<'a> {
     /// Confirm the six SAS words match the phone's screen. Returns false to
     /// cancel.
     pub confirm_sas: &'a mut dyn FnMut(&[&'static str; 6]) -> bool,
-    /// The keystore's DEK: the single key `latch account add` seals tokens
-    /// under. The ceremony delivers *this* key to the phone so a later approval
-    /// returns a DEK that actually decrypts the stored token ciphertext. It is
-    /// never a fresh key: sealing under one DEK and unlocking with another is
-    /// exactly the divergence this field exists to prevent.
-    pub dek: &'a crate::secrets::Dek,
+    /// Unwrap the keystore's DEK for delivery. Called exactly once, and only
+    /// after [`Self::confirm_sas`] has returned `true` -- never before. On a
+    /// Secure Enclave keystore this is where Touch ID fires, so the biometric
+    /// gates authorizing *this confirmed device*, not just starting the
+    /// ceremony: a same-UID process that can drive the pipe up to this point
+    /// still cannot complete a pairing without a live biometric at the moment
+    /// the human has already compared the SAS words. Must return the SAME key
+    /// `latch account add` seals tokens under: sealing under one DEK and
+    /// unlocking with another is exactly the divergence this exists to
+    /// prevent, so it is never a freshly generated key.
+    pub unwrap_dek: &'a mut dyn FnMut() -> Result<crate::secrets::Dek>,
 }
 
 /// Run the full daemon-side ceremony and return what to persist. The keystore's
-/// DEK ([`CeremonyOpts::dek`]) is delivered to the phone and dropped (zeroized)
-/// here; it is deliberately absent from the returned [`NewPairing`].
+/// DEK ([`CeremonyOpts::unwrap_dek`]) is unwrapped only after the SAS is
+/// confirmed, delivered to the phone, and dropped (zeroized) here; it is
+/// deliberately absent from the returned [`NewPairing`].
 pub fn run_ceremony(daemon_identity: DeviceIdentity, opts: CeremonyOpts<'_>) -> Result<NewPairing> {
     // Keep a copy of the daemon identity to persist: `mint` consumes the one we
     // pass it. Rebuilding from the secret bytes yields the same pinned keys.
@@ -149,19 +155,26 @@ pub fn run_ceremony(daemon_identity: DeviceIdentity, opts: CeremonyOpts<'_>) -> 
     }
     daemon.confirm().context("confirming the SAS")?;
 
-    // 4. Deliver the KEYSTORE's DEK, sealed to the phone (message 3), then erase
+    // 4. ONLY NOW -- after a human has confirmed the SAS -- unwrap the
+    //    keystore's DEK. On a Secure Enclave keystore this is the Touch ID
+    //    prompt; placing it here rather than at ceremony start means the
+    //    biometric gates authorizing this specific confirmed device.
+    let keystore_dek = (opts.unwrap_dek)().context("unwrapping the DEK for delivery")?;
+
+    // 5. Deliver the KEYSTORE's DEK, sealed to the phone (message 3), then erase
     //    the transport copy. This must be the same key `latch account add` seals
     //    tokens under, never a fresh one, or a real approval would return a DEK
     //    that cannot decrypt the stored token. `Dek::from_bytes` copies into a
     //    proto `Dek`, which is `ZeroizeOnDrop`; the keystore's own copy is the
-    //    caller's `Zeroizing` and outlives this call.
-    let dek = Dek::from_bytes(**opts.dek);
+    //    `Zeroizing` `keystore_dek` above and is dropped (zeroized) right after.
+    let dek = Dek::from_bytes(*keystore_dek);
     let env = daemon.deliver_dek(&dek, 1).context("sealing the DEK")?;
     let env_wire = serde_json::to_string(&env).context("serializing the DEK envelope")?;
     channel
         .send(env_wire)
         .context("sending the DEK to the phone")?;
     drop(dek);
+    drop(keystore_dek);
 
     // Let the transport flush the DEK before the channel is torn down.
     if !opts.flush_grace.is_zero() {
@@ -285,6 +298,7 @@ mod tests {
         let mut confirm = |_w: &[&'static str; 6]| true;
         let clock = || NOW;
         let dek = crate::secrets::generate_dek();
+        let mut unwrap_dek = || -> Result<crate::secrets::Dek> { Ok(dek.clone()) };
 
         let opts = CeremonyOpts {
             relay_url: "ws://relay.test".into(),
@@ -294,7 +308,7 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
-            dek: &dek,
+            unwrap_dek: &mut unwrap_dek,
         };
         let np = run_ceremony(daemon_id, opts).expect("ceremony completes");
 
@@ -337,6 +351,7 @@ mod tests {
         let mut confirm = |_w: &[&'static str; 6]| false; // human says the words differ
         let clock = || NOW;
         let dek = crate::secrets::generate_dek();
+        let mut unwrap_dek = || -> Result<crate::secrets::Dek> { Ok(dek.clone()) };
         let opts = CeremonyOpts {
             relay_url: "ws://relay.test".into(),
             response_timeout: Duration::from_secs(5),
@@ -345,7 +360,7 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
-            dek: &dek,
+            unwrap_dek: &mut unwrap_dek,
         };
         let err = match run_ceremony(daemon_id, opts) {
             Err(e) => e,
@@ -425,6 +440,7 @@ mod tests {
         };
         let mut confirm = |_w: &[&'static str; 6]| true;
         let clock = || NOW;
+        let mut unwrap_dek = || -> Result<crate::secrets::Dek> { Ok(keystore_dek.clone()) };
 
         let opts = CeremonyOpts {
             relay_url: "ws://relay.test".into(),
@@ -434,7 +450,7 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
-            dek: &keystore_dek,
+            unwrap_dek: &mut unwrap_dek,
         };
         run_ceremony(daemon_id, opts).expect("ceremony completes");
 
@@ -499,6 +515,7 @@ mod tests {
         let mut confirm = |_w: &[&'static str; 6]| true;
         let clock = || NOW;
         let dek = crate::secrets::generate_dek();
+        let mut unwrap_dek = || -> Result<crate::secrets::Dek> { Ok(dek.clone()) };
         let opts = CeremonyOpts {
             relay_url: "ws://relay.test".into(),
             response_timeout: Duration::from_secs(5),
@@ -507,7 +524,7 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
-            dek: &dek,
+            unwrap_dek: &mut unwrap_dek,
         };
         let np = run_ceremony(daemon_id, opts).expect("ceremony completes");
         phone_thread.join().unwrap();
