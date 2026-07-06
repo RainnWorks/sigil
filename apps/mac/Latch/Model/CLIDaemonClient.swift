@@ -184,14 +184,33 @@ struct CLIDaemonClient: DaemonClient {
         return dto.map { DoctorCheck(label: $0.label, ok: $0.ok, hint: $0.hint) }
     }
 
+    /// The 1Password accounts (a distinct on-disk store latch-config owns)
+    /// plus every configured env-file source (one entry in the generic
+    /// source list), merged into the one provider-blind list the UI shows.
     func accounts() async throws -> [Account] {
-        try decode([AccountDTO].self, await runConfig(["account", "list", "--json"])).map { $0.model() }
+        async let opAccounts = decode([AccountDTO].self, await runConfig(["account", "list", "--json"]))
+            .map { $0.model() }
+        async let envSources = decode([SourceDTO].self, await runConfig(["source", "list", "--json"]))
+            .compactMap { $0.envFileAccount() }
+        return try await opAccounts + envSources
     }
 
-    func addAccount(label: String, token: String) async throws -> Account {
-        let data = try await runConfig(["account", "add", "--token-stdin", "--label", label, "--json"],
-                                       stdin: Data(token.utf8))
-        return try decode(AccountDTO.self, data).model()
+    func addAccount(_ draft: AccountDraft) async throws -> Account {
+        switch draft {
+        case .onePassword(let label, let token):
+            let data = try await runConfig(["account", "add", "--token-stdin", "--label", label, "--json"],
+                                           stdin: Data(token.utf8))
+            return try decode(AccountDTO.self, data).model()
+        case .envFile(let name, let path):
+            // No probe: there is no credential to test, only a file path -
+            // the provider's own `probe()` returns Unsupported for exactly
+            // this reason. A failure (e.g. the name is already taken) throws
+            // from `runConfig` itself (non-zero exit); on success the result
+            // is just what was configured, so there is nothing to decode.
+            _ = try await runConfig(["source", "add", name, "--provider", "env-file",
+                                     "--path", path, "--json"])
+            return Account(id: name, label: name, provider: .envFile, path: path)
+        }
     }
 
     func rotateAccount(id: String, token: String) async throws -> Account {
@@ -200,8 +219,19 @@ struct CLIDaemonClient: DaemonClient {
         return try decode(AccountDTO.self, data).model()
     }
 
-    func removeAccount(id: String) async throws {
-        _ = try await runConfig(["account", "remove", "--id", id, "--json"])
+    func removeAccount(_ account: Account) async throws {
+        switch account.provider {
+        case .onePassword:
+            _ = try await runConfig(["account", "remove", "--id", account.id, "--json"])
+        case .envFile:
+            // Known gap, not new here: `source remove` reports "a rule still
+            // references it" as an ok:false JSON body on stdout with a
+            // non-zero exit; `execute()` throws on the exit code first, so
+            // that reason is currently lost in favor of a generic "latch-
+            // config exited 1". Same systemic run()-exit-code-vs-stdout-JSON
+            // mismatch flagged in the wipe/binary-split pass, not fixed here.
+            _ = try await runConfig(["source", "remove", account.id, "--json"])
+        }
     }
 
     func leases() async throws -> [Lease] {
@@ -383,9 +413,25 @@ private struct AccountDTO: Decodable {
     let id: String; let label: String; let vaults: [String]
     let health: String; let detail: String?; let last_used_ms: Int?
     func model() -> Account {
-        Account(id: id, label: label, vaults: vaults,
+        Account(id: id, label: label, provider: .onePassword, vaults: vaults,
                 health: TokenHealth(rawValue: health) ?? .healthy, detail: detail,
                 lastUsedAt: last_used_ms.map { Date(timeIntervalSince1970: Double($0) / 1000) })
+    }
+}
+
+/// `latch-config source list --json`: the generic source shape
+/// (crates/latch/src/config.rs `Source`). Only the env-file entries turn into
+/// an `Account` here; 1Password sources are the separate credential store
+/// decoded by `AccountDTO` above, so a `provider: "1password"` source (if one
+/// ever exists here too) is not double-counted.
+private struct SourceDTO: Decodable {
+    let name: String
+    let provider: String
+    let account: String?
+    let path: String?
+    func envFileAccount() -> Account? {
+        guard provider == SourceProvider.envFile.rawValue, let path else { return nil }
+        return Account(id: name, label: name, provider: .envFile, path: path)
     }
 }
 

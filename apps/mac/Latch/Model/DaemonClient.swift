@@ -40,13 +40,21 @@ protocol DaemonClient: Sendable {
     /// The doctor's ordered checks, each a (label, ok, hint) triple.
     func doctor() async throws -> [DoctorCheck]
 
-    // Accounts
+    // Accounts (really: configured secret sources — see `Account`, `AccountDraft`)
     func accounts() async throws -> [Account]
-    /// Add a service-account token. `probeVaults` returns the vaults the token
-    /// can route (empty is the warn case). The token never leaves this call.
-    func addAccount(label: String, token: String) async throws -> Account
+    /// Add a source for whichever provider the draft names. 1Password probes
+    /// the token's vaults live (empty is the warn case) and returns them on
+    /// the result; env-file has no equivalent probe (no credential to test),
+    /// so its result just echoes what was configured. The token, for the
+    /// 1Password case, never leaves this call.
+    func addAccount(_ draft: AccountDraft) async throws -> Account
+    /// 1Password only: replace the stored token. Env-file sources have no
+    /// token to rotate; the UI does not offer this for them.
     func rotateAccount(id: String, token: String) async throws -> Account
-    func removeAccount(id: String) async throws
+    /// Forget the source. Dispatches to the right backing store for
+    /// `account.provider` (the 1Password credential store vs. a named
+    /// config source), which is why this takes the whole `Account`.
+    func removeAccount(_ account: Account) async throws
 
     // Leases
     func leases() async throws -> [Lease]

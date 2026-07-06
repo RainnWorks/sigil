@@ -141,13 +141,13 @@ struct SocketDaemonClient: DaemonClient {
     // MARK: - Shelled out to `latch … --json` (keystore / config mutations)
 
     func accounts() async throws -> [Account] { try await cli.accounts() }
-    func addAccount(label: String, token: String) async throws -> Account {
-        try await cli.addAccount(label: label, token: token)
+    func addAccount(_ draft: AccountDraft) async throws -> Account {
+        try await cli.addAccount(draft)
     }
     func rotateAccount(id: String, token: String) async throws -> Account {
         try await cli.rotateAccount(id: id, token: token)
     }
-    func removeAccount(id: String) async throws { try await cli.removeAccount(id: id) }
+    func removeAccount(_ account: Account) async throws { try await cli.removeAccount(account) }
 
     func settings() async throws -> AppSettings { try await cli.settings() }
     func saveSettings(_ settings: AppSettings) async throws { try await cli.saveSettings(settings) }

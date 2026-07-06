@@ -161,14 +161,40 @@ final class AppModel {
     }
 
     @discardableResult
-    func addAccount(label: String, token: String) async -> Account? {
+    func addAccount(_ draft: AccountDraft) async -> Account? {
         defer { Task { await loadSecondaryScreens() } }
-        return try? await daemon.addAccount(label: label, token: token)
+        do {
+            let account = try await daemon.addAccount(draft)
+            lastError = nil
+            return account
+        } catch {
+            lastError = describe(error)
+            return nil
+        }
     }
 
     func removeAccount(_ account: Account) async {
-        try? await daemon.removeAccount(id: account.id)
+        do {
+            try await daemon.removeAccount(account)
+            lastError = nil
+        } catch {
+            lastError = describe(error)
+        }
         await loadSecondaryScreens()
+    }
+
+    /// 1Password only: replace a stored token.
+    @discardableResult
+    func rotateAccount(id: String, token: String) async -> Account? {
+        defer { Task { await loadSecondaryScreens() } }
+        do {
+            let account = try await daemon.rotateAccount(id: id, token: token)
+            lastError = nil
+            return account
+        } catch {
+            lastError = describe(error)
+            return nil
+        }
     }
 
     func setMacApprovals(_ mode: MacApprovalsMode) async {

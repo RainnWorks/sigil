@@ -99,15 +99,52 @@ enum ArmState: Equatable, Sendable {
 
 enum TokenHealth: String, Sendable { case healthy, rotate, expiring }
 
+/// A configured secret source's provider. The daemon's provider registry
+/// (crates/latch/src/provider.rs) is built to take more without changing this
+/// shape; 1Password is provider #1, not the product, so this list is not
+/// exhaustive on principle. Two ship today.
+enum SourceProvider: String, Sendable, Equatable, CaseIterable, Identifiable {
+    case onePassword = "1password"
+    case envFile = "env-file"
+
+    var id: String { rawValue }
+    var displayName: String {
+        switch self {
+        case .onePassword: return "1Password"
+        case .envFile: return "Env file"
+        }
+    }
+}
+
+/// One configured secret source. Mirrors the CLI's own `Source` shape
+/// (crates/latch/src/config.rs): one struct, provider-specific fields present
+/// or absent depending on `provider`, rather than a separate type per
+/// provider. 1Password sources carry a stored credential (vaults, health,
+/// rotation); env-file sources carry a file path and none of that, since there
+/// is no credential to rotate or vault to probe.
 struct Account: Identifiable, Equatable, Sendable {
     let id: String
     var label: String
-    /// Vaults the token can route to (probed live at add time). Empty is a
-    /// warning state: service accounts cannot see built-in Personal/Shared.
-    var vaults: [String]
-    var health: TokenHealth
+    var provider: SourceProvider = .onePassword
+    /// 1Password only: vaults the token can route to (probed live at add
+    /// time). Empty is a warning state: service accounts cannot see built-in
+    /// Personal/Shared. Always empty for env-file.
+    var vaults: [String] = []
+    var health: TokenHealth = .healthy
     var detail: String?
     var lastUsedAt: Date?
+    /// env-file only: the KEY=VALUE file this source injects from.
+    var path: String?
+}
+
+/// What the add sheet collected, already shaped for its provider: 1Password
+/// stores a credential (`latch-config account add`), env-file just names a
+/// source (`latch-config source add --provider env-file`). Keeping this a
+/// draft-per-provider enum (rather than one struct with optional fields)
+/// means a new provider's add flow cannot forget to handle its own fields.
+enum AccountDraft: Sendable {
+    case onePassword(label: String, token: String)
+    case envFile(name: String, path: String)
 }
 
 // MARK: - Leases

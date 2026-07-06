@@ -89,13 +89,19 @@ actor MockDaemonClient: DaemonClient {
 
     func accounts() -> [Account] { accountsStore }
 
-    func addAccount(label: String, token: String) -> Account {
-        // Probe is faked: a token with "empty" in it sees no vaults (the warn case).
-        let vaults = token.lowercased().contains("empty") ? [] : ["Engineering", "Rowm work"]
-        let a = Account(id: UUID().uuidString, label: label, vaults: vaults,
+    func addAccount(_ draft: AccountDraft) -> Account {
+        let a: Account
+        switch draft {
+        case .onePassword(let label, let token):
+            // Probe is faked: a token with "empty" in it sees no vaults (the warn case).
+            let vaults = token.lowercased().contains("empty") ? [] : ["Engineering", "Rowm work"]
+            a = Account(id: UUID().uuidString, label: label, provider: .onePassword, vaults: vaults,
                         health: vaults.isEmpty ? .rotate : .healthy,
                         detail: vaults.isEmpty ? "no usable vault visible" : nil,
                         lastUsedAt: nil)
+        case .envFile(let name, let path):
+            a = Account(id: name, label: name, provider: .envFile, path: path)
+        }
         accountsStore.append(a)
         return a
     }
@@ -109,7 +115,7 @@ actor MockDaemonClient: DaemonClient {
         return accountsStore[i]
     }
 
-    func removeAccount(id: String) { accountsStore.removeAll { $0.id == id } }
+    func removeAccount(_ account: Account) { accountsStore.removeAll { $0.id == account.id } }
 
     func leases() -> [Lease] { locked ? [] : leasesStore }
 
@@ -206,10 +212,15 @@ actor MockDaemonClient: DaemonClient {
 
 enum Fixtures {
     static let accounts: [Account] = [
-        Account(id: "acc-rowm", label: "Rowm work", vaults: ["Engineering", "Rowm work", "Shared"],
+        Account(id: "acc-rowm", label: "Rowm work", provider: .onePassword,
+                vaults: ["Engineering", "Rowm work", "Shared"],
                 health: .healthy, detail: nil, lastUsedAt: Date().addingTimeInterval(-420)),
-        Account(id: "acc-perso", label: "personal", vaults: ["Private"],
+        Account(id: "acc-perso", label: "personal", provider: .onePassword, vaults: ["Private"],
                 health: .expiring, detail: "expires in 6d", lastUsedAt: Date().addingTimeInterval(-86_400 * 2)),
+        // Provider #2, so the fixtures do not read as 1Password-only: a
+        // source has no token to rotate or vault to probe, just a path.
+        Account(id: "ci-secrets", label: "ci-secrets", provider: .envFile,
+                path: "/Users/tom/.config/latch/ci-secrets.env"),
     ]
 
     static let leases: [Lease] = [
