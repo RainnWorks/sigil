@@ -99,9 +99,14 @@ struct PairingView: View {
                 Text("Confirm these six words match your phone's screen.")
                     .font(.system(size: 12))
                 MonoText(words.joined(separator: " · "), size: 15, color: Palette.cobalt, weight: .medium)
-                Text("Reading them aloud is the human backstop; a mismatch is loud.")
+                Text("Reading them aloud is the human backstop; a mismatch is loud. The key is not sent until you confirm.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
-                ProgressView().controlSize(.small)
+                HStack(spacing: 10) {
+                    Button("Doesn't match", role: .destructive) { model.confirmSAS(match: false) }
+                        .buttonStyle(.glass).controlSize(.small)
+                    Button("Words match") { model.confirmSAS(match: true) }
+                        .buttonStyle(.glassProminent).tint(Palette.seaGreen).controlSize(.small)
+                }
             }
         case .paired(let device):
             ceremonyStep {

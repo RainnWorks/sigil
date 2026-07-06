@@ -58,9 +58,28 @@ import Foundation
 /// override it (Settings) if the user installed it somewhere non-standard.
 struct CLIDaemonClient: DaemonClient {
     var binaryURL: URL
+    /// The stdin pipe of the currently running `pair --json` ceremony (if any),
+    /// so `confirmPairing` can reach it. A class because `CLIDaemonClient` is a
+    /// value type but `beginPairing` and `confirmPairing` are called on the same
+    /// instance (held once by AppModel) and must share this across the calls.
+    private let pairingStdin = PairingStdin()
 
     init(binaryURL: URL? = nil) {
         self.binaryURL = binaryURL ?? CLIDaemonClient.resolveLatch()
+    }
+
+    /// Environment for every `latch` invocation. `LATCH_DEV_KEYSTORE=file` is
+    /// temporary: until the Secure Enclave DEK wrap is wired into the daemon
+    /// (task #24), the real keystore dies with "secure enclave path not yet
+    /// verified on hardware", so pairing and account mutations need the
+    /// dev file-backed keystore to run at all. `OP_SERVICE_ACCOUNT_TOKEN`, if
+    /// present in the app's own environment, already passes through via
+    /// ProcessInfo — nothing extra to do for it.
+    private static func env() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        env["NO_COLOR"] = "1"
+        env["LATCH_DEV_KEYSTORE"] = "file"
+        return env
     }
 
     // MARK: run
@@ -74,9 +93,7 @@ struct CLIDaemonClient: DaemonClient {
             proc.arguments = args
             // Ensure the shim-first PATH so `latch` finds the real `op` and its
             // own socket the same way an interactive shell would.
-            var env = ProcessInfo.processInfo.environment
-            env["NO_COLOR"] = "1"
-            proc.environment = env
+            proc.environment = Self.env()
 
             let outPipe = Pipe(), errPipe = Pipe()
             proc.standardOutput = outPipe
@@ -192,11 +209,14 @@ struct CLIDaemonClient: DaemonClient {
             let proc = Process()
             proc.executableURL = binaryURL
             proc.arguments = ["pair", "--relay", relayURL, "--json"]
-            var env = ProcessInfo.processInfo.environment
-            env["NO_COLOR"] = "1"
-            proc.environment = env
+            proc.environment = Self.env()
             let outPipe = Pipe()
+            let inPipe = Pipe()
             proc.standardOutput = outPipe
+            proc.standardInput = inPipe
+            // `confirmPairing` writes into this once the human taps match; cli.rs
+            // blocks on it after the "sas" event before it ever seals the DEK.
+            pairingStdin.set(inPipe)
             // Parse the NDJSON ceremony stream line by line.
             let handle = outPipe.fileHandleForReading
             handle.readabilityHandler = { fh in
@@ -209,14 +229,25 @@ struct CLIDaemonClient: DaemonClient {
             }
             proc.terminationHandler = { _ in
                 handle.readabilityHandler = nil
+                pairingStdin.set(nil)
                 continuation.finish()
             }
             do { try proc.run() }
             catch {
+                pairingStdin.set(nil)
                 continuation.yield(.failed(reason: String(describing: error)))
                 continuation.finish()
             }
         }
+    }
+
+    /// Write the human's SAS decision to the ceremony's stdin. `confirm` is the
+    /// only line cli.rs treats as a match; anything else fails the ceremony
+    /// closed, so `match: false` is spelled out explicitly rather than sent as
+    /// silence (closing the pipe would also work, but a stray zombie process
+    /// blocked on stdin should not read as "confirmed").
+    func confirmPairing(match: Bool) {
+        pairingStdin.send(match ? "confirm" : "reject")
     }
 
     func unpair() async throws -> ControlResult { try controlResult(await run(["unpair", "--json"])) }
@@ -246,6 +277,21 @@ struct CLIDaemonClient: DaemonClient {
     private func controlResult(_ data: Data) throws -> ControlResult {
         let dto = try decode(ControlDTO.self, data)
         return dto.ok ? .ok(lines: dto.lines) : .failed(lines: dto.lines)
+    }
+}
+
+/// The stdin pipe of an in-flight `pair --json` ceremony. A class (not a
+/// struct field alone) because `CLIDaemonClient` is a value type but the same
+/// instance's `beginPairing` and `confirmPairing` calls must share state; the
+/// lock is only ever held for a pointer read/write, never around IO.
+private final class PairingStdin: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pipe: Pipe?
+    func set(_ p: Pipe?) { lock.lock(); pipe = p; lock.unlock() }
+    func send(_ line: String) {
+        lock.lock(); let p = pipe; lock.unlock()
+        guard let p, let data = "\(line)\n".data(using: .utf8) else { return }
+        p.fileHandleForWriting.write(data)
     }
 }
 

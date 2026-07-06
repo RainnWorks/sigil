@@ -160,6 +160,7 @@ struct SocketDaemonClient: DaemonClient {
     func beginPairing(relayURL: String) -> AsyncStream<PairingCeremony> {
         cli.beginPairing(relayURL: relayURL)
     }
+    func confirmPairing(match: Bool) { cli.confirmPairing(match: match) }
     func unpair() async throws -> ControlResult { try await cli.unpair() }
 
     // MARK: - Socket round trips

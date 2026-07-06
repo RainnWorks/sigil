@@ -174,6 +174,16 @@ final class AppModel {
         }
     }
 
+    /// The human's decision at the `.confirmSAS` step. This is the real MITM
+    /// backstop: the DEK is only sealed and sent once `match: true` reaches the
+    /// running ceremony (see `DaemonClient.confirmPairing`). A mismatch tears
+    /// the ceremony down here too, since the CLI side fails closed but has no
+    /// way to push a friendlier reason than its own error string.
+    func confirmSAS(match: Bool) {
+        daemon.confirmPairing(match: match)
+        if !match { ceremony = .failed(reason: "SAS words did not match; pairing cancelled") }
+    }
+
     func unpair() async {
         _ = try? await daemon.unpair()
         ceremony = .idle

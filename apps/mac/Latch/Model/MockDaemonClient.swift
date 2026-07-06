@@ -181,6 +181,11 @@ actor MockDaemonClient: DaemonClient {
 
     private func setPaired(_ device: PairedDevice) { self.paired = device }
 
+    // The fixture ceremony above advances on a timer with no human gate to
+    // wire, so there is nothing for a real confirmation to reach; kept only to
+    // satisfy the protocol.
+    nonisolated func confirmPairing(match: Bool) {}
+
     func unpair() -> ControlResult {
         paired = nil
         return .ok(lines: ["phone unpaired; the daemon will fail closed until you pair again"])

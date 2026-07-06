@@ -73,6 +73,12 @@ protocol DaemonClient: Sendable {
     /// Begin the ceremony; the returned stream yields ceremony states as the
     /// phone responds. The app renders the QR and SAS words from these.
     func beginPairing(relayURL: String) -> AsyncStream<PairingCeremony>
+    /// The human's decision once the ceremony reaches `.confirmSAS`: this is
+    /// the actual MITM backstop, so it must only fire from a real tap after the
+    /// six words were compared on both screens. The DEK is not sealed or sent
+    /// until `match: true` reaches the ceremony; `false` (or never calling this)
+    /// fails it closed. A no-op outside an active `.confirmSAS` state.
+    func confirmPairing(match: Bool)
     func unpair() async throws -> ControlResult
     /// Toggle whether the Mac Secure Enclave envelope exists (Enable Mac
     /// approvals) vs hardened phone-only.
