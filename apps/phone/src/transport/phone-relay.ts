@@ -1,18 +1,17 @@
 /**
- * The real phone-side {@link Transport}: the v3 stateless relay's live
- * `/attach` rendezvous (see `relay-attach.ts`), mirroring
- * relay/shared/protocol.ts and the daemon's crates/relay-client. There is no
- * buffered mailbox any more: the relay only bridges two live sockets, so this
- * phone is never persistently connected. It attaches to check for or send
- * something, and disconnects once idle.
+ * The real phone-side {@link Transport}: sealed envelopes over the blind
+ * relay's v4 HTTP contract (`relay-http.ts`), mirroring crates/relay-client.
+ * There is no persistent connection: the phone drains
+ * `GET /mailbox/{id}/to-phone` on demand and posts to
+ * `POST /mailbox/{id}/to-daemon` to send. Push sending is the relay's job now
+ * (it holds the publisher's APNs cert); this phone only ever registers its
+ * token with the daemon (`src/lib/push.ts`), unaffected by this transport.
  *
- * The APNs push doorbell (`src/lib/push.ts`) is the primary wake: a push
- * receipt or tap calls {@link PhoneRelay.wake}, which attaches so the daemon's
- * `deliver` can land. While the app is foregrounded, a ~30s backstop
- * (`BACKSTOP_INTERVAL_MS`) plus one attach on every foreground transition
- * catches anything a missed push would have delivered. No idle socket, no
- * polling loop: every attach closes itself after `IDLE_CLOSE_MS` of no
- * traffic.
+ * The APNs push doorbell is the primary wake: a push receipt or tap calls
+ * {@link PhoneRelay.wake}, which drains `to-phone` once. While the app is
+ * foregrounded, a ~30s backstop (AppState-gated, re-armed on every foreground
+ * transition) catches anything a missed push would have delivered. No idle
+ * connection, no tight polling loop.
  */
 import { AppState, type AppStateStatus } from "react-native";
 
@@ -23,15 +22,13 @@ import {
   type EnvelopeWire,
 } from "@/src/protocol";
 import { type ConnectionRung } from "@/src/domain/types";
-import { AttachSocket, attachUrlForMailbox } from "./relay-attach";
+import { RelayMailbox } from "./relay-http";
 import { type Transport, type TransportStatus } from "./transport";
 
-/** An attach with no traffic for this long closes itself. */
-const IDLE_CLOSE_MS = 5_000;
 /**
- * Foreground backstop cadence: how often to re-attach in case a push was
- * missed. Push is the primary wake, so this is a safety net, not the latency
- * budget.
+ * Foreground backstop cadence: how often to drain `to-phone` in case a push
+ * was missed. Push is the primary wake, so this is a safety net, not the
+ * latency budget.
  */
 const BACKSTOP_INTERVAL_MS = 30_000;
 
@@ -47,18 +44,16 @@ export interface PhoneRelayConfig {
 type EnvelopeListener = (e: Envelope) => void;
 
 export class PhoneRelay implements Transport {
-  private readonly url: string;
-  private socket: AttachSocket | null = null;
+  private readonly mailbox: RelayMailbox;
   private readonly listeners = new Set<EnvelopeListener>();
   private running = false;
   private connected = false;
   private lastSeenAt = 0;
-  private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private backstopTimer: ReturnType<typeof setInterval> | null = null;
   private appStateSub: { remove: () => void } | null = null;
 
   constructor(private readonly cfg: PhoneRelayConfig) {
-    this.url = attachUrlForMailbox(cfg.base, cfg.mailbox);
+    this.mailbox = new RelayMailbox(cfg.base, cfg.mailbox);
   }
 
   async start(): Promise<void> {
@@ -77,7 +72,6 @@ export class PhoneRelay implements Transport {
     this.backstopTimer = null;
     this.appStateSub?.remove();
     this.appStateSub = null;
-    this.closeNow();
   }
 
   status(): TransportStatus {
@@ -95,70 +89,39 @@ export class PhoneRelay implements Transport {
   }
 
   /**
-   * Attach (if not already) so anything the daemon is trying to deliver right
-   * now lands. Used by the push doorbell (receipt or tap) and the foreground
-   * backstop; a no-op before `start()` or after `stop()`.
+   * Drain `to-phone` right now. Used by the push doorbell (receipt or tap)
+   * and the foreground backstop; a no-op before `start()` or after `stop()`.
    */
   async wake(): Promise<void> {
     if (!this.running) return;
     try {
-      await this.ensureAttached();
+      await this.drainOnce();
     } catch {
+      // A transient relay error just means the next backstop tick (or the
+      // next push) tries again.
       this.connected = false;
     }
   }
 
-  /** Seal-agnostic: send the envelope's opaque JSON over a live attach. */
+  /** Seal-agnostic: POST the envelope's opaque JSON toward the daemon. */
   async send(e: Envelope): Promise<void> {
-    const socket = await this.ensureAttached();
-    await socket.send(JSON.stringify(envelopeToWire(e)));
-    this.touch();
+    await this.mailbox.send(JSON.stringify(envelopeToWire(e)));
   }
 
-  private async ensureAttached(): Promise<AttachSocket> {
-    if (!this.socket) {
-      const socket = new AttachSocket(this.url);
-      socket.on((e) => {
-        if (e.kind === "open") {
-          this.connected = true;
-        } else if (e.kind === "deliver") {
-          this.lastSeenAt = Date.now();
-          this.touch();
-          let env: Envelope;
-          try {
-            env = envelopeFromWire(JSON.parse(e.env) as EnvelopeWire);
-          } catch {
-            return; // one malformed delivery is dropped, not fatal
-          }
-          for (const l of this.listeners) l(env);
-        } else if (e.kind === "close") {
-          this.connected = false;
-          if (this.socket === socket) this.socket = null;
-        }
-        // "peer" transitions (the daemon attaching/detaching) are informational
-        // only; nothing here reacts to them.
-      });
-      this.socket = socket;
+  /** Drain `to-phone`, decode, and fan out. One malformed entry is dropped, not fatal. */
+  private async drainOnce(): Promise<void> {
+    const batch = await this.mailbox.drain();
+    this.connected = true;
+    if (batch.length > 0) this.lastSeenAt = Date.now();
+    for (const s of batch) {
+      let env: Envelope;
+      try {
+        env = envelopeFromWire(JSON.parse(s) as EnvelopeWire);
+      } catch {
+        // An undecodable entry is dropped; fail closed on that one.
+        continue;
+      }
+      for (const l of this.listeners) l(env);
     }
-    await this.socket.open();
-    this.touch();
-    return this.socket;
-  }
-
-  /**
-   * Reset the idle-close timer: an attach with no traffic for
-   * `IDLE_CLOSE_MS` closes itself, so nothing stays attached at rest.
-   */
-  private touch(): void {
-    if (this.idleTimer) clearTimeout(this.idleTimer);
-    this.idleTimer = setTimeout(() => this.closeNow(), IDLE_CLOSE_MS);
-  }
-
-  private closeNow(): void {
-    if (this.idleTimer) clearTimeout(this.idleTimer);
-    this.idleTimer = null;
-    this.socket?.close();
-    this.socket = null;
-    this.connected = false;
   }
 }

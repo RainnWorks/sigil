@@ -136,7 +136,7 @@ export async function sendPushRegister(token: string): Promise<PushRegisterOutco
 }
 
 /**
- * Attach to the relay right now, e.g. right after a notification tap, so the
+ * Drain the relay right now, e.g. right after a notification tap, so the
  * approval sheet does not wait out the foreground backstop interval. A no-op
  * when unarmed.
  */

@@ -8,21 +8,18 @@
  *                   pin the daemon, derive the six SAS words and the rendezvous
  *                   mailbox (the bootstrap channel keyed by daemon id + secret).
  *   2. handshake  - build the authenticated PairingResponse (proof-of-secret MAC
- *                   over the transcript) and attach to the rendezvous mailbox to
- *                   send it, base64url. This is message 1; the daemon verifies
+ *                   over the transcript) and POST it, base64url, to the rendezvous
+ *                   mailbox's `to-daemon`. This is message 1; the daemon verifies
  *                   it, pins this phone, and shows its own six words.
  *   3. sas        - the human compares the six words on both screens (the backstop
  *                   against a leaked secret or a tag-path bug). A match proceeds.
- *   4. deliver    - wait on the same attach for the daemon's sealed DEK
- *                   (message 3), open it, recover the DEK, and store it behind
- *                   Face ID; then arm the live approval session.
+ *   4. deliver    - poll the rendezvous mailbox's `to-phone` for the daemon's
+ *                   sealed DEK (message 3), open it, recover the DEK, and store
+ *                   it behind Face ID; then arm the live approval session.
  *
- * v3: the rendezvous mailbox rides the same stateless `/attach` rendezvous as
- * the steady-state mailbox (see `transport/relay-attach.ts`), just keyed
- * differently. One attach is held open across messages 1 and 3 - matching the
- * daemon's `RendezvousWs` (crates/relay-client), which makes one bounded-
- * lifetime attach for the whole ceremony and does not reconnect: if it drops
- * mid-pairing, the ceremony fails closed and the human re-runs it.
+ * v4: both the rendezvous mailbox and the steady-state mailbox speak the same
+ * plain-HTTP deposit/drain contract (`transport/relay-http.ts`), just keyed
+ * differently - there is no persistent connection anywhere.
  *
  * Real key custody: the Ed25519 + X25519 private halves are generated on-device;
  * the DEK is written to the biometric-tier keystore item. See keystore.ts for the
@@ -50,8 +47,7 @@ import {
   ReplayGuard,
   type Sodium,
 } from "@/src/protocol";
-import { relayBaseFromEndpoints } from "@/src/transport/relay-http";
-import { AttachSocket, attachUrlForMailbox } from "@/src/transport/relay-attach";
+import { RelayMailbox, relayBaseFromEndpoints } from "@/src/transport/relay-http";
 import { generateShareKey, isSecureEnclaveAvailable } from "@/modules/latch-se";
 import { armLiveSession } from "./controller";
 import { savePairing } from "./keystore";
@@ -101,12 +97,6 @@ export interface Ceremony {
 
 let sodium: Sodium | null = null;
 let ceremony: Ceremony | null = null;
-/**
- * The one attach held open across message 1 (submit) and message 3 (deliver).
- * Opened by `submitPairingResponse`, closed by `awaitDekDelivery` (success or
- * timeout) or `resetCeremony` (abandoned).
- */
-let rendezvousSocket: AttachSocket | null = null;
 
 async function sod(): Promise<Sodium> {
   if (!sodium) sodium = await loadSodium();
@@ -150,12 +140,9 @@ export async function acceptScan(qr: string): Promise<Ceremony> {
 }
 
 /**
- * Message 1: build the authenticated PairingResponse and attach to the
- * rendezvous mailbox to send it (base64url). Sent before SAS, because the
- * daemon needs it to pin this phone and show its matching six words. Opens
- * {@link rendezvousSocket}, held across this call and the later
- * {@link awaitDekDelivery} - matching the daemon's one-bounded-lifetime-attach
- * `RendezvousWs`.
+ * Message 1: build the authenticated PairingResponse and POST it (base64url) to
+ * the rendezvous mailbox's `to-daemon`. Sent before SAS, because the daemon
+ * needs it to pin this phone and show its matching six words.
  *
  * v2: mint the Secure-Enclave share key `f` (if this device has an SE) FIRST, so
  * its public point `F` rides on this response as `se_share_pub`, bound into the
@@ -182,19 +169,18 @@ export async function submitPairingResponse(): Promise<void> {
     }
   }
   const resp = buildPairingResponse(s, c.scanned, c.phonePub, c.seSharePub);
-  rendezvousSocket ??= new AttachSocket(attachUrlForMailbox(c.relayBase, c.rendezvous));
-  await rendezvousSocket.send(pairingResponseToSubmitString(resp));
+  const mailbox = new RelayMailbox(c.relayBase, c.rendezvous);
+  await mailbox.send(pairingResponseToSubmitString(resp));
   c.responseSubmitted = true;
 }
 
 /**
- * Message 3: wait on the same attach for the daemon's sealed DEK, open it
- * (verify the daemon's signature, replay-check, decrypt), recover the DEK, store
- * it behind Face ID, persist the pairing (including the v2 SE key id, whose `F`
- * was already delivered on message 1), and arm the live approval session. Called
- * only after the human confirmed the SAS. Throws on timeout or a bad DEK envelope
- * (fail closed). Closes {@link rendezvousSocket} either way: the ceremony is
- * strictly one message per direction, so there is nothing left to wait for.
+ * Message 3: poll the rendezvous mailbox's `to-phone` for the daemon's sealed
+ * DEK, open it (verify the daemon's signature, replay-check, decrypt), recover
+ * the DEK, store it behind Face ID, persist the pairing (including the v2 SE
+ * key id, whose `F` was already delivered on message 1), and arm the live
+ * approval session. Called only after the human confirmed the SAS. Throws on
+ * timeout or a bad DEK envelope (fail closed).
  */
 export async function awaitDekDelivery(): Promise<void> {
   const s = await sod();
@@ -202,12 +188,8 @@ export async function awaitDekDelivery(): Promise<void> {
   if (!c?.scanned || !c.rendezvous || !c.relayBase || !c.mailbox || !c.confirmWords) {
     throw new Error("pairing is not ready to receive the DEK");
   }
-  const socket = (rendezvousSocket ??= new AttachSocket(
-    attachUrlForMailbox(c.relayBase, c.rendezvous),
-  ));
-  const wire = await socket.waitForDeliver(DEK_WAIT_MS);
-  socket.close();
-  rendezvousSocket = null;
+  const rendezvous = new RelayMailbox(c.relayBase, c.rendezvous);
+  const wire = await rendezvous.waitOne(DEK_WAIT_MS);
   if (!wire) {
     throw new Error("timed out waiting for the Mac to deliver the key");
   }
@@ -251,7 +233,5 @@ export async function awaitDekDelivery(): Promise<void> {
 }
 
 export function resetCeremony(): void {
-  rendezvousSocket?.close();
-  rendezvousSocket = null;
   ceremony = null;
 }
