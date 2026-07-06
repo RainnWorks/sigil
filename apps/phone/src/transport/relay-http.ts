@@ -3,8 +3,15 @@
  * opaque endpoints, exactly matching relay/shared/protocol.ts and the Rust
  * clients (crates/relay-client):
  *
- *   GET  /mailbox/{id}/to-phone    -> { envelopes: string[] }  (drain-on-read)
+ *   GET  /mailbox/{id}/to-phone    -> { envelopes: string[] }  (long-poll, drain-on-read)
  *   POST /mailbox/{id}/to-daemon   body { "env": "<opaque>" }  (deposit)
+ *
+ * `to-phone` (and the daemon's mirror `to-daemon` GET) LONG-POLLS: an empty
+ * mailbox holds the request open server-side until a deposit lands or the
+ * relay's own ~25s timeout, then returns (with or without envelopes) either
+ * way. The doorbell is the whole point of this transport, so the phone never
+ * sleep-polls; it just issues sequential GETs and lets the relay do the
+ * waiting (see `FETCH_TIMEOUT_MS` below and {@link RelayMailbox.waitOne}).
  *
  * The relay never parses the payload; it is a UTF-8 string in one side and out
  * the other. The steady-state {@link PhoneRelay} and the pairing rendezvous
@@ -17,6 +24,13 @@
  * unaffected by this module.
  */
 import { toHex } from "@/src/protocol";
+
+/**
+ * Client-side ceiling on one `to-phone` GET, comfortably above the relay's
+ * own ~25s server-side hold so a normal long-poll never gets aborted
+ * mid-hold; only a relay that hangs past its own timeout trips this.
+ */
+const FETCH_TIMEOUT_MS = 30_000;
 
 /** The `/to-phone` GET response body. */
 interface ToPhoneBody {
@@ -78,33 +92,43 @@ export class RelayMailbox {
     }
   }
 
-  /** GET and drain every queued payload for the mailbox (drain-on-read). */
+  /**
+   * GET and drain every queued payload for the mailbox (drain-on-read). This
+   * is the long-poll call: the relay itself holds it open server-side (up to
+   * ~25s) when the mailbox is empty, so one call already waits - callers
+   * never need their own sleep on top of it. `FETCH_TIMEOUT_MS` only guards
+   * against the relay hanging past its own timeout.
+   */
   async drain(): Promise<string[]> {
-    const resp = await fetch(this.toPhoneUrl(), { method: "GET" });
-    if (!resp.ok) {
-      throw new Error(`relay to-phone: HTTP ${resp.status}`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const resp = await fetch(this.toPhoneUrl(), { method: "GET", signal: controller.signal });
+      if (!resp.ok) {
+        throw new Error(`relay to-phone: HTTP ${resp.status}`);
+      }
+      const body = (await resp.json()) as ToPhoneBody;
+      return Array.isArray(body.envelopes) ? body.envelopes : [];
+    } finally {
+      clearTimeout(timer);
     }
-    const body = (await resp.json()) as ToPhoneBody;
-    return Array.isArray(body.envelopes) ? body.envelopes : [];
   }
 
   /**
-   * Poll `to-phone` until one payload arrives or `timeoutMs` elapses, sleeping
-   * `intervalMs` between empty polls. Returns the first payload, or `null` on
-   * timeout. Extra payloads in a single drain are returned on later calls only
-   * for the ceremony's strictly-one-per-direction use; the caller decides.
+   * Long-poll `to-phone` until one payload arrives or `timeoutMs` elapses.
+   * Each `drain()` call already blocks server-side while the mailbox is
+   * empty, so this just re-issues sequential GETs with no client sleep
+   * between them - the relay does the waiting. Returns the first payload, or
+   * `null` once `timeoutMs` has elapsed with nothing delivered. Extra
+   * payloads in a single drain are returned on later calls only, for the
+   * ceremony's strictly-one-per-direction use; the caller decides.
    */
-  async waitOne(timeoutMs: number, intervalMs = 400): Promise<string | null> {
+  async waitOne(timeoutMs: number): Promise<string | null> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const batch = await this.drain();
       if (batch.length > 0) return batch[0] ?? null;
       if (Date.now() >= deadline) return null;
-      await sleep(Math.min(intervalMs, Math.max(0, deadline - Date.now())));
     }
   }
-}
-
-export function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -30,6 +30,7 @@ import {
   type DeviceIdentity,
   type Envelope,
   envelopeFromWire,
+  EnvelopeOpenError,
   type EnvelopeWire,
   agreementSecretKey,
   fingerprintWords,
@@ -71,6 +72,48 @@ export class PairingExpiredError extends Error {
     super("This pairing QR has expired. Generate a fresh one on your Mac.");
     this.name = "PairingExpiredError";
   }
+}
+
+/** Shown when the in-memory ceremony state is missing a piece it needs (the
+ * app restarted mid-ceremony, or a screen was reached out of order). Exported
+ * so confirm.tsx's own "no ceremony" guard (reached before any pairing-flow
+ * call throws) shows the identical copy. */
+export const LOST_PLACE_COPY = "Pairing lost its place. Start again from the Mac's QR code.";
+/** The generic, safe fallback: never the raw cause, which goes to the console
+ * instead (see {@link describePairingError}). */
+const GENERIC_FAILURE_COPY = "Pairing could not complete. Try again from the Mac.";
+
+/**
+ * House-style copy for a pairing failure, in place of the raw thrown message.
+ * The user must never see a technical string like "the delivered key
+ * envelope was malformed" or an `EnvelopeOpenError`'s signature/replay/decrypt
+ * detail - those are exactly the kind of thing a MITM or a protocol bug would
+ * produce, and none of them are actionable to a human either way. The raw
+ * cause is logged (for a bug report), never rendered.
+ */
+export function describePairingError(e: unknown): string {
+  // eslint-disable-next-line no-console
+  console.error("[pairing] ceremony failed:", e);
+
+  if (e instanceof PairingExpiredError) return e.message; // already house copy
+
+  const message = e instanceof Error ? e.message : String(e);
+  if (message === "no scanned pairing to respond to" || message === "pairing is not ready to receive the DEK") {
+    return LOST_PLACE_COPY;
+  }
+  if (message === "timed out waiting for the Mac to deliver the key") {
+    return "The Mac didn't respond in time. Make sure it's on the same network and try again.";
+  }
+  if (message.startsWith("relay to-daemon:") || message.startsWith("relay to-phone:")) {
+    return "Could not reach the Mac over the relay. Check the connection and try again.";
+  }
+  if (e instanceof EnvelopeOpenError) {
+    return GENERIC_FAILURE_COPY;
+  }
+  // "the delivered key envelope was malformed", a keystore write failure, a
+  // bare network exception, or anything else unrecognized: the same safe
+  // fallback, never the raw cause.
+  return GENERIC_FAILURE_COPY;
 }
 
 export interface Ceremony {

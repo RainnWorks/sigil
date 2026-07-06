@@ -12,6 +12,12 @@
  * foregrounded, a ~30s backstop (AppState-gated, re-armed on every foreground
  * transition) catches anything a missed push would have delivered. No idle
  * connection, no tight polling loop.
+ *
+ * `to-phone` is now a long-poll (`relay-http.ts`): an empty mailbox holds the
+ * GET open server-side for ~25s before returning, so one `wake()` call can
+ * itself take that long. `wake()` collapses concurrent callers (push, tap,
+ * backstop tick, foreground transition) onto the same in-flight drain rather
+ * than firing overlapping GETs.
  */
 import { AppState, type AppStateStatus } from "react-native";
 
@@ -51,6 +57,7 @@ export class PhoneRelay implements Transport {
   private lastSeenAt = 0;
   private backstopTimer: ReturnType<typeof setInterval> | null = null;
   private appStateSub: { remove: () => void } | null = null;
+  private inFlight: Promise<void> | null = null;
 
   constructor(private readonly cfg: PhoneRelayConfig) {
     this.mailbox = new RelayMailbox(cfg.base, cfg.mailbox);
@@ -91,15 +98,27 @@ export class PhoneRelay implements Transport {
   /**
    * Drain `to-phone` right now. Used by the push doorbell (receipt or tap)
    * and the foreground backstop; a no-op before `start()` or after `stop()`.
+   * Since one drain can now itself hold for ~25-30s (the relay's long-poll),
+   * a wake that arrives while another is already in flight just joins it
+   * instead of firing a second overlapping GET.
    */
   async wake(): Promise<void> {
     if (!this.running) return;
+    if (this.inFlight) return this.inFlight;
+    const attempt = (async () => {
+      try {
+        await this.drainOnce();
+      } catch {
+        // A transient relay error just means the next backstop tick (or the
+        // next push) tries again.
+        this.connected = false;
+      }
+    })();
+    this.inFlight = attempt;
     try {
-      await this.drainOnce();
-    } catch {
-      // A transient relay error just means the next backstop tick (or the
-      // next push) tries again.
-      this.connected = false;
+      await attempt;
+    } finally {
+      if (this.inFlight === attempt) this.inFlight = null;
     }
   }
 

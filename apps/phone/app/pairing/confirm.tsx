@@ -10,6 +10,8 @@ import { radius, space } from "@/theme/tokens";
 import {
   awaitDekDelivery,
   currentCeremony,
+  describePairingError,
+  LOST_PLACE_COPY,
   resetCeremony,
   submitPairingResponse,
 } from "@/src/session/pairing-flow";
@@ -38,7 +40,7 @@ export default function ConfirmScreen() {
       const c = currentCeremony();
       if (!c?.confirmWords) {
         if (alive) {
-          setError("Pairing lost its place. Start again from the Mac's QR code.");
+          setError(LOST_PLACE_COPY);
           setPhase("error");
         }
         return;
@@ -51,7 +53,7 @@ export default function ConfirmScreen() {
         if (alive) setPhase("confirm");
       } catch (e) {
         if (alive) {
-          setError(e instanceof Error ? e.message : "Could not reach the Mac over the relay.");
+          setError(describePairingError(e));
           setPhase("error");
         }
       }
@@ -72,7 +74,7 @@ export default function ConfirmScreen() {
       await armLiveSession();
       router.replace({ pathname: "/pairing/done", params: { ok: "1" } });
     } catch (e) {
-      setError(e instanceof Error ? e.message : "The Mac did not deliver the key.");
+      setError(describePairingError(e));
       setPhase("error");
     }
   }
