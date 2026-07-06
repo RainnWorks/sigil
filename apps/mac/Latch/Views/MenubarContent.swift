@@ -28,7 +28,7 @@ struct MenubarContent: View {
         case .armed: .armed; case .lockedDown: .lockedDown; case .idle: .neutral
         }
         return HStack(spacing: 8) {
-            Text("latch").font(.mono(13, weight: .medium)).foregroundStyle(Palette.cobalt)
+            Text("sigil").font(.mono(13, weight: .medium)).foregroundStyle(Palette.cobalt)
             StatePill(tone: tone)
             Spacer()
             if model.macApprovalsMode == .hardenedPhoneOnly {

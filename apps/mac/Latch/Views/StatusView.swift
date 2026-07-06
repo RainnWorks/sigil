@@ -27,7 +27,7 @@ struct StatusView: View {
         case .armed: .armed; case .lockedDown: .lockedDown; case .idle: .neutral
         }
         return HStack(spacing: 10) {
-            Text("latch").font(.mono(20, weight: .medium)).foregroundStyle(Palette.cobalt)
+            Text("sigil").font(.mono(20, weight: .medium)).foregroundStyle(Palette.cobalt)
             StatePill(tone: tone)
             Spacer()
             if model.armState == .lockedDown {
