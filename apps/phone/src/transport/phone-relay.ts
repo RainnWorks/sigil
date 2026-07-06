@@ -1,6 +1,6 @@
 /**
  * The real phone-side {@link Transport}: sealed envelopes over the blind
- * relay's v4 HTTP contract (`relay-http.ts`), mirroring crates/relay-client.
+ * relay's v4 HTTP contract (`relay-http.ts`), mirroring crates/sigil-relay-client.
  * There is no persistent connection: the phone drains
  * `GET /mailbox/{id}/to-phone` on demand and posts to
  * `POST /mailbox/{id}/to-daemon` to send. Push sending is the relay's job now

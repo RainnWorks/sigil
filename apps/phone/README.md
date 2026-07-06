@@ -41,7 +41,7 @@ components/
   ui/                      Sans/Mono text, SF symbol wrapper, primitives
 theme/                     tokens (oklch→hex) and semantic color access
 src/
-  protocol/                crypto layer — byte-matches crates/proto
+  protocol/                crypto layer — byte-matches crates/sigil-proto
   transport/               transport interface + mock (proves the loop)
   session/                 session glue + pairing ceremony state
   state/                   observable store (useSyncExternalStore) + demo data
@@ -51,14 +51,14 @@ src/
 
 ## Protocol layer and the shared test-vector contract
 
-`src/protocol` mirrors `crates/proto` field-for-field: `identity`, `envelope`
+`src/protocol` mirrors `crates/sigil-proto` field-for-field: `identity`, `envelope`
 (seal/open, canonical bytes), `replay`, `fingerprint` (six words + mailbox id,
 sharing the 256-word list in `words.ts`), and `pairing` (QR payload). The one
 libsodium seam is `sodium.ts`; on device it is `react-native-libsodium`, in Node
 tests it is `libsodium-wrappers` (injected via `sodium-node.ts`).
 
 `ApprovalRequest` / `ApprovalResponse` in `requests.ts` are the payloads carried
-*inside* an envelope. `crates/proto` has not landed these yet; this is the
+*inside* an envelope. `crates/sigil-proto` has not landed these yet; this is the
 phone's proposed shape and must be reconciled when the Rust type lands (one file,
 one diff).
 

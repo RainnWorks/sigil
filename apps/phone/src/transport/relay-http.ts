@@ -1,7 +1,7 @@
 /**
  * The blind relay's v4 HTTP contract, as the phone speaks it. One mailbox, two
  * opaque endpoints, exactly matching relay/shared/protocol.ts and the Rust
- * clients (crates/relay-client):
+ * clients (crates/sigil-relay-client):
  *
  *   GET  /mailbox/{id}/to-phone    -> { envelopes: string[] }  (long-poll, drain-on-read)
  *   POST /mailbox/{id}/to-daemon   body { "env": "<opaque>" }  (deposit)
