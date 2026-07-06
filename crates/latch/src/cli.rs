@@ -19,14 +19,16 @@ use crate::style::Style;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Dispatch `latch <cmd>`. Returns the process exit code.
+/// Dispatch the lean `latch` binary: the runtime/daemon verbs and the
+/// `latch <cmd>` gating primitive. Configuration management (rules, sources,
+/// accounts, settings, wipe) is NOT here — it lives in the `latch-config`
+/// binary ([`run_config`]), so a program literally named `config`/`account`/…
+/// stays gateable as `latch <that-name> …`.
 ///
 /// `--json` is a global flag: it is stripped from the args once here (so each
 /// subcommand's own flag parsing is unchanged) and threaded to the emitting
-/// commands as a bool. A global flag is cleaner than a per-subcommand one for
-/// this hand-rolled dispatcher — every machine-readable verb needs it uniformly,
-/// and stripping it in one place keeps the human path and its tests untouched.
-pub fn run() -> i32 {
+/// commands as a bool.
+pub fn run_gating() -> i32 {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let json = extract_flag(&mut args, "--json");
     match args.first().map(String::as_str).unwrap_or("") {
@@ -38,20 +40,15 @@ pub fn run() -> i32 {
         "qr" => cmd_qr(&args[1..]),
         "unpair" => cmd_unpair(json),
         "start" | "stop" | "restart" => cmd_service(&args[0]),
-        "account" => cmd_account(&args[1..], json),
         "lease" => cmd_lease(&args[1..]),
         "lockdown" => cmd_lockdown(&args[1..]),
         "approve" => cmd_approve(&args[1..]),
         "deny" => cmd_deny(&args[1..]),
         "history" => cmd_history(),
         "pending" => cmd_pending(),
-        "mac-approvals" => cmd_mac_approvals(&args[1..], json),
-        "settings" => cmd_settings(&args[1..], json),
-        "wipe" => cmd_wipe(&args[1..], json),
         "ssh" => cmd_ssh(&args[1..]),
         "sshagent" => cmd_sshagent(),
         "shim" => cmd_shim(&args[1..], json),
-        "config" => cmd_config(&args[1..], json),
         "run" => cmd_run(&args[1..]),
         "version" | "--version" | "-V" => {
             println!("latch {VERSION}");
@@ -79,11 +76,48 @@ pub fn run() -> i32 {
     }
 }
 
-/// Whether `cmd` is a reserved `latch` verb (handled by the dispatch above) and
-/// therefore takes precedence over the `latch <cmd>` command primitive. The
-/// unambiguous escape hatch for a tool named like a verb is `latch run -- <cmd>`.
-/// Kept in one place so the precedence is testable and cannot silently drift from
-/// the match.
+/// Dispatch the `latch-config` binary: all configuration management. Its verbs
+/// are the config engine (`source`/`rule`/`list`/`export`/`import`) plus
+/// `account`, `settings`, `mac-approvals`, and `wipe`. It never gates a command;
+/// an unknown verb is an error, not a `latch <cmd>` invocation.
+pub fn run_config() -> i32 {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let json = extract_flag(&mut args, "--json");
+    match args.first().map(String::as_str).unwrap_or("") {
+        "" | "list" => config_list(json),
+        "source" => cmd_config_source(&args[1..], json),
+        "rule" => cmd_config_rule(&args[1..], json),
+        "export" => config_export(),
+        "import" => config_import(json),
+        // The one-command convenience desugar (source + rule in one step).
+        "add" => config_add(&args[1..], json),
+        "remove" | "rm" => config_remove(args.get(1).map(String::as_str), json),
+        "account" => cmd_account(&args[1..], json),
+        "settings" => cmd_settings(&args[1..], json),
+        "mac-approvals" => cmd_mac_approvals(&args[1..], json),
+        "wipe" => cmd_wipe(&args[1..], json),
+        "version" | "--version" | "-V" => {
+            println!("latch-config {VERSION}");
+            0
+        }
+        "help" | "--help" | "-h" => {
+            print_config_help();
+            0
+        }
+        other => {
+            eprintln!("latch-config: unknown command '{other}'\n");
+            print_config_help();
+            2
+        }
+    }
+}
+
+/// Whether `cmd` is a reserved verb in the lean `latch` binary (handled by
+/// [`run_gating`]) and therefore takes precedence over the `latch <cmd>`
+/// primitive. The management verbs (config/account/settings/mac-approvals/wipe)
+/// are deliberately NOT reserved here — they moved to `latch-config`, which frees
+/// those names to be gated. The escape hatch for a tool named like a residual
+/// reserved verb is `latch run -- <cmd>`.
 pub fn is_reserved_verb(cmd: &str) -> bool {
     matches!(
         cmd,
@@ -97,20 +131,15 @@ pub fn is_reserved_verb(cmd: &str) -> bool {
             | "start"
             | "stop"
             | "restart"
-            | "account"
             | "lease"
             | "lockdown"
             | "approve"
             | "deny"
             | "history"
             | "pending"
-            | "mac-approvals"
-            | "settings"
-            | "wipe"
             | "ssh"
             | "sshagent"
             | "shim"
-            | "config"
             | "run"
             | "version"
             | "--version"
@@ -173,25 +202,12 @@ fn print_help() {
         "latch {VERSION} — remote-approval instrument: gate any CLI on your phone
 
 usage: latch <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
-       latch <verb>            a reserved verb (below)
+       latch <verb>            a reserved runtime verb (below)
 
   <cmd> [args...]   run a command gated on your phone when a rule matches it
                     (e.g. latch op read op://…, latch gcloud …). An unmatched
-                    command is refused; add one with: latch config add <cmd>
+                    command is refused; configure one with: latch-config add <cmd>
   run -- <cmd>      escape hatch: run <cmd> even if it collides with a verb
-  config add <cmd> --provider <id> [--source <p>] [--account <l>] [--risk <r>]
-                    author a source + rule for one command (a convenience;
-                    providers: 1password, env-file)
-  config source add <name> --provider <id> [--account <l>] [--path <f>]
-                    add a named secret source; also: source list|remove
-  config rule add <name> --source <s> [--command <c>] [--subcommand <s>]
-                    [--argv-contains <str>...] [--flag <f>...] [--flag-eq <f>=<v>...]
-                    [--risk <r>] [--timeout <sec>]   a match -> gate + inject
-                    rule; also: rule list|remove
-  config list       summarize sources and rules (--json = the whole config)
-  config export     print the whole config as JSON (for the desktop to load)
-  config import     replace the whole config from JSON on stdin
-  config remove <cmd>  forget a command's rule (and its like-named source)
   status            instrument panel: daemon, shim, op, factor
   setup             guided first run: shim, PATH, launchd, then pair
   daemon [--dev-insecure]  run the approval daemon (foreground). Without a
@@ -206,10 +222,6 @@ usage: latch <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
                     stdin, --png <path> also writes a PNG, --out svg emits SVG,
                     --scale <n> sets pixels per module (PNG/SVG, default 8)
   start|stop|restart   control the launchd daemon agent
-  account add       add a service-account token (reads token from stdin)
-  account list      list configured accounts and their vault routing
-  account rotate --id <id>  replace an account's token (reads from stdin)
-  account remove --id <id>  forget an account
   lease list        list active session leases with countdowns
   lease revoke <p>  revoke leases whose grant-key hex starts with <p>
   lockdown [--clear]  seal the daemon (deny + refuse) or unseal it
@@ -217,9 +229,6 @@ usage: latch <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
   deny --local --id <id>               deny a pending request at the Mac
   history           the decision audit log (names and metadata only)
   pending           requests currently parked for a local decision
-  mac-approvals --enable|--phone-only  toggle the Mac local-approval factor
-  settings get|set  read or change preferences (timeouts, relay, retention)
-  wipe [--force]    remove pairing, accounts, keys, and settings
   ssh add           serve a 1Password SSH key (--vault --item --pubkey-file)
   ssh add-file      serve a local key file (--path <key>, signs from ~/.ssh/…)
   ssh list          list the SSH keys the agent serves
@@ -230,11 +239,49 @@ usage: latch <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
   version           print version
   help              print this message
 
+Configuration (rules, sources, accounts, settings, wipe) lives in a separate
+binary: run `latch-config help`. Keeping it off this binary means a program
+literally named `config`/`account`/… stays gateable as `latch <that-name> …`.
+
 The Mac app speaks the daemon control socket directly (see PROTOCOL.md):
 status, doctor, lease, lockdown, approve, deny, history, and pending are
-socket queries the human CLI renders. --json is for the CLI-only mutation
-commands the app shells out for: account, settings, wipe, mac-approvals,
-shim install, unpair, and pair (NDJSON ceremony stream)."
+socket queries the human CLI renders."
+    );
+}
+
+/// Help for the `latch-config` management binary.
+fn print_config_help() {
+    println!(
+        "latch-config {VERSION} — Latch configuration management
+
+usage: latch-config <cmd> [args...]   author rules/sources, manage accounts
+
+  add <cmd> --provider <id> [--source <p>] [--account <l>] [--risk <r>]
+                    convenience: author a source + rule for one command
+                    (providers: 1password, env-file)
+  source add <name> --provider <id> [--account <l>] [--path <f>]
+                    add a named secret source; also: source list|remove
+  rule add <name> --source <s> [--command <c>] [--subcommand <s>]
+                    [--argv-contains <str>...] [--flag <f>...] [--flag-eq <f>=<v>...]
+                    [--risk <r>] [--timeout <sec>]   a match -> gate + inject
+                    rule; also: rule list|remove
+  list              summarize sources and rules (--json = the whole config)
+  export            print the whole config as JSON (for the desktop to load)
+  import            replace the whole config from JSON on stdin
+  remove <cmd>      forget a command's rule (and its like-named source)
+  account add       add a service-account token (reads token from stdin)
+  account list      list configured accounts and their vault routing
+  account rotate --id <id>  replace an account's token (reads from stdin)
+  account remove --id <id>  forget an account
+  settings get|set  read or change preferences (timeouts, relay, retention)
+  mac-approvals --enable|--phone-only  toggle the Mac local-approval factor
+  wipe [--force]    remove pairing, accounts, keys, config, and settings
+  version           print version
+  help              print this message
+
+--json is for the CLI-only mutation commands the Mac app shells out for
+(source/rule/list/export/import, account, settings, wipe, mac-approvals).
+Re-run `latch restart` to apply a config change."
     );
 }
 
@@ -1811,7 +1858,7 @@ fn cmd_shim(args: &[String], json: bool) -> i32 {
 /// so a bare `<cmd>` on PATH re-enters as `latch <cmd>`. For callers that cannot
 /// be modified (a launcher shelling out to a bare tool, `git` reaching the SSH
 /// agent, an AI agent that only knows the real name). The command should already
-/// be configured (`latch config add <cmd>`); a warning notes it if not.
+/// be configured (`latch-config add <cmd>`); a warning notes it if not.
 fn shim_add(cmd: Option<&str>, json: bool) -> i32 {
     let s = Style::stdout();
     let Some(cmd) = cmd else {
@@ -1842,7 +1889,7 @@ fn shim_add(cmd: Option<&str>, json: bool) -> i32 {
         ];
         if !configured {
             lines.push(format!(
-                "warning: {cmd} is not configured; run latch config add {cmd}"
+                "warning: {cmd} is not configured; run latch-config add {cmd}"
             ));
         }
         return emit_local_control(&ControlResult::ok(lines));
@@ -1863,7 +1910,7 @@ fn shim_add(cmd: Option<&str>, json: bool) -> i32 {
             "  {} {}",
             s.brass("\u{2717}"),
             s.dim(&format!(
-                "{cmd} is not configured yet; run: latch config add {cmd} --provider <id>"
+                "{cmd} is not configured yet; run: latch-config add {cmd} --provider <id>"
             ))
         );
     }
@@ -1917,32 +1964,6 @@ fn shim_install(json: bool) -> i32 {
     0
 }
 
-/// `latch config …`: the provider-agnostic configuration CLI. It authors the
-/// rule/source model the daemon reads to gate `latch <cmd>`; it is the owned
-/// primitive the desktop app shells out to. A config *mutation*, so it lives
-/// CLI-side (the daemon only reads it); re-run `latch restart` to apply a change.
-///
-/// Verbs: `source add|list|remove`, `rule add|list|remove`, `export`/`import`
-/// (whole config as JSON), a human `list` summary, and the `add <cmd>`/`remove
-/// <cmd>` convenience desugar that authors a source+rule for one command.
-fn cmd_config(args: &[String], json: bool) -> i32 {
-    match args.first().map(String::as_str) {
-        Some("source") => cmd_config_source(&args[1..], json),
-        Some("rule") => cmd_config_rule(&args[1..], json),
-        Some("export") => config_export(),
-        Some("import") => config_import(json),
-        Some("add") => config_add(&args[1..], json),
-        Some("remove") | Some("rm") => config_remove(args.get(1).map(String::as_str), json),
-        Some("list") | None => config_list(json),
-        _ => {
-            eprintln!(
-                "usage: latch config <source|rule|list|export|import|add <cmd>|remove <cmd>>"
-            );
-            2
-        }
-    }
-}
-
 /// Load the config store, printing an error and returning `None` on failure.
 fn load_config() -> Option<crate::config::Config> {
     match crate::config::Config::load() {
@@ -1987,7 +2008,7 @@ fn cmd_config_source(args: &[String], json: bool) -> i32 {
         Some("remove") | Some("rm") => config_source_remove(args.get(1).map(String::as_str), json),
         _ => {
             eprintln!(
-                "usage: latch config source <add <name> --provider <id> | list | remove <name>>"
+                "usage: latch-config source <add <name> --provider <id> | list | remove <name>>"
             );
             2
         }
@@ -2011,7 +2032,7 @@ fn known_provider(provider: &str) -> bool {
 fn config_source_add(args: &[String], json: bool) -> i32 {
     let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
         eprintln!(
-            "usage: latch config source add <name> --provider <id> [--account <label>] [--path <file>]"
+            "usage: latch-config source add <name> --provider <id> [--account <label>] [--path <file>]"
         );
         return 2;
     };
@@ -2066,7 +2087,7 @@ fn config_source_list(json: bool) -> i32 {
     if cfg.sources.is_empty() {
         println!(
             "  {}",
-            s.dim("no sources; add one: latch config source add <name> --provider <id>")
+            s.dim("no sources; add one: latch-config source add <name> --provider <id>")
         );
         return 0;
     }
@@ -2091,7 +2112,7 @@ fn config_source_list(json: bool) -> i32 {
 
 fn config_source_remove(name: Option<&str>, json: bool) -> i32 {
     let Some(name) = name else {
-        eprintln!("usage: latch config source remove <name>");
+        eprintln!("usage: latch-config source remove <name>");
         return 2;
     };
     let mut cfg = match load_config() {
@@ -2117,7 +2138,7 @@ fn cmd_config_rule(args: &[String], json: bool) -> i32 {
         Some("list") | None => config_rule_list(json),
         Some("remove") | Some("rm") => config_rule_remove(args.get(1).map(String::as_str), json),
         _ => {
-            eprintln!("usage: latch config rule <add <name> --source <src> [match...] | list | remove <name>>");
+            eprintln!("usage: latch-config rule <add <name> --source <src> [match...] | list | remove <name>>");
             2
         }
     }
@@ -2162,7 +2183,7 @@ fn build_match(args: &[String]) -> Result<crate::config::Match, i32> {
 fn config_rule_add(args: &[String], json: bool) -> i32 {
     let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
         eprintln!(
-            "usage: latch config rule add <name> --source <src> [--command <c>] [--subcommand <s>] \
+            "usage: latch-config rule add <name> --source <src> [--command <c>] [--subcommand <s>] \
              [--argv-contains <str> ...] [--flag <f> ...] [--flag-eq <f>=<v> ...] \
              [--risk routine|elevated|critical] [--timeout <sec>]"
         );
@@ -2246,7 +2267,7 @@ fn config_rule_list(json: bool) -> i32 {
     if cfg.rules.is_empty() {
         println!(
             "  {}",
-            s.dim("no rules; add one: latch config rule add <name> --source <src> --command <cmd>")
+            s.dim("no rules; add one: latch-config rule add <name> --source <src> --command <cmd>")
         );
         return 0;
     }
@@ -2297,7 +2318,7 @@ fn describe_match(m: &crate::config::Match) -> String {
 
 fn config_rule_remove(name: Option<&str>, json: bool) -> i32 {
     let Some(name) = name else {
-        eprintln!("usage: latch config rule remove <name>");
+        eprintln!("usage: latch-config rule remove <name>");
         return 2;
     };
     let mut cfg = match load_config() {
@@ -2316,7 +2337,7 @@ fn config_rule_remove(name: Option<&str>, json: bool) -> i32 {
     print_config_result(&result, json)
 }
 
-/// `latch config export`: the whole config as pretty JSON on stdout, for the
+/// `latch-config export`: the whole config as pretty JSON on stdout, for the
 /// desktop to load or a human to inspect. Inherently machine-readable, so it
 /// ignores `--json` and always emits JSON.
 fn config_export() -> i32 {
@@ -2328,7 +2349,7 @@ fn config_export() -> i32 {
     0
 }
 
-/// `latch config import`: replace the whole config from a JSON object on stdin
+/// `latch-config import`: replace the whole config from a JSON object on stdin
 /// (the form `export` emits), so the desktop can save an edited config wholesale.
 fn config_import(json: bool) -> i32 {
     let mut buf = String::new();
@@ -2337,7 +2358,7 @@ fn config_import(json: bool) -> i32 {
         return 1;
     }
     if buf.trim().is_empty() {
-        eprintln!("latch: empty config on stdin (pipe the JSON `latch config export` emits)");
+        eprintln!("latch: empty config on stdin (pipe the JSON `latch-config export` emits)");
         return 2;
     }
     let cfg: crate::config::Config = match serde_json::from_str(&buf) {
@@ -2379,7 +2400,7 @@ fn config_import(json: bool) -> i32 {
     )
 }
 
-/// `latch config add <cmd> --provider <id> …`: the convenience desugar. Authors a
+/// `latch-config add <cmd> --provider <id> …`: the convenience desugar. Authors a
 /// source named `<cmd>` plus a rule named `<cmd>` matching `command == <cmd>`, so
 /// the common "gate this one command" case stays a one-liner. Equivalent to a
 /// `config source add <cmd>` + `config rule add <cmd> --command <cmd>`.
@@ -2387,7 +2408,7 @@ fn config_add(args: &[String], json: bool) -> i32 {
     let s = Style::stdout();
     let Some(cmd) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
         eprintln!(
-            "usage: latch config add <cmd> --provider <id> [--source <path>] [--account <label>] [--risk routine|elevated|critical]"
+            "usage: latch-config add <cmd> --provider <id> [--source <path>] [--account <label>] [--risk routine|elevated|critical]"
         );
         return 2;
     };
@@ -2469,7 +2490,7 @@ fn config_add(args: &[String], json: bool) -> i32 {
     0
 }
 
-/// `latch config list`: a human summary of sources and rules (JSON = the whole
+/// `latch-config list`: a human summary of sources and rules (JSON = the whole
 /// config, the same shape `export` emits).
 fn config_list(json: bool) -> i32 {
     if json {
@@ -2483,7 +2504,7 @@ fn config_list(json: bool) -> i32 {
         let s = Style::stdout();
         println!(
             "  {}",
-            s.dim("nothing configured; add a command: latch config add <cmd> --provider <id>")
+            s.dim("nothing configured; add a command: latch-config add <cmd> --provider <id>")
         );
         return 0;
     }
@@ -2492,12 +2513,12 @@ fn config_list(json: bool) -> i32 {
     config_rule_list(false)
 }
 
-/// `latch config remove <cmd>`: the desugar's inverse. Removes the rule named
+/// `latch-config remove <cmd>`: the desugar's inverse. Removes the rule named
 /// `<cmd>` and then its like-named source (best effort), so a `config add <cmd>`
 /// is fully undone by one command.
 fn config_remove(cmd: Option<&str>, json: bool) -> i32 {
     let Some(cmd) = cmd else {
-        eprintln!("usage: latch config remove <cmd>");
+        eprintln!("usage: latch-config remove <cmd>");
         return 2;
     };
     let mut cfg = match load_config() {
@@ -2778,14 +2799,27 @@ mod tests {
 
     #[test]
     fn reserved_verbs_take_precedence_over_command_dispatch() {
-        // Every latch verb is reserved; a bare tool name (op, gcloud) is not, so
-        // it falls through to the `latch <cmd>` primitive.
+        // A runtime verb is reserved in the lean binary; a bare tool name (op,
+        // gcloud) is not, so it falls through to the `latch <cmd>` primitive.
         for v in [
-            "status", "daemon", "pair", "config", "run", "ssh", "shim", "help", "version",
+            "status", "daemon", "pair", "run", "ssh", "shim", "help", "version",
         ] {
             assert!(is_reserved_verb(v), "{v} must be a reserved verb");
         }
-        for c in ["op", "gcloud", "bw", "kubectl", "mytool"] {
+        // Management verbs moved to latch-config, so they are NOT reserved in the
+        // lean binary — which frees those names to be gated as `latch <name>`.
+        for c in [
+            "op",
+            "gcloud",
+            "bw",
+            "kubectl",
+            "mytool",
+            "config",
+            "account",
+            "settings",
+            "wipe",
+            "mac-approvals",
+        ] {
             assert!(!is_reserved_verb(c), "{c} must dispatch as a command");
         }
     }

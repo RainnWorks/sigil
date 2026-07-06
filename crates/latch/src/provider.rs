@@ -140,7 +140,7 @@ impl ProviderRegistry {
             .map(|b| b.as_ref())
     }
 
-    /// The registered provider ids (for `latch config` guidance and diagnostics).
+    /// The registered provider ids (for `latch-config` guidance and diagnostics).
     pub fn ids(&self) -> Vec<&str> {
         self.providers.iter().map(|p| p.id()).collect()
     }

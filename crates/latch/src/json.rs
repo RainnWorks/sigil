@@ -107,7 +107,7 @@ pub struct AccountJson {
 }
 
 // The rule/source config JSON is the serialized `crate::config` domain types
-// (`Config`, `Source`, `Rule`), emitted directly by `latch config export` and
+// (`Config`, `Source`, `Rule`), emitted directly by `latch-config export` and
 // the `--json` config verbs; there is no separate DTO here.
 
 // --- leases ----------------------------------------------------------------

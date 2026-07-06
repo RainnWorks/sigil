@@ -16,13 +16,25 @@ description = "Latch daemon, op shim, and CLI as one multicall binary"
 #   cargo test -p latch --features real-relay -- --test-threads=1
 real-relay = []
 
+# The shared core: rule engine, providers, gating/daemon, keystore, transport,
+# proxy. Both binaries below depend on it; zero logic is duplicated between them.
 [lib]
-name = "latch"
+name = "latch_core"
 path = "src/lib.rs"
 
+# The lean hot-path + runtime binary: the transparent shim multicall, the
+# `latch <cmd>` gating primitive, and the runtime/daemon verbs. Reserved-verb
+# surface is kept small so a program named `config`/`account`/… stays gateable.
 [[bin]]
 name = "latch"
-path = "src/main.rs"
+path = "src/bin/latch.rs"
+
+# The configuration-management CLI the desktop shells out to: the rule/source
+# config engine plus account/settings/mac-approvals/wipe. Genuinely separate
+# artifact, same shared core.
+[[bin]]
+name = "latch-config"
+path = "src/bin/latch-config.rs"
 
 [dependencies]
 latch-proto = { path = "../proto" }

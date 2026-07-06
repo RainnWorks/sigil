@@ -21,7 +21,7 @@ the `op` provider plugin (`provider::OpProvider`). The core evaluates generic
 rules against an invocation and, on a match, gates then injects from a named
 source. Nothing in the rule vocabulary or the engine names `op`.
 
-## Package & binary layout (decided; split pending a contract call)
+## Package & binary layout (landed)
 
 One workspace package (`crates/latch`). Its `[lib]` is the shared core
 `latch_core` — the rule engine, providers, gating/daemon, keystore, transport,
@@ -38,14 +38,14 @@ with zero duplication. Two thin `[[bin]]` targets in `src/bin/`:
   to under the hood: `source`/`rule`/`list`/`export`/`import`, plus the
   config-ish mutations (`account`, `settings`, `mac-approvals`, `wipe`).
 
-Open item before executing the split: it moves the desktop's invocation from
-`latch config …`/`latch account …` to `latch-config …`, an outward-facing
-contract the Mac app (`apps/mac`) depends on. Either a hard cut (update the Mac
-app) or transitional aliases in the lean binary — a decision owned with the team
-lead + mac-app, not made unilaterally here.
-
-Until the split lands the code is still one multicall `latch` binary (below);
-the skeleton above is the target both this work and the proxy work assume.
+The split moves the desktop's invocation from `latch config …`/`latch account …`
+to `latch-config …` (source/rule/list/export/import + account/settings/
+mac-approvals/wipe are now `latch-config` verbs, no `config` prefix). That is an
+outward-facing contract the Mac app (`apps/mac`) depends on; updating it is a
+separate task. Because `config`/`account`/`settings`/`wipe` are no longer
+reserved in the lean `latch` binary, a program literally named any of those is
+now gateable as `latch <that-name> …`; the escape hatch for a residual reserved
+runtime verb is `latch run -- <cmd>`.
 
 ## Two CLIs, one binary
 

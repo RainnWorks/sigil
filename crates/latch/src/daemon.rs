@@ -757,7 +757,7 @@ fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
 /// routes a 1Password account, unwraps the DEK, decrypts the one token, and
 /// injects it; a direct-injection provider (`env-file`) needs no account and is
 /// gated on every run (no leasing, so resolved values never sit in RAM across a
-/// TTL). An *unconfigured* command is refused with a pointer to `latch config
+/// TTL). An *unconfigured* command is refused with a pointer to `latch-config
 /// add`, never run ungated.
 fn fulfill(
     core: &Core,
@@ -784,7 +784,7 @@ fn fulfill(
             stderr,
             &format!(
                 "latch: '{cmd}' is not configured (no rule matches); Latch will not run it ungated.\n  \
-                 configure it: latch config add {cmd} --provider <id>\n"
+                 configure it: latch-config add {cmd} --provider <id>\n"
             ),
         );
     };
@@ -1594,7 +1594,7 @@ mod tests {
         assert_eq!(read_all(read_end), "", "and produce no output");
         let err = read_all(err_r);
         assert!(err.contains("not configured"), "err: {err}");
-        assert!(err.contains("latch config add gcloud"), "err: {err}");
+        assert!(err.contains("latch-config add gcloud"), "err: {err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

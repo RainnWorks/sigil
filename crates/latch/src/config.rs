@@ -11,11 +11,11 @@
 //!
 //! A configured invocation is gated on the phone and its source's provider
 //! injects the approved environment; an *unmatched* invocation is refused with a
-//! pointer to `latch config` and never run ungated (a silent pass-through would
+//! pointer to `latch-config` and never run ungated (a silent pass-through would
 //! be false security).
 //!
 //! This is a config *mutation* surface, so — like the account and pairing stores
-//! — it lives CLI-side (`latch config …`). The daemon only *reads* it, loaded at
+//! — it lives CLI-side (`latch-config …`). The daemon only *reads* it, loaded at
 //! arm time (a compromised always-on daemon must not be able to rewrite which
 //! commands are gated). Re-run `latch restart` to apply a change.
 //!
@@ -370,7 +370,7 @@ impl Config {
 
     /// Resolve the first rule that matches `argv`, flattened with its source into
     /// a [`ResolvedAction`]. `None` means "unmatched" — the daemon refuses and
-    /// points at `latch config`. A rule whose action names an unknown source is
+    /// points at `latch-config`. A rule whose action names an unknown source is
     /// skipped (fails closed rather than dispatching to a non-existent provider).
     pub fn resolve(&self, argv: &[String]) -> Option<ResolvedAction> {
         for rule in &self.rules {
