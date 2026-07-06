@@ -60,7 +60,7 @@ struct StatusView: View {
                               value: "\(s.accountCount) configured")
                     Divider()
                     StatusRow(ok: s.factor.tone != .warn, warn: s.factor.tone == .warn,
-                              label: "factor", value: "\(s.factor.label) — \(s.factor.detail)")
+                              label: "factor", value: "\(s.factor.label) · \(s.factor.detail)")
                     if let reachable = s.relayReachable {
                         Divider()
                         StatusRow(ok: reachable, warn: !reachable, label: "relay",

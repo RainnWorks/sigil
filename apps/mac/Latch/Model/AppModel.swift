@@ -79,8 +79,35 @@ final class AppModel {
             paired = try await d
             lastError = nil
         } catch {
-            lastError = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            lastError = describe(error)
         }
+    }
+
+    /// A calm, human line for any daemon-call failure. `DaemonError`'s own
+    /// cases already read like sentences (DaemonClient.swift); anything else
+    /// — an unexpected Swift/Foundation error with no localized description —
+    /// gets a generic banner instead of its debug dump (`Optional(POSIXError(
+    /// ...))` reads like a crash log, not a message a person should see).
+    private func describe(_ error: Error) -> String {
+        (error as? LocalizedError)?.errorDescription ?? "Something went wrong talking to the daemon."
+    }
+
+    /// Run a daemon control call and surface however it actually went: a
+    /// `.failed` result (the daemon refused) and a thrown error (couldn't even
+    /// reach it) both land in `lastError`, so a button tap can never look like
+    /// it worked when it silently didn't. Always refreshes afterward.
+    private func performControl(_ operation: () async throws -> ControlResult) async {
+        do {
+            switch try await operation() {
+            case .ok:
+                lastError = nil
+            case .failed(let lines):
+                lastError = lines.joined(separator: "; ")
+            }
+        } catch {
+            lastError = describe(error)
+        }
+        await refresh()
     }
 
     func loadSecondaryScreens() async {
@@ -113,28 +140,24 @@ final class AppModel {
             if case .userCancelled = e { return }   // cancel is not an error state
             lastError = e.errorDescription
         } catch {
-            lastError = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            lastError = describe(error)
         }
     }
 
     func deny(_ req: PendingRequest) async {
-        _ = try? await daemon.deny(id: req.id)
-        await refresh()
+        await performControl { try await self.daemon.deny(id: req.id) }
     }
 
     func lockdown(clear: Bool) async {
-        _ = try? await daemon.lockdown(clear: clear)
-        await refresh()
+        await performControl { try await self.daemon.lockdown(clear: clear) }
     }
 
     func installShim() async {
-        _ = try? await daemon.installShim()
-        await refresh()
+        await performControl { try await self.daemon.installShim() }
     }
 
     func revokeLease(_ lease: Lease) async {
-        _ = try? await daemon.revokeLease(grantPrefix: lease.grantHex)
-        await refresh()
+        await performControl { try await self.daemon.revokeLease(grantPrefix: lease.grantHex) }
     }
 
     @discardableResult
@@ -161,7 +184,7 @@ final class AppModel {
                 try await daemon.setMacApprovals(.hardenedPhoneOnly)
             }
         } catch {
-            lastError = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            lastError = describe(error)
         }
     }
 
@@ -185,9 +208,16 @@ final class AppModel {
     }
 
     func unpair() async {
-        _ = try? await daemon.unpair()
         ceremony = .idle
-        await refresh()
+        await performControl { try await self.daemon.unpair() }
+    }
+
+    /// Wipe all daemon state. `SettingsView`'s confirmation dialog is the
+    /// human gate; by the time this runs the human already said yes, so this
+    /// only surfaces whether it actually happened, not whether to ask again.
+    func wipe() async {
+        await performControl { try await self.daemon.wipe() }
+        await loadSecondaryScreens()
     }
 
     func saveSettings(_ s: AppSettings) async {

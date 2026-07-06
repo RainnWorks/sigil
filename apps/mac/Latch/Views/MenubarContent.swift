@@ -1,6 +1,6 @@
 //  MenubarContent.swift
 //  The menubar pulse: pending requests with Touch ID approve and deny, quick
-//  lockdown, a recent-decision peek, and Open Latch. Admin lives in the window;
+//  lockdown, a recent-decision peek, and Open Sigil. Admin lives in the window;
 //  nothing heavier lives here.
 
 import SwiftUI
@@ -101,7 +101,7 @@ struct MenubarContent: View {
                 .buttonStyle(.glass)
             }
             Spacer()
-            Button("Open Latch", action: openConfigurator).buttonStyle(.glass)
+            Button("Open Sigil", action: openConfigurator).buttonStyle(.glass)
             Button { NSApplication.shared.terminate(nil) } label: {
                 Image(systemName: "power")
             }

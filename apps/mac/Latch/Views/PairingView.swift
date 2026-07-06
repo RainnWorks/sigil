@@ -88,7 +88,7 @@ struct PairingView: View {
         case .awaitingPhone(let payload):
             ceremonyStep {
                 QRCodeView(payload: payload)
-                Text("Scan this with the Latch approver on your phone.")
+                Text("Scan this with the Sigil approver on your phone.")
                     .font(.system(size: 12))
                 Text("Waiting for the phone to respond...")
                     .font(.system(size: 11)).foregroundStyle(.secondary)

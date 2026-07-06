@@ -30,7 +30,7 @@ enum MenubarGlyph {
             return true
         }
         image.isTemplate = true
-        image.accessibilityDescription = "Latch \(state.rawValue)"
+        image.accessibilityDescription = "Sigil \(state.rawValue)"
         return image
     }
 

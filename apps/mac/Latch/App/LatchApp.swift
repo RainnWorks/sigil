@@ -12,7 +12,7 @@ struct LatchApp: App {
 
     var body: some Scene {
         // The configurator: one window, source-list sidebar + detail.
-        Window("Latch", id: WindowID.configurator) {
+        Window("Sigil", id: WindowID.configurator) {
             RootWindow()
                 .environment(model)
                 .frame(minWidth: 720, minHeight: 480)
@@ -22,7 +22,7 @@ struct LatchApp: App {
         .windowToolbarStyle(.unified)
 
         // The menubar pulse: the four shape states, a pending list, quick
-        // lockdown, and Open Latch.
+        // lockdown, and Open Sigil.
         MenuBarExtra {
             MenubarContent(openConfigurator: { openConfigurator() })
                 .environment(model)

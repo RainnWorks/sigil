@@ -13,7 +13,11 @@
 //  LeaseDTO, HistoryDTO, PendingDTO) are shared by both so the wire shape is
 //  decoded in exactly one place.
 //
-//  `latch <cmd> --json` outputs (stdout, one JSON value, no ANSI):
+//  `latch <cmd> --json` outputs (stdout, one JSON value, no ANSI). The v4
+//  rework split configuration mutation into a second binary, `latch-config`
+//  (task #42): account/settings/mac-approvals/wipe live there now, so the
+//  runtime/pairing verbs below run against `binaryURL` (`run`) and the config
+//  verbs run against `configBinaryURL` (`runConfig`) — see `resolveLatchConfig`.
 //
 //    latch status --json
 //      { "daemon_up": bool, "socket": str, "shim": {"kind": "healthy|drift|not_installed|unknown",
@@ -21,12 +25,12 @@
 //        "accounts": int, "factor": {"kind":"phone|biometric|fail_closed","relay":str?},
 //        "relay_reachable": bool?, "relay_url": str?, "locked_down": bool }
 //    latch doctor --json   -> [ {"label": str, "ok": bool, "hint": str}, ... ]
-//    latch account list --json -> [ {"id":str,"label":str,"vaults":[str],
+//    latch-config account list --json -> [ {"id":str,"label":str,"vaults":[str],
 //        "health":"healthy|rotate|expiring","detail":str?,"last_used_ms":int?}, ... ]
-//    latch account add --token-stdin --label <l> --json
+//    latch-config account add --token-stdin --label <l> --json
 //        -> {"id":str,"label":str,"vaults":[str],"health":str,"detail":str?}
-//    latch account rotate --id <id> --token-stdin --json -> (same account shape)
-//    latch account remove --id <id> --json -> {"ok":bool,"lines":[str]}
+//    latch-config account rotate --id <id> --token-stdin --json -> (same account shape)
+//    latch-config account remove --id <id> --json -> {"ok":bool,"lines":[str]}
 //    latch lease list --json -> [ {"grant_hex":str,"caller":str,"account":str,
 //        "scope":str,"granted_ms":int,"expires_ms":int}, ... ]
 //    latch lease revoke <prefix> --json -> {"ok":bool,"lines":[str]}
@@ -44,13 +48,15 @@
 //        {"event":"qr","payload_b64":str}
 //        {"event":"sas","words":[str]}
 //        {"event":"paired","name":str,"sas_words":[str],"relay_url":str,"paired_ms":int}
-//        {"event":"failed","reason":str} )   (NEW: the CLI is interactive today)
+//        {"event":"failed","reason":str} )   after "sas", the ceremony blocks on
+//        one line of our stdin and proceeds only if it reads "confirm" — see
+//        `confirmPairing(match:)`.
 //    latch unpair --json -> {"ok":bool,"lines":[str]}
-//    latch mac-approvals --enable|--phone-only --json -> {"ok":bool}  (NEW verb;
-//        mints or drops the Mac Secure Enclave envelope. Pairs with the SE seam.)
+//    latch-config mac-approvals --enable|--phone-only --json -> {"ok":bool}
+//        (mints or drops the Mac Secure Enclave envelope. Pairs with the SE seam.)
 //    latch shim install --json -> {"ok":bool,"lines":[str]}
-//    latch settings get --json / latch settings set --json <patch>  (NEW verbs)
-//    latch wipe --json -> {"ok":bool,"lines":[str]}
+//    latch-config settings get --json / latch-config settings set --json <patch>
+//    latch-config wipe --force --json -> {"ok":bool,"lines":[str]}
 
 import Foundation
 
@@ -58,6 +64,10 @@ import Foundation
 /// override it (Settings) if the user installed it somewhere non-standard.
 struct CLIDaemonClient: DaemonClient {
     var binaryURL: URL
+    /// `latch-config`, the sibling binary the v4 rework split config mutation
+    /// into (task #42): account/settings/mac-approvals/wipe. Resolved next to
+    /// `binaryURL` since the two ship together.
+    var configBinaryURL: URL
     /// The stdin pipe of the currently running `pair --json` ceremony (if any),
     /// so `confirmPairing` can reach it. A class because `CLIDaemonClient` is a
     /// value type but `beginPairing` and `confirmPairing` are called on the same
@@ -65,7 +75,9 @@ struct CLIDaemonClient: DaemonClient {
     private let pairingStdin = PairingStdin()
 
     init(binaryURL: URL? = nil) {
-        self.binaryURL = binaryURL ?? CLIDaemonClient.resolveLatch()
+        let latch = binaryURL ?? CLIDaemonClient.resolveLatch()
+        self.binaryURL = latch
+        self.configBinaryURL = CLIDaemonClient.resolveLatchConfig(besideLatch: latch)
     }
 
     /// Environment for every `latch` invocation. `LATCH_DEV_KEYSTORE=file` is
@@ -84,12 +96,13 @@ struct CLIDaemonClient: DaemonClient {
 
     // MARK: run
 
-    /// Run `latch <args>`, optionally feeding `stdin`, returning stdout data.
-    /// Throws DaemonError on non-zero exit or spawn failure.
-    private func run(_ args: [String], stdin: Data? = nil) async throws -> Data {
+    /// Spawn `binary <args>`, optionally feeding `stdin`, returning stdout data.
+    /// Throws DaemonError on non-zero exit or spawn failure. Shared by `run`
+    /// (the `latch` binary) and `runConfig` (`latch-config`).
+    private func execute(_ binary: URL, _ args: [String], stdin: Data? = nil) async throws -> Data {
         try await withCheckedThrowingContinuation { cont in
             let proc = Process()
-            proc.executableURL = binaryURL
+            proc.executableURL = binary
             proc.arguments = args
             // Ensure the shim-first PATH so `latch` finds the real `op` and its
             // own socket the same way an interactive shell would.
@@ -110,12 +123,23 @@ struct CLIDaemonClient: DaemonClient {
                 if p.terminationStatus == 0 {
                     cont.resume(returning: out)
                 } else {
-                    cont.resume(throwing: DaemonError.cli(err.isEmpty ? "latch exited \(p.terminationStatus)" : err.trimmingCharacters(in: .whitespacesAndNewlines)))
+                    cont.resume(throwing: DaemonError.cli(err.isEmpty ? "\(binary.lastPathComponent) exited \(p.terminationStatus)" : err.trimmingCharacters(in: .whitespacesAndNewlines)))
                 }
             }
             do { try proc.run() }
-            catch { cont.resume(throwing: DaemonError.unreachable(String(describing: error))) }
+            catch { cont.resume(throwing: DaemonError.unreachable("could not launch \(binary.lastPathComponent)")) }
         }
+    }
+
+    /// Run `latch <args>` (runtime/pairing verbs).
+    private func run(_ args: [String], stdin: Data? = nil) async throws -> Data {
+        try await execute(binaryURL, args, stdin: stdin)
+    }
+
+    /// Run `latch-config <args>` (account/settings/mac-approvals/wipe — the
+    /// config-mutation verbs the v4 rework split into their own binary).
+    private func runConfig(_ args: [String], stdin: Data? = nil) async throws -> Data {
+        try await execute(configBinaryURL, args, stdin: stdin)
     }
 
     private func decode<T: Decodable>(_ type: T.Type, _ data: Data) throws -> T {
@@ -133,6 +157,21 @@ struct CLIDaemonClient: DaemonClient {
         return URL(fileURLWithPath: "/usr/local/bin/latch")
     }
 
+    /// `latch-config` ships next to `latch`, so try that sibling first; fall
+    /// back to the same candidate locations `resolveLatch` checks, in case the
+    /// two were installed separately.
+    static func resolveLatchConfig(besideLatch latch: URL) -> URL {
+        let sibling = latch.deletingLastPathComponent().appendingPathComponent("latch-config")
+        if FileManager.default.isExecutableFile(atPath: sibling.path) { return sibling }
+        for candidate in ["\(NSHomeDirectory())/.latch/bin/latch-config",
+                          "/usr/local/bin/latch-config", "/opt/homebrew/bin/latch-config"] {
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                return URL(fileURLWithPath: candidate)
+            }
+        }
+        return sibling
+    }
+
     // MARK: DaemonClient
 
     func status() async throws -> StatusReport {
@@ -146,23 +185,23 @@ struct CLIDaemonClient: DaemonClient {
     }
 
     func accounts() async throws -> [Account] {
-        try decode([AccountDTO].self, await run(["account", "list", "--json"])).map { $0.model() }
+        try decode([AccountDTO].self, await runConfig(["account", "list", "--json"])).map { $0.model() }
     }
 
     func addAccount(label: String, token: String) async throws -> Account {
-        let data = try await run(["account", "add", "--token-stdin", "--label", label, "--json"],
-                                 stdin: Data(token.utf8))
+        let data = try await runConfig(["account", "add", "--token-stdin", "--label", label, "--json"],
+                                       stdin: Data(token.utf8))
         return try decode(AccountDTO.self, data).model()
     }
 
     func rotateAccount(id: String, token: String) async throws -> Account {
-        let data = try await run(["account", "rotate", "--id", id, "--token-stdin", "--json"],
-                                 stdin: Data(token.utf8))
+        let data = try await runConfig(["account", "rotate", "--id", id, "--token-stdin", "--json"],
+                                       stdin: Data(token.utf8))
         return try decode(AccountDTO.self, data).model()
     }
 
     func removeAccount(id: String) async throws {
-        _ = try await run(["account", "remove", "--id", id, "--json"])
+        _ = try await runConfig(["account", "remove", "--id", id, "--json"])
     }
 
     func leases() async throws -> [Lease] {
@@ -235,7 +274,7 @@ struct CLIDaemonClient: DaemonClient {
             do { try proc.run() }
             catch {
                 pairingStdin.set(nil)
-                continuation.yield(.failed(reason: String(describing: error)))
+                continuation.yield(.failed(reason: "could not launch \(binaryURL.lastPathComponent)"))
                 continuation.finish()
             }
         }
@@ -254,7 +293,7 @@ struct CLIDaemonClient: DaemonClient {
 
     func setMacApprovals(_ mode: MacApprovalsMode) async throws {
         let flag = mode == .enabled ? "--enable" : "--phone-only"
-        _ = try await run(["mac-approvals", flag, "--json"])
+        _ = try await runConfig(["mac-approvals", flag, "--json"])
     }
 
     func installShim() async throws -> ControlResult {
@@ -262,15 +301,20 @@ struct CLIDaemonClient: DaemonClient {
     }
 
     func settings() async throws -> AppSettings {
-        try decode(SettingsDTO.self, await run(["settings", "get", "--json"])).model()
+        try decode(SettingsDTO.self, await runConfig(["settings", "get", "--json"])).model()
     }
 
     func saveSettings(_ settings: AppSettings) async throws {
         let patch = try JSONEncoder().encode(SettingsDTO(settings))
-        _ = try await run(["settings", "set", "--json"], stdin: patch)
+        _ = try await runConfig(["settings", "set", "--json"], stdin: patch)
     }
 
-    func wipe() async throws -> ControlResult { try controlResult(await run(["wipe", "--json"])) }
+    // `--force` here is not a missing confirmation step: SettingsView's own
+    // confirmationDialog is the human gate, so by the time this call happens
+    // the human already said yes. Without it latch-config just refuses (exit
+    // 1, "refusing to wipe without --force") and this would surface as a
+    // thrown error instead of the wipe actually happening.
+    func wipe() async throws -> ControlResult { try controlResult(await runConfig(["wipe", "--force", "--json"])) }
 
     // MARK: helpers
 

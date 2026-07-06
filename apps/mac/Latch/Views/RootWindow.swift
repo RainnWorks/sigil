@@ -47,7 +47,7 @@ struct RootWindow: View {
             detail
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .navigationTitle("Latch")
+        .navigationTitle("Sigil")
         .task(id: selection) { await model.loadSecondaryScreens() }
     }
 

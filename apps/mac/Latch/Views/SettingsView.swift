@@ -12,6 +12,12 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            if let error = model.lastError {
+                ErrorStrip(message: error)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
+            }
+
             SwiftUI.Section("Approvals") {
                 Stepper(value: $draft.approvalTimeoutSec, in: 30...600, step: 15) {
                     LabeledContent("Request timeout") {
@@ -53,7 +59,7 @@ struct SettingsView: View {
         }
         .onChange(of: draft) { _, new in Task { await model.saveSettings(new) } }
         .confirmationDialog("Wipe all state?", isPresented: $confirmingWipe, titleVisibility: .visible) {
-            Button("Wipe", role: .destructive) { Task { _ = try? await model.daemon.wipe() } }
+            Button("Wipe", role: .destructive) { Task { await model.wipe() } }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This cannot be undone.")
