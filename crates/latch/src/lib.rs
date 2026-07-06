@@ -9,7 +9,7 @@
 pub mod approve;
 pub mod audit;
 pub mod cli;
-pub mod command;
+pub mod config;
 pub mod daemon;
 pub mod factor;
 pub mod json;

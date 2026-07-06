@@ -175,14 +175,23 @@ fn print_help() {
 usage: latch <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
        latch <verb>            a reserved verb (below)
 
-  <cmd> [args...]   run a configured command gated on your phone (e.g.
-                    latch op read op://…, latch gcloud …). An unconfigured
-                    command is refused; add it with: latch config add <cmd>
+  <cmd> [args...]   run a command gated on your phone when a rule matches it
+                    (e.g. latch op read op://…, latch gcloud …). An unmatched
+                    command is refused; add one with: latch config add <cmd>
   run -- <cmd>      escape hatch: run <cmd> even if it collides with a verb
   config add <cmd> --provider <id> [--source <p>] [--account <l>] [--risk <r>]
-                    configure a command (providers: 1password, env-file)
-  config list       list configured commands
-  config remove <cmd>  forget a command's config
+                    author a source + rule for one command (a convenience;
+                    providers: 1password, env-file)
+  config source add <name> --provider <id> [--account <l>] [--path <f>]
+                    add a named secret source; also: source list|remove
+  config rule add <name> --source <s> [--command <c>] [--subcommand <s>]
+                    [--argv-contains <str>...] [--flag <f>...] [--flag-eq <f>=<v>...]
+                    [--risk <r>] [--timeout <sec>]   a match -> gate + inject
+                    rule; also: rule list|remove
+  config list       summarize sources and rules (--json = the whole config)
+  config export     print the whole config as JSON (for the desktop to load)
+  config import     replace the whole config from JSON on stdin
+  config remove <cmd>  forget a command's rule (and its like-named source)
   status            instrument panel: daemon, shim, op, factor
   setup             guided first run: shim, PATH, launchd, then pair
   daemon [--dev-insecure]  run the approval daemon (foreground). Without a
@@ -417,6 +426,24 @@ fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+/// Collect every value of a repeatable `--flag value` / `--flag=value` option.
+/// Used by the rule matcher flags (`--argv-contains`, `--flag`, `--flag-eq`).
+fn flag_values(args: &[String], name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let eq = format!("{name}=");
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix(&eq) {
+            out.push(v.to_string());
+        } else if a == name {
+            if let Some(v) = it.next() {
+                out.push(v.clone());
+            }
+        }
+    }
+    out
 }
 
 fn cmd_account(args: &[String], json: bool) -> i32 {
@@ -1791,8 +1818,12 @@ fn shim_add(cmd: Option<&str>, json: bool) -> i32 {
         eprintln!("usage: latch shim add <cmd>");
         return 2;
     };
-    let configured = crate::command::CommandStore::load()
-        .map(|st| st.resolve(cmd).is_some())
+    let configured = crate::config::Config::load()
+        .map(|cfg| {
+            cfg.rules
+                .iter()
+                .any(|r| r.match_.command.as_deref() == Some(cmd))
+        })
         .unwrap_or(false);
     let (link, target) = match crate::setup::install_shim_for(cmd) {
         Ok(pair) => pair,
@@ -1890,186 +1921,56 @@ fn shim_install(json: bool) -> i32 {
     0
 }
 
-/// `latch config <add|list|remove>`: manage the per-command configuration that
-/// makes `latch <cmd>` gate-and-run. A config *mutation*, so it lives CLI-side
-/// (the daemon only reads it); re-run `latch restart` to apply a change.
+/// `latch config …`: the provider-agnostic configuration CLI. It authors the
+/// rule/source model the daemon reads to gate `latch <cmd>`; it is the owned
+/// primitive the desktop app shells out to. A config *mutation*, so it lives
+/// CLI-side (the daemon only reads it); re-run `latch restart` to apply a change.
+///
+/// Verbs: `source add|list|remove`, `rule add|list|remove`, `export`/`import`
+/// (whole config as JSON), a human `list` summary, and the `add <cmd>`/`remove
+/// <cmd>` convenience desugar that authors a source+rule for one command.
 fn cmd_config(args: &[String], json: bool) -> i32 {
     match args.first().map(String::as_str) {
+        Some("source") => cmd_config_source(&args[1..], json),
+        Some("rule") => cmd_config_rule(&args[1..], json),
+        Some("export") => config_export(),
+        Some("import") => config_import(json),
         Some("add") => config_add(&args[1..], json),
-        Some("list") | None => config_list(json),
         Some("remove") | Some("rm") => config_remove(args.get(1).map(String::as_str), json),
+        Some("list") | None => config_list(json),
         _ => {
-            eprintln!("usage: latch config <add <cmd> --provider <id> | list | remove <cmd>>");
+            eprintln!(
+                "usage: latch config <source|rule|list|export|import|add <cmd>|remove <cmd>>"
+            );
             2
         }
     }
 }
 
-/// The GUI/JSON shape for one command config.
-fn command_json(c: &crate::command::CommandConfig) -> json::CommandJson {
-    json::CommandJson {
-        command: c.command.clone(),
-        provider: c.provider.clone(),
-        source: c.source.clone(),
-        account: c.account.clone(),
-        risk: crate::command::risk_str(c.risk).to_string(),
+/// Load the config store, printing an error and returning `None` on failure.
+fn load_config() -> Option<crate::config::Config> {
+    match crate::config::Config::load() {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("latch: loading config: {e}");
+            None
+        }
     }
 }
 
-fn config_add(args: &[String], json: bool) -> i32 {
-    let s = Style::stdout();
-    // The command is the first positional token after `add`.
-    let Some(cmd) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
-        eprintln!(
-            "usage: latch config add <cmd> --provider <id> [--source <path>] [--account <label>] [--risk routine|elevated|critical]"
-        );
-        return 2;
-    };
-    let Some(provider) = flag_value(args, "--provider").map(str::to_string) else {
-        eprintln!("latch: --provider <id> is required (e.g. 1password, env-file)");
-        return 2;
-    };
-    // Validate the provider against the shipping registry so a typo is caught
-    // here rather than as a silent fail-closed at run time.
-    let registry = crate::provider::ProviderRegistry::with_defaults();
-    if registry.get(&provider).is_none() {
-        eprintln!(
-            "latch: unknown provider '{provider}'; known providers: {}",
-            registry.ids().join(", ")
-        );
-        return 2;
+/// Save the config store, printing an error and returning false on failure.
+fn save_config(cfg: &crate::config::Config) -> bool {
+    if let Err(e) = cfg.save() {
+        eprintln!("latch: saving config: {e}");
+        return false;
     }
-    let source = flag_value(args, "--source").map(str::to_string);
-    let account = flag_value(args, "--account").map(str::to_string);
-    let risk = match flag_value(args, "--risk") {
-        Some(r) => match crate::command::parse_risk(r) {
-            Some(risk) => risk,
-            None => {
-                eprintln!("latch: unknown risk '{r}'; use routine, elevated, or critical");
-                return 2;
-            }
-        },
-        None => latch_proto::RiskLevel::Routine,
-    };
-    // env-file needs a source; refuse a config that could never inject anything.
-    if provider == crate::provider::EnvFileProvider::ID && source.is_none() {
-        eprintln!("latch: the env-file provider needs --source <path> to the KEY=VALUE file");
-        return 2;
-    }
-
-    let cfg = crate::command::CommandConfig {
-        command: cmd.clone(),
-        provider,
-        source,
-        account,
-        risk,
-    };
-
-    let mut store = match crate::command::CommandStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("latch: loading command config: {e}");
-            return 1;
-        }
-    };
-    if let Err(e) = store.add(cfg.clone()) {
-        eprintln!("latch: {e}");
-        return 1;
-    }
-    if let Err(e) = store.save() {
-        eprintln!("latch: saving command config: {e}");
-        return 1;
-    }
-
-    if json {
-        println!("{}", json::to_line(&command_json(&cfg)));
-        return 0;
-    }
-    println!("{} configured {}", s.ok("\u{2713}"), s.cobalt(&cmd));
-    println!("  {}  {}", s.dim("provider"), s.dim(&cfg.provider));
-    if let Some(src) = &cfg.source {
-        println!("  {}    {}", s.dim("source"), s.dim(src));
-    }
-    println!(
-        "  {}      {}",
-        s.dim("risk"),
-        s.dim(crate::command::risk_str(cfg.risk))
-    );
-    println!(
-        "  {}",
-        s.faint(&format!(
-            "restart the daemon to apply, then: latch {cmd} <args>  (or: latch shim add {cmd})"
-        ))
-    );
-    0
+    true
 }
 
-fn config_list(json: bool) -> i32 {
-    let s = Style::stdout();
-    let store = match crate::command::CommandStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("latch: loading command config: {e}");
-            return 1;
-        }
-    };
+/// Emit `result` as JSON (control shape) or styled lines, returning its code.
+fn print_config_result(result: &ControlResult, json: bool) -> i32 {
     if json {
-        let list: Vec<_> = store.commands.iter().map(command_json).collect();
-        println!("{}", json::to_pretty(&list));
-        return 0;
-    }
-    if store.commands.is_empty() {
-        println!(
-            "  {}",
-            s.dim("no commands configured (op works by default); add one: latch config add <cmd> --provider <id>")
-        );
-        return 0;
-    }
-    println!("{}", s.cobalt("configured commands"));
-    println!();
-    for c in &store.commands {
-        let extra = c
-            .source
-            .as_deref()
-            .or(c.account.as_deref())
-            .map(|x| format!(" \u{b7} {x}"))
-            .unwrap_or_default();
-        println!(
-            "  {}  {}  {}",
-            pad(&c.command, 14),
-            pad(&c.provider, 12),
-            s.dim(&format!("{}{}", crate::command::risk_str(c.risk), extra))
-        );
-    }
-    0
-}
-
-fn config_remove(cmd: Option<&str>, json: bool) -> i32 {
-    let Some(cmd) = cmd else {
-        eprintln!("usage: latch config remove <cmd>");
-        return 2;
-    };
-    let mut store = match crate::command::CommandStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("latch: loading command config: {e}");
-            return 1;
-        }
-    };
-    let removed = store.remove(cmd);
-    if removed {
-        if let Err(e) = store.save() {
-            eprintln!("latch: saving command config: {e}");
-            return 1;
-        }
-    }
-    let result = if removed {
-        ControlResult::line(true, format!("command {cmd} removed"))
-    } else {
-        ControlResult::line(false, format!("no configured command named {cmd}"))
-    };
-    if json {
-        return emit_local_control(&result);
+        return emit_local_control(result);
     }
     let s = Style::stdout();
     for line in &result.lines {
@@ -2081,6 +1982,544 @@ fn config_remove(cmd: Option<&str>, json: bool) -> i32 {
         println!("  {glyph} {line}");
     }
     i32::from(!result.ok)
+}
+
+fn cmd_config_source(args: &[String], json: bool) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("add") => config_source_add(&args[1..], json),
+        Some("list") | None => config_source_list(json),
+        Some("remove") | Some("rm") => config_source_remove(args.get(1).map(String::as_str), json),
+        _ => {
+            eprintln!(
+                "usage: latch config source <add <name> --provider <id> | list | remove <name>>"
+            );
+            2
+        }
+    }
+}
+
+/// Validate a provider id against the shipping registry, so a typo is caught at
+/// authoring time rather than as a silent fail-closed at run time.
+fn known_provider(provider: &str) -> bool {
+    let registry = crate::provider::ProviderRegistry::with_defaults();
+    if registry.get(provider).is_none() {
+        eprintln!(
+            "latch: unknown provider '{provider}'; known providers: {}",
+            registry.ids().join(", ")
+        );
+        return false;
+    }
+    true
+}
+
+fn config_source_add(args: &[String], json: bool) -> i32 {
+    let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
+        eprintln!(
+            "usage: latch config source add <name> --provider <id> [--account <label>] [--path <file>]"
+        );
+        return 2;
+    };
+    let Some(provider) = flag_value(args, "--provider").map(str::to_string) else {
+        eprintln!("latch: --provider <id> is required (e.g. 1password, env-file)");
+        return 2;
+    };
+    if !known_provider(&provider) {
+        return 2;
+    }
+    let account = flag_value(args, "--account").map(str::to_string);
+    let path = flag_value(args, "--path").map(str::to_string);
+    // env-file needs a path; refuse a source that could never inject anything.
+    if provider == crate::provider::EnvFileProvider::ID && path.is_none() {
+        eprintln!("latch: the env-file provider needs --path <file> to the KEY=VALUE file");
+        return 2;
+    }
+
+    let mut cfg = match load_config() {
+        Some(c) => c,
+        None => return 1,
+    };
+    let src = crate::config::Source {
+        name: name.clone(),
+        provider,
+        account,
+        path,
+    };
+    if let Err(e) = cfg.add_source(src) {
+        eprintln!("latch: {e}");
+        return 1;
+    }
+    if !save_config(&cfg) {
+        return 1;
+    }
+    print_config_result(
+        &ControlResult::line(true, format!("source {name} added")),
+        json,
+    )
+}
+
+fn config_source_list(json: bool) -> i32 {
+    let cfg = match load_config() {
+        Some(c) => c,
+        None => return 1,
+    };
+    if json {
+        println!("{}", json::to_pretty(&cfg.sources));
+        return 0;
+    }
+    let s = Style::stdout();
+    if cfg.sources.is_empty() {
+        println!(
+            "  {}",
+            s.dim("no sources; add one: latch config source add <name> --provider <id>")
+        );
+        return 0;
+    }
+    println!("{}", s.cobalt("sources"));
+    println!();
+    for src in &cfg.sources {
+        let extra = src
+            .account
+            .as_deref()
+            .or(src.path.as_deref())
+            .map(|x| format!(" \u{b7} {x}"))
+            .unwrap_or_default();
+        println!(
+            "  {}  {}{}",
+            pad(&src.name, 16),
+            s.dim(&src.provider),
+            s.dim(&extra)
+        );
+    }
+    0
+}
+
+fn config_source_remove(name: Option<&str>, json: bool) -> i32 {
+    let Some(name) = name else {
+        eprintln!("usage: latch config source remove <name>");
+        return 2;
+    };
+    let mut cfg = match load_config() {
+        Some(c) => c,
+        None => return 1,
+    };
+    let result = match cfg.remove_source(name) {
+        Ok(true) => {
+            if !save_config(&cfg) {
+                return 1;
+            }
+            ControlResult::line(true, format!("source {name} removed"))
+        }
+        Ok(false) => ControlResult::line(false, format!("no source named {name}")),
+        Err(e) => ControlResult::line(false, e),
+    };
+    print_config_result(&result, json)
+}
+
+fn cmd_config_rule(args: &[String], json: bool) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("add") => config_rule_add(&args[1..], json),
+        Some("list") | None => config_rule_list(json),
+        Some("remove") | Some("rm") => config_rule_remove(args.get(1).map(String::as_str), json),
+        _ => {
+            eprintln!("usage: latch config rule <add <name> --source <src> [match...] | list | remove <name>>");
+            2
+        }
+    }
+}
+
+/// Parse the risk flag, defaulting to routine. `Err` on an unknown value.
+fn risk_flag(args: &[String]) -> Result<latch_proto::RiskLevel, i32> {
+    match flag_value(args, "--risk") {
+        Some(r) => crate::config::parse_risk(r).ok_or_else(|| {
+            eprintln!("latch: unknown risk '{r}'; use routine, elevated, or critical");
+            2
+        }),
+        None => Ok(latch_proto::RiskLevel::Routine),
+    }
+}
+
+/// Build a [`Match`](crate::config::Match) from the rule-matcher flags.
+fn build_match(args: &[String]) -> Result<crate::config::Match, i32> {
+    let flag_equals = flag_values(args, "--flag-eq")
+        .into_iter()
+        .map(|fe| match fe.split_once('=') {
+            Some((f, v)) => Ok(crate::config::FlagEq {
+                flag: f.to_string(),
+                value: v.to_string(),
+            }),
+            None => {
+                eprintln!("latch: --flag-eq expects <flag>=<value>, got '{fe}'");
+                Err(2)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(crate::config::Match {
+        command: flag_value(args, "--command").map(str::to_string),
+        subcommand: flag_value(args, "--subcommand").map(str::to_string),
+        argv_contains: flag_values(args, "--argv-contains"),
+        flag_present: flag_values(args, "--flag"),
+        flag_equals,
+        arg_regex: flag_value(args, "--regex").map(str::to_string),
+    })
+}
+
+fn config_rule_add(args: &[String], json: bool) -> i32 {
+    let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
+        eprintln!(
+            "usage: latch config rule add <name> --source <src> [--command <c>] [--subcommand <s>] \
+             [--argv-contains <str> ...] [--flag <f> ...] [--flag-eq <f>=<v> ...] \
+             [--risk routine|elevated|critical] [--timeout <sec>]"
+        );
+        return 2;
+    };
+    let Some(source) = flag_value(args, "--source").map(str::to_string) else {
+        eprintln!("latch: --source <name> is required (the source this rule injects from)");
+        return 2;
+    };
+    let match_ = match build_match(args) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    // Regex is modeled but not yet evaluated (needs the `regex` dependency); a
+    // rule that sets it would silently never match, so refuse it at authoring.
+    if match_.arg_regex.is_some() {
+        eprintln!(
+            "latch: --regex is not implemented yet (needs the regex dependency); \
+             use --command/--subcommand/--argv-contains/--flag/--flag-eq"
+        );
+        return 2;
+    }
+    let risk = match risk_flag(args) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    let timeout_sec = match flag_value(args, "--timeout") {
+        Some(t) => match t.parse::<u32>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                eprintln!("latch: --timeout expects a whole number of seconds, got '{t}'");
+                return 2;
+            }
+        },
+        None => None,
+    };
+
+    let mut cfg = match load_config() {
+        Some(c) => c,
+        None => return 1,
+    };
+    let rule = crate::config::Rule {
+        name: name.clone(),
+        match_,
+        action: crate::config::Action {
+            source,
+            risk,
+            timeout_sec,
+        },
+    };
+    if let Err(e) = cfg.add_rule(rule) {
+        eprintln!("latch: {e}");
+        return 1;
+    }
+    if !save_config(&cfg) {
+        return 1;
+    }
+    let s = Style::stdout();
+    if !json {
+        println!(
+            "  {}",
+            s.faint("restart the daemon to apply, then: latch <cmd> <args>")
+        );
+    }
+    print_config_result(
+        &ControlResult::line(true, format!("rule {name} added")),
+        json,
+    )
+}
+
+fn config_rule_list(json: bool) -> i32 {
+    let cfg = match load_config() {
+        Some(c) => c,
+        None => return 1,
+    };
+    if json {
+        println!("{}", json::to_pretty(&cfg.rules));
+        return 0;
+    }
+    let s = Style::stdout();
+    if cfg.rules.is_empty() {
+        println!(
+            "  {}",
+            s.dim("no rules; add one: latch config rule add <name> --source <src> --command <cmd>")
+        );
+        return 0;
+    }
+    println!("{}", s.cobalt("rules"));
+    println!();
+    for r in &cfg.rules {
+        println!(
+            "  {}  {}  {}",
+            pad(&r.name, 16),
+            pad(&format!("-> {}", r.action.source), 18),
+            s.dim(&format!(
+                "{} \u{b7} {}",
+                crate::config::risk_str(r.action.risk),
+                describe_match(&r.match_)
+            ))
+        );
+    }
+    0
+}
+
+/// A one-line human summary of a match's conditions.
+fn describe_match(m: &crate::config::Match) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(c) = &m.command {
+        parts.push(format!("cmd={c}"));
+    }
+    if let Some(s) = &m.subcommand {
+        parts.push(format!("sub={s}"));
+    }
+    for a in &m.argv_contains {
+        parts.push(format!("has:{a}"));
+    }
+    for f in &m.flag_present {
+        parts.push(format!("flag:{f}"));
+    }
+    for fe in &m.flag_equals {
+        parts.push(format!("{}={}", fe.flag, fe.value));
+    }
+    if let Some(re) = &m.arg_regex {
+        parts.push(format!("regex:{re}"));
+    }
+    if parts.is_empty() {
+        "(no conditions)".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn config_rule_remove(name: Option<&str>, json: bool) -> i32 {
+    let Some(name) = name else {
+        eprintln!("usage: latch config rule remove <name>");
+        return 2;
+    };
+    let mut cfg = match load_config() {
+        Some(c) => c,
+        None => return 1,
+    };
+    let removed = cfg.remove_rule(name);
+    if removed && !save_config(&cfg) {
+        return 1;
+    }
+    let result = if removed {
+        ControlResult::line(true, format!("rule {name} removed"))
+    } else {
+        ControlResult::line(false, format!("no rule named {name}"))
+    };
+    print_config_result(&result, json)
+}
+
+/// `latch config export`: the whole config as pretty JSON on stdout, for the
+/// desktop to load or a human to inspect. Inherently machine-readable, so it
+/// ignores `--json` and always emits JSON.
+fn config_export() -> i32 {
+    let cfg = match load_config() {
+        Some(c) => c,
+        None => return 1,
+    };
+    println!("{}", json::to_pretty(&cfg));
+    0
+}
+
+/// `latch config import`: replace the whole config from a JSON object on stdin
+/// (the form `export` emits), so the desktop can save an edited config wholesale.
+fn config_import(json: bool) -> i32 {
+    let mut buf = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+        eprintln!("latch: reading the config from stdin: {e}");
+        return 1;
+    }
+    if buf.trim().is_empty() {
+        eprintln!("latch: empty config on stdin (pipe the JSON `latch config export` emits)");
+        return 2;
+    }
+    let cfg: crate::config::Config = match serde_json::from_str(&buf) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("latch: parsing the config: {e}");
+            return 2;
+        }
+    };
+    // Validate referential integrity before persisting: every rule's source must
+    // exist and no match may be empty, so an imported config cannot fail closed
+    // on every request or dispatch to a non-existent source.
+    for rule in &cfg.rules {
+        if rule.match_.is_empty() {
+            eprintln!("latch: imported rule {} has no match conditions", rule.name);
+            return 2;
+        }
+        if cfg.source(&rule.action.source).is_none() {
+            eprintln!(
+                "latch: imported rule {} references unknown source {}",
+                rule.name, rule.action.source
+            );
+            return 2;
+        }
+    }
+    if !save_config(&cfg) {
+        return 1;
+    }
+    print_config_result(
+        &ControlResult::line(
+            true,
+            format!(
+                "imported {} rule(s), {} source(s)",
+                cfg.rules.len(),
+                cfg.sources.len()
+            ),
+        ),
+        json,
+    )
+}
+
+/// `latch config add <cmd> --provider <id> …`: the convenience desugar. Authors a
+/// source named `<cmd>` plus a rule named `<cmd>` matching `command == <cmd>`, so
+/// the common "gate this one command" case stays a one-liner. Equivalent to a
+/// `config source add <cmd>` + `config rule add <cmd> --command <cmd>`.
+fn config_add(args: &[String], json: bool) -> i32 {
+    let s = Style::stdout();
+    let Some(cmd) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
+        eprintln!(
+            "usage: latch config add <cmd> --provider <id> [--source <path>] [--account <label>] [--risk routine|elevated|critical]"
+        );
+        return 2;
+    };
+    let Some(provider) = flag_value(args, "--provider").map(str::to_string) else {
+        eprintln!("latch: --provider <id> is required (e.g. 1password, env-file)");
+        return 2;
+    };
+    if !known_provider(&provider) {
+        return 2;
+    }
+    // Historical spelling: `--source <path>` here is the env-file path (the new
+    // `source` verb calls it `--path`); accept either for the desugar.
+    let path = flag_value(args, "--source")
+        .or_else(|| flag_value(args, "--path"))
+        .map(str::to_string);
+    let account = flag_value(args, "--account").map(str::to_string);
+    let risk = match risk_flag(args) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    if provider == crate::provider::EnvFileProvider::ID && path.is_none() {
+        eprintln!("latch: the env-file provider needs --source <path> to the KEY=VALUE file");
+        return 2;
+    }
+
+    let mut cfg = match load_config() {
+        Some(c) => c,
+        None => return 1,
+    };
+    let src = crate::config::Source {
+        name: cmd.clone(),
+        provider: provider.clone(),
+        account,
+        path: path.clone(),
+    };
+    if let Err(e) = cfg.add_source(src) {
+        eprintln!("latch: {e}");
+        return 1;
+    }
+    let rule = crate::config::Rule {
+        name: cmd.clone(),
+        match_: crate::config::Match {
+            command: Some(cmd.clone()),
+            ..crate::config::Match::default()
+        },
+        action: crate::config::Action {
+            source: cmd.clone(),
+            risk,
+            timeout_sec: None,
+        },
+    };
+    if let Err(e) = cfg.add_rule(rule) {
+        eprintln!("latch: {e}");
+        return 1;
+    }
+    if !save_config(&cfg) {
+        return 1;
+    }
+
+    if json {
+        return emit_local_control(&ControlResult::line(true, format!("configured {cmd}")));
+    }
+    println!("{} configured {}", s.ok("\u{2713}"), s.cobalt(&cmd));
+    println!("  {}  {}", s.dim("provider"), s.dim(&provider));
+    if let Some(p) = &path {
+        println!("  {}    {}", s.dim("source"), s.dim(p));
+    }
+    println!(
+        "  {}      {}",
+        s.dim("risk"),
+        s.dim(crate::config::risk_str(risk))
+    );
+    println!(
+        "  {}",
+        s.faint(&format!(
+            "restart the daemon to apply, then: latch {cmd} <args>  (or: latch shim add {cmd})"
+        ))
+    );
+    0
+}
+
+/// `latch config list`: a human summary of sources and rules (JSON = the whole
+/// config, the same shape `export` emits).
+fn config_list(json: bool) -> i32 {
+    if json {
+        return config_export();
+    }
+    let cfg = match load_config() {
+        Some(c) => c,
+        None => return 1,
+    };
+    if cfg.sources.is_empty() && cfg.rules.is_empty() {
+        let s = Style::stdout();
+        println!(
+            "  {}",
+            s.dim("nothing configured; add a command: latch config add <cmd> --provider <id>")
+        );
+        return 0;
+    }
+    config_source_list(false);
+    println!();
+    config_rule_list(false)
+}
+
+/// `latch config remove <cmd>`: the desugar's inverse. Removes the rule named
+/// `<cmd>` and then its like-named source (best effort), so a `config add <cmd>`
+/// is fully undone by one command.
+fn config_remove(cmd: Option<&str>, json: bool) -> i32 {
+    let Some(cmd) = cmd else {
+        eprintln!("usage: latch config remove <cmd>");
+        return 2;
+    };
+    let mut cfg = match load_config() {
+        Some(c) => c,
+        None => return 1,
+    };
+    let removed_rule = cfg.remove_rule(cmd);
+    // Remove the like-named source too, but only if nothing else references it.
+    let removed_source = matches!(cfg.remove_source(cmd), Ok(true));
+    if (removed_rule || removed_source) && !save_config(&cfg) {
+        return 1;
+    }
+    let result = if removed_rule || removed_source {
+        ControlResult::line(true, format!("removed {cmd}"))
+    } else {
+        ControlResult::line(false, format!("nothing configured named {cmd}"))
+    };
+    print_config_result(&result, json)
 }
 
 /// `latch mac-approvals --enable | --phone-only`: toggle the Mac local-approval
@@ -2296,7 +2735,8 @@ fn cmd_wipe(args: &[String], json: bool) -> i32 {
         for (name, path) in [
             ("accounts", home.join("latch.db")),
             ("ssh keys", home.join("ssh-keys.json")),
-            ("command config", home.join("commands.json")),
+            ("config", home.join("config.json")),
+            ("legacy command config", home.join("commands.json")),
             ("settings", home.join("settings.json")),
             ("dev keystore", home.join("dev-keystore.json")),
             ("history", home.join("history.jsonl")),

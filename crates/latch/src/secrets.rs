@@ -203,17 +203,21 @@ impl AccountStore {
         self.accounts.len() != before
     }
 
-    /// Pick the account that serves `vault`. With one account and no vault
-    /// hint, that account is used; otherwise a vault must match.
-    pub fn route(&self, vault: Option<&str>) -> Result<&Account, SecretsError> {
+    /// Pick the account for a routing `hint`. The hint is a source's configured
+    /// account label or a vault name: an account matches when its **label** or
+    /// one of its **vaults** equals the hint (config now routes by the source's
+    /// account label, not by argv archaeology; a vault name still works so a
+    /// migrated store keeps routing). With one account and no hint, that account
+    /// is used; otherwise a hint must match.
+    pub fn route(&self, hint: Option<&str>) -> Result<&Account, SecretsError> {
         if self.accounts.is_empty() {
             return Err(SecretsError::NoAccounts);
         }
-        match vault {
+        match hint {
             Some(v) => self
                 .accounts
                 .iter()
-                .find(|a| a.vaults.iter().any(|x| x == v))
+                .find(|a| a.label == v || a.vaults.iter().any(|x| x == v))
                 .or_else(|| {
                     // Fall back to the sole account so a vault we have not yet
                     // catalogued still routes rather than failing closed here;

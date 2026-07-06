@@ -106,18 +106,9 @@ pub struct AccountJson {
     pub last_used_ms: Option<i64>,
 }
 
-// --- command config --------------------------------------------------------
-
-/// One per-command configuration entry, as `latch config list/add --json` emits.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommandJson {
-    pub command: String,
-    pub provider: String,
-    pub source: Option<String>,
-    pub account: Option<String>,
-    /// `routine` | `elevated` | `critical`.
-    pub risk: String,
-}
+// The rule/source config JSON is the serialized `crate::config` domain types
+// (`Config`, `Source`, `Rule`), emitted directly by `latch config export` and
+// the `--json` config verbs; there is no separate DTO here.
 
 // --- leases ----------------------------------------------------------------
 

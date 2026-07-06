@@ -36,7 +36,7 @@ use crate::approve::{
     ApprovalContext, ApprovalGate, Approver, Decision, DevMode, LocalApprover, NullApprover,
     PendingRegistry,
 };
-use crate::command::{self, CommandStore};
+use crate::config::{self, Config};
 use crate::factor::{self, Factor};
 use crate::keystore::{self, Keystore};
 use crate::lease::{self, LeaseStore, ProcessTable, SysProcessTable};
@@ -74,9 +74,10 @@ pub struct Core {
     /// daemon dispatches the run to it. 1Password and env-file ship by default;
     /// the seam is generic and each provider owns its own tool discovery.
     providers: ProviderRegistry,
-    /// The per-command configuration: which provider backs each command, what to
-    /// inject, and its risk. Loaded at arm time; `op` resolves by default.
-    commands: CommandStore,
+    /// The generic rule/source config: an ordered rule list matched against each
+    /// invocation, resolving to a provider + source + risk. Loaded at arm time.
+    /// The core holds no concept of `op`; op-ness lives in user-authored rules.
+    config: Config,
     lease_ttl: Duration,
     /// The approving factor resolved at arm time (residual #1 mitigation).
     factor: Factor,
@@ -207,13 +208,14 @@ impl Core {
             }
         };
 
-        // Load the per-command config (which provider backs each command). A bad
-        // config is logged and treated as empty (op still resolves by default).
-        let commands = match CommandStore::load() {
+        // Load the rule/source config (which rules gate which invocations, and
+        // the sources they inject from). A bad config is logged and treated as
+        // empty (every command then refuses until configured).
+        let config = match Config::load() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("latch daemon: ignoring an unreadable command config: {e}");
-                CommandStore::default()
+                eprintln!("latch daemon: ignoring an unreadable config: {e}");
+                Config::default()
             }
         };
 
@@ -227,7 +229,7 @@ impl Core {
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(SysProcessTable),
             providers: ProviderRegistry::with_defaults(),
-            commands,
+            config,
             lease_ttl: DEFAULT_LEASE_TTL,
             factor,
             ssh_signers,
@@ -731,7 +733,7 @@ fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
                     machine: crate::json::hostname(),
                     requested_ms: s.queued_at_ms,
                 },
-                risk: command::risk_str(ctx.risk).to_string(),
+                risk: config::risk_str(ctx.risk).to_string(),
                 reason: None,
                 expires_ms: s.queued_at_ms + s.timeout_ms,
                 timeout_ms: s.timeout_ms,
@@ -769,36 +771,39 @@ fn fulfill(
         return fail_closed(stderr, "latch: empty command\n");
     };
 
-    // Look up the command config. An unconfigured command is refused (never run
-    // ungated) with the exact command to configure it.
-    let Some(cfg) = core.commands.resolve(cmd) else {
+    // Evaluate the rules against this whole invocation. An invocation that no
+    // rule matches is refused (never run ungated) with a pointer to `latch
+    // config`; the core holds no built-in rule for any command, `op` included.
+    let Some(action) = core.config.resolve(argv) else {
         return fail_closed(
             stderr,
             &format!(
-                "latch: '{cmd}' is not configured; Latch will not run it ungated.\n  \
+                "latch: '{cmd}' is not configured (no rule matches); Latch will not run it ungated.\n  \
                  configure it: latch config add {cmd} --provider <id>\n"
             ),
         );
     };
-    let Some(provider) = core.providers.get(&cfg.provider) else {
+    let Some(provider) = core.providers.get(&action.provider) else {
         return fail_closed(
             stderr,
             &format!(
-                "latch: '{cmd}' names an unknown provider '{}'\n",
-                cfg.provider
+                "latch: rule '{}' names an unknown provider '{}'\n",
+                action.rule, action.provider
             ),
         );
     };
-    let source = cfg.source.as_deref().unwrap_or("");
+    let source = action.source_path.as_deref().unwrap_or("");
     let needs_account = provider.needs_account();
 
     let scope = argv.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
     let caller = lease::walk_ancestry(core.proc_table.as_ref(), peer.unwrap_or(-1));
     let gk = lease::grant_key(&caller, cwd, &scope);
 
-    // Route the account only for providers that inject a stored token.
+    // Route the account only for providers that inject a stored token. Routing is
+    // the source's configured account label (or a legacy vault name) — never argv
+    // archaeology, so the core stays provider-agnostic.
     let vault = if needs_account {
-        parse_vault(argv).or_else(|| cfg.account.clone())
+        action.account.clone()
     } else {
         None
     };
@@ -900,7 +905,7 @@ fn fulfill(
         command: argv.to_vec(),
         secret_refs: provider.describe(argv, source),
         kind: provider.kind(argv),
-        risk: cfg.risk,
+        risk: action.risk,
         ssh: None,
         threshold,
     };
@@ -1031,20 +1036,6 @@ fn fail_closed(stderr: Option<OwnedFd>, msg: &str) -> i32 {
     1
 }
 
-/// The `--vault`/`--vault=` value from an op argv, if any.
-fn parse_vault(argv: &[String]) -> Option<String> {
-    let mut it = argv.iter();
-    while let Some(a) = it.next() {
-        if let Some(v) = a.strip_prefix("--vault=") {
-            return Some(v.to_string());
-        }
-        if a == "--vault" {
-            return it.next().cloned();
-        }
-    }
-    None
-}
-
 /// Log request metadata: argv (item names, not secret values), cwd, peer pid.
 fn log_request(argv: &[String], cwd: &str, peer: Option<i32>) {
     let ts = SystemTime::now()
@@ -1098,6 +1089,101 @@ mod tests {
         path
     }
 
+    /// A minimal rule/source config that gates `op` to the 1Password provider
+    /// with no account hint (single-account fallback) — the zero-config `op` the
+    /// tests used to get for free before the rule engine replaced the built-in
+    /// default. op-ness now lives entirely in this user-authored rule.
+    fn op_config() -> Config {
+        use crate::config::{Action, Match, Rule, Source};
+        let mut cfg = Config::default();
+        cfg.add_source(Source {
+            name: "op".into(),
+            provider: OpProvider::ID.into(),
+            account: None,
+            path: None,
+        })
+        .unwrap();
+        cfg.add_rule(Rule {
+            name: "op".into(),
+            match_: Match {
+                command: Some("op".into()),
+                ..Match::default()
+            },
+            action: Action {
+                source: "op".into(),
+                risk: RiskLevel::Routine,
+                timeout_sec: None,
+            },
+        })
+        .unwrap();
+        cfg
+    }
+
+    /// A config gating `<command>` to the `env-file` provider at `path` (the
+    /// direct-injection shape). Used by the env-file daemon tests in place of the
+    /// old per-command store.
+    fn env_file_config(command: &str, path: &str) -> Config {
+        use crate::config::{Action, Match, Rule, Source};
+        let mut cfg = Config::default();
+        cfg.add_source(Source {
+            name: command.into(),
+            provider: EnvFileProvider::ID.into(),
+            account: None,
+            path: Some(path.into()),
+        })
+        .unwrap();
+        cfg.add_rule(Rule {
+            name: command.into(),
+            match_: Match {
+                command: Some(command.into()),
+                ..Match::default()
+            },
+            action: Action {
+                source: command.into(),
+                risk: RiskLevel::Routine,
+                timeout_sec: None,
+            },
+        })
+        .unwrap();
+        cfg
+    }
+
+    /// The coexistence config: two op rules routing by an argv marker to two op
+    /// sources, one hinting the v2 vault (`Engineering`) and one the v1 vault
+    /// (`Legacy`). It stands in for the old argv `--vault` routing so the
+    /// v1/v2 coexistence test still drives each token down its own path.
+    fn coexist_config() -> Config {
+        use crate::config::{Action, Match, Rule, Source};
+        let mut cfg = Config::default();
+        for (name, account, marker) in [
+            ("v2", "Engineering", "Engineering"),
+            ("v1", "Legacy", "Legacy"),
+        ] {
+            cfg.add_source(Source {
+                name: name.into(),
+                provider: OpProvider::ID.into(),
+                account: Some(account.into()),
+                path: None,
+            })
+            .unwrap();
+            cfg.add_rule(Rule {
+                name: name.into(),
+                match_: Match {
+                    command: Some("op".into()),
+                    argv_contains: vec![marker.into()],
+                    ..Match::default()
+                },
+                action: Action {
+                    source: name.into(),
+                    risk: RiskLevel::Routine,
+                    timeout_sec: None,
+                },
+            })
+            .unwrap();
+        }
+        cfg
+    }
+
     /// Build a core wired to an in-memory keystore holding one account whose
     /// token decrypts to `token`, a fake `op`, the given dev mode, and the given
     /// local-approval timeout.
@@ -1135,7 +1221,7 @@ mod tests {
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
             ))]),
-            commands: CommandStore::default(),
+            config: op_config(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: Vec::new(),
@@ -1220,7 +1306,7 @@ mod tests {
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(&dir, "tok", "secret-1"),
             ))]),
-            commands: CommandStore::default(),
+            config: op_config(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: Vec::new(),
@@ -1525,16 +1611,7 @@ mod tests {
         let approver = LocalApprover::new(keystore.clone(), pending.clone())
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
-        let mut commands = CommandStore::default();
-        commands
-            .add(crate::command::CommandConfig {
-                command: "faketool".into(),
-                provider: EnvFileProvider::ID.into(),
-                source: Some(env_path.to_str().unwrap().to_string()),
-                account: None,
-                risk: RiskLevel::Routine,
-            })
-            .unwrap();
+        let config = env_file_config("faketool", env_path.to_str().unwrap());
         let core = Arc::new(Core {
             keystore,
             accounts: Mutex::new(AccountStore::default()),
@@ -1545,7 +1622,7 @@ mod tests {
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
-            commands,
+            config,
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: Vec::new(),
@@ -1609,7 +1686,7 @@ mod tests {
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
-            commands: CommandStore::default(),
+            config: op_config(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: vec![Box::new(sshagent::FileSshSigner::new(vec![(
@@ -1802,7 +1879,7 @@ mod tests {
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
             ))]),
-            commands: CommandStore::default(),
+            config: op_config(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::Phone,
             ssh_signers: Vec::new(),
@@ -2005,7 +2082,7 @@ mod tests {
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
             ))]),
-            commands: CommandStore::default(),
+            config: op_config(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::Phone,
             ssh_signers: Vec::new(),
@@ -2192,7 +2269,7 @@ mod tests {
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_echo_op(&dir),
             ))]),
-            commands: CommandStore::default(),
+            config: coexist_config(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::Phone,
             ssh_signers: Vec::new(),
@@ -2534,7 +2611,7 @@ mod tests {
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
             ))]),
-            commands: CommandStore::default(),
+            config: op_config(),
             lease_ttl: Duration::from_secs(60),
             factor,
             ssh_signers: Vec::new(),
@@ -2878,19 +2955,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_vault_reads_both_spellings() {
-        assert_eq!(
-            parse_vault(&["op".into(), "--vault".into(), "Engineering".into()]),
-            Some("Engineering".into())
-        );
-        assert_eq!(
-            parse_vault(&["op".into(), "--vault=Personal".into()]),
-            Some("Personal".into())
-        );
-        assert_eq!(parse_vault(&["op".into(), "read".into()]), None);
-    }
-
-    #[test]
     fn env_file_lease_decision_grants_no_lease() {
         // Leasing is disabled for a direct-injection provider even when the
         // decision would grant a session lease: resolved secret VALUES must never
@@ -2915,16 +2979,7 @@ mod tests {
         let approver = LocalApprover::new(keystore.clone(), pending.clone())
             .with_dev(DevMode::Lease(Duration::from_secs(60)))
             .with_control_socket(true);
-        let mut commands = CommandStore::default();
-        commands
-            .add(crate::command::CommandConfig {
-                command: "faketool".into(),
-                provider: EnvFileProvider::ID.into(),
-                source: Some(env_path.to_str().unwrap().to_string()),
-                account: None,
-                risk: RiskLevel::Routine,
-            })
-            .unwrap();
+        let config = env_file_config("faketool", env_path.to_str().unwrap());
         let core = Arc::new(Core {
             keystore,
             accounts: Mutex::new(AccountStore::default()),
@@ -2935,7 +2990,7 @@ mod tests {
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
-            commands,
+            config,
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: Vec::new(),
@@ -3003,7 +3058,7 @@ mod tests {
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
-            commands: CommandStore::default(),
+            config: op_config(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: vec![Box::new(sshagent::FileSshSigner::new(vec![(

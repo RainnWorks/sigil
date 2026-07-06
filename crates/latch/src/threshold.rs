@@ -305,29 +305,30 @@ impl ThresholdStore {
         self.accounts.iter().find(|a| a.label() == label)
     }
 
-    /// Pick the v2 account whose vault list contains `vault` exactly, with no
-    /// single-account fallback. Used when v1 accounts coexist (a migration
-    /// store): v2 then claims only an exact match, leaving everything else to v1.
-    pub fn route_exact(&self, vault: Option<&str>) -> Option<&ThresholdAccount> {
-        let v = vault?;
+    /// Pick the v2 account matching `hint` (a source's account label or a vault
+    /// name) exactly by **label or vault**, with no single-account fallback. Used
+    /// when v1 accounts coexist (a migration store): v2 then claims only an exact
+    /// match, leaving everything else to v1.
+    pub fn route_exact(&self, hint: Option<&str>) -> Option<&ThresholdAccount> {
+        let v = hint?;
         self.accounts
             .iter()
-            .find(|a| a.vaults.iter().any(|x| x == v))
+            .find(|a| a.label() == v || a.vaults.iter().any(|x| x == v))
     }
 
-    /// Pick the v2 account that serves `vault`, mirroring
+    /// Pick the v2 account for a routing `hint`, mirroring
     /// [`AccountStore::route`](crate::secrets::AccountStore::route): a matching
-    /// vault wins; with a single account and no match it is the fallback; `None`
-    /// means no v2 account serves this request (the caller then tries v1).
-    pub fn route(&self, vault: Option<&str>) -> Option<&ThresholdAccount> {
+    /// label or vault wins; with a single account and no match it is the fallback;
+    /// `None` means no v2 account serves this request (the caller then tries v1).
+    pub fn route(&self, hint: Option<&str>) -> Option<&ThresholdAccount> {
         if self.accounts.is_empty() {
             return None;
         }
-        match vault {
+        match hint {
             Some(v) => self
                 .accounts
                 .iter()
-                .find(|a| a.vaults.iter().any(|x| x == v))
+                .find(|a| a.label() == v || a.vaults.iter().any(|x| x == v))
                 .or_else(|| (self.accounts.len() == 1).then(|| &self.accounts[0])),
             None => Some(&self.accounts[0]),
         }
