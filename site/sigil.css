@@ -1,4 +1,4 @@
-/* Latch site. One stylesheet, two pages (index, trust).
+/* Sigil site. One stylesheet, two pages (index, trust).
    Palette, type, and component grammar carried over from
    docs/design/latch-design-brief.html so the site matches the product.
    Cold neutrals, cobalt accent, brass/sea-green/rust semantics only. */
@@ -384,7 +384,7 @@ tr td:last-child, tr th:last-child { padding-right: 0; }
 .tag-live::before, .tag-soon::before { content: "· "; }
 .tag-soon { color: var(--brass); }
 
-/* featured use-case panel (Latch for 1Password) */
+/* featured use-case panel (Sigil for 1Password) */
 .feat {
   border: 1px solid var(--line-strong); border-radius: 14px;
   padding: 28px; background: var(--surface);

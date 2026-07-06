@@ -3,16 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Latch · the trust model</title>
-<meta name="description" content="The Latch trust model in full: the pairing ceremony, what each party can never see, the enumerated worst case of a malicious relay, and the claim-to-code-to-test philosophy. Written for the skeptical reader.">
-<link rel="stylesheet" href="latch.css">
+<title>Sigil · the trust model</title>
+<meta name="description" content="The Sigil trust model in full: the pairing ceremony, what each party can never see, the enumerated worst case of a malicious relay, and the claim-to-code-to-test philosophy. Written for the skeptical reader.">
+<link rel="stylesheet" href="sigil.css">
 </head>
 <body>
 
 <!-- TODO: repo has no remote yet; point every href="#repo" at the GitHub URL once it exists -->
 <nav class="nav">
   <div class="wrap">
-    <a class="brand" href="index.html">latch<span class="cursor">_</span></a>
+    <a class="brand" href="index.html">sigil<span class="cursor">_</span></a>
     <div class="nav-links">
       <a class="opt" href="index.html#how">How it works</a>
       <a class="opt" href="index.html#layers">Architecture</a>
@@ -45,7 +45,7 @@
     </div>
     <div class="term plain mt-m">
 <pre><span class="t-dim"># both screens must show the same three words twice</span>
-<span class="t-co">latch pair</span>
+<span class="t-co">sigil pair</span>
 
   scan the QR on your phone, then confirm the fingerprint:
 
@@ -73,7 +73,7 @@
         <tr><td><strong>Calling process</strong></td><td>the one secret it asked for, on stdout, after approval</td><td>anything it did not ask for; anything without an approval</td></tr>
       </table>
     </div>
-    <p class="mt-m muted" style="font-size:0.92rem;max-width:66ch">Read the last row honestly. An approved request does deliver that secret to that process. Latch gates release; it does not sandbox the recipient. The defense against a malicious caller is that every fulfillment needs a fresh, out-of-band approval that shows you the process and its working directory before anything is unsealed.</p>
+    <p class="mt-m muted" style="font-size:0.92rem;max-width:66ch">Read the last row honestly. An approved request does deliver that secret to that process. Sigil gates release; it does not sandbox the recipient. The defense against a malicious caller is that every fulfillment needs a fresh, out-of-band approval that shows you the process and its working directory before anything is unsealed.</p>
   </div>
 </section>
 
@@ -117,16 +117,16 @@
   <div class="wrap-narrow">
     <div class="sec-head">
       <h2>Claim, code, test</h2>
-      <p>A security claim you cannot check is marketing. Latch is built so each one is a line you can follow.</p>
+      <p>A security claim you cannot check is marketing. Sigil is built so each one is a line you can follow.</p>
     </div>
     <div class="prose">
-      <p>The protocol core lives in <code>crates/proto</code>: the sealed and signed envelope, the pairing and fingerprint logic, the counters, and the mailbox hash. It has no I/O and no platform code, so it is exhaustively testable in isolation. That is where the proof lives too.</p>
+      <p>The protocol core lives in <code>crates/sigil-proto</code>: the sealed and signed envelope, the pairing and fingerprint logic, the counters, and the mailbox hash. It has no I/O and no platform code, so it is exhaustively testable in isolation. That is where the proof lives too.</p>
       <p>The repository ships a deliberately hostile relay implementation whose whole job is to attack: it tampers with envelopes, replays old ones, reorders them, forges signatures, truncates ciphertext, and stalls. A client test suite runs the full protocol across that hostile relay and asserts that every attack is rejected and that every failure is closed, never open. Alongside it is a claim map: each sentence of the trust model points at the function that enforces it and the test that exercises the attack it defends against.</p>
       <p>None of this is aspirational scaffolding. It is the part being built first, because a protocol you cannot attack in CI is a protocol you are only hoping is correct.</p>
     </div>
     <div class="claim mt-m">
       <span class="k">Why client-side and not audited-server</span>
-      <p>An audit tells you what a server ran on the day of the audit. Client-side proof tells you what any server, audited or not, honest or not, is structurally unable to do. Latch chooses the second because it is the only one that survives the server being replaced, compromised, or lying.</p>
+      <p>An audit tells you what a server ran on the day of the audit. Client-side proof tells you what any server, audited or not, honest or not, is structurally unable to do. Sigil chooses the second because it is the only one that survives the server being replaced, compromised, or lying.</p>
     </div>
   </div>
 </section>
@@ -143,7 +143,7 @@
         <tr><th>Threat</th><th>Answer</th><th>Honest residue</th></tr>
         <tr><td>Daemon store stolen</td><td>ciphertext without the phone or the Mac enclave</td><td>rotate tokens on suspicion anyway</td></tr>
         <tr><td>Phone stolen</td><td>keys are enclave-gated; every approve needs a biometric</td><td>remote lockdown from the Mac, re-pair, rotate</td></tr>
-        <tr><td>Malicious process calls the shim</td><td>every fulfillment needs a fresh out-of-band approval showing process and cwd</td><td>an approved request does deliver that secret; Latch gates release, it does not sandbox the recipient</td></tr>
+        <tr><td>Malicious process calls the shim</td><td>every fulfillment needs a fresh out-of-band approval showing process and cwd</td><td>an approved request does deliver that secret; Sigil gates release, it does not sandbox the recipient</td></tr>
         <tr><td>Approval replay</td><td>single-use ids, per-pairing counters, a short window, ephemeral per-request keys</td><td>aggressive clock skew rejects valid responses; doctor flags it</td></tr>
         <tr><td>Push spoofing</td><td>a push only wakes the app; the real request must carry the daemon's pinned signature</td><td>nuisance wake-ups at worst</td></tr>
         <tr><td>Relay compromised</td><td>sees only sealed envelopes; cannot read, forge, or replay; dropping traffic fails closed</td><td>metadata: pairing id, timing, sizes; self-host to keep even that at home</td></tr>
@@ -164,7 +164,7 @@
     <div class="resid">
       <div class="r">
         <div class="h">An approved consumer gets the secret</div>
-        <div class="b">Latch decides whether a secret is released, not what the caller does with it afterward. If you approve a request, that process receives that secret in cleartext on its stdout, exactly as if you had clicked the Mac prompt. The protection is that you saw the process, the directory, and the item first, and that nothing is released without that fresh decision.</div>
+        <div class="b">Sigil decides whether a secret is released, not what the caller does with it afterward. If you approve a request, that process receives that secret in cleartext on its stdout, exactly as if you had clicked the Mac prompt. The protection is that you saw the process, the directory, and the item first, and that nothing is released without that fresh decision.</div>
       </div>
       <div class="r">
         <div class="h">The relay sees metadata</div>
@@ -184,7 +184,7 @@
   <div class="wrap">
     <div class="foot-grid">
       <div>
-        <span class="brand">latch<span class="cursor">_</span></span>
+        <span class="brand">sigil<span class="cursor">_</span></span>
         <p class="tag">A personal instrument that gates the secrets your CLIs inject, behind an approval on your phone. 1Password is the first provider; built for one user, the team never knows it exists.</p>
       </div>
       <div class="foot-links">

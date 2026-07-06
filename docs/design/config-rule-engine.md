@@ -7,7 +7,7 @@ ANY-CLI PIVOT / INVOCATION MODEL notes in the project memory.
 
 ## Why
 
-Latch is "gated env-var injection + phone approval for ANY CLI", not an `op`
+Sigil is "gated env-var injection + phone approval for ANY CLI", not an `op`
 tool. The core must have **zero** concept of 1Password. Until now two things
 baked `op` into the core gating path:
 
@@ -23,40 +23,40 @@ source. Nothing in the rule vocabulary or the engine names `op`.
 
 ## Package & binary layout (landed)
 
-One workspace package (`crates/latch`). Its `[lib]` is the shared core
-`latch_core` — the rule engine, providers, gating/daemon, keystore, transport,
+One workspace package (`crates/sigil`). Its `[lib]` is the shared core
+`sigil_core` — the rule engine, providers, gating/daemon, keystore, transport,
 and the proxy module all live here, so both binaries call one implementation
 with zero duplication. Two thin `[[bin]]` targets in `src/bin/`:
 
-- **`latch`** — the lean hot-path + runtime binary agents and launchd invoke:
-  the `latch <cmd>` gating primitive, the transparent shim multicall, `latch
-  proxy …` (the auto-aliasing proxy), `latch run`, and the runtime verbs
+- **`sigil`** — the lean hot-path + runtime binary agents and launchd invoke:
+  the `sigil <cmd>` gating primitive, the transparent shim multicall, `sigil
+  proxy …` (the auto-aliasing proxy), `sigil run`, and the runtime verbs
   (daemon, status, pair, lease, ssh, …). Reserved verbs in this binary: the
-  runtime set + `run` + `proxy` + `config` (hint-only, points at `latch-config`);
-  everything else is the `latch <cmd>` primitive.
-- **`latch-config`** — the configuration-management CLI the desktop shells out
+  runtime set + `run` + `proxy` + `config` (hint-only, points at `sigil-config`);
+  everything else is the `sigil <cmd>` primitive.
+- **`sigil-config`** — the configuration-management CLI the desktop shells out
   to under the hood: `source`/`rule`/`list`/`export`/`import`, plus the
   config-ish mutations (`account`, `settings`, `mac-approvals`, `wipe`).
 
-The split moves the desktop's invocation from `latch config …`/`latch account …`
-to `latch-config …` (source/rule/list/export/import + account/settings/
-mac-approvals/wipe are now `latch-config` verbs, no `config` prefix). That is an
+The split moves the desktop's invocation from `sigil config …`/`sigil account …`
+to `sigil-config …` (source/rule/list/export/import + account/settings/
+mac-approvals/wipe are now `sigil-config` verbs, no `config` prefix). That is an
 outward-facing contract the Mac app (`apps/mac`) depends on; updating it is a
 separate task. Because `config`/`account`/`settings`/`wipe` are no longer
-reserved in the lean `latch` binary, a program literally named any of those is
-now gateable as `latch <that-name> …`; the escape hatch for a residual reserved
-runtime verb is `latch run -- <cmd>`.
+reserved in the lean `sigil` binary, a program literally named any of those is
+now gateable as `sigil <that-name> …`; the escape hatch for a residual reserved
+runtime verb is `sigil run -- <cmd>`.
 
 ## Two CLIs, one binary
 
-The multicall `latch` binary keeps its two faces; this change sharpens the split:
+The multicall `sigil` binary keeps its two faces; this change sharpens the split:
 
-- **Gating CLI** — `latch <cmd> [args]`, the transparent shim alias, and
-  `latch run -- <cmd>`. On an invocation the daemon evaluates the configured
+- **Gating CLI** — `sigil <cmd> [args]`, the transparent shim alias, and
+  `sigil run -- <cmd>`. On an invocation the daemon evaluates the configured
   rules; the first matching rule gates the command on the phone, injects its
   source's env, and execs+streams. No rule matches -> refuse and point at
-  `latch config` (never run ungated: a silent pass-through is false security).
-- **Configuration CLI** — `latch config …`. A provider-agnostic config layer
+  `sigil config` (never run ungated: a silent pass-through is false security).
+- **Configuration CLI** — `sigil config …`. A provider-agnostic config layer
   that authors rules and sources. It is the owned primitive; the **desktop app
   is a client** that shells out to it (or, later, speaks the same JSON). JSON
   in/out mirrors the daemon-control-protocol philosophy: one machine interface,
@@ -64,7 +64,7 @@ The multicall `latch` binary keeps its two faces; this change sharpens the split
 
 ## Data model
 
-Persisted at `~/.latch/config.json` (plaintext by design — it holds routing,
+Persisted at `~/.sigil/config.json` (plaintext by design — it holds routing,
 never a secret; it must be readable while the daemon is inert). Two collections:
 
 ```jsonc
@@ -152,7 +152,7 @@ The core never parses `op://`, never reads `--vault`, never special-cases `op`.
 
 1. `Config::resolve(argv)` -> the first rule whose match holds, resolved against
    its source into a `ResolvedAction { provider, source_path, account, risk,
-   timeout_sec }`. `None` -> refuse with `latch config` guidance.
+   timeout_sec }`. `None` -> refuse with `sigil config` guidance.
 2. Look up the provider by id in the `ProviderRegistry`.
 3. If the provider `needs_account()` (op), route the account by the **source's
    `account` label** (not by sniffing argv). `AccountStore::route` now matches an
@@ -171,33 +171,33 @@ argv archaeology — which is exactly the generalization.
 All verbs take `--json` for the machine path (the desktop shells out for these):
 
 ```
-latch config source add <name> --provider <id> [--account <label>] [--path <file>]
-latch config source list
-latch config source remove <name>
+sigil config source add <name> --provider <id> [--account <label>] [--path <file>]
+sigil config source list
+sigil config source remove <name>
 
-latch config rule add <name> --source <src>
+sigil config rule add <name> --source <src>
       [--command <c>] [--subcommand <s>]
       [--argv-contains <needle> ...] [--flag <f> ...] [--flag-eq <f>=<v> ...]
       [--risk routine|elevated|critical] [--timeout <sec>]
-latch config rule list
-latch config rule remove <name>
+sigil config rule list
+sigil config rule remove <name>
 
-latch config export          # whole config as JSON on stdout
-latch config import          # replace whole config from JSON on stdin
-latch config list            # human summary of sources + rules
+sigil config export          # whole config as JSON on stdout
+sigil config import          # replace whole config from JSON on stdin
+sigil config list            # human summary of sources + rules
 
 # Convenience desugar (keeps the old one-liner + the docs/tests that use it):
-latch config add <cmd> --provider <id> [--source <path>] [--account <label>] [--risk r]
+sigil config add <cmd> --provider <id> [--source <path>] [--account <label>] [--risk r]
       == source add <cmd> + rule add <cmd> matching command==<cmd>
 ```
 
 The daemon only **reads** the config (loaded at arm time); a compromised
 always-on daemon must not be able to rewrite which commands are gated. Re-run
-`latch restart` to apply a change. This is unchanged from the old store.
+`sigil restart` to apply a change. This is unchanged from the old store.
 
 ## Persistence & migration
 
-- New store: `~/.latch/config.json`.
+- New store: `~/.sigil/config.json`.
 - On load, if `config.json` is absent but the legacy `commands.json` exists, it
   is migrated in memory (and can be written on first mutation): each legacy
   `CommandConfig{command,provider,source,account,risk}` becomes a `Source`
@@ -205,9 +205,9 @@ always-on daemon must not be able to rewrite which commands are gated. Re-run
   the historical implicit behavior, if no legacy entry named `op` exists, a
   default `op` rule + `1password` source (no account) is synthesized — so Tom's
   existing zero-config `op` keeps working after upgrade. The legacy file is left
-  in place (non-destructive); `latch wipe` removes both.
+  in place (non-destructive); `sigil wipe` removes both.
 
-## Migration: verb moves (lean `latch` vs `latch-config`)
+## Migration: verb moves (lean `sigil` vs `sigil-config`)
 
 The split is a HARD CUT — no back-compat aliases in the lean binary (aliases
 would re-reserve the very verbs we moved off it, defeating gateability). The
@@ -215,23 +215,23 @@ exact moves, so retargeting the Mac app (#42) is mechanical:
 
 | old invocation                    | new invocation                         |
 |-----------------------------------|----------------------------------------|
-| `latch config <verb>`             | `latch-config <verb>` (no `config` word)|
-| `latch config source …`           | `latch-config source …`                |
-| `latch config rule …`             | `latch-config rule …`                  |
-| `latch config list` / `export` / `import` | `latch-config list` / `export` / `import` |
-| `latch config add <cmd> …`        | `latch-config add <cmd> …`             |
-| `latch account <verb>`            | `latch-config account <verb>`          |
-| `latch settings <verb>`           | `latch-config settings <verb>`         |
-| `latch mac-approvals …`           | `latch-config mac-approvals …`         |
-| `latch wipe [--force]`            | `latch-config wipe [--force]`          |
-| `latch <anything-else>`           | unchanged (lean `latch`)               |
+| `sigil config <verb>`             | `sigil-config <verb>` (no `config` word)|
+| `sigil config source …`           | `sigil-config source …`                |
+| `sigil config rule …`             | `sigil-config rule …`                  |
+| `sigil config list` / `export` / `import` | `sigil-config list` / `export` / `import` |
+| `sigil config add <cmd> …`        | `sigil-config add <cmd> …`             |
+| `sigil account <verb>`            | `sigil-config account <verb>`          |
+| `sigil settings <verb>`           | `sigil-config settings <verb>`         |
+| `sigil mac-approvals …`           | `sigil-config mac-approvals …`         |
+| `sigil wipe [--force]`            | `sigil-config wipe [--force]`          |
+| `sigil <anything-else>`           | unchanged (lean `sigil`)               |
 
 Everything else (`status`, `daemon`, `doctor`, `pair`, `unpair`, `qr`,
 `start`/`stop`/`restart`, `lease`, `lockdown`, `approve`, `deny`, `history`,
-`pending`, `ssh`, `sshagent`, `setup`, `shim`, `run`) stays on the lean `latch`
+`pending`, `ssh`, `sshagent`, `setup`, `shim`, `run`) stays on the lean `sigil`
 binary. Proxy management (`proxy add|remove|list|status|doctor|env`) lives on
-`latch-config`, NOT reserved in the lean binary, so a program named `proxy` is
-gateable as `latch proxy …`.
+`sigil-config`, NOT reserved in the lean binary, so a program named `proxy` is
+gateable as `sigil proxy …`.
 
 ## Security notes (for the security-reviewer, not self-certified)
 
@@ -246,7 +246,7 @@ gateable as `latch proxy …`.
   hint that string is order-dependent (the account earlier in the store wins).
   This is a Tom-authored-config misconfiguration, not an exploit (both accounts
   are the operator's own, and the approval is still gated), but it is surprising.
-  `latch-config account add` warns when a new account's label collides with an
+  `sigil-config account add` warns when a new account's label collides with an
   existing account's vault (or vice versa) so the ambiguity is visible at
   authoring time. Prefer account labels that are not also vault names.
 

@@ -29,7 +29,7 @@ secrets**. Each row is exactly where to get the value.
 | `MAC_ASC_ISSUER_ID` | macOS notarization | Same page, "Issuer ID". |
 | `MAC_ASC_API_KEY_P8` | macOS notarization | Same download-once `.p8` flow as `ASC_API_KEY_P8`, under the Rowm LTD account. |
 | `MAC_TEAM_ID` | macOS notarization | The Rowm LTD team id (visible in the same ASC page, or `security find-identity -v -p codesigning` locally - it's the 10-character id in the cert name, e.g. `YK42U4LDMG`). |
-| `CLOUDFLARE_API_TOKEN` | Relay Worker deploy | Cloudflare dashboard -> My Profile -> API Tokens -> Create Token -> "Edit Cloudflare Workers" template, scoped to the account that will host `latch-relay`. |
+| `CLOUDFLARE_API_TOKEN` | Relay Worker deploy | Cloudflare dashboard -> My Profile -> API Tokens -> Create Token -> "Edit Cloudflare Workers" template, scoped to the account that will host `sigil-relay`. |
 | `CLOUDFLARE_ACCOUNT_ID` | Relay Worker deploy | Cloudflare dashboard -> any Workers page -> Account ID shown in the right sidebar. |
 | `APNS_KEY_P8` | Relay's push doorbell (not this pipeline - `wrangler secret put`, see below) | 1Password, Engineering vault, item `bs6pgv35lpazziews7zsvd6y7e` ("Latch APNs Auth Key, Key ID 5PCK76SDBA"). Get the document contents. |
 
@@ -65,7 +65,7 @@ duplicates.
 ## Homebrew tap (optional, not automated)
 
 `release.yml`'s `cli-release-assets` job renders `sigil.rb` (a Homebrew
-formula for the `latch` + `latch-config` binaries, sha256-pinned to that
+formula for the `sigil` + `sigil-config` binaries, sha256-pinned to that
 release's tarballs) and attaches it to the GitHub Release as an artifact.
 Nothing in this pipeline pushes it anywhere. To make `brew install` work:
 
@@ -87,8 +87,8 @@ needs a repo that does not exist yet, so it is left manual for now.
 |---|---|---|
 | Sigil (iOS) | `fastlane ios beta` (`fastlane/Fastfile`) | TestFlight, internal testing group (no auto-submit to review - `skip_submission: true`) |
 | Latch.dmg (macOS) | `fastlane mac release` (`fastlane/Fastfile`) | GitHub Release asset |
-| `latch` + `latch-config` (CLI) | `scripts/release/package-cli.sh` | GitHub Release assets (`latch-<version>-<target>.tar.gz` + `.sha256`, both macOS archs) + a rendered, unpublished Homebrew formula |
-| `latch-relay` (Worker) | `wrangler deploy` | Cloudflare, `latch-relay.<subdomain>.workers.dev` or your custom domain (see `relay/DEPLOY.md`) |
+| `sigil` + `sigil-config` (CLI) | `scripts/release/package-cli.sh` | GitHub Release assets (`sigil-<version>-<target>.tar.gz` + `.sha256`, both macOS archs) + a rendered, unpublished Homebrew formula |
+| `sigil-relay` (Worker) | `wrangler deploy` | Cloudflare, `sigil-relay.<subdomain>.workers.dev` or your custom domain (see `relay/DEPLOY.md`) |
 | `sigil-relay` (Docker image) | `docker/build-push-action` | `ghcr.io/<repo-owner>/sigil-relay:<tag>` and `:latest` |
 
 ## Local validation without secrets
@@ -104,7 +104,7 @@ cd relay && npm run typecheck && npm run typecheck:bun && npm run test && npm ru
 
 # Phone
 cd apps/phone && bun run typecheck && bun run proto:selftest
-cargo run -p latch-proto --bin export-vectors   # from repo root, before proto:vectors
+cargo run -p sigil-proto --bin export-vectors   # from repo root, before proto:vectors
 cd apps/phone && bun run proto:vectors
 
 # House-rule lint

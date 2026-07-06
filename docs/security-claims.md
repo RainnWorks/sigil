@@ -1,6 +1,6 @@
 # Security claims → enforcing code → proving test
 
-This is the map a skeptical adopter reads. Every row is a claim Latch makes,
+This is the map a skeptical adopter reads. Every row is a claim Sigil makes,
 the exact code that enforces it (`file::symbol`), and the test that proves it.
 A claim with no test is marked **UNPROVEN** in bold; a claim proven only for a
 seam that is not yet wired into the shipping daemon is marked **PARTIAL** with
@@ -129,7 +129,7 @@ Extended again at commit `747b3a4` (the P-256 Secure Enclave DEK wrap) — secti
 | The mailbox id carries no identity and is order-independent | `fingerprint.rs::mailbox_id` | `fingerprint.rs::mailbox_is_order_independent`, `mailbox_differs_for_different_pairs`, `fingerprint_and_mailbox_are_domain_separated` |
 | The relay has no key-distribution role (pairing is out-of-band QR) | `pairing.rs` (keys travel optically) | design invariant; the whole `pairing_mitm.rs` suite proves trust does not rest on any network party |
 
-## 10. Pairing persistence stays inert at rest (the `latch pair` at-rest format)
+## 10. Pairing persistence stays inert at rest (the `sigil pair` at-rest format)
 
 | Claim | Enforcing code | Proving test |
 |-------|----------------|--------------|
@@ -151,10 +151,10 @@ the security boundary between them is stated honestly, not blurred.
 
 | Claim | Enforcing code | Proving test |
 |-------|----------------|--------------|
-| An **unconfigured** command is refused, never run ungated; the caller gets the exact `latch config add` hint | `daemon.rs::fulfill` (`commands.resolve` → `None` → `fail_closed`), `command.rs::CommandStore::resolve` (only `op` resolves by default) | `daemon.rs::unconfigured_command_is_refused_with_a_config_hint`, `command.rs::an_unconfigured_command_does_not_resolve` |
+| An **unconfigured** command is refused, never run ungated; the caller gets the exact `sigil config add` hint | `daemon.rs::fulfill` (`commands.resolve` → `None` → `fail_closed`), `command.rs::CommandStore::resolve` (only `op` resolves by default) | `daemon.rs::unconfigured_command_is_refused_with_a_config_hint`, `command.rs::an_unconfigured_command_does_not_resolve` |
 | A config entry naming an **unknown provider** fails closed, never runs | `daemon.rs::fulfill` (`providers.get` → `None` → `fail_closed`) | reviewed by inspection (the `unknown provider` branch); exercised structurally by `provider.rs::registry_dispatches_by_id_and_lists_defaults` |
 | The env-file **source path comes only from the CLI-side config (0600), never from the caller's argv**, so a caller cannot redirect env-file at an arbitrary file (`/etc/shadow`, a co-worker's `.env`) | `daemon.rs::fulfill` (`source = cfg.source`, argv is never consulted for the source), `command.rs` (config is a CLI-only mutation surface) | reviewed by inspection; the config-store add/get/remove path is `command.rs::add_get_remove_round_trip_and_reject_duplicates` |
-| A command that **shadows a reserved verb** fails toward the built-in verb (safe), never toward ungated execution; the escape hatch is `latch run -- <cmd>` | `cli.rs::main` dispatch + `is_reserved_verb`, `shim.rs::dispatch` (the daemon's `fulfill` is the sole injection chokepoint) | `cli.rs::reserved_verbs_take_precedence_over_command_dispatch` |
+| A command that **shadows a reserved verb** fails toward the built-in verb (safe), never toward ungated execution; the escape hatch is `sigil run -- <cmd>` | `cli.rs::main` dispatch + `is_reserved_verb`, `shim.rs::dispatch` (the daemon's `fulfill` is the sole injection chokepoint) | `cli.rs::reserved_verbs_take_precedence_over_command_dispatch` |
 | Argv is passed to the child as **separate argv entries, never a shell string** (no shell-injection surface); the real binary is resolved via PATH skipping the shim | `provider.rs::{OpProvider,EnvFileProvider}::run` (`Command::new(real).args(...)`), `paths::{find_real,find_real_op}` | `daemon.rs::env_file_command_runs_gated_and_injects_env`, `provider.rs::run_streams_op_child_output_to_the_caller_fd` |
 | A **down daemon** makes the shim exec the bare tool with **no injected secret** (fail-safe: nothing is released); a protocol error while the daemon is **up** fails closed (exit 70), never runs ungated | `shim.rs::dispatch` (`Ok`→exit code; `forward` error→exit 70; only a *down* socket → `exec_real`), `shim.rs::exec_real` (no env injected) | reviewed by inspection (the module contract; no negative test asserts the exec fallback injects nothing) — **UNPROVEN** by a dedicated test |
 
@@ -201,7 +201,7 @@ advertised public key. A same-UID attacker who swaps the private-key file
 between arm and sign makes the agent emit a signature under a *different* key —
 which the SSH client then rejects (it does not match the offered identity), so
 this breaks the connection rather than forging anything. A same-UID file swap is
-already outside Latch's boundary. Not a distinct escalation; noted for
+already outside Sigil's boundary. Not a distinct escalation; noted for
 completeness.
 
 ## 14. The P-256 Secure Enclave DEK wrap (`747b3a4`)
@@ -283,7 +283,7 @@ the account/threshold stores.
 `add_rule`, `remove_source`, and `config import` all validate referential
 integrity (`cli.rs::config_import` rejects an unknown source / empty match), so a
 dangling source cannot arrive via the CLI or import; only a direct hand-edit of
-the 0600 `config.json` (a same-UID write, already outside Latch's boundary) can
+the 0600 `config.json` (a same-UID write, already outside Sigil's boundary) can
 reach it, and the worst effect is a *downgrade* to a later broader rule — still
 gated, never ungated. Recommend a matched-rule-with-unknown-source hard
 fail-closed (refuse the invocation) rather than fall through, so a misconfigured
@@ -308,7 +308,7 @@ the crypto is byte-identical.
 | Removing R5 creates **no** new attack worse than residual #7. A hostile relay gains nothing (the request rides the Ed25519-signed `Envelope` + replay guard; any tamper breaks the signature). A compromised Mac controls BOTH the displayed `secret_refs` AND the challenge `label`/`accountId`, so R5's fuzzy token-overlap was trivially self-satisfiable and never stopped the residual-#7 spoof; the "inconsistent request" R5 caught maps to no capable-adversary primitive | `envelope.rs::open`, `replay.rs::ReplayGuard`; phone `controller.ts::liveApproveThreshold` (no consent check, SE gate is the key release) | `proto/tests/hostile_relay.rs` (26 attacks) + `pairing_mitm.rs` pass unchanged; the phone gates the KEY not the display truth |
 | The honest residual is correctly a **Mac-trust boundary, not a phone one**: a compromised Mac can spoof the display; the phone gates the SE key-agreement / DEK read behind Face ID, and the human declining an unexpected request is the backstop | `controller.ts::liveApprove{,Threshold}` (Face ID gate), residual #7 | reviewed by inspection; consistent with residual #7 |
 | The phone learns only **TRANSPORT** status, never **OUTCOME**: `ApproveOutcome = sent \| refused \| no-session \| error`; "sent" means only that the response left the phone. All Mac-outcome copy ("Secret delivered" / "No secret was delivered" / "Could not reach your Mac") is removed for phone-local facts ("Approved. Sent." / "Denied." / "Request expired." / cause-neutral "That didn't go through.") | `controller.ts::liveApprove` (doc: "does not learn, and must not infer, whether the Mac then unlocked or delivered anything"), `approval-sheet.tsx::{DecisionSent,TerminalStatus}` | `bun run proto:selftest` green; grep confirms no approval-time outcome inference remains (only zero-knowledge doc-comments + legitimate pairing-msg-1 transport facts) |
-| **Crypto byte-identical.** The only crypto-path edit is the Face ID `reason` string (`Approve ${label}` -> `"Approve request"`), which is a display-only `LAContext` prompt — the ECDH is `sharedSecretFromKeyAgreement(f, E)`, independent of `reason`. `requests.ts` is doc-comment only; wire fields unchanged; `ephemeralPub` is the sole crypto input, authenticated by the enclosing signed envelope; `accountId`/`seKeyId` travel in one signed challenge | phone `LatchSeModule.swift::computePartial` (reason feeds only the prompt), `controller.ts` (loadDek/computePartial/shapeEcdh/session.respond unchanged), `requests.ts` (doc only) | phone protocol **vectors 15/15**, `proto:selftest` all green (envelope, replay, forged-sender, wrong-recipient, tamper, fingerprint/mailbox, pairing tag/rendezvous vs rust); Rust `latch-proto` 26 pass |
+| **Crypto byte-identical.** The only crypto-path edit is the Face ID `reason` string (`Approve ${label}` -> `"Approve request"`), which is a display-only `LAContext` prompt — the ECDH is `sharedSecretFromKeyAgreement(f, E)`, independent of `reason`. `requests.ts` is doc-comment only; wire fields unchanged; `ephemeralPub` is the sole crypto input, authenticated by the enclosing signed envelope; `accountId`/`seKeyId` travel in one signed challenge | phone `LatchSeModule.swift::computePartial` (reason feeds only the prompt), `controller.ts` (loadDek/computePartial/shapeEcdh/session.respond unchanged), `requests.ts` (doc only) | phone protocol **vectors 15/15**, `proto:selftest` all green (envelope, replay, forged-sender, wrong-recipient, tamper, fingerprint/mailbox, pairing tag/rendezvous vs rust); Rust `sigil-proto` 26 pass |
 
 **Minor doc-drift (non-security, both changes).** A stale comment at
 `apps/phone/modules/latch-se/ios/LatchSeModule.swift:138` still reads "Bind the
@@ -398,10 +398,10 @@ fix — the `Run` fd path is now airtight); see §18.
 
 ## 18. The auto-aliasing proxy (`f5448cf`, `65d75d2`)
 
-`~/.latch/bin` goes first on `PATH`; each intercepted command is a symlink there
-at the `latch` runtime binary. Running `op` resolves the symlink -> `latch`
-re-enters as `latch op ...` -> gates on the phone -> execs the **real** `op`
-(resolved with the proxy excluded). Management is `latch-config proxy
+`~/.sigil/bin` goes first on `PATH`; each intercepted command is a symlink there
+at the `sigil` runtime binary. Running `op` resolves the symlink -> `sigil`
+re-enters as `sigil op ...` -> gates on the phone -> execs the **real** `op`
+(resolved with the proxy excluded). Management is `sigil-config proxy
 add|remove|list|status|doctor|env`. Design: `docs/design/proxy-aliasing.md`.
 
 **Independent review verdict — CONFIRMED SOUND (two low-severity notes, neither a
@@ -415,11 +415,11 @@ a security decision, and does not weaken caller identity (#6) or secret handling
 
 | Claim | Enforcing code | Proving test |
 |-------|----------------|--------------|
-| `find_real` cannot be steered to an **attacker binary** via symlinks: `canonicalize` resolves a symlink / symlink-chain / real-looking symlink-into-the-proxy-dir to the running `latch` binary, and rule 1 (canonical == `own_binary`) excludes it **in any directory** | `paths.rs::find_real` (skip `canon == own`), `proxy.rs::alias_target` | `proxy::a_stray_alias_symlink_outside_the_proxy_dir_is_not_the_real_tool`, `drift_when_a_real_binary_precedes_the_alias_is_a_bypass`, `healthy_when_alias_is_first_and_points_at_current` |
-| The **daemon-up** path is immune to **caller PATH poisoning**: the `Run` frame carries only `argv`/`cwd`/`proxy_depth`/fds — never the caller's `PATH`/env — so the daemon resolves the real binary in its **own** trusted (launchd-pinned) `PATH`; a caller cannot redirect what the daemon spawns or steer the injected SA token to an attacker binary. The daemon-**down** path uses the caller's `PATH` but injects **no** secret (transparent exec), so a poisoned `PATH` there just runs the caller's own binary with no token — identical to no-Latch | `local.rs::Frame::Run` (no env field), `provider.rs::OpProvider::resolve` -> `paths::find_real` (daemon env), `shim.rs::exec_real` (no env injected) | reviewed by inspection; `daemon.rs` provider tests spawn from the daemon's own resolution |
-| A **hard copy** of the `latch` binary planted as `<cmd>` (not caught by canonical equality) **fails closed**: `find_real` returns it -> re-enter -> loop, bounded by the depth fuse to exit 70 (shim) / daemon refuse at `MAX_DEPTH`. No ungated run, no secret leak — a bounded self-DoS requiring same-UID to plant a copy of the binary | `shim.rs::dispatch` (`depth_exceeded` -> exit 70), `daemon.rs::fulfill` (`proxy_depth >= MAX_DEPTH` -> `fail_closed`) | `daemon.rs::proxy_depth_is_incremented_on_the_child_and_fuses_at_the_limit`, `proxy::depth_fuse_reads_and_increments` |
+| `find_real` cannot be steered to an **attacker binary** via symlinks: `canonicalize` resolves a symlink / symlink-chain / real-looking symlink-into-the-proxy-dir to the running `sigil` binary, and rule 1 (canonical == `own_binary`) excludes it **in any directory** | `paths.rs::find_real` (skip `canon == own`), `proxy.rs::alias_target` | `proxy::a_stray_alias_symlink_outside_the_proxy_dir_is_not_the_real_tool`, `drift_when_a_real_binary_precedes_the_alias_is_a_bypass`, `healthy_when_alias_is_first_and_points_at_current` |
+| The **daemon-up** path is immune to **caller PATH poisoning**: the `Run` frame carries only `argv`/`cwd`/`proxy_depth`/fds — never the caller's `PATH`/env — so the daemon resolves the real binary in its **own** trusted (launchd-pinned) `PATH`; a caller cannot redirect what the daemon spawns or steer the injected SA token to an attacker binary. The daemon-**down** path uses the caller's `PATH` but injects **no** secret (transparent exec), so a poisoned `PATH` there just runs the caller's own binary with no token — identical to no-Sigil | `local.rs::Frame::Run` (no env field), `provider.rs::OpProvider::resolve` -> `paths::find_real` (daemon env), `shim.rs::exec_real` (no env injected) | reviewed by inspection; `daemon.rs` provider tests spawn from the daemon's own resolution |
+| A **hard copy** of the `sigil` binary planted as `<cmd>` (not caught by canonical equality) **fails closed**: `find_real` returns it -> re-enter -> loop, bounded by the depth fuse to exit 70 (shim) / daemon refuse at `MAX_DEPTH`. No ungated run, no secret leak — a bounded self-DoS requiring same-UID to plant a copy of the binary | `shim.rs::dispatch` (`depth_exceeded` -> exit 70), `daemon.rs::fulfill` (`proxy_depth >= MAX_DEPTH` -> `fail_closed`) | `daemon.rs::proxy_depth_is_incremented_on_the_child_and_fuses_at_the_limit`, `proxy::depth_fuse_reads_and_increments` |
 | **PATH-order bypass is documented as a residual, never claimed prevented.** A real `<cmd>` before the proxy routes an *unmodified* caller ungated; `doctor` reports it as an operator convenience, and a caller that *wants* to skip the gate always can (real binary is never moved). No code treats PATH order as a control | `proxy.rs::ProxyStatus::issue` ("a real {cmd} precedes the proxy on PATH (requests would be ungated)"), `docs/design/proxy-aliasing.md` §"not a containment boundary" | `proxy::drift_when_a_real_binary_precedes_the_alias_is_a_bypass` |
-| The **recursion guard cannot be cleared to escape gating.** `proxy_depth` is used in exactly one decision — `fulfill`'s `>= MAX_DEPTH -> fail_closed` (deny, safe direction) — and is **never** consulted by the phone gate, account routing, caller-identity derivation, or lease keys. Setting `LATCH_PROXY_DEPTH` high -> self-deny; setting it to 0 -> only prolongs a loop that exists solely if `find_real` is buggy (self-DoS), never a bypass; `saturating_add` prevents wrap | `daemon.rs::fulfill` (sole `proxy_depth` decision + `child_depth` env), `proxy.rs::{current_depth,depth_exceeded,next_depth_value}` | `daemon.rs::proxy_depth_is_incremented_on_the_child_and_fuses_at_the_limit`, `proxy::depth_fuse_reads_and_increments` |
+| The **recursion guard cannot be cleared to escape gating.** `proxy_depth` is used in exactly one decision — `fulfill`'s `>= MAX_DEPTH -> fail_closed` (deny, safe direction) — and is **never** consulted by the phone gate, account routing, caller-identity derivation, or lease keys. Setting `SIGIL_PROXY_DEPTH` high -> self-deny; setting it to 0 -> only prolongs a loop that exists solely if `find_real` is buggy (self-DoS), never a bypass; `saturating_add` prevents wrap | `daemon.rs::fulfill` (sole `proxy_depth` decision + `child_depth` env), `proxy.rs::{current_depth,depth_exceeded,next_depth_value}` | `daemon.rs::proxy_depth_is_incremented_on_the_child_and_fuses_at_the_limit`, `proxy::depth_fuse_reads_and_increments` |
 | Caller identity (#6) is **not weakened**: the daemon derives identity from the kernel peer pid + ancestry walk, independent of anything the proxy supplies (argv/cwd/depth are decorative for identity) | `daemon.rs::handle_conn` (`peer = lease::peer_pid`), `lease.rs::walk_ancestry` | existing `lease.rs` ancestry/grant-key suite (unchanged) |
 | Fail-closed (#7): a resolution failure execs nothing (`exit 127`); a protocol fault while the daemon is up is `exit 70`, never an ungated run; only a **down** daemon execs transparently (by design, injecting no secret) | `shim.rs::{exec_real,forward}` (127 / 70), `daemon.rs::fulfill` | reviewed by inspection; `shim.rs` module contract |
 
@@ -430,10 +430,10 @@ implements only rule 1, not the proxy-dir exclusion (rule 2) the design claims.*
 dir. `paths::find_real` (the resolver that actually chooses what to exec/spawn)
 implements only rule 1; rule 2 exists only in the **diagnostic** path
 (`proxy.rs::ProxyStatus::detect_with`, via `is_shim_dir`). Impact: a **non-symlink**
-executable resident in `~/.latch/bin` under a tool's name (a hard copy, a script,
-or a same-UID-planted non-latch binary) is not excluded by `find_real`, so the
+executable resident in `~/.sigil/bin` under a tool's name (a hard copy, a script,
+or a same-UID-planted non-sigil binary) is not excluded by `find_real`, so the
 daemon-up path would treat it as "the real tool" and spawn it **with the injected
-SA token**. Every route requires same-UID write to `~/.latch/bin` — already
+SA token**. Every route requires same-UID write to `~/.sigil/bin` — already
 game-over (such an attacker can read the approved tool's `/proc/<pid>/environ` or
 replace the real binary), so it is not a distinct escalation — but it is a real
 gap between the doc's claimed guarantee and the code, and it diverges from the
@@ -445,9 +445,9 @@ real tool instead of fail-closed-looping.
 
 **Low-severity note B (display correctness post-split, no security impact):**
 `paths::find_real` keys its exclusion on `own_binary()` (= `current_exe`), while
-aliases point at `alias_target()` (the sibling `latch` runtime binary). In the
-runtime `latch` and the daemon these coincide, so **execution is correct**. But
-called from `latch-config` (`current_exe` != the runtime the aliases point at),
+aliases point at `alias_target()` (the sibling `sigil` runtime binary). In the
+runtime `sigil` and the daemon these coincide, so **execution is correct**. But
+called from `sigil-config` (`current_exe` != the runtime the aliases point at),
 rule 1 fails to exclude the proxy-dir alias, so `Alias.real` (used only for
 `proxy list`/`doctor` **display**) can show the alias path instead of the real
 binary, disagreeing with `ProxyStatus.real` (which uses `alias_target`, correct).
@@ -458,10 +458,10 @@ Display-only; no execution/security impact. Recommend `find_real` exclude agains
 now delegates to a testable pure core `find_real_in(cmd, path, own, alias_target,
 proxy_dir)` that applies **rule 2** (skip any candidate whose parent dir
 canonicalises to the proxy dir — so a non-symlink executable planted in
-`~/.latch/bin` is excluded, closing the daemon-up credential-injection corner and
+`~/.sigil/bin` is excluded, closing the daemon-up credential-injection corner and
 making the hard-copy-in-proxy-dir case resolve to the real tool instead of
 fail-closed-looping) **and rule 1 against both `own_binary()` and
-`alias_target()`** (so from `latch-config` the alias is excluded and `list`/`doctor`
+`alias_target()`** (so from `sigil-config` the alias is excluded and `list`/`doctor`
 `.real` agrees with `ProxyStatus.real`). Proven by
 `paths::find_real_skips_a_non_symlink_planted_in_the_proxy_dir` and
 `find_real_excludes_via_own_and_alias_target`; the design doc's rule 1/2 wording
@@ -480,7 +480,7 @@ These are real and deliberately surfaced, not defects hidden.
    `Frame::Approve { id }` on the 0600 unix socket, and the request `id` is only
    printed to the daemon's stderr, so a same-UID attacker who can read it can
    self-approve. A compromised same-UID agent (a rogue `claude`/`op`) is exactly
-   the adversary Latch exists to stop, so this path must never be the sole gate.
+   the adversary Sigil exists to stop, so this path must never be the sole gate.
 
    The mitigation, added with the network transport: at arm time the daemon
    resolves an explicit **approving factor** (`factor.rs::resolve`,
@@ -490,12 +490,12 @@ These are real and deliberately surfaced, not defects hidden.
    - a **verified hardware biometric** (`Keystore::is_biometric()` true) — the
      Secure Enclave unwrap is the gate;
    - otherwise **fail closed**: a `NullApprover` denies every gated request,
-     **unless** started with `--dev-insecure` / `LATCH_DEV_INSECURE=1`.
+     **unless** started with `--dev-insecure` / `SIGIL_DEV_INSECURE=1`.
 
-   Only under `--dev-insecure` are `LATCH_DEV_AUTOAPPROVE` (`with_dev`) and the
+   Only under `--dev-insecure` are `SIGIL_DEV_AUTOAPPROVE` (`with_dev`) and the
    control-socket park (`with_control_socket`) wired at all, and that mode prints
    a loud multi-line stderr warning naming the same-UID risk on every start
-   (`factor.rs::warn_dev_insecure`). A normal `latch daemon` with no phone and no
+   (`factor.rs::warn_dev_insecure`). A normal `sigil daemon` with no phone and no
    biometric is **not** silently self-approvable: it runs the `NullApprover` and
    refuses. With a biometric factor, an unresolved local decision fails closed
    rather than parking on the socket (`approve.rs::LocalApprover::decide_local`
@@ -605,7 +605,7 @@ These are real and deliberately surfaced, not defects hidden.
      For a short-lived child this is a blink; for a long-running one the secrets
      sit in its environment the whole time. This is inherent to *any* "inject env
      and exec" model (the `op` SA token has the same exposure in `op`'s environ),
-     and same-UID is already the boundary Latch does not defend below.
+     and same-UID is already the boundary Sigil does not defend below.
 
    Leasing is **disabled** for this shape precisely so resolved values never also
    persist in daemon RAM across a TTL (`daemon.rs::env_file_lease_decision_grants_no_lease`).
@@ -644,7 +644,7 @@ These are real and deliberately surfaced, not defects hidden.
     value to it. This is safe as designed because the wrap is produced and consumed
     **locally** — the daemon wraps the DEK to the same Mac's SE key, and the SE
     unwraps it under Touch ID — so forging or swapping the stored blob already
-    requires same-UID write (outside Latch's boundary) and yields only a fail-closed
+    requires same-UID write (outside Sigil's boundary) and yields only a fail-closed
     denial (a substituted DEK cannot decrypt the real AES-256-GCM token ciphertext),
     never a secret. AAD binding is **impossible** anyway: `SecKeyCreateDecryptedData`
     for this ECIES algorithm accepts no AAD, so any AAD would break SE interop.
@@ -661,7 +661,7 @@ These are real and deliberately surfaced, not defects hidden.
 ## Independent review verdict: pairing-security unit (f1192b6, 37035ee, 13e56c2)
 
 **Reviewer:** independent security-reviewer (did NOT write this code). **Date:**
-2026-07-06. **Scope:** the SAS-confirm stdin gate on `latch pair --json`
+2026-07-06. **Scope:** the SAS-confirm stdin gate on `sigil pair --json`
 (f1192b6), the real P-256 Secure Enclave DEK wrap in `keystore_macos.rs`
 (37035ee) plus its uncommitted `for_test`-isolation follow-up in the working
 tree, and the relocation of the DEK unwrap from ceremony-start to
@@ -681,16 +681,16 @@ correctly fixes and that must be committed.
 ### CONFIRMED SOUND (static)
 
 1. **SAS bypass on the `--json` path is closed.** `run_pairing_json`'s
-   `confirm` closure (`crates/latch/src/cli.rs:1428`-`1440`) now emits the `sas`
+   `confirm` closure (`crates/sigil/src/cli.rs:1428`-`1440`) now emits the `sas`
    event, then blocks on one line of stdin and returns `true` only for a
    trimmed, case-insensitive `"confirm"`; `Ok(0)` (EOF), any other line, and
-   `Err(_)` all return `false`. `run_ceremony` (`crates/latch/src/pair.rs:153`)
+   `Err(_)` all return `false`. `run_ceremony` (`crates/sigil/src/pair.rs:153`)
    treats `false` as `bail!` before any unwrap or deliver. The pre-fix
    auto-`true` is gone. Fail-closed on every non-confirm input.
 
 2. **Confirm → biometric → deliver ordering is correct and has no
    pre-biometric delivery path.** In `run_ceremony`
-   (`crates/latch/src/pair.rs:149`-`177`) the strict order is: `confirm_sas`
+   (`crates/sigil/src/pair.rs:149`-`177`) the strict order is: `confirm_sas`
    (human) → `daemon.confirm()` → `unwrap_dek()` (on an SE keystore, the Touch
    ID moment) → `deliver_dek` → `channel.send`. `daemon.confirm()` transmits
    nothing over the channel; the *only* `channel.send` of DEK material is at
@@ -736,7 +736,7 @@ correctly fixes and that must be committed.
 
 6. **DEK protected at rest; wrap/unwrap matched.** Only the SE-wrapped blob is
    persisted (`DEK_ENVELOPE_LABEL`, ciphertext); the DEK plaintext is built in
-   pure Rust (`latch_proto::wrap_dek_p256`), used, and dropped/zeroized in
+   pure Rust (`sigil_proto::wrap_dek_p256`), used, and dropped/zeroized in
    `ensure_dek` (`keystore_macos.rs:213`-`220`). The wrap
    (`p256::ECDH` + ANSI-X9.63-SHA256 KDF + AES-128-GCM, 16-byte variable IV,
    65+32+16 = 113-byte blob) and the SE unwrap
@@ -815,7 +815,7 @@ correctly fixes and that must be committed.
 
 The end-to-end crypto **still holds** despite the relay becoming a
 content-free "blind doorbell": every envelope remains opaque and sealed by
-`crates/proto` (Ed25519 sender auth + `crypto_box`/threshold + replay guard),
+`crates/sigil-proto` (Ed25519 sender auth + `crypto_box`/threshold + replay guard),
 the relay never parses one, and the push body is fixed and generic. The relay's
 new powers — a shared publisher APNs signing key held as a platform secret, and
 a phone push token seen transiently per deposit and never stored — do not let it

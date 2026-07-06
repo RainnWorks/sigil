@@ -12,8 +12,8 @@ list for that reviewer. **The independent reviewer's verdict and findings are in
 §15** (verdict: sound to implement, subject to required corrections R1–R5).
 
 Companion docs: `docs/design/pairing.md` (root of trust), `docs/security-claims.md`
-(claim → code → test map), `crates/proto/src/se_ecies.rs` (the P-256/Apple-ECIES
-prior art this reuses), `crates/proto/src/{envelope,request,identity}.rs` (the
+(claim → code → test map), `crates/sigil-proto/src/se_ecies.rs` (the P-256/Apple-ECIES
+prior art this reuses), `crates/sigil-proto/src/{envelope,request,identity}.rs` (the
 wire types v2 extends).
 
 ---
@@ -87,7 +87,7 @@ dependency set.
   BLAKE2b everywhere is the house rule — no new `hkdf`/`hmac`/`sha2` for the
   combiner. (The one exception, `se_ecies.rs`, uses SHA-256 *only* because Apple's
   ECIES KDF is fixed to SHA-256; the combiner here is ours to choose, so it is
-  BLAKE2b.) Domain separator: `latch.threshold.v2`.
+  BLAKE2b.) Domain separator: `sigil.threshold.v2`.
 - **AEAD: AES-256-GCM, unchanged from v1** (`secrets.rs::encrypt_token`), 96-bit
   random nonce per seal. v2 changes only *where the 32-byte key comes from*, not
   the token-ciphertext format. This is deliberate: the at-rest token blob is
@@ -138,7 +138,7 @@ secrets, AND-combined by a KDF**:
 ```
 Z_M = x(m · E)            // Mac's partial, full software, RustCrypto p256
 Z_F = x(f · E)            // phone's partial, exactly what the SE returns
-K   = KDF( "latch.threshold.v2" ∥ len·Z_M ∥ len·Z_F ∥ len·E_x963 ∥ len·account_id )
+K   = KDF( "sigil.threshold.v2" ∥ len·Z_M ∥ len·Z_F ∥ len·E_x963 ∥ len·account_id )
 ```
 
 `Z_F` is *precisely and only* the raw X-coordinate the Secure Enclave emits —
@@ -171,7 +171,7 @@ goal (two parties, no skeleton key, phone share in the SE, per-request Face ID).
 | Third-party can encrypt to it | yes (knows only `P`) — irrelevant, encryptor is always the Mac | n/a |
 
 Additive's only distinctive property (a third party who knows `P` but not the
-split can encrypt) is worthless to Latch: the encryptor is **always the Mac**,
+split can encrypt) is worthless to Sigil: the encryptor is **always the Mac**,
 which holds the split. Against that non-benefit it pays SE point-reconstruction
 complexity. **Decision: concatenative.**
 
@@ -215,11 +215,11 @@ pairing (§12).
 path as DEK handoff), so a hostile relay can neither read nor forge it, and the
 Mac pins `F` under the already-pinned phone identity. In a fresh v2 pairing this
 is a new message after SAS `Confirmed` (replacing the v1 "DEK delivery" message
-3 of `pairing.md`); in an upgrade it is a one-shot `latch pair upgrade` envelope
+3 of `pairing.md`); in an upgrade it is a one-shot `sigil pair upgrade` envelope
 (§12). The Mac's `M` stays local.
 
 **What the account store persists (v2 record).** Per account, at
-`latch account add` (a CLI-only mutation, per the design brief — the
+`sigil account add` (a CLI-only mutation, per the design brief — the
 network-exposed daemon never mutates keys/config):
 
 ```
@@ -246,7 +246,7 @@ Diffie-Hellman problem.
 e  ← random scalar;  E = e·G
 Z_M = x(e·M)          // = x(m·E); Mac holds m, uses e·M or m·E, same value
 Z_F = x(e·F)          // = x(f·E); Mac holds e and the pinned public F — no phone, no f
-K   = KDF("latch.threshold.v2" ∥ Z_M ∥ Z_F ∥ E_x963 ∥ account_id)
+K   = KDF("sigil.threshold.v2" ∥ Z_M ∥ Z_F ∥ E_x963 ∥ account_id)
 token_ct = AES-256-GCM(token; K, nonce)
 store AccountRecordV2{ E, nonce, token_ct, … };  zeroize e, Z_M, Z_F, K
 ```
@@ -277,7 +277,7 @@ Phone (inside an approved, verified request — see §8):
 
 Mac:
   9.  opens the response (verify sig + replay + decrypt)
-  10. K = KDF("latch.threshold.v2" ∥ Z_M ∥ Z_F ∥ E_x963 ∥ account_id)
+  10. K = KDF("sigil.threshold.v2" ∥ Z_M ∥ Z_F ∥ E_x963 ∥ account_id)
   11. token = AES-256-GCM^{-1}(token_ct; K, nonce)   // fails closed if K wrong
   12. inject token into the provider child env (unchanged), splice child stdout to caller
   13. zeroize m, Z_M, Z_F, K, token immediately
@@ -586,12 +586,12 @@ path (`secrets.rs` DEK, `pairing.md` DEK handoff, `wrapped_dek`) remains as-is f
 accounts can live in the same store simultaneously, each decrypted by its own path.
 
 **Upgrade sequence (per pairing, then per account):**
-1. **Add the shares to an existing pairing** via a new one-shot `latch pair upgrade`:
+1. **Add the shares to an existing pairing** via a new one-shot `sigil pair upgrade`:
    the phone mints `f` in the SE and returns `F` in a sealed `Envelope`; the Mac
    mints `m`, seals it to the Keychain, and pins `F`. No DEK is involved; the v1
    DEK and the new shares coexist. (A fresh pairing does this inline after SAS.)
-2. **Re-encrypt accounts on demand.** `latch account add` (or a new
-   `latch account upgrade`) re-wraps a token to `(M, F)` as a `version: 2` record
+2. **Re-encrypt accounts on demand.** `sigil account add` (or a new
+   `sigil account upgrade`) re-wraps a token to `(M, F)` as a `version: 2` record
    and drops the `version: 1` record for that account. Existing v1 records keep
    working until upgraded; there is **no** bulk re-encryption and no downtime.
 3. **Rotation = re-key.** Rotating an account picks a fresh `e`/`E` and re-encrypts,

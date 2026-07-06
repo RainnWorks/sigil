@@ -34,26 +34,23 @@ use, on your phone."
 
 | Part | What it is |
 | --- | --- |
-| CLI (`latch`, `latch-config`) | Gates a command, injects its secret, runs it. `latch op read ...` asks your phone first. |
+| CLI (`sigil`, `sigil-config`) | Gates a command, injects its secret, runs it. `sigil op read ...` asks your phone first. |
 | iOS app | The approver. A zero-knowledge approve/deny surface: it sees a request, never the outcome. |
 | Mac app | A menubar configurator: pair a phone, add accounts, manage rules. |
 | Relay | A stateless blind mailbox (a Cloudflare Worker, or a self-hosted Docker image). |
-
-The command-line tool is named `latch` for historical reasons; the product is
-Sigil.
 
 ## Quickstart
 
 ```sh
 # Gate a command on your phone. An unmatched command is refused until you
 # configure a rule for it.
-latch op read "op://Private/GitHub/token"
+sigil op read "op://Private/GitHub/token"
 
 # Configure what gets gated.
-latch-config add op --provider 1password
+sigil-config add op --provider 1password
 
 # Pair your phone (shows a QR; compare the six words on both screens).
-latch pair --relay https://relay.rainn.works
+sigil pair --relay https://relay.rainn.works
 ```
 
 Approving requires a hardware biometric on your phone. Denying requires nothing.
@@ -75,8 +72,8 @@ the Docker path.
 
 | Path | What |
 | --- | --- |
-| `crates/proto` | Protocol core: sealed and signed envelopes, pairing, threshold crypto, the shared cross-language test vectors, and the hostile-relay suite |
-| `crates/latch` | The daemon and CLI (multicall binary); `crates/relay-client` is the transport |
+| `crates/sigil-proto` | Protocol core: sealed and signed envelopes, pairing, threshold crypto, the shared cross-language test vectors, and the hostile-relay suite |
+| `crates/sigil` | The daemon and CLI (multicall binary, package name `sigil`); `crates/sigil-relay-client` is the transport |
 | `apps/phone` | The Expo iOS approver app |
 | `apps/mac` | The SwiftUI menubar configurator |
 | `relay` | The blind relay: a Cloudflare Worker and a protocol-identical Bun server |

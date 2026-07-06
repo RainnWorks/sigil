@@ -1,13 +1,13 @@
 # Pairing: the root of trust
 
-Pairing is the one moment where Latch establishes who is who. Everything after
+Pairing is the one moment where Sigil establishes who is who. Everything after
 it (every secret release, every SSH signature, every lease) rests on the keys
 pinned here. If pairing is sound, a fully hostile network can carry every byte
 between the Mac and the phone and still never read a request or forge an
 approval. This document describes the ceremony, the crypto that authenticates
 it, and why each choice is the one made.
 
-Implementation: `crates/proto/src/pairing.rs`. Tests: same file (`mod tests`)
+Implementation: `crates/sigil-proto/src/pairing.rs`. Tests: same file (`mod tests`)
 plus the MITM suite the security-reviewer owns.
 
 ## The asymmetry, and why it exists
@@ -128,7 +128,7 @@ pairing secret, over a transcript that binds everything that must not be
 swapped.
 
 **Transcript.** `pairing_transcript` hashes, with length-prefixed fields under a
-domain separator (`latch.pairing.v1`):
+domain separator (`sigil.pairing.v1`):
 
 ```
 H( domain
@@ -173,7 +173,7 @@ phone's X25519 `crypto_box` envelope. It is a second, independent wrap of the
 same DEK, using **P-256 ECIES**, and either factor (the phone's X25519 key or the
 Mac SE's P-256 key) can recover the DEK on its own.
 
-Implementation: `crates/proto/src/se_ecies.rs`
+Implementation: `crates/sigil-proto/src/se_ecies.rs`
 (`wrap_dek_p256` / `unwrap_dek_p256`), reached from the handshake via
 `DaemonPairing::wrap_dek_for_se_p256`, which is gated on SAS `Confirmed` exactly
 like the phone and X25519 wraps.
@@ -343,7 +343,7 @@ is a documented place to mount an attack and assert it fails closed:
 ## Device-side unknowns — NEEDS VERIFICATION
 
 This crate defines the protocol and its in-memory operations. The following
-depend on platform behavior outside `crates/proto` and must be verified when the
+depend on platform behavior outside `crates/sigil-proto` and must be verified when the
 device layers land:
 
 - **NEEDS VERIFICATION:** the phone mints its X25519 agreement key such that the
