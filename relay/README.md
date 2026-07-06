@@ -1,4 +1,4 @@
-# Latch / Sigil blind relay
+# Sigil blind relay
 
 A deliberately tiny HTTP mailbox for sealed envelopes, plus the publisher-side
 APNs push doorbell. It carries opaque bytes between a paired Mac daemon and
@@ -112,7 +112,7 @@ way — the relay can't tell which, and doesn't need to.
 
 | Route | Purpose | Body / response |
 |-------|---------|------------------|
-| `GET /health` | Liveness. No mailbox needed. | `{"ok":true,"service":"latch-relay"}` |
+| `GET /health` | Liveness. No mailbox needed. | `{"ok":true,"service":"sigil-relay"}` |
 | `POST /mailbox/{id}/to-phone` | Daemon deposits an envelope for the phone. | Body `{"env":"<opaque>","pushToken":"<hex>","platform":"apns"}`. `pushToken`/`platform` are optional; if `pushToken` is present the relay rings the doorbell for it and forgets it immediately. Response `{"ok":true}`. |
 | `GET /mailbox/{id}/to-phone` | Phone waits for the next envelope. Long-poll, drain-on-read. | `{"envelopes":["<opaque>",...]}` — immediately if something's already queued, otherwise held until a matching deposit or ~`LONG_POLL_MS` elapses (then `[]`). |
 | `POST /mailbox/{id}/to-daemon` | Phone deposits an envelope for the daemon. | Body `{"env":"<opaque>"}`. Response `{"ok":true}`. |
@@ -252,8 +252,8 @@ or without compose:
 
 ```sh
 cd relay
-docker build -t latch-relay .
-docker run --rm -p 8787:8787 latch-relay
+docker build -t sigil-relay .
+docker run --rm -p 8787:8787 sigil-relay
 ```
 
 **Environment variables** (all optional; the relay runs with none of them set,
@@ -276,7 +276,7 @@ environment line and the matching `volumes:` bind mount. With plain
 docker run --rm -p 8787:8787 \
   -v /path/to/AuthKey.p8:/run/secrets/apns_key.p8:ro \
   -e APNS_KEY_P8_PATH=/run/secrets/apns_key.p8 \
-  latch-relay
+  sigil-relay
 ```
 
 **TLS.** The container serves plain HTTP only; it does not terminate TLS

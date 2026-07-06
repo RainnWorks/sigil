@@ -1,9 +1,9 @@
-# Latch/Sigil blind relay: Bun self-host image.
+# Sigil blind relay: Bun self-host image.
 #
 # Build with the relay/ directory itself as the build context, so nothing
 # outside relay/ (the rest of the monorepo, crates/, apps/) ever enters the
 # image:
-#   cd relay && docker build -t latch-relay .
+#   cd relay && docker build -t sigil-relay .
 # or via the accompanying docker-compose.yml, which already points its
 # context here:
 #   cd relay && docker compose up --build

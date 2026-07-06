@@ -38,7 +38,7 @@ npx wrangler deploy
 ```
 
 `wrangler deploy` prints the URL it published to (either
-`latch-relay.<your-subdomain>.workers.dev`, or your custom domain if routes
+`sigil-relay.<your-subdomain>.workers.dev`, or your custom domain if routes
 are configured, see below).
 
 ## Custom domain (optional)
@@ -46,7 +46,7 @@ are configured, see below).
 Requires the domain to already be a zone in the same Cloudflare account.
 Either:
 
-- **Dashboard**: Workers & Pages -> `latch-relay` -> Settings -> Triggers ->
+- **Dashboard**: Workers & Pages -> `sigil-relay` -> Settings -> Triggers ->
   Custom Domains -> Add, e.g. `relay.rainn.works`. Cloudflare provisions the
   DNS record and certificate automatically.
 - **Config file**: uncomment and fill in the `routes` block already sketched
@@ -60,7 +60,7 @@ Either:
 ```sh
 # Liveness.
 curl https://<your-worker-or-domain>/health
-# -> {"ok":true,"service":"latch-relay"}
+# -> {"ok":true,"service":"sigil-relay"}
 
 # Deposit/drain round trip (any 64-lowercase-hex string is a valid mailbox id
 # for this smoke test; it does not need to correspond to a real pairing).
@@ -87,7 +87,7 @@ doesn't arrive.
 ## Rollback / redeploy
 
 Every `wrangler deploy` is a new version; roll back from the dashboard
-(Workers & Pages -> `latch-relay` -> Deployments -> pick a previous version
+(Workers & Pages -> `sigil-relay` -> Deployments -> pick a previous version
 -> Rollback) or redeploy the previous commit. There is no data migration
 concern: the relay carries no persisted state to migrate or roll back.
 

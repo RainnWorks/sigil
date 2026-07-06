@@ -7,7 +7,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: latch-relay:local
+    image: sigil-relay:local
     restart: unless-stopped
     ports:
       - "8787:8787"

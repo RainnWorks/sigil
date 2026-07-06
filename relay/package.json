@@ -1,9 +1,9 @@
 {
-  "name": "latch-relay",
+  "name": "sigil-relay",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Latch/Sigil blind relay: a tiny HTTP mailbox for opaque sealed envelopes, plus the publisher-side APNs push doorbell.",
+  "description": "Sigil blind relay: a tiny HTTP mailbox for opaque sealed envelopes, plus the publisher-side APNs push doorbell.",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",

@@ -265,7 +265,7 @@ export function wake(list: Item[], waiters: Waiter[], now: number): void {
 
 /** JSON response bodies, shared so both variants emit identical bytes. */
 export const RESP = {
-  health: () => ({ ok: true, service: "latch-relay" }),
+  health: () => ({ ok: true, service: "sigil-relay" }),
   deposited: () => ({ ok: true }),
   envelopes: (list: string[]) => ({ envelopes: list }),
   err: (error: string) => ({ ok: false, error }),

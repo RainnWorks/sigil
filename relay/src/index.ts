@@ -1,4 +1,4 @@
-// Latch/Sigil blind relay: Cloudflare Worker + one Durable Object per mailbox.
+// Sigil blind relay: Cloudflare Worker + one Durable Object per mailbox.
 //
 // The Worker validates the mailbox id and routes to the mailbox's Durable
 // Object; the DO holds that one mailbox's envelopes ONLY in its own instance

@@ -1,4 +1,4 @@
-// Latch/Sigil blind relay: Bun variant, for self-hosting without Cloudflare.
+// Sigil blind relay: Bun variant, for self-hosting without Cloudflare.
 //
 // Same routes, same status codes, same JSON bodies as the Worker: every wire
 // decision comes from ../shared/protocol (and the push doorbell from
@@ -139,4 +139,4 @@ setInterval(() => {
   }
 }, P.TTL_MS).unref();
 
-console.log(`latch-relay (bun) listening on :${server.port}`);
+console.log(`sigil-relay (bun) listening on :${server.port}`);

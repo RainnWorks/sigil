@@ -17,7 +17,7 @@ const toDaemon = (id: string, body: unknown) =>
 describe("routing and health", () => {
   it("health needs no mailbox", async () => {
     const r = await SELF.fetch(`${base}/health`);
-    expect(await r.json()).toEqual({ ok: true, service: "latch-relay" });
+    expect(await r.json()).toEqual({ ok: true, service: "sigil-relay" });
   });
 
   it("GET / serves the landing page as HTML, not the health JSON", async () => {

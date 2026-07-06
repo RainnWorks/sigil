@@ -59,7 +59,7 @@ afterAll(() => proc?.kill());
 test("health needs no mailbox", async () => {
   expect(await (await fetch(`${baseUrl}/health`)).json()).toEqual({
     ok: true,
-    service: "latch-relay",
+    service: "sigil-relay",
   });
 });
 
