@@ -135,9 +135,9 @@ public final class LatchSeModule: Module {
 
       guard let blob = loadBlob(keyId) else { throw MissingKeyException() }
 
-      // Bind the Face-ID prompt to the account being unlocked (R5): the reason is
-      // the account label the phone displayed and consented to. Passcode fallback
-      // is disabled so key release is strictly biometric.
+      // `reason` is the generic Face-ID prompt string ("Approve request"); the
+      // provider-blind phone no longer names an account here (R5 removed). Passcode
+      // fallback is disabled so key release is strictly biometric.
       let context = LAContext()
       if !reason.isEmpty {
         context.localizedFallbackTitle = ""

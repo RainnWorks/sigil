@@ -62,8 +62,9 @@ export function generateShareKey(keyId: string): Promise<string> {
  * Secure Enclave (the Face-ID gate) and return the RAW 32-byte ECDH X-coordinate
  * x(f·E), standard-base64. The caller applies the record's ECDH-output shaping
  * (see src/protocol/threshold.ts `shapeEcdh`) to turn this into `Z_F`. `reason`
- * is the account label shown in the biometric prompt (R5). Rejects on an
- * off-curve `E`, a missing key, or a denied/failed biometric.
+ * is the generic biometric-prompt string; the provider-blind phone does not name
+ * an account here (R5 removed). Rejects on an off-curve `E`, a missing key, or a
+ * denied/failed biometric.
  */
 export function computePartial(
   keyId: string,
