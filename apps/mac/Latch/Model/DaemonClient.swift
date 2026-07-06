@@ -1,6 +1,6 @@
 //  DaemonClient.swift
 //  The seam between the app and the daemon. Everything the GUI does must also be
-//  possible headless via the `latch` CLI, so this protocol is deliberately a
+//  possible headless via the `sigil` CLI, so this protocol is deliberately a
 //  thin mirror of the CLI verbs (crates/latch/src/cli.rs) and the local control
 //  protocol (crates/latch/src/local.rs Frame/Reply).
 //
@@ -8,7 +8,7 @@
 //  transport alongside the real one:
 //    - MockDaemonClient  — realistic fixtures, every screen and state renders
 //                          with no daemon running.
-//    - CLIDaemonClient   — shells out to the real `latch` binary.
+//    - CLIDaemonClient   — shells out to the real `sigil` binary.
 
 import Foundation
 

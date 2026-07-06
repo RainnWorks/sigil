@@ -1,11 +1,11 @@
 //  SocketDaemonClient.swift
 //  The real DaemonClient. It speaks the daemon's unix control socket directly for
 //  everything the daemon may report or control at runtime (PROTOCOL.md), and
-//  shells out to the `latch` binary only for the keystore/config mutations the
+//  shells out to the `sigil` binary only for the keystore/config mutations the
 //  least-privilege split keeps out of the daemon (JSON.md).
 //
 //  There is one interface, two renderers: this client is the second socket client
-//  alongside the human `latch` CLI. The wire is the Frame/Reply protocol in
+//  alongside the human `sigil` CLI. The wire is the Frame/Reply protocol in
 //  crates/latch/src/local.rs; the json bodies are the DTOs in crates/latch/src/
 //  json.rs, decoded here by the same structs CLIDaemonClient uses (StatusDTO,
 //  CheckDTO, LeaseDTO, HistoryDTO, PendingDTO — shared, not duplicated).
@@ -14,10 +14,10 @@
 //    - Over the socket: status, doctor, lease_list, pending, history (Reply.json);
 //      lockdown, lease_revoke, approve, deny (Reply.control); and a long-lived
 //      subscribe_pending event stream (Reply.event) that drives the menubar live.
-//    - Shelled out to `latch … --json` via the composed CLIDaemonClient: account
+//    - Shelled out to `sigil … --json` via the composed CLIDaemonClient: account
 //      add/rotate/remove, account list, settings get/set, wipe, mac-approvals,
 //      shim install, unpair, and the pairing NDJSON ceremony. These write the
-//      keystore / ~/.latch and are deliberately not daemon capabilities.
+//      keystore / ~/.sigil and are deliberately not daemon capabilities.
 //
 //  When the socket is unreachable the read verbs degrade to a calm "daemon not
 //  running" state rather than throwing, so the window and menubar render an
@@ -26,7 +26,7 @@
 import Foundation
 
 struct SocketDaemonClient: DaemonClient {
-    /// The daemon control socket, $LATCH_SOCK or $TMPDIR/latch/daemon.sock.
+    /// The daemon control socket, $SIGIL_SOCK or $TMPDIR/sigil/daemon.sock.
     let socketPath: String
     /// The shell-out half, for the CLI-only keystore/config mutations.
     private let cli: CLIDaemonClient
@@ -36,7 +36,7 @@ struct SocketDaemonClient: DaemonClient {
     /// its own short-lived connection, as the protocol's one-reply-then-close
     /// verbs expect).
     private static let ioQueue = DispatchQueue(
-        label: "co.rowm.latch.socket", qos: .userInitiated, attributes: .concurrent)
+        label: "co.rowm.sigil.socket", qos: .userInitiated, attributes: .concurrent)
 
     init(socketPath: String? = nil, cli: CLIDaemonClient = CLIDaemonClient()) {
         self.socketPath = socketPath ?? SocketDaemonClient.defaultSocketPath()
@@ -45,9 +45,9 @@ struct SocketDaemonClient: DaemonClient {
 
     static func defaultSocketPath() -> String {
         let env = ProcessInfo.processInfo.environment
-        if let sock = env["LATCH_SOCK"], !sock.isEmpty { return sock }
+        if let sock = env["SIGIL_SOCK"], !sock.isEmpty { return sock }
         let tmp = env["TMPDIR"] ?? NSTemporaryDirectory()
-        return (tmp as NSString).appendingPathComponent("latch/daemon.sock")
+        return (tmp as NSString).appendingPathComponent("sigil/daemon.sock")
     }
 
     // MARK: - Read / report (Reply.json) — degrade to daemon-down, never throw
@@ -138,7 +138,7 @@ struct SocketDaemonClient: DaemonClient {
         }
     }
 
-    // MARK: - Shelled out to `latch … --json` (keystore / config mutations)
+    // MARK: - Shelled out to `sigil … --json` (keystore / config mutations)
 
     func accounts() async throws -> [Account] { try await cli.accounts() }
     func addAccount(_ draft: AccountDraft) async throws -> Account {

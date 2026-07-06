@@ -1,4 +1,4 @@
-//  LatchApp.swift
+//  SigilApp.swift
 //  The app: a menubar pulse plus an on-demand configurator window. Agent app
 //  (LSUIElement), so there is no Dock icon; the menubar is always present and the
 //  window opens when asked.
@@ -6,8 +6,8 @@
 import SwiftUI
 
 @main
-struct LatchApp: App {
-    @State private var model = LatchApp.makeModel()
+struct SigilApp: App {
+    @State private var model = SigilApp.makeModel()
     @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
@@ -48,11 +48,11 @@ struct LatchApp: App {
     /// which speaks the daemon control socket and self-degrades to a calm "daemon
     /// not running" state when the socket is not listening (so no daemon probe is
     /// needed at launch — it tracks the daemon coming up and going down live). It
-    /// falls back to the mock when `LATCH_MOCK=1` (dev, demo, no daemon) so every
+    /// falls back to the mock when `SIGIL_MOCK=1` (dev, demo, no daemon) so every
     /// screen renders. Previews use the mock directly.
     @MainActor
     private static func makeModel() -> AppModel {
-        let useMock = ProcessInfo.processInfo.environment["LATCH_MOCK"] == "1"
+        let useMock = ProcessInfo.processInfo.environment["SIGIL_MOCK"] == "1"
         if useMock {
             return AppModel(daemon: MockDaemonClient(scenario: .pendingRequests),
                             approver: MockApprover())

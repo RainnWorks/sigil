@@ -27,7 +27,7 @@ import Security
 /// invalidated if the enrolled biometric set changes.
 final class SecureEnclaveApprover: LocalApprovalService, @unchecked Sendable {
     /// Keychain tag for the SE private key. One key per install.
-    private let keyTag = "co.rowm.latch.local-approval.p256".data(using: .utf8)!
+    private let keyTag = "co.rowm.sigil.local-approval.p256".data(using: .utf8)!
 
     var biometricsAvailable: Bool {
         let ctx = LAContext()

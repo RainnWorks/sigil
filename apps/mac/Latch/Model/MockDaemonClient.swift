@@ -53,10 +53,10 @@ actor MockDaemonClient: DaemonClient {
     func status() -> StatusReport {
         StatusReport(
             daemonUp: scenario != .failClosed || locked,
-            socketPath: "/var/folders/xy/latch/daemon.sock",
+            socketPath: "/var/folders/xy/sigil/daemon.sock",
             shim: scenario == .failClosed
-                ? ShimState(kind: .drift, path: "~/.latch/bin/op", issue: "another op wins on PATH (/opt/homebrew/bin/op)")
-                : ShimState(kind: .healthy, path: "~/.latch/bin/op", issue: nil),
+                ? ShimState(kind: .drift, path: "~/.sigil/bin/op", issue: "another op wins on PATH (/opt/homebrew/bin/op)")
+                : ShimState(kind: .healthy, path: "~/.sigil/bin/op", issue: nil),
             opFound: true,
             opPath: "/opt/homebrew/bin/op",
             accountCount: accountsStore.count,
@@ -73,7 +73,7 @@ actor MockDaemonClient: DaemonClient {
             .init(label: "shim wins on PATH and is current", ok: s.shim.kind == .healthy,
                   hint: s.shim.issue ?? ""),
             .init(label: "daemon socket reachable", ok: s.daemonUp,
-                  hint: s.daemonUp ? "" : "daemon not running (latch start)"),
+                  hint: s.daemonUp ? "" : "daemon not running (sigil start)"),
             .init(label: "socket path length ok", ok: true, hint: ""),
             .init(label: "approving factor resolved", ok: {
                 if case .failClosed = s.factor { return false } else { return true }
@@ -200,7 +200,7 @@ actor MockDaemonClient: DaemonClient {
     func setMacApprovals(_ mode: MacApprovalsMode) { macMode = mode }
 
     func installShim() -> ControlResult {
-        .ok(lines: ["shim installed", "~/.latch/bin/op -> /usr/local/bin/latch"])
+        .ok(lines: ["shim installed", "~/.sigil/bin/op -> /usr/local/bin/sigil"])
     }
 
     func settings() -> AppSettings { appSettings }
@@ -220,7 +220,7 @@ enum Fixtures {
         // Provider #2, so the fixtures do not read as 1Password-only: a
         // source has no token to rotate or vault to probe, just a path.
         Account(id: "ci-secrets", label: "ci-secrets", provider: .envFile,
-                path: "/Users/tom/.config/latch/ci-secrets.env"),
+                path: "/Users/tom/.config/sigil/ci-secrets.env"),
     ]
 
     static let leases: [Lease] = [

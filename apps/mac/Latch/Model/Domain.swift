@@ -32,7 +32,7 @@ enum Factor: Equatable, Sendable {
         switch self {
         case .pairedPhone(let relay): return "via \(relay)"
         case .biometric: return "hardware Touch ID (Secure Enclave)"
-        case .failClosed: return "no factor; run: latch pair"
+        case .failClosed: return "no factor; run: sigil pair"
         }
     }
 }
@@ -42,7 +42,7 @@ enum Factor: Equatable, Sendable {
 struct ShimState: Equatable, Sendable {
     enum Kind: Equatable, Sendable { case healthy, drift, notInstalled, unknown }
     var kind: Kind
-    /// Where the shim is (or would be), e.g. ~/.latch/bin/op.
+    /// Where the shim is (or would be), e.g. ~/.sigil/bin/op.
     var path: String?
     /// A single drift line when not healthy, e.g. "another op wins on PATH".
     var issue: String?
@@ -138,8 +138,8 @@ struct Account: Identifiable, Equatable, Sendable {
 }
 
 /// What the add sheet collected, already shaped for its provider: 1Password
-/// stores a credential (`latch-config account add`), env-file just names a
-/// source (`latch-config source add --provider env-file`). Keeping this a
+/// stores a credential (`sigil-config account add`), env-file just names a
+/// source (`sigil-config source add --provider env-file`). Keeping this a
 /// draft-per-provider enum (rather than one struct with optional fields)
 /// means a new provider's add flow cannot forget to handle its own fields.
 enum AccountDraft: Sendable {

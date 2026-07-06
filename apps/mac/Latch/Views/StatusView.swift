@@ -1,5 +1,5 @@
 //  StatusView.swift
-//  `latch doctor` / status as a native panel: daemon up, shim on PATH + drift,
+//  `sigil doctor` / status as a native panel: daemon up, shim on PATH + drift,
 //  op present, accounts, the resolved factor, relay reachability. Fix-it buttons,
 //  not error codes.
 
@@ -47,7 +47,7 @@ struct StatusView: View {
                     StatusRow(ok: s.daemonUp, warn: false, label: "daemon",
                               value: s.daemonUp ? s.socketPath : "socket not listening", mono: true,
                               fixTitle: s.daemonUp ? nil : "Start",
-                              fix: s.daemonUp ? nil : { /* wired: latch start */ })
+                              fix: s.daemonUp ? nil : { /* wired: sigil start */ })
                     Divider()
                     StatusRow(ok: s.shim.kind == .healthy, warn: s.shim.kind != .healthy,
                               label: "shim", value: s.shim.issue ?? s.shim.path, mono: true,

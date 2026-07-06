@@ -1,5 +1,5 @@
 //  CLIDaemonClient.swift
-//  Drives the `latch` binary the same way a human would from a shell. Its live
+//  Drives the `sigil` binary the same way a human would from a shell. Its live
 //  role is the shell-out half of SocketDaemonClient: the CLI-only keystore/config
 //  mutations that the least-privilege split (PROTOCOL.md) keeps out of the daemon
 //  — account add/rotate/remove + list, settings, wipe, mac-approvals, shim
@@ -13,58 +13,58 @@
 //  LeaseDTO, HistoryDTO, PendingDTO) are shared by both so the wire shape is
 //  decoded in exactly one place.
 //
-//  `latch <cmd> --json` outputs (stdout, one JSON value, no ANSI). The v4
-//  rework split configuration mutation into a second binary, `latch-config`
+//  `sigil <cmd> --json` outputs (stdout, one JSON value, no ANSI). The v4
+//  rework split configuration mutation into a second binary, `sigil-config`
 //  (task #42): account/settings/mac-approvals/wipe live there now, so the
 //  runtime/pairing verbs below run against `binaryURL` (`run`) and the config
-//  verbs run against `configBinaryURL` (`runConfig`) — see `resolveLatchConfig`.
+//  verbs run against `configBinaryURL` (`runConfig`) — see `resolveSigilConfig`.
 //
-//    latch status --json
+//    sigil status --json
 //      { "daemon_up": bool, "socket": str, "shim": {"kind": "healthy|drift|not_installed|unknown",
 //        "path": str?, "issue": str?}, "op": {"found": bool, "path": str?},
 //        "accounts": int, "factor": {"kind":"phone|biometric|fail_closed","relay":str?},
 //        "relay_reachable": bool?, "relay_url": str?, "locked_down": bool }
-//    latch doctor --json   -> [ {"label": str, "ok": bool, "hint": str}, ... ]
-//    latch-config account list --json -> [ {"id":str,"label":str,"vaults":[str],
+//    sigil doctor --json   -> [ {"label": str, "ok": bool, "hint": str}, ... ]
+//    sigil-config account list --json -> [ {"id":str,"label":str,"vaults":[str],
 //        "health":"healthy|rotate|expiring","detail":str?,"last_used_ms":int?}, ... ]
-//    latch-config account add --token-stdin --label <l> --json
+//    sigil-config account add --token-stdin --label <l> --json
 //        -> {"id":str,"label":str,"vaults":[str],"health":str,"detail":str?}
-//    latch-config account rotate --id <id> --token-stdin --json -> (same account shape)
-//    latch-config account remove --id <id> --json -> {"ok":bool,"lines":[str]}
-//    latch lease list --json -> [ {"grant_hex":str,"caller":str,"account":str,
+//    sigil-config account rotate --id <id> --token-stdin --json -> (same account shape)
+//    sigil-config account remove --id <id> --json -> {"ok":bool,"lines":[str]}
+//    sigil lease list --json -> [ {"grant_hex":str,"caller":str,"account":str,
 //        "scope":str,"granted_ms":int,"expires_ms":int}, ... ]
-//    latch lease revoke <prefix> --json -> {"ok":bool,"lines":[str]}
-//    latch history --json -> [ {"id":str,"kind":str,"label":str,"account":str,
+//    sigil lease revoke <prefix> --json -> {"ok":bool,"lines":[str]}
+//    sigil history --json -> [ {"id":str,"kind":str,"label":str,"account":str,
 //        "process":str,"cwd":str,"decision":"approved|denied|expired","note":str?,
 //        "at_ms":int,"via":str}, ... ]     (NEW verb; the CLI has no `history` yet)
-//    latch pending --json -> [ ApprovalRequest-shaped, with expires_ms/timeout_ms ]
+//    sigil pending --json -> [ ApprovalRequest-shaped, with expires_ms/timeout_ms ]
 //        (NEW verb; menubar needs to enumerate what the daemon is holding)
-//    latch approve --local --id <id> [--lease] --json -> {"ok":bool,"lines":[str]}
-//    latch deny --local --id <id> --json -> {"ok":bool,"lines":[str]}
-//    latch lockdown [--clear] --json -> {"ok":bool,"lines":[str]}
-//    latch pair list --json -> {"paired": {"name":str,"sas_words":[str],
+//    sigil approve --local --id <id> [--lease] --json -> {"ok":bool,"lines":[str]}
+//    sigil deny --local --id <id> --json -> {"ok":bool,"lines":[str]}
+//    sigil lockdown [--clear] --json -> {"ok":bool,"lines":[str]}
+//    sigil pair list --json -> {"paired": {"name":str,"sas_words":[str],
 //        "relay_url":str,"paired_ms":int} | null }
-//    latch pair --relay <url> --json  (streams NDJSON ceremony events on stdout:
+//    sigil pair --relay <url> --json  (streams NDJSON ceremony events on stdout:
 //        {"event":"qr","payload_b64":str}
 //        {"event":"sas","words":[str]}
 //        {"event":"paired","name":str,"sas_words":[str],"relay_url":str,"paired_ms":int}
 //        {"event":"failed","reason":str} )   after "sas", the ceremony blocks on
 //        one line of our stdin and proceeds only if it reads "confirm" — see
 //        `confirmPairing(match:)`.
-//    latch unpair --json -> {"ok":bool,"lines":[str]}
-//    latch-config mac-approvals --enable|--phone-only --json -> {"ok":bool}
+//    sigil unpair --json -> {"ok":bool,"lines":[str]}
+//    sigil-config mac-approvals --enable|--phone-only --json -> {"ok":bool}
 //        (mints or drops the Mac Secure Enclave envelope. Pairs with the SE seam.)
-//    latch shim install --json -> {"ok":bool,"lines":[str]}
-//    latch-config settings get --json / latch-config settings set --json <patch>
-//    latch-config wipe --force --json -> {"ok":bool,"lines":[str]}
+//    sigil shim install --json -> {"ok":bool,"lines":[str]}
+//    sigil-config settings get --json / sigil-config settings set --json <patch>
+//    sigil-config wipe --force --json -> {"ok":bool,"lines":[str]}
 
 import Foundation
 
-/// Drives the `latch` binary. `binaryURL` defaults to a PATH lookup; the app can
+/// Drives the `sigil` binary. `binaryURL` defaults to a PATH lookup; the app can
 /// override it (Settings) if the user installed it somewhere non-standard.
 struct CLIDaemonClient: DaemonClient {
     var binaryURL: URL
-    /// `latch-config`, the sibling binary the v4 rework split config mutation
+    /// `sigil-config`, the sibling binary the v4 rework split config mutation
     /// into (task #42): account/settings/mac-approvals/wipe. Resolved next to
     /// `binaryURL` since the two ship together.
     var configBinaryURL: URL
@@ -75,12 +75,12 @@ struct CLIDaemonClient: DaemonClient {
     private let pairingStdin = PairingStdin()
 
     init(binaryURL: URL? = nil) {
-        let latch = binaryURL ?? CLIDaemonClient.resolveLatch()
-        self.binaryURL = latch
-        self.configBinaryURL = CLIDaemonClient.resolveLatchConfig(besideLatch: latch)
+        let sigil = binaryURL ?? CLIDaemonClient.resolveSigil()
+        self.binaryURL = sigil
+        self.configBinaryURL = CLIDaemonClient.resolveSigilConfig(besideSigil: sigil)
     }
 
-    /// Environment for every `latch` invocation. `LATCH_DEV_KEYSTORE=file` is
+    /// Environment for every `sigil` invocation. `SIGIL_DEV_KEYSTORE=file` is
     /// temporary: until the Secure Enclave DEK wrap is wired into the daemon
     /// (task #24), the real keystore dies with "secure enclave path not yet
     /// verified on hardware", so pairing and account mutations need the
@@ -90,7 +90,7 @@ struct CLIDaemonClient: DaemonClient {
     private static func env() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         env["NO_COLOR"] = "1"
-        env["LATCH_DEV_KEYSTORE"] = "file"
+        env["SIGIL_DEV_KEYSTORE"] = "file"
         return env
     }
 
@@ -98,13 +98,13 @@ struct CLIDaemonClient: DaemonClient {
 
     /// Spawn `binary <args>`, optionally feeding `stdin`, returning stdout data.
     /// Throws DaemonError on non-zero exit or spawn failure. Shared by `run`
-    /// (the `latch` binary) and `runConfig` (`latch-config`).
+    /// (the `sigil` binary) and `runConfig` (`sigil-config`).
     private func execute(_ binary: URL, _ args: [String], stdin: Data? = nil) async throws -> Data {
         try await withCheckedThrowingContinuation { cont in
             let proc = Process()
             proc.executableURL = binary
             proc.arguments = args
-            // Ensure the shim-first PATH so `latch` finds the real `op` and its
+            // Ensure the shim-first PATH so `sigil` finds the real `op` and its
             // own socket the same way an interactive shell would.
             proc.environment = Self.env()
 
@@ -144,12 +144,12 @@ struct CLIDaemonClient: DaemonClient {
         }
     }
 
-    /// Run `latch <args>` (runtime/pairing verbs).
+    /// Run `sigil <args>` (runtime/pairing verbs).
     private func run(_ args: [String], stdin: Data? = nil) async throws -> Data {
         try await execute(binaryURL, args, stdin: stdin)
     }
 
-    /// Run `latch-config <args>` (account/settings/mac-approvals/wipe — the
+    /// Run `sigil-config <args>` (account/settings/mac-approvals/wipe — the
     /// config-mutation verbs the v4 rework split into their own binary).
     private func runConfig(_ args: [String], stdin: Data? = nil) async throws -> Data {
         try await execute(configBinaryURL, args, stdin: stdin)
@@ -157,27 +157,27 @@ struct CLIDaemonClient: DaemonClient {
 
     private func decode<T: Decodable>(_ type: T.Type, _ data: Data) throws -> T {
         do { return try JSONDecoder().decode(T.self, from: data) }
-        catch { throw DaemonError.cli("could not parse `latch ... --json` output: \(error)") }
+        catch { throw DaemonError.cli("could not parse `sigil ... --json` output: \(error)") }
     }
 
-    static func resolveLatch() -> URL {
-        for candidate in ["\(NSHomeDirectory())/.latch/bin/latch",
-                          "/usr/local/bin/latch", "/opt/homebrew/bin/latch"] {
+    static func resolveSigil() -> URL {
+        for candidate in ["\(NSHomeDirectory())/.sigil/bin/sigil",
+                          "/usr/local/bin/sigil", "/opt/homebrew/bin/sigil"] {
             if FileManager.default.isExecutableFile(atPath: candidate) {
                 return URL(fileURLWithPath: candidate)
             }
         }
-        return URL(fileURLWithPath: "/usr/local/bin/latch")
+        return URL(fileURLWithPath: "/usr/local/bin/sigil")
     }
 
-    /// `latch-config` ships next to `latch`, so try that sibling first; fall
-    /// back to the same candidate locations `resolveLatch` checks, in case the
+    /// `sigil-config` ships next to `sigil`, so try that sibling first; fall
+    /// back to the same candidate locations `resolveSigil` checks, in case the
     /// two were installed separately.
-    static func resolveLatchConfig(besideLatch latch: URL) -> URL {
-        let sibling = latch.deletingLastPathComponent().appendingPathComponent("latch-config")
+    static func resolveSigilConfig(besideSigil sigil: URL) -> URL {
+        let sibling = sigil.deletingLastPathComponent().appendingPathComponent("sigil-config")
         if FileManager.default.isExecutableFile(atPath: sibling.path) { return sibling }
-        for candidate in ["\(NSHomeDirectory())/.latch/bin/latch-config",
-                          "/usr/local/bin/latch-config", "/opt/homebrew/bin/latch-config"] {
+        for candidate in ["\(NSHomeDirectory())/.sigil/bin/sigil-config",
+                          "/usr/local/bin/sigil-config", "/opt/homebrew/bin/sigil-config"] {
             if FileManager.default.isExecutableFile(atPath: candidate) {
                 return URL(fileURLWithPath: candidate)
             }
@@ -197,7 +197,7 @@ struct CLIDaemonClient: DaemonClient {
         return dto.map { DoctorCheck(label: $0.label, ok: $0.ok, hint: $0.hint) }
     }
 
-    /// The 1Password accounts (a distinct on-disk store latch-config owns)
+    /// The 1Password accounts (a distinct on-disk store sigil-config owns)
     /// plus every configured env-file source (one entry in the generic
     /// source list), merged into the one provider-blind list the UI shows.
     func accounts() async throws -> [Account] {
@@ -352,7 +352,7 @@ struct CLIDaemonClient: DaemonClient {
 
     // `--force` here is not a missing confirmation step: SettingsView's own
     // confirmationDialog is the human gate, so by the time this call happens
-    // the human already said yes. Without it latch-config just refuses (exit
+    // the human already said yes. Without it sigil-config just refuses (exit
     // 1, "refusing to wipe without --force") and this would surface as a
     // thrown error instead of the wipe actually happening.
     func wipe() async throws -> ControlResult { try controlResult(await runConfig(["wipe", "--force", "--json"])) }
@@ -430,7 +430,7 @@ private struct AccountDTO: Decodable {
     }
 }
 
-/// `latch-config source list --json`: the generic source shape
+/// `sigil-config source list --json`: the generic source shape
 /// (crates/latch/src/config.rs `Source`). Only the env-file entries turn into
 /// an `Account` here; 1Password sources are the separate credential store
 /// decoded by `AccountDTO` above, so a `provider: "1password"` source (if one
