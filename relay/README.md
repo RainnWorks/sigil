@@ -46,6 +46,16 @@ the APNs doorbell**, using one Rainnworks-held key shared by every mailbox
 (`shared/push.ts`, ported from what used to be the daemon's
 `crates/latch/src/apns.rs`). The daemon carries zero Apple secret.
 
+**v5 (this build)** replaces v4's instant-return GET with long-poll: an empty
+slot holds the request open instead of returning `{"envelopes":[]}` right
+away, so a caller finds out about a new deposit the moment it happens instead
+of on its next poll tick. This is not a return to v3's mistake: nothing is
+held for an *idle* party. A long-poll is held only by whichever side is
+actively waiting on a live operation (a pending approval, a pairing in
+progress), for at most `LONG_POLL_MS` (~25s), and only one at a time per
+slot. See "Long-poll" below for the wire and a real, bounded residual found
+and only partly closed while building this.
+
 ## Trust-model note (relaxation, not a verdict)
 
 This is a real change to what the relay is trusted with, and it is recorded
@@ -104,12 +114,45 @@ way — the relay can't tell which, and doesn't need to.
 |-------|---------|------------------|
 | `GET /health` | Liveness. No mailbox needed. | `{"ok":true,"service":"latch-relay"}` |
 | `POST /mailbox/{id}/to-phone` | Daemon deposits an envelope for the phone. | Body `{"env":"<opaque>","pushToken":"<hex>","platform":"apns"}`. `pushToken`/`platform` are optional; if `pushToken` is present the relay rings the doorbell for it and forgets it immediately. Response `{"ok":true}`. |
-| `GET /mailbox/{id}/to-phone` | Phone drains what's waiting for it. Drain-on-read. | `{"envelopes":["<opaque>",...]}` |
+| `GET /mailbox/{id}/to-phone` | Phone waits for the next envelope. Long-poll, drain-on-read. | `{"envelopes":["<opaque>",...]}` — immediately if something's already queued, otherwise held until a matching deposit or ~`LONG_POLL_MS` elapses (then `[]`). |
 | `POST /mailbox/{id}/to-daemon` | Phone deposits an envelope for the daemon. | Body `{"env":"<opaque>"}`. Response `{"ok":true}`. |
-| `GET /mailbox/{id}/to-daemon` | Daemon drains what's waiting for it. Drain-on-read. | `{"envelopes":["<opaque>",...]}` |
+| `GET /mailbox/{id}/to-daemon` | Daemon waits for the next envelope. Long-poll, drain-on-read. | Same long-poll shape as `to-phone`. |
 
 Status codes: `400` bad mailbox id or a body missing `env`, `413` envelope too
 large, `429` rate limited, `507` queue full, `404` unknown route.
+
+### Long-poll
+
+A GET with nothing queued holds the request open (see `longPoll`/`wake` in
+`shared/protocol.ts`) instead of returning empty immediately. A matching
+`POST` wakes it right away; failing that, it resolves to `{"envelopes":[]}`
+after `LONG_POLL_MS`. At most one live long-poll is tracked per slot: a new
+GET on the same slot evicts (resolves empty) any waiter already registered
+there before registering itself.
+
+That eviction rule exists because of a real gap found and confirmed against
+a real local Workers runtime (`wrangler dev`, not just the simulated test
+pool): an incoming request's `AbortSignal` does **not** reliably fire when a
+long-poll GET is forwarded through a Durable Object. A client whose
+connection drops mid-poll can leave an orphaned waiter behind with nobody
+left to hear from it. Without eviction, `wake` could hand the next deposit to
+that orphan and the data would be gone, not merely delayed. Eviction closes
+this for the common case — disconnect, then reconnect with a fresh long-poll,
+*then* the next deposit arrives — since the reconnect supersedes the orphan
+before anything is deposited.
+
+**It does not close every case.** If a deposit lands in the narrow window
+after a disconnect but *before* the reconnect's long-poll re-attaches, that
+deposit is still handed to the (already-abandoned) orphan and is genuinely
+lost for that one delivery, not merely delayed — confirmed by direct testing
+against `wrangler dev` (see the module comment above `longPoll` in
+`shared/protocol.ts` for the exact mechanism). This is bounded (one lost
+delivery per unlucky disconnect, never a permanent stall) and something
+client-side retry/resend should account for regardless of anything this
+relay does, but it is a real residual, not a hypothetical one, and it has not
+been verified whether Cloudflare's actual edge network handles incoming
+`AbortSignal` differently from local `wrangler dev` — that would either
+close this residual entirely or confirm it holds in production too.
 
 ### Limits (in `shared/protocol.ts`)
 
@@ -119,7 +162,8 @@ large, `429` rate limited, `507` queue full, `404` unknown route.
 | `MAX_QUEUE` | 32 | Bounded FIFO depth per direction. Overflow is rejected (`507`), never silently dropped. |
 | `MAX_ENVELOPE_BYTES` | 16 384 | Size cap on `env` itself. Larger is rejected (`413`). |
 | `MAX_BODY_BYTES` | `MAX_ENVELOPE_BYTES` + 4096 | Coarse pre-read guard on the whole request body (generous slack for the JSON wrapper); the authoritative per-envelope cap is `MAX_ENVELOPE_BYTES` on `env`. |
-| `RATE_MAX` / `RATE_WINDOW_MS` | 120 / 60 000 | Per-mailbox fixed-window limiter over ordinary deposits/drains. Held only in the mailbox's in-memory record; never persisted. Over is `429`. |
+| `LONG_POLL_MS` | 25 000 | How long a GET holds an empty slot open before resolving to `[]`. See "Long-poll" above. |
+| `RATE_MAX` / `RATE_WINDOW_MS` | 60 / 60 000 | Per-mailbox fixed-window limiter over ordinary deposits/drains. Held only in the mailbox's in-memory record; never persisted. Sized for long-poll: each side holds at most one outstanding GET per slot and re-issues only after it resolves, so a two-sided active exchange is a couple of requests a minute per direction, with real headroom over that. Over is `429`. |
 | `PUSH_MAX` / `PUSH_WINDOW_MS` | 5 / 60 000 | A separate, tighter per-mailbox cap on push dispatches, so a leaked push token can't turn a mailbox into a doorbell-spam amplifier. **Residual**: this is per-mailbox, not per-token, so the same leaked token deposited against different mailbox ids is rate-limited independently for each; a push over this cap is silently skipped (the deposit still succeeds and 200s). |
 
 All of it — the mailbox's two queues, its rate counters, its push counter —
@@ -227,12 +271,29 @@ promises not to retain beyond its own short-lived buffer.
 
 ```sh
 npm test            # vitest-pool-workers, test/worker.test.ts
-npm run test:bun     # bun test, bun/server.test.ts + shared/push.test.ts
+npm run test:bun     # bun test: bun/server.test.ts, shared/push.test.ts, shared/protocol.test.ts
 ```
+
+Both integration suites run against a `LONG_POLL_MS` shrunk to 150ms (a spawn
+env var for Bun, a `miniflare.bindings` override in `vitest.config.ts` for the
+Worker suite), so a held GET that legitimately times out still resolves in
+well under a second instead of the real ~25s.
 
 Covered and passing locally:
 
 - **Deposit and drain**, both directions, drain-on-read, independent queues.
+- **Long-poll** — a GET on an empty slot holds and resolves the moment a
+  matching deposit lands, well before its timeout; with nothing deposited, it
+  times out to `[]`.
+- **Disconnect cleanup** — an aborted GET's waiter is removed immediately
+  (both suites); a later deposit against the same mailbox still lands
+  normally afterward, proving the mailbox isn't corrupted by an abandoned
+  long-poll.
+- **Long-poll unit tests** (`shared/protocol.test.ts`, pure logic, no server):
+  immediate/wake/timeout paths, `wake()` on an empty waiter list is a no-op,
+  a second long-poll on the same slot evicts the first (resolving it empty),
+  and the eviction specifically closes the disconnect-then-reconnect
+  ordering so a deposit reaches the live waiter instead of an orphan.
 - **Opacity** — adversarial non-JSON bytes round-trip byte-identically inside
   `env`.
 - **Bounds** — an oversized envelope is `413`; the 33rd deposit past
@@ -246,6 +307,16 @@ Covered and passing locally:
   the fixed doorbell body is identical across calls regardless of input;
   Apple rejecting a push never throws; `platform: "fcm"` and a missing key
   both make zero network calls.
+
+Verified by hand against a real local Workers runtime (`wrangler dev`, not
+just the simulated test pool), because this is exactly where the disconnect
+residual above was found: a held GET, killed client-side with a real
+`AbortController` over a real HTTP connection, followed by a deposit and then
+a fresh reconnect, delivers correctly (confirmed woken in ~500ms, not the
+full 25s) — and the same sequence with the deposit landing *before* the
+reconnect reproduces the known residual (confirmed still pending after 5s of
+a 25s window). Both outcomes match what the eviction logic in `longPoll`
+predicts; see the comment above it in `shared/protocol.ts`.
 
 **NEEDS VERIFICATION** (needs a live Cloudflare account, a real APNs key,
 on-device clients, or a working local Docker engine):

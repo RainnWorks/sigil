@@ -6,6 +6,8 @@
 // this one process; nothing is ever written to disk, so a restart just drops
 // every mailbox. That's fine: envelopes are meant to be short-lived, and the
 // side that deposited one still has its own copy if a retry is needed.
+// GETs are long-poll (see ../shared/protocol's longPoll/wake): held open on an
+// empty slot until a matching POST wakes them, or ~LONG_POLL_MS elapses.
 // Run: `bun run relay/bun/server.ts` (PORT defaults to 8787).
 
 import { readFileSync } from "node:fs";
@@ -43,6 +45,10 @@ function resolveApnsKey(): string | undefined {
 }
 const APNS_KEY_P8 = resolveApnsKey();
 
+// Overridable only so the integration suite can shrink the long-poll window;
+// production should leave this unset and get shared/protocol's LONG_POLL_MS.
+const LONG_POLL_MS = Number(process.env.LONG_POLL_MS) || P.LONG_POLL_MS;
+
 const port = Number(process.env.PORT ?? 8787);
 
 const server = Bun.serve({
@@ -59,7 +65,8 @@ const server = Bun.serve({
     if (!P.rateOk(m, now())) return json(P.RESP.err("rate_limited"), 429);
 
     if (verb === "to-phone" && req.method === "GET") {
-      return json(P.RESP.envelopes(P.drain(m.toPhone, now())));
+      const envelopes = await P.longPoll(m.toPhone, m.toPhoneWaiters, now(), LONG_POLL_MS, req.signal);
+      return json(P.RESP.envelopes(envelopes));
     }
 
     if (verb === "to-phone" && req.method === "POST") {
@@ -70,6 +77,7 @@ const server = Bun.serve({
       if (!body) return json(P.RESP.err("bad_body"), 400);
       const r = P.enqueue(m.toPhone, body.env, now());
       if (!r.ok) return json(P.RESP.err(r.code === 413 ? "too_large" : "queue_full"), r.code);
+      P.wake(m.toPhone, m.toPhoneWaiters, now());
       if (body.pushToken && P.pushOk(m, now())) {
         void sendPush(
           { token: body.pushToken, platform: body.platform, keyPem: APNS_KEY_P8 },
@@ -80,7 +88,8 @@ const server = Bun.serve({
     }
 
     if (verb === "to-daemon" && req.method === "GET") {
-      return json(P.RESP.envelopes(P.drain(m.toDaemon, now())));
+      const envelopes = await P.longPoll(m.toDaemon, m.toDaemonWaiters, now(), LONG_POLL_MS, req.signal);
+      return json(P.RESP.envelopes(envelopes));
     }
 
     if (verb === "to-daemon" && req.method === "POST") {
@@ -91,6 +100,7 @@ const server = Bun.serve({
       if (env === null) return json(P.RESP.err("bad_body"), 400);
       const r = P.enqueue(m.toDaemon, env, now());
       if (!r.ok) return json(P.RESP.err(r.code === 413 ? "too_large" : "queue_full"), r.code);
+      P.wake(m.toDaemon, m.toDaemonWaiters, now());
       return json(P.RESP.deposited());
     }
 
@@ -98,14 +108,23 @@ const server = Bun.serve({
   },
 });
 
-// Proactive TTL sweep, and drop mailboxes that are empty so the Map stays
-// bounded. Correctness never depends on this: expired items are also filtered
-// lazily on every access.
+// Proactive TTL sweep, and drop mailboxes that are both empty and unwatched
+// so the Map stays bounded. Never drop one with a live long-poll waiter: its
+// queue is legitimately empty (that's the whole point of the wait), and
+// deleting the entry here would orphan that waiter from the Mailbox object a
+// concurrent deposit's `box(id)` would recreate, silently losing the wake.
+// Correctness never depends on this sweep otherwise: expired items are also
+// filtered lazily on every access.
 setInterval(() => {
   const t = now();
   for (const [id, m] of boxes) {
     P.evictExpired(m, t);
-    if (!m.toPhone.length && !m.toDaemon.length) boxes.delete(id);
+    const idle =
+      !m.toPhone.length &&
+      !m.toDaemon.length &&
+      !m.toPhoneWaiters.length &&
+      !m.toDaemonWaiters.length;
+    if (idle) boxes.delete(id);
   }
 }, P.TTL_MS).unref();
 

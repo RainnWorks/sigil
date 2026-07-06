@@ -17,6 +17,30 @@
 // the phone may also carry a push token, which the relay reads once to ring a
 // content-free APNs doorbell (see ../shared/push) and then forgets; it is
 // never part of the buffered item and never stored.
+//
+// v5: GET .../to-phone and .../to-daemon are long-poll, not instant-return.
+// An empty slot holds the request open (see {@link longPoll}) until a
+// matching deposit wakes it (see {@link wake}) or ~LONG_POLL_MS elapses. This
+// is not the v3 held-socket mistake: nothing is held for an idle party. A
+// long-poll is held only by whichever side is actively waiting on a live
+// operation (a pending approval, a pairing in progress), for seconds, not for
+// as long as the app is open. Idle daemon/phone hold nothing open at all.
+//
+// Known residual, confirmed against a real local Workers runtime (not just a
+// simulated test double): an incoming Request's `signal` does not reliably
+// fire when a long-poll GET is forwarded through a Durable Object, so a
+// client that disconnects mid-poll can leave an orphaned waiter behind that
+// nobody will ever hear from. `longPoll` evicts any such stale waiter the
+// moment the same slot's next long-poll re-attaches, so wake() can never hand
+// a deposit to a waiter that's already been superseded. The gap this does
+// NOT close: a deposit landing in the narrow window after the disconnect but
+// before the reconnect's long-poll re-attaches is still handed to the
+// (already-abandoned) orphan and is genuinely lost, not merely delayed, for
+// that one delivery. Bounded, rare (requires unlucky timing on top of an
+// actual disconnect), and something client-side retry/resend should account
+// for regardless of this relay's behavior; flagged here rather than silently
+// assumed away. Confirm on a real Cloudflare deploy whether the edge network
+// behaves differently from local wrangler dev before treating it as closed.
 
 /** Envelope time-to-live, ms. Short: this only has to outlive the gap between
  * a deposit and the other side's next poll, not a real offline window.
@@ -34,14 +58,17 @@ export const MAX_ENVELOPE_BYTES = 16_384;
  * a coarse pre-read guard against an oversized body; the authoritative
  * per-envelope cap is enforced on `env` itself by {@link enqueue}. */
 export const MAX_BODY_BYTES = MAX_ENVELOPE_BYTES + 4_096;
+/** How long a long-poll GET holds an empty slot open before returning an
+ * empty result. Clients read with a comfortably longer timeout than this. */
+export const LONG_POLL_MS = 25_000;
 /** Per-mailbox operations allowed per {@link RATE_WINDOW_MS}. Held only in the
  * mailbox's in-memory record; never persisted. Non-load-bearing anti-abuse.
- * Sized for the current poll cadence: the daemon polls at ~2s, and the phone's
- * pairing rendezvous at ~400ms (~150/min), so a two-sided active pairing is
- * ~180/min; 300 leaves headroom. The long-poll rework (#44) makes the relay
- * event-driven (one held GET per message), after which this drops to a low
- * floor. */
-export const RATE_MAX = 300;
+ * Long-poll GETs are event-driven now, not a 2s/400ms hammer: each side holds
+ * at most one outstanding GET per slot and re-issues it only after it
+ * resolves, so a two-sided active exchange is on the order of a couple of
+ * requests a minute per direction. 60 is a low floor with real headroom over
+ * that, not a tuned ceiling against a poll cadence. */
+export const RATE_MAX = 60;
 export const RATE_WINDOW_MS = 60_000;
 /** A separate, tighter cap on pushes specifically, so a leaked push token
  * can't turn a mailbox into a doorbell-spam amplifier. Residual: this is
@@ -54,11 +81,20 @@ export const MAILBOX_ID = /^[0-9a-f]{64}$/;
 
 export type Item = { blob: string; exp: number };
 
+/** A pending long-poll GET's resolver, called at most once with whatever was
+ * just drained for it. Held on the {@link Mailbox} itself so both variants
+ * share one shape; nothing here is I/O, it's a plain callback. */
+export type Waiter = (blobs: string[]) => void;
+
 export type Mailbox = {
   /** daemon -> phone; drained by GET .../to-phone. */
   toPhone: Item[];
   /** phone -> daemon; drained by GET .../to-daemon. */
   toDaemon: Item[];
+  /** GETs on .../to-phone currently long-polling an empty toPhone. */
+  toPhoneWaiters: Waiter[];
+  /** GETs on .../to-daemon currently long-polling an empty toDaemon. */
+  toDaemonWaiters: Waiter[];
   rateCount: number;
   rateStart: number;
   pushCount: number;
@@ -66,7 +102,16 @@ export type Mailbox = {
 };
 
 export function newMailbox(): Mailbox {
-  return { toPhone: [], toDaemon: [], rateCount: 0, rateStart: 0, pushCount: 0, pushStart: 0 };
+  return {
+    toPhone: [],
+    toDaemon: [],
+    toPhoneWaiters: [],
+    toDaemonWaiters: [],
+    rateCount: 0,
+    rateStart: 0,
+    pushCount: 0,
+    pushStart: 0,
+  };
 }
 
 export function validId(id: string | undefined): boolean {
@@ -132,6 +177,90 @@ export function drain(list: Item[], now: number): string[] {
   const out = live(list, now).map((i) => i.blob);
   list.length = 0;
   return out;
+}
+
+/**
+ * Long-poll one slot: if it already has data, resolve immediately (drained,
+ * same as the old instant-return GET). Otherwise register a waiter and hold
+ * the returned promise open until either {@link wake} resolves it with a
+ * fresh deposit, `signal` aborts (the client disconnected; the waiter is
+ * cleaned up the same as on a real resolve, nobody is left to read the
+ * result), or `timeoutMs` elapses, whichever comes first — at which point it
+ * resolves with one last drain (ordinarily `[]`, but never presumed to be:
+ * see the comment on the timeout branch below).
+ *
+ * `timeoutMs` defaults to {@link LONG_POLL_MS} and exists as a parameter
+ * purely so tests can shrink it; production callers should not pass it.
+ */
+export function longPoll(
+  list: Item[],
+  waiters: Waiter[],
+  now: number,
+  timeoutMs: number = LONG_POLL_MS,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const immediate = drain(list, now);
+  if (immediate.length > 0) return Promise.resolve(immediate);
+
+  // At most one live long-poll per slot: a new GET supersedes whatever was
+  // already registered here, resolving it empty. This is the fix for a real,
+  // confirmed gap: an incoming Request's `signal` does not reliably fire when
+  // this fetch is forwarded through a Durable Object (verified against a real
+  // local Workers runtime, not just a simulated one) — a client that
+  // disconnects mid-poll can leave its waiter registered with nobody left to
+  // hear from it. Without eviction, `wake` could hand a deposit to that
+  // orphaned waiter and the data would be gone, not merely delayed, by the
+  // time the reconnect's long-poll registers behind it. This closes that gap
+  // for the disconnect-then-reconnect ordering. It does not close the
+  // narrower one where a deposit lands in the gap before the reconnect's
+  // long-poll re-attaches at all: see the residual note in the module header.
+  for (const evicted of waiters.splice(0)) evicted([]);
+
+  return new Promise<string[]>((resolve) => {
+    let settled = false;
+    const cleanup = () => {
+      const idx = waiters.indexOf(waiter);
+      if (idx >= 0) waiters.splice(idx, 1);
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const waiter: Waiter = (blobs) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(blobs);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve([]); // a disconnected client will never read this; harmless
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      // {@link wake} always drains before calling a waiter, so in the normal
+      // case nothing is left here; this final drain only matters for the
+      // vanishingly unlikely case of a deposit landing in the same tick the
+      // timer fires, after this waiter already left the array.
+      resolve(drain(list, Date.now()));
+    }, timeoutMs);
+    waiters.push(waiter);
+    signal?.addEventListener("abort", onAbort);
+  });
+}
+
+/**
+ * Wake the oldest pending long-poll waiter for a slot, if any, handing it
+ * everything now queued (drained). Call this right after a successful
+ * {@link enqueue} on the same list. A no-op if nothing is waiting: the item
+ * just sits in the queue for the next GET, long-poll or not, to pick up.
+ */
+export function wake(list: Item[], waiters: Waiter[], now: number): void {
+  if (waiters.length === 0) return;
+  const waiter = waiters.shift()!;
+  waiter(drain(list, now));
 }
 
 /** JSON response bodies, shared so both variants emit identical bytes. */

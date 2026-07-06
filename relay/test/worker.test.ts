@@ -27,14 +27,50 @@ describe("routing and health", () => {
 });
 
 describe("deposit and drain", () => {
-  it("to-phone: deposit then drain, then empty on a second read", async () => {
+  it("to-phone: deposit then drain, then a held GET times out empty", async () => {
     const id = mailboxId();
     const env = '{"pairing_id":[1,2,3],"ciphertext":[9,9,9]}';
     const r = await toPhone(id, { env });
     expect(r.status).toBe(200);
     expect(await r.json()).toEqual({ ok: true });
     expect(await (await SELF.fetch(mbox(id, "to-phone"))).json()).toEqual({ envelopes: [env] });
+    // Nothing queued now: this GET long-polls and times out to empty rather
+    // than returning instantly, hence the tiny LONG_POLL_MS test binding.
     expect(await (await SELF.fetch(mbox(id, "to-phone"))).json()).toEqual({ envelopes: [] });
+  });
+
+  it("a long-poll GET resolves as soon as a deposit arrives, well before its timeout", async () => {
+    const id = mailboxId();
+    const started = Date.now();
+    const held = SELF.fetch(mbox(id, "to-phone")); // nothing queued yet: this holds
+    await new Promise((r) => setTimeout(r, 30)); // well inside the hold
+    await toPhone(id, { env: "woke-it-up" });
+    const body = await (await held).json();
+    const elapsed = Date.now() - started;
+    expect(body).toEqual({ envelopes: ["woke-it-up"] });
+    expect(elapsed).toBeLessThan(150); // woken, not timed out (matches the test LONG_POLL_MS)
+  });
+
+  it("a disconnected long-poll GET does not leak: a later deposit still lands normally", async () => {
+    const id = mailboxId();
+    const ctrl = new AbortController();
+    const held = SELF.fetch(mbox(id, "to-phone"), { signal: ctrl.signal });
+    await new Promise((r) => setTimeout(r, 10));
+    ctrl.abort();
+    await expect(held).rejects.toThrow(); // the client's own fetch is cancelled
+
+    // The DO-side waiter must have been cleaned up by the abort, not left
+    // registered forever; a fresh GET after this behaves like any other
+    // empty-slot long-poll (times out empty here, since nothing is queued).
+    const after = await (await SELF.fetch(mbox(id, "to-phone"))).json();
+    expect(after).toEqual({ envelopes: [] });
+
+    // And a real deposit afterward still drains normally: the mailbox was
+    // never corrupted by the earlier disconnect.
+    await toPhone(id, { env: "still-works" });
+    expect(await (await SELF.fetch(mbox(id, "to-phone"))).json()).toEqual({
+      envelopes: ["still-works"],
+    });
   });
 
   it("to-daemon: deposit then drain, symmetric with to-phone", async () => {
@@ -109,8 +145,11 @@ describe("bounds and limits", () => {
     const id = mailboxId();
     let sawLimit = false;
     for (let i = 0; i < P.RATE_MAX + 5; i++) {
-      const r = await SELF.fetch(mbox(id, "to-phone"));
-      if (r.status === 429) {
+      // A malformed deposit (missing env) still counts against the mailbox's
+      // rate limit, which is checked before the body is even parsed, without
+      // enqueueing anything or long-polling - so this floods fast regardless
+      // of MAX_QUEUE or LONG_POLL_MS.
+      if ((await toPhone(id, {})).status === 429) {
         sawLimit = true;
         break;
       }

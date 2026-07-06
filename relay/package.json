@@ -9,7 +9,7 @@
     "deploy": "wrangler deploy",
     "start:bun": "bun run bun/server.ts",
     "test": "vitest run",
-    "test:bun": "bun test bun/server.test.ts shared/push.test.ts",
+    "test:bun": "bun test bun/server.test.ts shared/push.test.ts shared/protocol.test.ts",
     "typecheck": "tsc --noEmit",
     "typecheck:bun": "tsc -p bun/tsconfig.json"
   },

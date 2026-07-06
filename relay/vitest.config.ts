@@ -15,6 +15,11 @@ export default defineWorkersConfig({
         // the several requests one test makes against the same mailbox id.
         isolatedStorage: false,
         wrangler: { configPath: "./wrangler.jsonc" },
+        // Overrides production's wrangler.jsonc (which sets no LONG_POLL_MS
+        // at all, so it falls back to shared/protocol's real ~25s) with a
+        // tiny value just for this suite, so a long-poll GET on an empty
+        // slot times out in milliseconds instead of seconds.
+        miniflare: { bindings: { LONG_POLL_MS: "150" } },
       },
     },
   },
