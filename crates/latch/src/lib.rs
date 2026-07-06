@@ -6,11 +6,11 @@
 //! and leases. They are `pub` so the trait surfaces and their unit tests are
 //! part of the crate's public API rather than dead code in a binary.
 
-// NOTE: `src/apns.rs` is intentionally NOT a module. In the v4 deployment the
-// RELAY (publisher-operated) holds the APNs key and sends the push, so the daemon
-// signs nothing and carries zero Apple secret. The file is kept out of the build
-// as a reference for porting its ES256 provider-JWT logic to the relay (TS), and
-// is deleted once that lift lands.
+// NOTE: there is no `apns` module. In the v4 deployment the RELAY
+// (publisher-operated) holds the APNs key and sends the push, so the daemon signs
+// nothing and carries zero Apple secret; it merely forwards the phone's push token
+// to the relay per deposit (see `remote::RemoteApprover::push_hint`). The ES256
+// provider-JWT signing now lives on the relay (`relay/shared/push.ts`).
 pub mod approve;
 pub mod audit;
 pub mod cli;
