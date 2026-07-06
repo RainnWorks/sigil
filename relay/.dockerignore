@@ -1,0 +1,25 @@
+# Keep the self-host image lean and dev-only files out of it entirely.
+# The Dockerfile only ever COPYs package.json, package-lock.json, bun/, and
+# shared/; everything below is excluded from the build context so those
+# COPY instructions can't pick it up even by accident.
+node_modules
+.wrangler
+dist
+*.log
+
+# Cloudflare Worker variant: not part of the Bun image.
+src
+wrangler.jsonc
+
+# Tests and tooling: not needed at runtime.
+test
+**/*.test.ts
+tsconfig.json
+bun/tsconfig.json
+vitest.config.ts
+
+# Docs and VCS.
+README.md
+DEPLOY.md
+.gitignore
+.git

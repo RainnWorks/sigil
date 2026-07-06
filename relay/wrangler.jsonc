@@ -19,4 +19,11 @@
   // not a var: set it with `wrangler secret put APNS_KEY_P8`, never committed
   // here. Absent, the push doorbell is disabled and every deposit still
   // succeeds, relying on the phone's poll backstop. See shared/push.ts.
+  //
+  // Without a route, `wrangler deploy` publishes to the default
+  // latch-relay.<subdomain>.workers.dev. To serve this from your own domain
+  // instead (the domain must already be a zone in the same Cloudflare
+  // account), add a routes block, e.g.:
+  // "routes": [{ "pattern": "relay.rainn.works", "custom_domain": true }]
+  // See DEPLOY.md for the full runbook.
 }

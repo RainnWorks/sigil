@@ -9,5 +9,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["server.ts", "server.test.ts", "../shared"]
+  "include": ["server.ts", "server.test.ts", "healthcheck.ts", "../shared"]
 }

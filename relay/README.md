@@ -148,17 +148,71 @@ and every deposit still succeeds.
 
 ## Deploy
 
-Cloudflare (the publisher's shared instance):
+Two independent ways to run this relay, kept behaviorally identical by
+`shared/protocol.ts` and `shared/push.ts`: the publisher's shared Cloudflare
+instance, or self-hosting it yourself with Docker (or plain Bun). Pick either;
+nothing about the wire or the trust model differs between them.
+
+### Cloudflare (the publisher's shared instance)
+
+Full runbook, including the exact command sequence, custom-domain setup, and
+how to verify a real deploy, is in **`DEPLOY.md`**. Short version:
 
 ```sh
 cd relay
 npm install
 npx wrangler secret put APNS_KEY_P8   # paste the .p8 PEM text
-npx wrangler deploy                    # NEEDS VERIFICATION: requires a Cloudflare account
+npx wrangler deploy
 ```
 
-Self-host with Bun (no Cloudflare, no account; the doorbell needs your own
-APNs key, or just runs without one):
+### Self-host with Docker (the Bun variant)
+
+```sh
+cd relay
+docker compose up --build
+curl http://localhost:8787/health
+```
+
+or without compose:
+
+```sh
+cd relay
+docker build -t latch-relay .
+docker run --rm -p 8787:8787 latch-relay
+```
+
+**Environment variables** (all optional; the relay runs with none of them set,
+just without the push doorbell):
+
+| Variable | Meaning |
+|----------|---------|
+| `PORT` | Listen port. Defaults to `8787`. |
+| `APNS_KEY_P8` | The APNs `.p8` PEM text directly. Simplest, but the value then shows up in `docker inspect` and the container's process environment; avoid on a shared or multi-tenant host. |
+| `APNS_KEY_P8_PATH` | A path to the `.p8` file instead, meant to be a read-only mount (see below). Preferred over `APNS_KEY_P8` for anything beyond a quick local test. |
+
+**Mounting the key.** Never bake the `.p8` into the image; it must always be
+injected at container start, and it is never part of the built image's
+layers. With `docker-compose.yml`, put the file next to it (keep it out of
+git: it is not part of this repo) and uncomment the `APNS_KEY_P8_PATH`
+environment line and the matching `volumes:` bind mount. With plain
+`docker run`:
+
+```sh
+docker run --rm -p 8787:8787 \
+  -v /path/to/AuthKey.p8:/run/secrets/apns_key.p8:ro \
+  -e APNS_KEY_P8_PATH=/run/secrets/apns_key.p8 \
+  latch-relay
+```
+
+**TLS.** The container serves plain HTTP only; it does not terminate TLS
+itself, deliberately, to keep it tiny and to keep certificate management out
+of the relay's trust surface. If it is reachable from the internet, put a
+reverse proxy in front that terminates HTTPS, e.g. Caddy (automatic
+certificates via Let's Encrypt, one line of config: `relay.example.com {
+reverse_proxy localhost:8787 }`), nginx, or Cloudflare Tunnel. Never expose
+port 8787 directly to the internet over plain HTTP.
+
+Without Docker, the same image's contents run directly:
 
 ```sh
 cd relay
@@ -193,15 +247,22 @@ Covered and passing locally:
   Apple rejecting a push never throws; `platform: "fcm"` and a missing key
   both make zero network calls.
 
-**NEEDS VERIFICATION** (needs a live Cloudflare account, a real APNs key, or
-on-device clients):
+**NEEDS VERIFICATION** (needs a live Cloudflare account, a real APNs key,
+on-device clients, or a working local Docker engine):
 
 - `wrangler deploy` against a real account with a real `APNS_KEY_P8` secret,
-  and a real push landing on a real device.
+  and a real push landing on a real device. See `DEPLOY.md`.
 - End-to-end against the real daemon and phone once those land on this wire:
   that a `serde_json` `Envelope` survives the string round trip unchanged,
   that `PushRegister` correctly lands the daemon's copy of the phone's token,
   and that the phone's poll backstop covers a push that never arrives.
+- `docker build` / `docker compose up` actually producing a working
+  container: the Dockerfile and compose file were written and reviewed by
+  hand, and the server code they wrap is the same code the Bun test suite
+  above already exercises directly, but the container build itself was not
+  run in this environment (the local Docker engine was unresponsive; see the
+  session notes). Run `docker compose up --build` and `curl
+  http://localhost:8787/health` once Docker is available to close this out.
 
 ## One divergence from the invariant wording — please confirm
 
