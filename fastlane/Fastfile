@@ -1,0 +1,150 @@
+\
+require "tempfile"
+require "shellwords"
+require "fileutils"
+
+default_platform(:ios)
+
+# fastlane's own Dir.pwd is fastlane/ itself (confirmed empirically - it does
+# NOT cd up to the repo root the way some fastlane docs imply), so every path
+# below is built from this instead of assumed relative to cwd.
+ROOT = File.expand_path("..", __dir__)
+
+# ---------------------------------------------------------------------------
+# iOS: Sigil (apps/phone)
+# ---------------------------------------------------------------------------
+platform :ios do
+  desc "Build and sign the Sigil app, upload to TestFlight"
+  desc ""
+  desc "Requires (see docs/RELEASE.md for exactly where each comes from):"
+  desc "  ASC_KEY_ID, ASC_ISSUER_ID, ASC_API_KEY_P8  - App Store Connect API key (Rainnworks)"
+  desc "  IOS_TEAM_ID                                - Apple team id (53W966FBFP)"
+  lane :beta do
+    ensure_env_vars(
+      env_vars: ["ASC_KEY_ID", "ASC_ISSUER_ID", "ASC_API_KEY_P8", "IOS_TEAM_ID"]
+    )
+
+    # apps/phone/ios/ is generated (gitignored, see apps/phone/.gitignore) -
+    # Expo continuous native generation, not a committed native project. CI
+    # regenerates it from app.json before this lane ever touches Xcode; see
+    # .github/workflows/release.yml. Locally, run `bunx expo prebuild -p ios`
+    # in apps/phone/ first if ios/ is missing or stale.
+    ios_dir = File.join(ROOT, "apps/phone/ios")
+    UI.user_error!("apps/phone/ios is missing - run `bunx expo prebuild -p ios` in apps/phone/ first") unless Dir.exist?(ios_dir)
+
+    api_key = app_store_connect_api_key(
+      key_id: ENV["ASC_KEY_ID"],
+      issuer_id: ENV["ASC_ISSUER_ID"],
+      key_content: ENV["ASC_API_KEY_P8"],
+      is_key_content_base64: false,
+      in_house: false
+    )
+
+    # TestFlight requires a strictly increasing CFBundleVersion per version
+    # string. app.json carries no ios.buildNumber (Expo CNG default), so the
+    # regenerated project always starts at "1" - bump it to the CI run number,
+    # which only ever goes up for this repo.
+    build_number = ENV["GITHUB_RUN_NUMBER"] || Time.now.strftime("%Y%m%d%H%M")
+    increment_build_number(
+      xcodeproj: File.join(ios_dir, "Sigil.xcodeproj"),
+      build_number: build_number
+    )
+
+    gym(
+      workspace: File.join(ios_dir, "Sigil.xcworkspace"),
+      scheme: "Sigil",
+      configuration: "Release",
+      export_method: "app-store",
+      output_directory: File.join(ROOT, "build/ios"),
+      output_name: "Sigil.ipa",
+      clean: true,
+      xcargs: "-allowProvisioningUpdates DEVELOPMENT_TEAM=#{ENV['IOS_TEAM_ID']}"
+    )
+
+    upload_to_testflight(
+      api_key: api_key,
+      ipa: File.join(ROOT, "build/ios/Sigil.ipa"),
+      skip_waiting_for_build_processing: true,
+      skip_submission: true
+    )
+  end
+end
+
+# ---------------------------------------------------------------------------
+# macOS: Latch configurator (apps/mac)
+# ---------------------------------------------------------------------------
+platform :mac do
+  desc "Generate, build, sign, and notarize the Latch macOS app; package a DMG"
+  desc ""
+  desc "Requires (see docs/RELEASE.md):"
+  desc "  MAC_ASC_KEY_ID, MAC_ASC_ISSUER_ID, MAC_ASC_API_KEY_P8  - ASC API key for notarization"
+  desc "  MAC_TEAM_ID                                            - Apple team id signing the app"
+  desc ""
+  desc "MAC_* credentials are named separately from the iOS ASC_* ones because, until #35"
+  desc "(migrate the Mac identity Rowm LTD -> Rainnworks) lands, the two apps sign under"
+  desc "different Apple Developer teams. Once that migration ships, both can point at the"
+  desc "same key and this comment (and the duplicate secrets) should go away."
+  lane :release do
+    ensure_env_vars(
+      env_vars: ["MAC_ASC_KEY_ID", "MAC_ASC_ISSUER_ID", "MAC_ASC_API_KEY_P8", "MAC_TEAM_ID"]
+    )
+
+    mac_dir = File.join(ROOT, "apps/mac")
+    build_dir = File.join(ROOT, "build/mac")
+    FileUtils.mkdir_p(build_dir)
+
+    # Latch.xcodeproj is generated (see apps/mac/project.yml's own header) -
+    # never hand-edited, never assumed fresh in CI.
+    Dir.chdir(mac_dir) { sh("xcodegen generate") }
+
+    gym(
+      project: File.join(mac_dir, "Latch.xcodeproj"),
+      scheme: "Latch",
+      configuration: "Release",
+      export_method: "developer-id",
+      output_directory: build_dir,
+      output_name: "Latch.app",
+      skip_package_ipa: true,
+      clean: true,
+      xcargs: "-allowProvisioningUpdates DEVELOPMENT_TEAM=#{ENV['MAC_TEAM_ID']}"
+    )
+
+    app_path = File.join(build_dir, "Latch.app")
+    zip_path = File.join(build_dir, "Latch.zip")
+    dmg_path = File.join(build_dir, "Latch.dmg")
+
+    # notarytool wants a zip/dmg/pkg, not a raw .app bundle, for submission.
+    sh("ditto -c -k --keepParent #{app_path.shellescape} #{zip_path.shellescape}")
+
+    # The API key needs to be a file on disk for notarytool; write it to a
+    # tempfile that never leaves this process (no path under version control,
+    # nothing logged).
+    key_file = Tempfile.new(["asc_notarize_key", ".p8"])
+    begin
+      key_file.write(ENV["MAC_ASC_API_KEY_P8"])
+      key_file.close
+
+      sh(
+        "xcrun notarytool submit #{zip_path.shellescape} " \
+        "--key #{key_file.path.shellescape} " \
+        "--key-id #{ENV['MAC_ASC_KEY_ID'].shellescape} " \
+        "--issuer #{ENV['MAC_ASC_ISSUER_ID'].shellescape} " \
+        "--wait"
+      )
+    ensure
+      key_file.unlink
+    end
+
+    # Staple the .app itself (what Gatekeeper actually checks at launch), not
+    # the zip used only to ship it to Apple's notary service.
+    sh("xcrun stapler staple #{app_path.shellescape}")
+
+    # Package the stapled, notarized .app into the DMG that ships.
+    sh(
+      "hdiutil create -volname Latch -srcfolder #{app_path.shellescape} " \
+      "-ov -format UDZO #{dmg_path.shellescape}"
+    )
+
+    UI.success("Notarized DMG ready at #{dmg_path}")
+  end
+end

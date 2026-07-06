@@ -1,0 +1,119 @@
+name: ci
+
+# Every push and PR. No secrets required, no signing, nothing outward-facing;
+# this is the fast, always-on correctness gate. See release.yml for the
+# secret-gated build/sign/deploy pipeline that runs on a version tag.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust (test, clippy, fmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # CLAUDE.md's own gate command for crates/, run as three steps so a
+      # failure names which one broke.
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo fmt --check
+
+  house-rules-lint:
+    name: house-rules (zero em-dash, zero emoji)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/lint/house-rules.py --verbose
+
+  relay:
+    name: relay (typecheck, vitest, bun test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run typecheck:bun
+      - run: npm run test
+      - run: npm run test:bun
+
+  phone:
+    name: phone (tsc, protocol self-test + rust-vector check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+      - name: bun install
+        working-directory: apps/phone
+        run: bun install --frozen-lockfile
+      - name: tsc --noEmit
+        working-directory: apps/phone
+        run: bun run typecheck
+      - name: protocol self-test (pure JS, no rust vectors needed)
+        working-directory: apps/phone
+        run: bun run proto:selftest
+      - name: export rust test vectors
+        run: cargo run -p latch-proto --bin export-vectors
+      - name: verify JS protocol layer against the rust vectors
+        working-directory: apps/phone
+        run: bun run proto:vectors
+
+  mac-debug-build:
+    name: mac (debug build, unsigned)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: xcodegen generate
+        run: |
+          brew install xcodegen
+          cd apps/mac && xcodegen generate
+      # Exactly apps/mac/README.md's own "Build" command: unsigned, warnings
+      # are errors (SWIFT_TREAT_WARNINGS_AS_ERRORS in project.yml), so this
+      # catches a broken build or a new warning on every PR without needing
+      # any Apple credentials.
+      - run: |
+          cd apps/mac
+          xcodebuild -project Latch.xcodeproj -scheme Latch -configuration Debug \
+            -destination 'platform=macOS' build CODE_SIGNING_ALLOWED=NO
+
+  ios-debug-build:
+    name: ios (debug build, unsigned)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: bun install
+        working-directory: apps/phone
+        run: bun install --frozen-lockfile
+      # apps/phone/ios is gitignored (Expo continuous native generation, see
+      # apps/phone/.gitignore) - regenerate it here the same way release.yml
+      # does, then build unsigned to catch a broken native build on every PR.
+      - name: expo prebuild
+        working-directory: apps/phone
+        run: bunx expo prebuild -p ios
+      - name: pod install
+        working-directory: apps/phone/ios
+        run: pod install
+      - run: |
+          cd apps/phone/ios
+          xcodebuild -workspace Sigil.xcworkspace -scheme Sigil -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' build CODE_SIGNING_ALLOWED=NO

@@ -1,0 +1,6 @@
+# Pin fastlane so CI and Tom's machine run the same release tooling.
+# `bundle install` in fastlane/ (or `bundle exec fastlane ...` from the repo
+# root, since fastlane walks up looking for this Gemfile) resolves this.
+source "https://rubygems.org"
+
+gem "fastlane", "~> 2.237"
