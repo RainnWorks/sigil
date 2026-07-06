@@ -21,7 +21,7 @@ use latch_proto::TransportError;
 use crate::http::{HttpMailbox, Slot};
 
 /// Delay between empty rendezvous polls.
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
+const POLL_INTERVAL: Duration = Duration::from_millis(2000);
 
 /// A blocking client for one rendezvous mailbox, fixed to one party's direction
 /// pair (send toward the peer, receive from the peer).
