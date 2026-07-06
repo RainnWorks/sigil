@@ -36,7 +36,7 @@
 use core_foundation::base::TCFType;
 use core_foundation::data::CFData;
 use core_foundation::error::{CFError, CFErrorRef};
-use security_framework::access_control::SecAccessControl;
+use security_framework::access_control::{ProtectionMode, SecAccessControl};
 use security_framework::item::{
     ItemClass, ItemSearchOptions, KeyClass, Location, Reference, SearchResult,
 };
@@ -174,7 +174,13 @@ impl Keystore for MacKeystore {
         //    key usable for a private-key op at all; `.biometryCurrentSet`
         //    pins that to the biometrics currently enrolled, so re-enrolling
         //    Touch ID invalidates the key rather than silently widening it).
-        let access_control = SecAccessControl::create_with_flags(
+        //    `create_with_protection` (not `create_with_flags`, which passes a
+        //    NULL protection class) pins `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`,
+        //    matching every Swift counterpart (se-selftest.swift,
+        //    SecureEnclaveApprover.swift, the phone's LatchSeModule.swift) and
+        //    apps/mac/RESEARCH.md. Security-review finding (P2, docs/security-claims.md).
+        let access_control = SecAccessControl::create_with_protection(
+            Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
             kSecAccessControlPrivateKeyUsage | kSecAccessControlBiometryCurrentSet,
         )
         .map_err(|e| KeystoreError::Backend(format!("building the access control: {e}")))?;
