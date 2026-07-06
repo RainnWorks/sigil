@@ -21,6 +21,32 @@ the `op` provider plugin (`provider::OpProvider`). The core evaluates generic
 rules against an invocation and, on a match, gates then injects from a named
 source. Nothing in the rule vocabulary or the engine names `op`.
 
+## Package & binary layout (decided; split pending a contract call)
+
+One workspace package (`crates/latch`). Its `[lib]` is the shared core
+`latch_core` — the rule engine, providers, gating/daemon, keystore, transport,
+and the proxy module all live here, so both binaries call one implementation
+with zero duplication. Two thin `[[bin]]` targets in `src/bin/`:
+
+- **`latch`** — the lean hot-path + runtime binary agents and launchd invoke:
+  the `latch <cmd>` gating primitive, the transparent shim multicall, `latch
+  proxy …` (the auto-aliasing proxy), `latch run`, and the runtime verbs
+  (daemon, status, pair, lease, ssh, …). Reserved verbs in this binary: the
+  runtime set + `run` + `proxy` + `config` (hint-only, points at `latch-config`);
+  everything else is the `latch <cmd>` primitive.
+- **`latch-config`** — the configuration-management CLI the desktop shells out
+  to under the hood: `source`/`rule`/`list`/`export`/`import`, plus the
+  config-ish mutations (`account`, `settings`, `mac-approvals`, `wipe`).
+
+Open item before executing the split: it moves the desktop's invocation from
+`latch config …`/`latch account …` to `latch-config …`, an outward-facing
+contract the Mac app (`apps/mac`) depends on. Either a hard cut (update the Mac
+app) or transitional aliases in the lean binary — a decision owned with the team
+lead + mac-app, not made unilaterally here.
+
+Until the split lands the code is still one multicall `latch` binary (below);
+the skeleton above is the target both this work and the proxy work assume.
+
 ## Two CLIs, one binary
 
 The multicall `latch` binary keeps its two faces; this change sharpens the split:
