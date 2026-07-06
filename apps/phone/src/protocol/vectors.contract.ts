@@ -162,6 +162,40 @@ export interface CombinerVector {
   expectedTokenCt: string;
 }
 
+/**
+ * pairingTranscript: locks the phone's `pairingTranscript` builder and the
+ * final confirmation `tag` against crates/proto's `pairing_transcript` +
+ * `pairing_confirmation_vector` (#34) - the exact cross-language check that
+ * would have caught the camelCase `seSharePub` wire bug in CI before it ever
+ * reached a device.
+ *
+ * All inputs are the fixed values the Rust side minted for reproducibility
+ * (not fresh CSPRNG bytes); `secret` and `nonce` feed
+ * `buildPairingResponseWithNonce` (the fixed-nonce production wrapper) to
+ * get `expectedTag`, while `daemon`/`endpoints`/`createdAt`/`phone`/`nonce`/
+ * `seSharePub` feed `pairingTranscript` directly to get `expectedTranscript`.
+ * `seSharePub` is present only on the v2 case, mirroring a real v2 pairing.
+ */
+export interface PairingTranscriptVector {
+  name: string;
+  daemon: PeerHex;
+  endpoints: string[];
+  createdAt: number;
+  /** The one-time pairing secret. 32-byte hex. */
+  secret: string;
+  phone: PeerHex;
+  /** 32-byte hex. */
+  nonce: string;
+  /** v2 only: the phone's threshold share `F`, standard base64 x963. `null`
+   * (not just absent) on the v1 case - Rust's `Option::None` serializes to
+   * JSON `null`, so callers must treat both the same as "absent". */
+  seSharePub?: string | null;
+  /** Expected `pairingTranscript(...)` output. 32-byte hex. */
+  expectedTranscript: string;
+  /** Expected `buildPairingResponseWithNonce(...).tag`. 32-byte hex. */
+  expectedTag: string;
+}
+
 export interface LatchVectors {
   version: number;
   canonicalBytes: CanonicalVector[];
@@ -170,6 +204,7 @@ export interface LatchVectors {
   open: OpenVector[];
   replay: ReplayVector[];
   combiner: CombinerVector[];
+  pairingTranscript?: PairingTranscriptVector[];
 }
 
 /** Where verify-vectors.ts expects the Rust-exported file. */

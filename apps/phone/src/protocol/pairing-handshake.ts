@@ -70,8 +70,14 @@ export function rendezvousMailbox(
  * The transcript both sides bind the confirmation MAC to. Commits to every QR
  * field except the secret (the secret is the MAC key, not signed), plus the
  * phone identity and a fresh nonce. Unkeyed BLAKE2b-512 truncated to 32 bytes.
+ *
+ * Exported (only) for the shared-vector harness (verify-vectors.ts), which
+ * checks this intermediate value byte-for-byte against crates/proto's
+ * `pairing_transcript` before checking the final tag - the same cross-language
+ * lock that would have caught the camelCase `seSharePub` bug in CI. Production
+ * code never calls this directly; it goes through `buildPairingResponse(WithNonce)`.
  */
-function pairingTranscript(
+export function pairingTranscript(
   sodium: Sodium,
   daemon: PeerIdentity,
   endpoints: string[],

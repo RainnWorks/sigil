@@ -14,6 +14,7 @@ import { concatBytes, fromHex, toHex } from "./bytes";
 import { canonicalBytes, EnvelopeOpenError, open } from "./envelope";
 import { fingerprintWords, mailboxId } from "./fingerprint";
 import { pairingToQrString } from "./pairing";
+import { buildPairingResponseWithNonce, pairingTranscript } from "./pairing-handshake";
 import { ReplayGuard, ReplayRejected } from "./replay";
 import { loadSodiumForTests } from "./sodium-node";
 import { combine } from "./threshold";
@@ -129,6 +130,35 @@ async function main(): Promise<void> {
     check(toHex(k) === c.expectedK, `combiner/${c.name}/K`);
     const ct = aeadSeal(k, fromHex(c.aeadNonce), fromHex(c.token));
     check(toHex(ct) === c.expectedTokenCt, `combiner/${c.name}/tokenCt`);
+  }
+
+  for (const t of v.pairingTranscript ?? []) {
+    const daemon = peer(t.daemon);
+    const phone = peer(t.phone);
+    const nonce = fromHex(t.nonce);
+    // Rust's Option::None serializes to JSON null, not an absent key; treat
+    // both as "no seSharePub" so the v1 case doesn't absorb a null field.
+    const seSharePub = t.seSharePub ?? undefined;
+
+    const gotTranscript = pairingTranscript(
+      sodium,
+      daemon,
+      t.endpoints,
+      t.createdAt,
+      phone,
+      nonce,
+      seSharePub,
+    );
+    check(toHex(gotTranscript) === t.expectedTranscript, `pairingTranscript/${t.name}/transcript`);
+
+    const resp = buildPairingResponseWithNonce(
+      sodium,
+      { daemon, endpoints: t.endpoints, secret: fromHex(t.secret), createdAt: t.createdAt },
+      phone,
+      nonce,
+      seSharePub,
+    );
+    check(toHex(resp.tag) === t.expectedTag, `pairingTranscript/${t.name}/tag`);
   }
 
   console.log(`vectors: ${pass} passed, ${fails.length} failed`);
