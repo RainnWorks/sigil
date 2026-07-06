@@ -42,6 +42,7 @@
   .tag { color: var(--muted); font-size: 1.05rem; margin: 0 0 2.5rem; }
   p { color: #cdd3d9; margin: 0 0 1.15rem; }
   p.lead { font-size: 1.08rem; }
+  p.note { color: var(--muted); font-size: 0.95rem; }
   strong { color: var(--ink); font-weight: 600; }
   .rule { height: 1px; background: var(--line); border: 0; margin: 2.5rem 0; }
   h2 {
@@ -88,8 +89,12 @@
     memory only long enough to hand it to the other side, then it is gone.</p>
 
     <p>That is why it is safe to run wide open. <strong>No accounts, no passwords,
-    nothing to configure or trust</strong>, because there is nothing here to protect.
-    The security is in the sealing, not the server.</p>
+    nothing to configure or trust</strong> on the path your secret takes, because
+    that path holds nothing. The security is in the sealing, not the server.</p>
+
+    <p class="note">The shared instance does keep one thing: a push key, so it can
+    ring your phone's doorbell. That key can buzz you; it cannot read a secret,
+    forge an approval, or learn what you decided. Self-host, and even that is yours.</p>
 
     <hr class="rule">
 
