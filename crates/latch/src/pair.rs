@@ -370,6 +370,76 @@ mod tests {
         phone_thread.join().unwrap();
     }
 
+    /// Ordering guard for #48 (commit 13e56c2): the keystore DEK unwrap -- on a
+    /// Secure Enclave keystore, the Touch ID moment -- must fire *only after*
+    /// the SAS is confirmed, never before. A same-UID caller that can drive the
+    /// ceremony's `confirm_sas` decision to `false` (a hostile GUI, or a stdin
+    /// writer that sends anything but "confirm" on the `--json` path) must not
+    /// be able to make the ceremony reach `unwrap_dek` at all: no biometric
+    /// prompt, no sealed DEK. Counts unwrap invocations and asserts zero on the
+    /// declined path, so a future refactor that moved the unwrap back ahead of
+    /// the SAS gate (the exact bug #48 fixed) would fail here.
+    #[test]
+    fn the_dek_is_never_unwrapped_when_the_sas_is_declined() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let d2p = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        let p2d = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        let (qr_tx, qr_rx) = std::sync::mpsc::channel::<String>();
+        let phone_thread = {
+            let p2d = p2d.clone();
+            std::thread::spawn(move || {
+                let qr = qr_rx.recv().unwrap();
+                let phone_id = DeviceIdentity::generate();
+                let (_pairing, resp) =
+                    Pairing::scan(phone_id, &qr, NOW + 1_000, Policy::Approve).unwrap();
+                let resp_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&resp).unwrap());
+                p2d.lock().unwrap().push_back(resp_b64);
+            })
+        };
+        let daemon_id = DeviceIdentity::generate();
+        let mut make_channel = |_m: [u8; 32]| -> Result<Box<dyn PairChannel>> {
+            Ok(Box::new(MemChannel {
+                d2p: d2p.clone(),
+                p2d: p2d.clone(),
+            }))
+        };
+        let mut present_qr = |_u: &str, b64: &str| qr_tx.send(b64.to_string()).unwrap();
+        let mut confirm = |_w: &[&'static str; 6]| false; // the SAS did not match
+        let clock = || NOW;
+        let dek = crate::secrets::generate_dek();
+        let unwraps = AtomicUsize::new(0);
+        let mut unwrap_dek = || -> Result<crate::secrets::Dek> {
+            unwraps.fetch_add(1, Ordering::SeqCst);
+            Ok(dek.clone())
+        };
+        let opts = CeremonyOpts {
+            relay_url: "ws://relay.test".into(),
+            response_timeout: Duration::from_secs(5),
+            flush_grace: Duration::ZERO,
+            now: &clock,
+            make_channel: &mut make_channel,
+            present_qr: &mut present_qr,
+            confirm_sas: &mut confirm,
+            unwrap_dek: &mut unwrap_dek,
+        };
+        assert!(
+            run_ceremony(daemon_id, opts).is_err(),
+            "a declined SAS must fail the ceremony closed"
+        );
+        assert_eq!(
+            unwraps.load(Ordering::SeqCst),
+            0,
+            "unwrap_dek (the Touch ID moment) must never fire when the SAS is declined"
+        );
+        // Nothing was ever sealed toward the phone.
+        assert!(
+            d2p.lock().unwrap().is_empty(),
+            "no DEK envelope may be sent when the SAS is declined"
+        );
+        phone_thread.join().unwrap();
+    }
+
     /// The regression for the DEK-divergence bug: the ceremony must deliver the
     /// *keystore* DEK (the one `latch account add` seals tokens under), not a
     /// fresh key. This drives the real seam end to end — provision a keystore

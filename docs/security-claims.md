@@ -655,3 +655,186 @@ These are real and deliberately surfaced, not defects hidden.
     validate. Severity: **None today (local-only, fail-closed); a tripwire for the
     integration step.** Enforcing code: `se_ecies.rs` module docs §"Binding and
     sender authentication".
+
+---
+
+## Independent review verdict: pairing-security unit (f1192b6, 37035ee, 13e56c2)
+
+**Reviewer:** independent security-reviewer (did NOT write this code). **Date:**
+2026-07-06. **Scope:** the SAS-confirm stdin gate on `latch pair --json`
+(f1192b6), the real P-256 Secure Enclave DEK wrap in `keystore_macos.rs`
+(37035ee) plus its uncommitted `for_test`-isolation follow-up in the working
+tree, and the relocation of the DEK unwrap from ceremony-start to
+post-SAS-confirm (13e56c2). Static/adversarial review only; no biometric
+hardware was exercised (see residuals). This verdict is written by the
+independent reviewer per the review-integrity rule; the implementer did not
+self-certify.
+
+**Bottom line: SOUND at the logic/code level, assuming the Secure Enclave FFI
+behaves as Apple documents.** No P0 or P1 confirmed. The central claim holds:
+**there is no path that delivers the DEK without both a genuine SAS gate and a
+fresh Secure-Enclave-gated biometric.** Two P2 code findings and a set of
+hardware-verification residuals are recorded below; one P2 is a data-loss
+footgun in the committed hardware test that the uncommitted working-tree change
+correctly fixes and that must be committed.
+
+### CONFIRMED SOUND (static)
+
+1. **SAS bypass on the `--json` path is closed.** `run_pairing_json`'s
+   `confirm` closure (`crates/latch/src/cli.rs:1428`-`1440`) now emits the `sas`
+   event, then blocks on one line of stdin and returns `true` only for a
+   trimmed, case-insensitive `"confirm"`; `Ok(0)` (EOF), any other line, and
+   `Err(_)` all return `false`. `run_ceremony` (`crates/latch/src/pair.rs:153`)
+   treats `false` as `bail!` before any unwrap or deliver. The pre-fix
+   auto-`true` is gone. Fail-closed on every non-confirm input.
+
+2. **Confirm → biometric → deliver ordering is correct and has no
+   pre-biometric delivery path.** In `run_ceremony`
+   (`crates/latch/src/pair.rs:149`-`177`) the strict order is: `confirm_sas`
+   (human) → `daemon.confirm()` → `unwrap_dek()` (on an SE keystore, the Touch
+   ID moment) → `deliver_dek` → `channel.send`. `daemon.confirm()` transmits
+   nothing over the channel; the *only* `channel.send` of DEK material is at
+   line 173-175, strictly after `unwrap_dek()` at line 162. A declined/EOF/error
+   SAS bails before line 162; an `unwrap_dek` error (`Declined` or `Backend`,
+   mapped to `anyhow` in cli.rs:1310-1312 / 1440-1442) bails before any send.
+   Fail-closed throughout.
+
+3. **The 13e56c2 relocation genuinely closes the same-UID stdin-writer
+   threat.** Because the biometric now fires at `unwrap_dek` (after the stdin
+   `confirm`), a process that can only write `"confirm"` to the pair
+   subprocess's stdin cannot complete a pairing: it still faces a fresh
+   Secure-Enclave biometric it cannot satisfy. The stdin `confirm` and the
+   biometric are *not* separable into a single reusable authorization — the
+   biometric is enforced by the SE key's own access control on
+   `SecKeyCreateDecryptedData`, not by any token the caller holds. Encoded as a
+   regression test: `pair.rs::the_dek_is_never_unwrapped_when_the_sas_is_declined`
+   (added by this review) asserts `unwrap_dek` is invoked **zero** times and no
+   envelope is sent when `confirm_sas` returns `false`. A refactor that moved the
+   unwrap back ahead of the SAS gate fails this test.
+
+4. **No error-code mapping can cause a fail-OPEN.** The residual flagged by the
+   implementer (errSecUserCanceled `-128` vs errSecAuthFailed `-25293`) is a
+   *classification* question, not a safety one: the **only** success path out of
+   `unwrap_dek` is a non-null `plaintext_ref` of exactly 32 bytes
+   (`keystore_macos.rs:249`-`279`). Every `CFError` — whichever code — routes
+   through `cf_error_to_keystore` to either `Declined` or `Backend`, and **both**
+   abort the pairing ceremony (`pair.rs:162` bails) and deny in the local-approve
+   path (`approve.rs:420`-`422`: only `Ok(_dek)` approves; `Declined` denies;
+   any other error falls through to a `Deny` under production config). So even a
+   fully wrong `-128`/`-25293` mapping changes only the deny-vs-hard-error UX,
+   never approve-vs-deny. Confirmed for both the pairing and approval surfaces.
+
+5. **The `SecKeyCreateDecryptedData` FFI is memory-safe and leak-free (modulo
+   hardware behavior).** `keystore_macos.rs:249`-`279`: the out-error is checked
+   before the plaintext; a non-null `CFErrorRef` is taken under
+   `wrap_under_create_rule` (create-rule ownership, no double-free/leak); a
+   null-plaintext-with-null-error case is handled as a `Backend` fault; the
+   `CFData` result is taken under the create rule; the recovered bytes are
+   length-checked to 32 and copied into a `Zeroizing<[u8;32]>`. `key` and
+   `ciphertext` are live `TCFType`s across the call. The DEK plaintext exists
+   only in the `Zeroizing` buffer and is never logged or copied elsewhere.
+
+6. **DEK protected at rest; wrap/unwrap matched.** Only the SE-wrapped blob is
+   persisted (`DEK_ENVELOPE_LABEL`, ciphertext); the DEK plaintext is built in
+   pure Rust (`latch_proto::wrap_dek_p256`), used, and dropped/zeroized in
+   `ensure_dek` (`keystore_macos.rs:213`-`220`). The wrap
+   (`p256::ECDH` + ANSI-X9.63-SHA256 KDF + AES-128-GCM, 16-byte variable IV,
+   65+32+16 = 113-byte blob) and the SE unwrap
+   (`ECIESEncryptionCofactorVariableIVX963SHA256AESGCM`) are the same
+   construction, already reviewed under #23; the KDF is pinned by a
+   known-answer test. At the code level the access control is
+   `kSecAccessControlPrivateKeyUsage | kSecAccessControlBiometryCurrentSet`
+   (biometric mandated, **no** `.devicePasscode`/`.userPresence` fallback), so a
+   passcode alone cannot unwrap.
+
+### CONFIRMED FINDINGS (code-level, need a fix)
+
+- **P2 — the SE access control is created with a NULL protection class,
+  diverging from every reference and the design's stated intent.**
+  `keystore_macos.rs:186`-`189` calls
+  `SecAccessControl::create_with_flags(...)`, which in security-framework 2.11.1
+  is `create_with_protection(None, flags)` — it passes a **null** protection
+  value to `SecAccessControlCreateWithFlags`
+  (`.cargo/.../security-framework-2.11.1/src/access_control.rs:51`-`76`). Every
+  Swift counterpart pins `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`
+  (`apps/mac/Tools/se-selftest.swift:29`,
+  `apps/mac/Latch/Security/SecureEnclaveApprover.swift:52`,
+  `apps/phone/.../LatchSeModule.swift:95`) and `apps/mac/RESEARCH.md:70`
+  specifies exactly that class. Consequence is **fail-closed, not
+  fail-open**: on hardware this most likely makes `SecKeyCreateRandomKey`
+  reject the request (ensure_dek → `Backend`, denies), or at best mints the key
+  without the intended `WhenUnlocked`/`ThisDeviceOnly` guarantee the brief calls
+  for. Fix: `SecAccessControl::create_with_protection(Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly), flags)`.
+  Not a disclosure risk (the biometry flag and SE non-extractability are
+  independent of the protection class), but it is a real divergence that should
+  be corrected before the on-hardware verification, or the verification will
+  test the wrong construction.
+
+- **P2 (data-loss footgun, not disclosure) — the committed 37035ee hardware
+  test deletes the REAL production DEK blob.** As committed, the ignored test
+  `se_dek_round_trips_through_a_real_touch_id` ran `MacKeystore::new()` (real
+  labels) and `delete_blob(DEK_ENVELOPE_LABEL)` (the real production envelope),
+  then `ensure_dek()` — minting a **fresh** DEK under the real label. Running it
+  on Tom's Mac would have bricked every account whose token was sealed under the
+  prior DEK (the new DEK cannot decrypt them; fails closed, but the tokens are
+  unrecoverable without re-add). **Resolved in HEAD by df78e8f** ("make the SE
+  round-trip harness isolation-safe"), which landed during this review:
+  per-instance labels via `MacKeystore::for_test`, `.selftest` suffixes, and
+  always-cleanup with `catch_unwind`, so the test can never touch the production
+  `SE_KEY_LABEL`/`DEK_ENVELOPE_LABEL`. Recorded so the reason the isolation
+  exists is not lost: never let a hardware test run against the real labels.
+
+### RESIDUALS — require Tom's on-hardware verification (cannot be settled statically)
+
+- **Declined-biometric error code** (`ERR_SEC_USER_CANCELED` `-128` vs
+  `ERR_SEC_AUTH_FAILED` `-25293`, `keystore_macos.rs:66`-`79`): confirm which
+  `SecKeyCreateDecryptedData` actually returns on a declined prompt. Per finding
+  #4 this affects only deny-vs-hard-error UX, never safety.
+- **SE-key re-query** (`find_se_private_key`, `keystore_macos.rs:286`-`300`):
+  `ItemSearchOptions` has no `kSecUseDataProtectionKeychain`; confirm a key
+  minted in the `DataProtectionKeychain` actually surfaces by label. If not, it
+  returns `NoDek` → fails closed.
+- **SE decrypt interop**: that Apple's `SecKeyCreateDecryptedData` opens a blob
+  produced by `wrap_dek_p256` byte-for-byte. The in-crate tests only prove
+  Rust-side self-consistency. Confirm with `apps/mac/Tools/se-selftest.swift`
+  and the ignored round-trip test on Apple-silicon with an enrolled biometric.
+- **`.biometryCurrentSet` mandates biometric with no passcode fallback** on
+  macOS as documented — confirm the prompt is biometric-only and that a fresh
+  evaluation fires on *each* unwrap (no LAContext is passed, so there is no
+  biometric-reuse window by construction; verify the OS honors that).
+- **Generic prompt copy (social-engineering residual).** `unwrap_dek` does not
+  thread `reason` into an `LAContext`, so the Touch ID sheet shows default
+  system copy. The biometric therefore proves *fresh human presence at DEK
+  release*, not *human authorizing this specific device* — the device-binding
+  backstop remains the human's SAS-word eyeball comparison, not the biometric.
+  Acceptable (the SAS is the MITM gate; the biometric is presence), but until an
+  `LAContext` names the action the prompt cannot itself disambiguate a
+  legitimate pairing from a same-UID-triggered one to a distracted user.
+
+### SECONDARY — relay v4 trust-model relaxation (opinion, not the primary verdict)
+
+The end-to-end crypto **still holds** despite the relay becoming a
+content-free "blind doorbell": every envelope remains opaque and sealed by
+`crates/proto` (Ed25519 sender auth + `crypto_box`/threshold + replay guard),
+the relay never parses one, and the push body is fixed and generic. The relay's
+new powers — a shared publisher APNs signing key held as a platform secret, and
+a phone push token seen transiently per deposit and never stored — do not let it
+read a secret, forge an approval, or learn an outcome. Invariant #3's "powerless
+and anonymous" is genuinely relaxed to "blind doorbell, holds a push secret";
+the README records this honestly and defers the verdict here, which is correct.
+
+The **per-mailbox (not per-token) push cap** (`PUSH_MAX=5/min`) is an
+acceptable residual with a named limit: a party who has already obtained a
+victim's push token (itself not secret-bearing) can ring that phone's doorbell
+and evade the cap by rotating the `mailbox_id` in the deposit URL, since the cap
+is keyed per mailbox and the push targets whatever token the body carries. Worst
+case is generic "Approval requested" notification spam / battery drain — **not**
+a secret disclosure and **not** an approval (the phone still needs the real
+sealed request plus a biometric to approve anything). Acceptable as a
+nuisance-only vector; a per-token bucket, or requiring the doorbell deposit to
+be bound to the sealed envelope, would close it if push-spam becomes a concern.
+
+**Verdict recorded by the independent security-reviewer. The pairing-security
+unit is sound; fix the two P2s (commit the `for_test` isolation; give the SE
+access control an explicit `WhenUnlockedThisDeviceOnly` protection class) and
+clear the hardware residuals before treating the SE path as verified.**
