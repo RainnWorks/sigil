@@ -95,19 +95,27 @@ final class AppModel {
     /// Run a daemon control call and surface however it actually went: a
     /// `.failed` result (the daemon refused) and a thrown error (couldn't even
     /// reach it) both land in `lastError`, so a button tap can never look like
-    /// it worked when it silently didn't. Always refreshes afterward.
-    private func performControl(_ operation: () async throws -> ControlResult) async {
+    /// it worked when it silently didn't. Always refreshes afterward. Returns
+    /// whether it actually succeeded, for callers (like `unpair`) that must
+    /// gate a UI transition on the real outcome instead of assuming it.
+    @discardableResult
+    private func performControl(_ operation: () async throws -> ControlResult) async -> Bool {
+        let ok: Bool
         do {
             switch try await operation() {
             case .ok:
                 lastError = nil
+                ok = true
             case .failed(let lines):
                 lastError = lines.joined(separator: "; ")
+                ok = false
             }
         } catch {
             lastError = describe(error)
+            ok = false
         }
         await refresh()
+        return ok
     }
 
     func loadSecondaryScreens() async {
@@ -234,8 +242,12 @@ final class AppModel {
     }
 
     func unpair() async {
-        ceremony = .idle
-        await performControl { try await self.daemon.unpair() }
+        // Optimistically flipping to .idle before the call would show
+        // "unpaired" even when the daemon refused (socket down, etc.) - gate
+        // the transition on the call actually succeeding.
+        if await performControl({ try await self.daemon.unpair() }) {
+            ceremony = .idle
+        }
     }
 
     /// Wipe all daemon state. `SettingsView`'s confirmation dialog is the

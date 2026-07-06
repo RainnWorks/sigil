@@ -20,6 +20,7 @@ struct PairingView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
+                if let error = model.lastError { ErrorStrip(message: error) }
                 if let paired = model.paired {
                     pairedList(paired)
                     macApprovalsToggle
@@ -153,7 +154,7 @@ struct PairingView: View {
                 subtitle: "The relay carries only sealed envelopes between this Mac and your phone; it can neither read nor forge them.") {
             VStack(alignment: .leading, spacing: 12) {
                 if useCustomRelay { customRelayField } else { defaultRelayRow }
-                Button("Render QR") { model.beginPairing(relayURL: relayURL) }
+                Button("Show QR") { model.beginPairing(relayURL: relayURL) }
                     .buttonStyle(.glassProminent).tint(Palette.cobalt)
                     .disabled(relayURL.isEmpty)
             }
@@ -208,4 +209,15 @@ struct PairingView: View {
     NavigationStack { PairingView() }
         .environment(AppModel(daemon: MockDaemonClient(scenario: .failClosed), approver: MockApprover()))
         .frame(width: 640, height: 560)
+}
+
+#Preview("Unpair failed") {
+    // The state a silently-failed Unpair would otherwise hide: lastError set,
+    // the paired device still shown (the optimistic-UI bug this closes would
+    // have shown "unpaired" here instead).
+    let model = AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover())
+    model.lastError = "daemon unreachable: socket not listening"
+    return NavigationStack { PairingView() }
+        .environment(model)
+        .frame(width: 640, height: 640)
 }

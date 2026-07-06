@@ -12,6 +12,7 @@ struct MenubarContent: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
+            if let error = model.lastError { errorStrip(error) }
             Divider()
             content
             Divider()
@@ -19,6 +20,20 @@ struct MenubarContent: View {
         }
         .padding(.vertical, 8)
         .task { model.start(); await model.refresh() }
+    }
+
+    /// A compact ErrorStrip for the ~320pt popover: every control here (Deny,
+    /// Lock down, Unseal, Approve) routes through AppModel.performControl,
+    /// which already captures a refusal or a failure into `lastError` - this
+    /// is what makes that visible. Without it a failed deny reads as a
+    /// successful one: the popover just sits there looking unchanged, and the
+    /// person walks away believing they denied something they did not.
+    private func errorStrip(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "exclamationmark.triangle").foregroundStyle(Palette.brass).font(.system(size: 10))
+            Text(message).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 6)
     }
 
     // MARK: header
@@ -205,5 +220,15 @@ private struct PendingCard: View {
 #Preview("Menubar locked") {
     MenubarContent(openConfigurator: {})
         .environment(AppModel(daemon: MockDaemonClient(scenario: .lockedDown), approver: MockApprover()))
+        .frame(width: 320)
+}
+
+#Preview("Menubar deny failed") {
+    // The state a silently-failed deny would otherwise hide: lastError set,
+    // nothing else about the popover changed.
+    let model = AppModel(daemon: MockDaemonClient(scenario: .pendingRequests), approver: MockApprover())
+    model.lastError = "daemon unreachable: socket not listening"
+    return MenubarContent(openConfigurator: {})
+        .environment(model)
         .frame(width: 320)
 }
