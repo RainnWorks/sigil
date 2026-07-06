@@ -22,6 +22,7 @@ pub mod pair;
 pub mod pairing_store;
 pub mod paths;
 pub mod provider;
+pub mod proxy;
 pub mod qr;
 pub mod remote;
 pub mod report;

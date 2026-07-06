@@ -92,6 +92,7 @@ pub fn run_config() -> i32 {
         // The one-command convenience desugar (source + rule in one step).
         "add" => config_add(&args[1..], json),
         "remove" | "rm" => config_remove(args.get(1).map(String::as_str), json),
+        "proxy" => cmd_proxy(&args[1..], json),
         "account" => cmd_account(&args[1..], json),
         "settings" => cmd_settings(&args[1..], json),
         "mac-approvals" => cmd_mac_approvals(&args[1..], json),
@@ -269,6 +270,9 @@ usage: latch-config <cmd> [args...]   author rules/sources, manage accounts
   export            print the whole config as JSON (for the desktop to load)
   import            replace the whole config from JSON on stdin
   remove <cmd>      forget a command's rule (and its like-named source)
+  proxy add <cmd>   install a transparent PATH alias so a bare <cmd> hits Latch;
+                    also: proxy remove <cmd> [--purge] | list | status |
+                    doctor [<cmd>] | env [--shell zsh|bash|fish|nu]
   account add       add a service-account token (reads token from stdin)
   account list      list configured accounts and their vault routing
   account rotate --id <id>  replace an account's token (reads from stdin)
@@ -1961,6 +1965,375 @@ fn shim_install(json: bool) -> i32 {
         "  {}",
         s.faint("or run `latch setup`, which edits your profile and loads the daemon.")
     );
+    0
+}
+
+/// `latch-config proxy <add|remove|list|status|doctor|env>`: manage the
+/// transparent PATH aliases that let an unmodifiable caller (an agent, a
+/// launcher's bare `op`, `git` reaching the SSH agent) hit Latch without knowing
+/// it exists. An alias is a symlink in `~/.latch/bin` at the `latch` runtime
+/// binary; running the command resolves the alias, which gates on the phone and
+/// execs the real tool. See `docs/design/proxy-aliasing.md`.
+fn cmd_proxy(args: &[String], json: bool) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("add") => proxy_add(&args[1..], json),
+        Some("remove") | Some("rm") => proxy_remove(&args[1..], json),
+        Some("list") | None => proxy_list(json),
+        Some("status") => proxy_status(json),
+        Some("doctor") => proxy_doctor(args.get(1).map(String::as_str), json),
+        Some("env") => proxy_env(&args[1..]),
+        _ => {
+            eprintln!(
+                "usage: latch-config proxy <add <cmd> | remove <cmd> [--purge] | list | status | doctor [<cmd>] | env [--shell zsh|bash|fish|nu]>"
+            );
+            2
+        }
+    }
+}
+
+/// `proxy add <cmd> [--force]`: install the alias, ensure the proxy dir is on
+/// PATH for this shell, and report the resolved real binary + gating coverage.
+/// Warnings (a real binary already ahead on PATH, or no rule gating `<cmd>`) are
+/// surfaced but do not block; the alias is still installed.
+fn proxy_add(args: &[String], json: bool) -> i32 {
+    let s = Style::stdout();
+    let Some(cmd) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
+        eprintln!("usage: latch-config proxy add <cmd> [--force]");
+        return 2;
+    };
+
+    // Gating coverage and the real binary a shell would otherwise resolve.
+    let gated = crate::config::Config::load()
+        .map(|cfg| cfg.gates_command(&cmd))
+        .unwrap_or(false);
+    let real = crate::paths::find_real(&cmd);
+
+    let (link, target) = match crate::proxy::install_alias(&cmd) {
+        Ok(pair) => pair,
+        Err(e) => {
+            if json {
+                return emit_local_control(&ControlResult::line(
+                    false,
+                    format!("proxy add failed: {e}"),
+                ));
+            }
+            eprintln!("latch-config: {e}");
+            return 1;
+        }
+    };
+
+    // Put the proxy dir on PATH for the current shell (one file, like setup).
+    let path_added = match crate::proxy::primary_rc_file() {
+        Some((file, shell)) => crate::proxy::ensure_path_in(&file, shell)
+            .map(|added| (file, added))
+            .ok(),
+        None => None,
+    };
+    let session_line = crate::proxy::env_line(crate::proxy::Shell::detect());
+
+    if json {
+        let mut lines = vec![
+            format!("proxy alias for {cmd} installed"),
+            format!("link {}", link.display()),
+            format!("-> {}", target.display()),
+            match &real {
+                Some(p) => format!("real {}", p.display()),
+                None => format!("real: no {cmd} found on PATH"),
+            },
+        ];
+        if !gated {
+            lines.push(format!(
+                "warning: no rule gates {cmd}; every call is refused until you run latch-config add {cmd}"
+            ));
+        }
+        if let Some((file, true)) = &path_added {
+            lines.push(format!("added ~/.latch/bin to {}", file.display()));
+        }
+        return emit_local_control(&ControlResult::ok(lines));
+    }
+
+    println!(
+        "{} proxy alias for {} installed",
+        s.ok("\u{2713}"),
+        s.cobalt(&cmd)
+    );
+    println!(
+        "  {} {} -> {}",
+        s.dim("link"),
+        link.display(),
+        target.display()
+    );
+    match &real {
+        Some(p) => println!("  {} {}", s.dim("real"), s.dim(&p.display().to_string())),
+        None => println!(
+            "  {} {}",
+            s.brass("\u{2717}"),
+            s.brass(&format!(
+                "no {cmd} found on PATH; the alias will exit 127 when the daemon is down"
+            ))
+        ),
+    }
+    if !gated {
+        println!(
+            "  {} {}",
+            s.brass("\u{2717}"),
+            s.brass(&format!(
+                "no rule gates {cmd}: every call is refused until you configure it (latch-config add {cmd} --provider <id>)"
+            ))
+        );
+    }
+    match &path_added {
+        Some((file, true)) => println!(
+            "  {} added ~/.latch/bin to {}",
+            s.ok("\u{2713}"),
+            s.dim(&file.display().to_string())
+        ),
+        Some((_, false)) => println!("  {} ~/.latch/bin already on PATH", s.ok("\u{2713}")),
+        None => {}
+    }
+    println!();
+    println!("  {}", s.dim("open a new shell, or load it now:"));
+    println!("    {}", s.cobalt(&format!("eval \"$({session_line})\"")));
+    println!(
+        "  {}",
+        s.faint("for an agent that inherits env without an rc file, put ~/.latch/bin first in its launcher's PATH (latch-config proxy env)")
+    );
+    0
+}
+
+/// `proxy remove <cmd> [--purge]`: remove the alias (never the real binary). With
+/// `--purge`, once no aliases remain, also strip the managed PATH block.
+fn proxy_remove(args: &[String], json: bool) -> i32 {
+    let Some(cmd) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
+        eprintln!("usage: latch-config proxy remove <cmd> [--purge]");
+        return 2;
+    };
+    let removed = match crate::proxy::remove_alias(&cmd) {
+        Ok(r) => r,
+        Err(e) => {
+            let r = ControlResult::line(false, format!("proxy remove failed: {e}"));
+            return print_config_result(&r, json);
+        }
+    };
+    let mut lines = vec![if removed {
+        format!("proxy alias for {cmd} removed")
+    } else {
+        format!("no proxy alias for {cmd}")
+    }];
+
+    // --purge strips the PATH block only when the proxy dir is now empty of
+    // aliases, so a shared dir with other aliases keeps its PATH entry.
+    if has_flag(args, "--purge") {
+        let empty = crate::proxy::list_aliases()
+            .map(|a| a.is_empty())
+            .unwrap_or(false);
+        if empty {
+            if let Some((file, _)) = crate::proxy::primary_rc_file() {
+                match crate::proxy::strip_path_in(&file) {
+                    Ok(true) => {
+                        lines.push(format!("stripped ~/.latch/bin from {}", file.display()))
+                    }
+                    Ok(false) => {}
+                    Err(e) => lines.push(format!("could not strip PATH block: {e}")),
+                }
+            }
+        } else {
+            lines.push("kept ~/.latch/bin on PATH (other aliases remain)".to_string());
+        }
+    }
+    print_config_result(&ControlResult::ok(lines), json)
+}
+
+/// `proxy list`: every installed alias with its resolved real target and whether
+/// a rule actually gates it (a NO RULE alias refuses every call).
+fn proxy_list(json: bool) -> i32 {
+    let s = Style::stdout();
+    let aliases = match crate::proxy::list_aliases() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("latch-config: listing proxy aliases: {e}");
+            return 1;
+        }
+    };
+    if json {
+        let lines: Vec<String> = aliases
+            .iter()
+            .map(|a| {
+                format!(
+                    "{} -> {} [{}]",
+                    a.cmd,
+                    a.real
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "no real binary".into()),
+                    if a.gated { "gated" } else { "NO RULE" }
+                )
+            })
+            .collect();
+        return emit_local_control(&ControlResult::ok(lines));
+    }
+    if aliases.is_empty() {
+        println!(
+            "  {}",
+            s.dim("no proxy aliases; add one: latch-config proxy add <cmd>")
+        );
+        return 0;
+    }
+    println!("{}", s.cobalt("proxy aliases"));
+    println!();
+    for a in &aliases {
+        let coverage = if a.gated {
+            s.ok("gated")
+        } else {
+            s.brass("NO RULE")
+        };
+        let real = match &a.real {
+            Some(p) => s.dim(&p.display().to_string()),
+            None => s.brass("no real binary on PATH"),
+        };
+        println!("  {}  {}  {}", pad(&a.cmd, 14), coverage, real);
+    }
+    0
+}
+
+/// `proxy status`: is the proxy dir live on PATH for this shell, and how many
+/// aliases it serves. The at-a-glance "is interception on" view.
+fn proxy_status(json: bool) -> i32 {
+    let s = Style::stdout();
+    let dir = crate::paths::shim_bin_dir();
+    let count = crate::proxy::list_aliases().map(|a| a.len()).unwrap_or(0);
+
+    // Where the proxy dir sits on PATH: present, and first among all entries.
+    let (on_path, is_first) = match (&dir, std::env::var_os("PATH")) {
+        (Some(d), Some(path)) => {
+            let dirs: Vec<_> = std::env::split_paths(&path).collect();
+            let idx = dirs.iter().position(|p| p == d);
+            (idx.is_some(), idx == Some(0))
+        }
+        _ => (false, false),
+    };
+
+    if json {
+        let lines = vec![
+            format!("aliases {count}"),
+            format!("on_path {on_path}"),
+            format!("first {is_first}"),
+        ];
+        return emit_local_control(&ControlResult::ok(lines));
+    }
+    println!("{}", s.cobalt("proxy status"));
+    println!();
+    let (glyph, note) = if is_first {
+        (s.ok("\u{25cf}"), s.dim("first on PATH (aliases win)"))
+    } else if on_path {
+        (
+            s.brass("\u{25cf}"),
+            s.brass("on PATH but not first; a real binary may win"),
+        )
+    } else {
+        (
+            s.deny("\u{25cb}"),
+            s.brass("not on PATH in this shell (latch-config proxy env)"),
+        )
+    };
+    println!("  {}  {glyph} {note}", s.dim("proxy dir"));
+    println!(
+        "  {}  {}",
+        s.dim("aliases  "),
+        s.dim(&format!("{count} installed"))
+    );
+    0
+}
+
+/// `proxy doctor [<cmd>]`: deep per-alias diagnosis (PATH order, resolved real
+/// binary, drift, and gating coverage). With no argument, every installed alias.
+fn proxy_doctor(cmd: Option<&str>, json: bool) -> i32 {
+    let cmds: Vec<String> = match cmd {
+        Some(c) => vec![c.to_string()],
+        None => crate::proxy::list_aliases()
+            .map(|a| a.into_iter().map(|x| x.cmd).collect())
+            .unwrap_or_default(),
+    };
+    if cmds.is_empty() {
+        let r = ControlResult::ok(vec!["no proxy aliases to diagnose".to_string()]);
+        return print_config_result(&r, json);
+    }
+    let cfg = crate::config::Config::load().unwrap_or_default();
+    let s = Style::stdout();
+    if !json {
+        println!("{}", s.cobalt("proxy doctor"));
+        println!();
+    }
+    let mut all_ok = true;
+    let mut lines = Vec::new();
+    for c in &cmds {
+        let st = crate::proxy::ProxyStatus::detect(c);
+        let gated = cfg.gates_command(c);
+        let healthy = st.healthy() && gated;
+        all_ok &= healthy;
+        let real = st.real.as_ref().map(|p| p.display().to_string());
+        if json {
+            lines.push(format!(
+                "{c}: {} · {} · real {}",
+                if st.healthy() {
+                    "path ok"
+                } else {
+                    "path drift"
+                },
+                if gated { "gated" } else { "NO RULE" },
+                real.as_deref().unwrap_or("none")
+            ));
+            continue;
+        }
+        let glyph = if healthy {
+            s.ok("\u{2713}")
+        } else {
+            s.brass("\u{2717}")
+        };
+        println!("  {glyph} {}", s.cobalt(c));
+        if let Some(issue) = st.issue() {
+            println!("      {}", s.brass(&issue));
+        }
+        if !gated {
+            println!(
+                "      {}",
+                s.brass(&format!(
+                    "no rule gates {c}; it refuses every call (latch-config add {c})"
+                ))
+            );
+        }
+        match &real {
+            Some(p) => println!("      {} {}", s.dim("real"), s.dim(p)),
+            None => println!("      {}", s.brass(&format!("no real {c} on PATH"))),
+        }
+    }
+    if json {
+        return emit_local_control(&ControlResult { ok: all_ok, lines });
+    }
+    println!();
+    if all_ok {
+        println!("  {}", s.ok("all proxies healthy"));
+        0
+    } else {
+        println!("  {}", s.brass("some proxies need attention"));
+        1
+    }
+}
+
+/// `proxy env [--shell zsh|bash|fish|nu]`: print the PATH-prepend line for the
+/// current (or named) shell, for a session or an agent launcher's environment.
+fn proxy_env(args: &[String]) -> i32 {
+    let shell = match flag_value(args, "--shell") {
+        Some(name) => match crate::proxy::Shell::parse(name) {
+            Some(sh) => sh,
+            None => {
+                eprintln!("latch-config: unknown shell '{name}'; use zsh, bash, fish, or nu");
+                return 2;
+            }
+        },
+        None => crate::proxy::Shell::detect(),
+    };
+    println!("{}", crate::proxy::env_line(shell));
     0
 }
 
