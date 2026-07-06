@@ -10,8 +10,9 @@ export default defineWorkersConfig({
     poolOptions: {
       workers: {
         // Every test uses a unique random mailbox id, so per-test storage
-        // isolation is unnecessary; disabling it sidesteps a known pool-workers
-        // crash when a hibernatable WebSocket is still open at a test boundary.
+        // isolation is unnecessary; disabling it also keeps a mailbox's
+        // Durable Object instance (and its in-memory queues) stable across
+        // the several requests one test makes against the same mailbox id.
         isolatedStorage: false,
         wrangler: { configPath: "./wrangler.jsonc" },
       },

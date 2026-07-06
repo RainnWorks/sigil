@@ -1,16 +1,24 @@
-// Latch blind relay: Cloudflare Worker + one Durable Object per mailbox.
+// Latch/Sigil blind relay: Cloudflare Worker + one Durable Object per mailbox.
 //
 // The Worker validates the mailbox id and routes to the mailbox's Durable
-// Object; the DO stores and forwards opaque envelopes. All wire behaviour lives
-// in ../shared/protocol so this variant and the Bun variant are byte-identical.
-// The DO never parses an envelope: it only moves opaque strings between the
-// daemon's outbound WebSocket and the phone's HTTPS pulls.
+// Object; the DO holds that one mailbox's envelopes ONLY in its own instance
+// memory (`this.mailbox`), never in `ctx.storage`. Zero storage/KV writes: if
+// the DO's isolate is evicted or recycled, the mailbox's contents are gone,
+// exactly as if the relay had restarted; nothing here was ever meant to
+// outlive a short TTL anyway. All wire behaviour lives in ../shared/protocol,
+// and the push doorbell in ../shared/push, so this variant and the Bun
+// variant are byte-identical.
 
 import { DurableObject } from "cloudflare:workers";
 import * as P from "../shared/protocol";
+import { sendPush } from "../shared/push";
 
 export interface Env {
   MAILBOX: DurableObjectNamespace<Mailbox>;
+  /** Publisher secret: `wrangler secret put APNS_KEY_P8` (the `.p8` PEM text).
+   * Absent disables the doorbell; every deposit still succeeds and relies on
+   * the phone's poll backstop. */
+  APNS_KEY_P8?: string;
 }
 
 const now = () => Date.now();
@@ -23,112 +31,54 @@ function json(body: unknown, status = 200): Response {
 }
 
 export class Mailbox extends DurableObject<Env> {
-  // State is persisted so it survives WebSocket hibernation, when the DO leaves
-  // memory while the daemon stays connected. Load-modify-save is safe: the DO is
-  // single-threaded and input gates serialize storage access.
-  private async load(): Promise<P.Mailbox> {
-    return (await this.ctx.storage.get<P.Mailbox>("m")) ?? P.newMailbox();
-  }
-
-  private async save(m: P.Mailbox): Promise<void> {
-    await this.ctx.storage.put("m", m);
-    if (m.toPhone.length || m.toDaemon.length) {
-      await this.ctx.storage.setAlarm(now() + P.TTL_MS);
-    }
-  }
-
-  // Deliver everything queued for the daemon over its socket, draining as we go.
-  private flushToDaemon(m: P.Mailbox, ws: WebSocket): void {
-    for (const blob of P.drain(m.toDaemon, now())) ws.send(P.FRAME.deliver(blob));
-  }
+  // The entire state of this mailbox. In-memory only: no `ctx.storage` call
+  // anywhere in this class.
+  private mailbox: P.Mailbox = P.newMailbox();
 
   async fetch(req: Request): Promise<Response> {
     const verb = new URL(req.url).pathname.split("/").filter(Boolean)[2];
-    const m = await this.load();
-    if (!P.rateOk(m, now())) {
-      await this.save(m);
-      return json(P.RESP.err("rate_limited"), 429);
+    const m = this.mailbox;
+    if (!P.rateOk(m, now())) return json(P.RESP.err("rate_limited"), 429);
+
+    if (verb === "to-phone" && req.method === "GET") {
+      return json(P.RESP.envelopes(P.drain(m.toPhone, now())));
     }
 
-    if (verb === "attach") {
-      if (req.headers.get("Upgrade") !== "websocket") {
-        return json(P.RESP.err("expected_websocket"), 426);
-      }
-      const [client, server] = Object.values(new WebSocketPair());
-      this.ctx.acceptWebSocket(server); // hibernatable
-      this.flushToDaemon(m, server);
-      await this.save(m);
-      return new Response(null, { status: 101, webSocket: client });
-    }
-
-    if (verb === "pending" && req.method === "GET") {
-      const envelopes = P.drain(m.toPhone, now());
-      m.relayed += envelopes.length;
-      await this.save(m);
-      return json(P.RESP.pending(envelopes));
-    }
-
-    if (verb === "submit" && req.method === "POST") {
-      // Reject on Content-Length before reading, so we never buffer a large body.
-      if (Number(req.headers.get("content-length") ?? "0") > P.MAX_ENVELOPE_BYTES) {
+    if (verb === "to-phone" && req.method === "POST") {
+      if (Number(req.headers.get("content-length") ?? "0") > P.MAX_BODY_BYTES) {
         return json(P.RESP.err("too_large"), 413);
       }
-      const blob = await req.text();
-      const r = P.enqueue(m.toDaemon, blob, now());
-      if (!r.ok) {
-        await this.save(m);
-        return json(P.RESP.err(r.code === 413 ? "too_large" : "queue_full"), r.code);
+      const body = P.parseToPhoneBody(await req.json().catch(() => null));
+      if (!body) return json(P.RESP.err("bad_body"), 400);
+      const r = P.enqueue(m.toPhone, body.env, now());
+      if (!r.ok) return json(P.RESP.err(r.code === 413 ? "too_large" : "queue_full"), r.code);
+      if (body.pushToken && P.pushOk(m, now())) {
+        this.ctx.waitUntil(
+          sendPush(
+            { token: body.pushToken, platform: body.platform, keyPem: this.env.APNS_KEY_P8 },
+            now(),
+          ),
+        );
       }
-      const sockets = this.ctx.getWebSockets();
-      for (const ws of sockets) this.flushToDaemon(m, ws);
-      m.relayed += 1;
-      await this.save(m);
-      return json(P.RESP.submit(sockets.length > 0));
+      return json(P.RESP.deposited());
     }
 
-    if (verb === "depth" && req.method === "GET") {
-      P.evictExpired(m, now());
-      await this.save(m);
-      return json(P.RESP.depth(m.toPhone.length, m.toDaemon.length));
+    if (verb === "to-daemon" && req.method === "GET") {
+      return json(P.RESP.envelopes(P.drain(m.toDaemon, now())));
+    }
+
+    if (verb === "to-daemon" && req.method === "POST") {
+      if (Number(req.headers.get("content-length") ?? "0") > P.MAX_BODY_BYTES) {
+        return json(P.RESP.err("too_large"), 413);
+      }
+      const env = P.parseEnvBody(await req.json().catch(() => null));
+      if (env === null) return json(P.RESP.err("bad_body"), 400);
+      const r = P.enqueue(m.toDaemon, env, now());
+      if (!r.ok) return json(P.RESP.err(r.code === 413 ? "too_large" : "queue_full"), r.code);
+      return json(P.RESP.deposited());
     }
 
     return json(P.RESP.err("not_found"), 404);
-  }
-
-  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    const m = await this.load();
-    if (!P.rateOk(m, now())) {
-      await this.save(m);
-      ws.send(P.FRAME.err(429));
-      return;
-    }
-    const env = P.parseSend(typeof message === "string" ? message : "");
-    if (env === null) {
-      await this.save(m);
-      return; // keepalive or unknown control frame
-    }
-    const r = P.enqueue(m.toPhone, env, now());
-    if (!r.ok) {
-      await this.save(m);
-      ws.send(P.FRAME.err(r.code));
-      return;
-    }
-    m.relayed += 1;
-    await this.save(m);
-    ws.send(P.FRAME.ack(r.depth));
-  }
-
-  async webSocketClose(): Promise<void> {
-    // Nothing to clean up. Items queued for the daemon wait for the next attach.
-  }
-
-  async alarm(): Promise<void> {
-    const m = await this.load();
-    P.evictExpired(m, now());
-    await this.ctx.storage.put("m", m);
-    if (m.toPhone.length || m.toDaemon.length) {
-      await this.ctx.storage.setAlarm(now() + P.TTL_MS);
-    }
   }
 }
 

@@ -3,13 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Latch blind relay: a tiny store-and-forward mailbox for opaque sealed envelopes.",
+  "description": "Latch/Sigil blind relay: a tiny HTTP mailbox for opaque sealed envelopes, plus the publisher-side APNs push doorbell.",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "start:bun": "bun run bun/server.ts",
     "test": "vitest run",
-    "test:bun": "bun test bun/server.test.ts",
+    "test:bun": "bun test bun/server.test.ts shared/push.test.ts",
     "typecheck": "tsc --noEmit",
     "typecheck:bun": "tsc -p bun/tsconfig.json"
   },

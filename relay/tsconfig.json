@@ -14,5 +14,6 @@
     "verbatimModuleSyntax": true
   },
   // The Bun variant is typechecked separately by bun/tsconfig.json (Bun types).
-  "include": ["src", "shared", "test"]
+  "include": ["src", "shared", "test"],
+  "exclude": ["shared/push.test.ts"]
 }

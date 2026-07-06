@@ -2,42 +2,62 @@
 //
 // Both the Cloudflare Worker (../src) and the Bun server (../bun) drive their
 // entire wire behaviour through this module, so the two speak a byte-identical
-// protocol: identical routes, identical status codes, identical JSON bodies,
-// identical WebSocket frames. If a wire decision is not made here, it is a bug.
+// protocol: identical routes, identical status codes, identical JSON bodies. If
+// a wire decision is not made here, it is a bug.
 //
 // The relay never inspects an envelope. Every payload is an opaque string that
 // flows in one side and out the other unchanged; nothing below parses it, hashes
 // it, or reads a single field of it. Routing is by the mailbox id in the URL,
 // which the daemon and phone both derive from their pinned keys (proto
 // `mailbox_id`); the relay only pattern-checks its shape.
+//
+// v4: plain HTTP deposit and drain, no held sockets. A mailbox is a small
+// ephemeral in-memory buffer per direction (Durable Object instance memory, or
+// a Bun Map): bounded, short-TTL, never written to disk. A deposit bound for
+// the phone may also carry a push token, which the relay reads once to ring a
+// content-free APNs doorbell (see ../shared/push) and then forgets; it is
+// never part of the buffered item and never stored.
 
-/** Envelope time-to-live, ms. Matches the client request-expiry window. */
-export const TTL_MS = 600_000;
+/** Envelope time-to-live, ms. Short: this only has to outlive the gap between
+ * a deposit and the other side's next poll, not a real offline window. */
+export const TTL_MS = 120_000;
 /** Bounded FIFO depth per direction. Overflow is rejected, never silently dropped. */
 export const MAX_QUEUE = 32;
 /** Envelopes are tiny (a sealed DEK or a small request). Anything larger is abuse. */
 export const MAX_ENVELOPE_BYTES = 16_384;
-/** Per-mailbox operations allowed per {@link RATE_WINDOW_MS}. */
+/** Generous slack over {@link MAX_ENVELOPE_BYTES} for the JSON wrapper around
+ * the opaque envelope (a push token and platform tag, both tiny). This is only
+ * a coarse pre-read guard against an oversized body; the authoritative
+ * per-envelope cap is enforced on `env` itself by {@link enqueue}. */
+export const MAX_BODY_BYTES = MAX_ENVELOPE_BYTES + 4_096;
+/** Per-mailbox operations allowed per {@link RATE_WINDOW_MS}. Held only in the
+ * mailbox's in-memory record; never persisted. Non-load-bearing anti-abuse. */
 export const RATE_MAX = 120;
 export const RATE_WINDOW_MS = 60_000;
+/** A separate, tighter cap on pushes specifically, so a leaked push token
+ * can't turn a mailbox into a doorbell-spam amplifier. Residual: this is
+ * per-mailbox, not per-token, so the same leaked token deposited against
+ * different mailbox ids is rate-limited independently for each. */
+export const PUSH_MAX = 5;
+export const PUSH_WINDOW_MS = 60_000;
 /** A mailbox id is the lowercase hex of the 32-byte proto `mailbox_id`. */
 export const MAILBOX_ID = /^[0-9a-f]{64}$/;
 
 export type Item = { blob: string; exp: number };
 
 export type Mailbox = {
-  /** daemon -> phone; drained by GET /pending. */
+  /** daemon -> phone; drained by GET .../to-phone. */
   toPhone: Item[];
-  /** phone -> daemon; pushed over the attached daemon WebSocket. */
+  /** phone -> daemon; drained by GET .../to-daemon. */
   toDaemon: Item[];
   rateCount: number;
   rateStart: number;
-  /** Coarse lifetime relay count. Operational only; not per-message metadata. */
-  relayed: number;
+  pushCount: number;
+  pushStart: number;
 };
 
 export function newMailbox(): Mailbox {
-  return { toPhone: [], toDaemon: [], rateCount: 0, rateStart: 0, relayed: 0 };
+  return { toPhone: [], toDaemon: [], rateCount: 0, rateStart: 0, pushCount: 0, pushStart: 0 };
 }
 
 export function validId(id: string | undefined): boolean {
@@ -65,7 +85,8 @@ export function evictExpired(m: Mailbox, now: number): void {
   retainLive(m.toDaemon, now);
 }
 
-/** Fixed-window limiter. Non-load-bearing anti-abuse; clients verify everything. */
+/** Fixed-window limiter over ordinary deposits/drains. Non-load-bearing
+ * anti-abuse; clients verify everything themselves. */
 export function rateOk(m: Mailbox, now: number): boolean {
   if (now - m.rateStart >= RATE_WINDOW_MS) {
     m.rateStart = now;
@@ -75,8 +96,18 @@ export function rateOk(m: Mailbox, now: number): boolean {
   return m.rateCount <= RATE_MAX;
 }
 
+/** A separate, tighter fixed-window limiter gating only the push proxy. */
+export function pushOk(m: Mailbox, now: number): boolean {
+  if (now - m.pushStart >= PUSH_WINDOW_MS) {
+    m.pushStart = now;
+    m.pushCount = 0;
+  }
+  m.pushCount += 1;
+  return m.pushCount <= PUSH_MAX;
+}
+
 /** Result codes mirror the HTTP status the adapters return to the client. */
-export type EnqueueResult = { ok: true; depth: number } | { ok: false; code: 413 | 507 };
+export type EnqueueResult = { ok: true } | { ok: false; code: 413 | 507 };
 
 /** Evict expired, reject oversized (413) or a full queue (507), else append. */
 export function enqueue(list: Item[], blob: string, now: number): EnqueueResult {
@@ -84,7 +115,7 @@ export function enqueue(list: Item[], blob: string, now: number): EnqueueResult 
   retainLive(list, now);
   if (list.length >= MAX_QUEUE) return { ok: false, code: 507 };
   list.push({ blob, exp: now + TTL_MS });
-  return { ok: true, depth: list.length };
+  return { ok: true };
 }
 
 /** Return every unexpired blob and empty the queue (drain-on-read). */
@@ -97,35 +128,32 @@ export function drain(list: Item[], now: number): string[] {
 /** JSON response bodies, shared so both variants emit identical bytes. */
 export const RESP = {
   health: () => ({ ok: true, service: "latch-relay" }),
-  pending: (envelopes: string[]) => ({ envelopes, depth: 0 }),
-  submit: (attached: boolean) => ({ ok: true, queued: true, attached }),
-  depth: (pending: number, inbound: number) => ({ pending, inbound }),
+  deposited: () => ({ ok: true }),
+  envelopes: (list: string[]) => ({ envelopes: list }),
   err: (error: string) => ({ ok: false, error }),
 };
 
 /**
- * WebSocket control frames on the daemon's outbound connection. The connection
- * multiplexes both directions plus flow control, so every frame is a small JSON
- * envelope with a tag `t`. The opaque payload rides in `env` as a string the
- * relay never parses.
+ * The body of a phone-bound deposit: the opaque envelope, plus an optional
+ * push token and platform tag the relay reads once to ring a doorbell, then
+ * forgets. This parses only these three fields; `env` itself stays opaque.
  */
-export const FRAME = {
-  deliver: (env: string) => JSON.stringify({ t: "deliver", env }),
-  ack: (depth: number) => JSON.stringify({ t: "ack", depth }),
-  err: (code: number) => JSON.stringify({ t: "err", code }),
-};
+export type ToPhoneBody = { env: string; pushToken?: string; platform?: string };
 
-/**
- * A daemon -> relay frame is `{"t":"send","env":"<opaque envelope>"}`. Returns
- * the opaque `env` string, or null for keepalives and anything unrecognised.
- * This parses the control wrapper only; `env` is passed through untouched.
- */
-export function parseSend(msg: string): string | null {
-  try {
-    const o = JSON.parse(msg);
-    if (o && o.t === "send" && typeof o.env === "string") return o.env;
-  } catch {
-    // not a control frame; ignore
-  }
-  return null;
+export function parseToPhoneBody(body: unknown): ToPhoneBody | null {
+  if (!body || typeof body !== "object") return null;
+  const o = body as Record<string, unknown>;
+  if (typeof o.env !== "string") return null;
+  const pushToken = typeof o.pushToken === "string" ? o.pushToken : undefined;
+  const platform = typeof o.platform === "string" ? o.platform : undefined;
+  return { env: o.env, pushToken, platform };
+}
+
+/** The body of a daemon-bound deposit: just the opaque envelope. Carries both
+ * an ApprovalResponse and a PushRegister; the relay can't tell which, and
+ * doesn't need to. */
+export function parseEnvBody(body: unknown): string | null {
+  if (!body || typeof body !== "object") return null;
+  const env = (body as Record<string, unknown>).env;
+  return typeof env === "string" ? env : null;
 }
