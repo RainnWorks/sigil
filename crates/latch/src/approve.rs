@@ -406,10 +406,12 @@ impl LocalApprover {
         // 2. Mac Secure Enclave + Touch ID, when provisioned. The unwrap itself
         //    is the biometric gate; a successful unwrap is the approval. Only a
         //    real biometric keystore counts here, so a dev/in-memory keystore
-        //    (whose unwrap is not a biometric) can never auto-approve. Held
-        //    behind NEEDS-VERIFICATION until exercised on hardware, so today it
-        //    falls through to the control-socket path below rather than
-        //    approving on an unverified enclave call.
+        //    (whose unwrap is not a biometric) can never auto-approve. A
+        //    declined prompt denies outright; any other error (no DEK
+        //    provisioned, or a Secure Enclave / backend fault -- see
+        //    `keystore_macos.rs`, still pending on-hardware verification) falls
+        //    through to the control-socket path below rather than treating an
+        //    unexpected keystore fault as an approval.
         if self.keystore.is_biometric() && self.keystore.has_dek() {
             match self
                 .keystore
@@ -417,7 +419,7 @@ impl LocalApprover {
             {
                 Ok(_dek) => return Decision::Approve,
                 Err(crate::keystore::KeystoreError::Declined) => return Decision::Deny,
-                Err(_) => { /* NeedsVerification / no-dek: fall through */ }
+                Err(_) => { /* no DEK, or a backend fault: fall through */ }
             }
         }
 

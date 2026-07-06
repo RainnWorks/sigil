@@ -43,10 +43,10 @@ pub enum KeystoreError {
 pub fn dek_error_hint(e: &KeystoreError) -> &'static str {
     match e {
         KeystoreError::NeedsVerification(_) => {
-            "the Secure Enclave DEK path is not yet enabled on this Mac (task #24). \
-             For local development, set LATCH_DEV_KEYSTORE=file. Otherwise, a \
-             threshold account (latch account add <label> --threshold) does not \
-             need the DEK ceremony at all."
+            "this Mac's Secure Enclave path has not been confirmed working on this \
+             hardware yet. For local development, set LATCH_DEV_KEYSTORE=file. \
+             Otherwise, a threshold account (latch account add <label> --threshold) \
+             does not need the DEK ceremony at all."
         }
         KeystoreError::Declined => "the Touch ID prompt was declined; try again and approve it.",
         KeystoreError::NoDek => {

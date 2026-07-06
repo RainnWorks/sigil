@@ -3031,8 +3031,9 @@ fn cmd_mac_approvals(args: &[String], json: bool) -> i32 {
     }
 
     // --enable: provision the local DEK envelope. On a dev keystore this
-    // succeeds; on a real Secure Enclave the mint path is unverified and returns
-    // NeedsVerification, which we surface honestly rather than faking success.
+    // always succeeds; on a real Secure Enclave the mint (`keystore_macos.rs`)
+    // is implemented but still pending on-hardware Touch ID verification, so a
+    // real failure here is surfaced honestly rather than faking success.
     let ks = keystore::for_host();
     match ks.ensure_dek() {
         Ok(()) => {

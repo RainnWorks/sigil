@@ -102,6 +102,16 @@ latch-softphone = { path = "../softphone" }
 ed25519-dalek = { workspace = true }
 
 # security-framework: macOS Keychain blob storage and the Secure Enclave seam.
-# macOS-only so Linux/Windows fills stay dependency-free.
+# macOS-only so Linux/Windows fills stay dependency-free. OSX_10_15 pulls in
+# `Location::DataProtectionKeychain`, which the crate's own docs say Secure
+# Enclave keys must use (SecKeyCreateRandomKey with kSecAttrTokenIDSecureEnclave
+# fails against the older file-based keychain).
+# security-framework-sys: `SecKeyCreateDecryptedData` has no safe wrapper in
+# `security-framework` (only signing is wrapped), so the SE DEK unwrap calls it
+# directly; already a transitive dependency of security-framework, named
+# explicitly here so keystore_macos.rs can reach it.
+# core-foundation: CFData/CFError/TCFType for that same raw call.
 [target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "2"
+security-framework = { version = "2", features = ["OSX_10_15"] }
+security-framework-sys = "2"
+core-foundation = "0.9"
