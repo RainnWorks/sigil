@@ -355,6 +355,19 @@ impl Config {
         self.sources.iter().find(|s| s.name == name)
     }
 
+    /// Whether any rule is keyed to the command name `cmd` (its match pins
+    /// `command == cmd`). The coverage predicate the proxy/shim tooling asks
+    /// before dropping an alias — "is `<cmd>` gated by a rule?" — kept here so it
+    /// cannot drift from the match vocabulary. Note this is a *command-keyed*
+    /// check, not full argv evaluation: a rule that matches only via
+    /// subcommand/argv-contains without a `command` is deliberately not counted,
+    /// because an alias is per-command and needs a command-anchored rule.
+    pub fn gates_command(&self, cmd: &str) -> bool {
+        self.rules
+            .iter()
+            .any(|r| r.match_.command.as_deref() == Some(cmd))
+    }
+
     /// Resolve the first rule that matches `argv`, flattened with its source into
     /// a [`ResolvedAction`]. `None` means "unmatched" — the daemon refuses and
     /// points at `latch config`. A rule whose action names an unknown source is
@@ -601,6 +614,49 @@ mod tests {
         assert_eq!(g.source_path.as_deref(), Some("/x/.env"));
 
         assert!(cfg.resolve(&argv(&["kubectl", "get"])).is_none());
+    }
+
+    #[test]
+    fn gates_command_is_command_keyed() {
+        let mut cfg = Config::default();
+        cfg.add_source(Source {
+            name: "s".into(),
+            provider: "env-file".into(),
+            account: None,
+            path: Some("/x".into()),
+        })
+        .unwrap();
+        cfg.add_rule(Rule {
+            name: "op".into(),
+            match_: Match {
+                command: Some("op".into()),
+                ..Match::default()
+            },
+            action: Action {
+                source: "s".into(),
+                risk: RiskLevel::Routine,
+                timeout_sec: None,
+            },
+        })
+        .unwrap();
+        // A rule anchored only on a subcommand (no `command`) is not counted:
+        // an alias is per-command and needs a command-anchored rule.
+        cfg.add_rule(Rule {
+            name: "sub-only".into(),
+            match_: Match {
+                subcommand: Some("read".into()),
+                ..Match::default()
+            },
+            action: Action {
+                source: "s".into(),
+                risk: RiskLevel::Routine,
+                timeout_sec: None,
+            },
+        })
+        .unwrap();
+        assert!(cfg.gates_command("op"));
+        assert!(!cfg.gates_command("read"));
+        assert!(!cfg.gates_command("gcloud"));
     }
 
     #[test]

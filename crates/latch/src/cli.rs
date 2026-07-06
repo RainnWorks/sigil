@@ -1819,11 +1819,7 @@ fn shim_add(cmd: Option<&str>, json: bool) -> i32 {
         return 2;
     };
     let configured = crate::config::Config::load()
-        .map(|cfg| {
-            cfg.rules
-                .iter()
-                .any(|r| r.match_.command.as_deref() == Some(cmd))
-        })
+        .map(|cfg| cfg.gates_command(cmd))
         .unwrap_or(false);
     let (link, target) = match crate::setup::install_shim_for(cmd) {
         Ok(pair) => pair,
