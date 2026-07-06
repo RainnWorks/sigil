@@ -23,8 +23,12 @@
 //!     -- --ignored --nocapture
 //! ```
 //!
+//! It runs entirely under test-only labels (never `SERVICE`'s real
+//! `SE_KEY_LABEL`/`DEK_ENVELOPE_LABEL`) and deletes what it minted when done, so
+//! it cannot leave behind a Secure Enclave key that diverges from whatever DEK
+//! is currently sealing real account tokens (see [`MacKeystore::for_test`]).
 //! It calls `ensure_dek()` then `unwrap_dek()` and asserts the recovered DEK
-//! matches what was sealed; a live Touch ID prompt must appear for the unwrap.
+//! matches what was sealed; a live Touch ID prompt must appear for each unwrap.
 //! Two spots are flagged individually below where the exact on-device behavior
 //! is unconfirmed (the `unwrap_dek` reason string, and the declined-biometric
 //! error code).
@@ -50,13 +54,14 @@ use crate::secrets::{self, Dek};
 
 /// Keychain service under which all Latch blobs are stored.
 const SERVICE: &str = "com.rowm.latch";
-/// The blob label under which the sealed (Secure-Enclave-wrapped) DEK lives.
-/// This is ciphertext at rest; it needs no ACL of its own; the wrap so far
-/// is useless without the SE private key.
+/// The blob label under which the sealed (Secure-Enclave-wrapped) DEK lives in
+/// production. This is ciphertext at rest; it needs no ACL of its own; the
+/// wrap alone is useless without the SE private key.
 const DEK_ENVELOPE_LABEL: &str = "dek.se-envelope.v1";
-/// `kSecAttrLabel` of the Secure Enclave key that wraps the DEK. `unwrap_dek`
-/// re-finds the persisted key by this label across process restarts (the
-/// daemon and every `latch` CLI invocation are separate processes).
+/// `kSecAttrLabel` of the production Secure Enclave key that wraps the DEK.
+/// `unwrap_dek` re-finds the persisted key by this label across process
+/// restarts (the daemon and every `latch` CLI invocation are separate
+/// processes).
 const SE_KEY_LABEL: &str = "com.rowm.latch.dek";
 
 /// `errSecItemNotFound`: the Keychain has no item matching the query.
@@ -71,9 +76,15 @@ const ERR_SEC_AUTH_FAILED: isize = -25293;
 /// Touch ID prompt.
 const ERR_SEC_USER_CANCELED: isize = -128;
 
-/// macOS Keychain + Secure Enclave keystore.
+/// macOS Keychain + Secure Enclave keystore. The blob label and SE key label
+/// are per-instance (not bare constants) so tests can point a `MacKeystore` at
+/// throwaway labels instead of the real ones production uses -- see
+/// [`MacKeystore::for_test`]. `new()` (the only public constructor) always
+/// uses the real, production labels.
 pub struct MacKeystore {
     service: String,
+    dek_envelope_label: String,
+    se_key_label: String,
 }
 
 impl Default for MacKeystore {
@@ -86,6 +97,37 @@ impl MacKeystore {
     pub fn new() -> Self {
         Self {
             service: SERVICE.to_string(),
+            dek_envelope_label: DEK_ENVELOPE_LABEL.to_string(),
+            se_key_label: SE_KEY_LABEL.to_string(),
+        }
+    }
+
+    /// A `MacKeystore` scoped to test-only labels, so exercising the real
+    /// `ensure_dek`/`unwrap_dek` implementation (the point of the hardware
+    /// round-trip test) can never mint or touch the production
+    /// `SE_KEY_LABEL`/`DEK_ENVELOPE_LABEL` a real account's tokens are sealed
+    /// under. Test-only: production always goes through `new()`.
+    #[cfg(test)]
+    fn for_test(dek_envelope_label: &str, se_key_label: &str) -> Self {
+        Self {
+            service: SERVICE.to_string(),
+            dek_envelope_label: dek_envelope_label.to_string(),
+            se_key_label: se_key_label.to_string(),
+        }
+    }
+
+    /// Delete the Secure Enclave private key this instance's `se_key_label`
+    /// points at, if one exists. Test-only cleanup so a round-trip test never
+    /// leaves a minted key behind; production never rotates/deletes the SE key
+    /// through this path (there is no "un-enroll" flow yet).
+    #[cfg(test)]
+    fn delete_se_key(&self) -> Result<(), KeystoreError> {
+        match find_se_private_key(&self.se_key_label) {
+            Ok(key) => key
+                .delete()
+                .map_err(|e| KeystoreError::Backend(format!("deleting the SE key: {e}"))),
+            Err(KeystoreError::NoDek) => Ok(()), // nothing to delete
+            Err(e) => Err(e),
         }
     }
 }
@@ -119,7 +161,7 @@ impl Keystore for MacKeystore {
     }
 
     fn has_dek(&self) -> bool {
-        matches!(self.load_blob(DEK_ENVELOPE_LABEL), Ok(Some(_)))
+        matches!(self.load_blob(&self.dek_envelope_label), Ok(Some(_)))
     }
 
     fn ensure_dek(&self) -> Result<(), KeystoreError> {
@@ -149,7 +191,7 @@ impl Keystore for MacKeystore {
             .set_size_in_bits(256)
             .set_token(Token::SecureEnclave)
             .set_location(Location::DataProtectionKeychain)
-            .set_label(SE_KEY_LABEL)
+            .set_label(&self.se_key_label)
             .set_access_control(access_control);
         let private_key = SecKey::generate(opts.to_dictionary())
             .map_err(|e| KeystoreError::Backend(format!("minting the Secure Enclave key: {e}")))?;
@@ -178,7 +220,7 @@ impl Keystore for MacKeystore {
         drop(proto_dek);
         drop(dek);
 
-        self.store_blob(DEK_ENVELOPE_LABEL, &sealed)
+        self.store_blob(&self.dek_envelope_label, &sealed)
     }
 
     fn unwrap_dek(&self, _reason: &str) -> Result<Dek, KeystoreError> {
@@ -190,9 +232,9 @@ impl Keystore for MacKeystore {
         // prompt's copy is the system default rather than this string until
         // that lands.
         let sealed = self
-            .load_blob(DEK_ENVELOPE_LABEL)?
+            .load_blob(&self.dek_envelope_label)?
             .ok_or(KeystoreError::NoDek)?;
-        let key = find_se_private_key()?;
+        let key = find_se_private_key(&self.se_key_label)?;
 
         let algorithm: security_framework_sys::key::SecKeyAlgorithm =
             Algorithm::ECIESEncryptionCofactorVariableIVX963SHA256AESGCM.into();
@@ -241,19 +283,19 @@ impl Keystore for MacKeystore {
 }
 
 /// Re-find the Secure Enclave private key [`MacKeystore::ensure_dek`] minted,
-/// by its label -- the only handle a *new* process has on it, since the
-/// private key itself never leaves the enclave.
+/// by `label` -- the only handle a *new* process has on it, since the private
+/// key itself never leaves the enclave.
 ///
 /// NEEDS-VERIFICATION: confirm this query actually surfaces a key generated in
 /// the `DataProtectionKeychain`. `ItemSearchOptions` (the safe search builder
 /// this uses) has no `kSecUseDataProtectionKeychain` option; if the query comes
 /// back empty on hardware despite `ensure_dek` having succeeded, that flag
 /// (added to a hand-rolled `SecItemCopyMatching` query) is the likely fix.
-fn find_se_private_key() -> Result<SecKey, KeystoreError> {
+fn find_se_private_key(label: &str) -> Result<SecKey, KeystoreError> {
     let results = ItemSearchOptions::new()
         .class(ItemClass::key())
         .key_class(KeyClass::private())
-        .label(SE_KEY_LABEL)
+        .label(label)
         .load_refs(true)
         .limit(1)
         .search()
@@ -306,28 +348,51 @@ mod tests {
     // and NOT part of `cargo test`'s default run. Run on the Mac with:
     //   cargo test -p latch --lib keystore_macos::tests::se_dek_round_trips_through_a_real_touch_id \
     //     -- --ignored --nocapture
+    //
+    // ISOLATION: this uses `.selftest`-suffixed labels via `MacKeystore::for_test`,
+    // never the real `SE_KEY_LABEL`/`DEK_ENVELOPE_LABEL` a real account's tokens
+    // are sealed under, and deletes both the blob and the SE key at the end (and
+    // defensively at the start, in case a prior run panicked before cleanup) --
+    // so running this can never provision a real SE DEK that diverges from
+    // whatever DEK is currently sealing Tom's actual account tokens.
     #[test]
     #[ignore = "mints a real Secure Enclave key and prompts Touch ID; run manually on the Mac"]
     fn se_dek_round_trips_through_a_real_touch_id() {
-        let ks = MacKeystore::new();
-        // Clean slate: a leftover envelope/key from a prior run would make
-        // `ensure_dek` a no-op and this test wouldn't actually mint anything.
-        ks.delete_blob(DEK_ENVELOPE_LABEL).ok();
+        const TEST_DEK_ENVELOPE_LABEL: &str = "dek.se-envelope.v1.selftest";
+        const TEST_SE_KEY_LABEL: &str = "com.rowm.latch.dek.selftest";
 
-        ks.ensure_dek()
-            .expect("provisioning the Secure Enclave DEK");
-        assert!(ks.has_dek());
+        let ks = MacKeystore::for_test(TEST_DEK_ENVELOPE_LABEL, TEST_SE_KEY_LABEL);
+        // Clean slate: a leftover envelope/key from a prior (e.g. panicked) run
+        // would make `ensure_dek` a no-op and this test wouldn't actually mint
+        // anything.
+        ks.delete_blob(TEST_DEK_ENVELOPE_LABEL).ok();
+        ks.delete_se_key().ok();
 
-        eprintln!("expect a Touch ID prompt now...");
-        let dek_a = ks
-            .unwrap_dek("latch: hardware round-trip test")
-            .expect("unwrapping the DEK (approve the Touch ID prompt)");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ks.ensure_dek()
+                .expect("provisioning the Secure Enclave DEK");
+            assert!(ks.has_dek());
 
-        eprintln!("expect a second Touch ID prompt now...");
-        let dek_b = ks
-            .unwrap_dek("latch: hardware round-trip test, second unwrap")
-            .expect("second unwrap must also succeed");
+            eprintln!("expect a Touch ID prompt now...");
+            let dek_a = ks
+                .unwrap_dek("latch: hardware round-trip test")
+                .expect("unwrapping the DEK (approve the Touch ID prompt)");
 
-        assert_eq!(*dek_a, *dek_b, "every unwrap must recover the same DEK");
+            eprintln!("expect a second Touch ID prompt now...");
+            let dek_b = ks
+                .unwrap_dek("latch: hardware round-trip test, second unwrap")
+                .expect("second unwrap must also succeed");
+
+            assert_eq!(*dek_a, *dek_b, "every unwrap must recover the same DEK");
+        }));
+
+        // Always clean up -- success or failure -- so this test never leaves a
+        // throwaway SE key/envelope sitting under a real-looking label.
+        ks.delete_blob(TEST_DEK_ENVELOPE_LABEL).ok();
+        ks.delete_se_key().ok();
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 }
