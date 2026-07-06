@@ -7,9 +7,10 @@
 //!
 //! Used by the reference softphone in the end-to-end tests; the real iOS approver
 //! speaks the same wire from TypeScript. Blocking is deliberate: the approver's
-//! serve loop is one thread doing one round trip at a time. Any transport error
-//! fails closed: the approver drops that turn and the daemon's request times out
-//! and is retried.
+//! serve loop is one thread doing one round trip at a time. A transient poll
+//! error (network blip, a 5xx) is retried with backoff inside `recv` rather
+//! than dropping the turn outright; only running out the deadline with
+//! nothing received fails closed.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -22,7 +23,12 @@ use crate::http::{HttpMailbox, Slot};
 use crate::wire;
 
 /// Delay between empty `to-phone` polls, trading latency for request volume.
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
+const POLL_INTERVAL: Duration = Duration::from_millis(2000);
+
+/// Ceiling on the backoff after consecutive transient poll errors, so a
+/// prolonged relay outage still polls often enough to catch it recovering
+/// before the caller's deadline.
+const MAX_POLL_BACKOFF: Duration = Duration::from_secs(10);
 
 /// A phone-side [`Transport`] over plain HTTP to the blind relay.
 pub struct PhoneRelay {
@@ -100,11 +106,18 @@ impl Transport for PhoneRelay {
             ));
         }
         let deadline = Instant::now() + timeout;
+        let mut backoff = self.poll_interval;
         loop {
             if let Some(env) = self.pop_buffered()? {
                 return Ok(Some(env));
             }
-            self.poll_to_phone()?;
+            // Same discipline as `DaemonRelay::recv`: a transient poll error
+            // retries with backoff up to the deadline instead of dropping the
+            // turn on the first blip.
+            match self.poll_to_phone() {
+                Ok(()) => backoff = self.poll_interval,
+                Err(e) => eprintln!("latch relay: to-phone poll failed, retrying: {e}"),
+            }
             if let Some(env) = self.pop_buffered()? {
                 return Ok(Some(env));
             }
@@ -112,7 +125,8 @@ impl Transport for PhoneRelay {
             if remaining.is_zero() {
                 return Ok(None);
             }
-            std::thread::sleep(self.poll_interval.min(remaining));
+            std::thread::sleep(backoff.min(remaining));
+            backoff = (backoff * 2).min(MAX_POLL_BACKOFF);
         }
     }
 }

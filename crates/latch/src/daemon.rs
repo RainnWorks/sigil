@@ -25,7 +25,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -441,6 +441,60 @@ impl SshBackend for Core {
     }
 }
 
+/// Hard cap on connections being served concurrently on the blocking pool
+/// (control socket and ssh-agent socket share one gate: both compete for the
+/// same pool). A stalled or hostile same-UID client opening connections
+/// faster than they close cannot pin every slot and starve legitimate
+/// `latch`/ssh traffic; past the cap a new connection is refused rather than
+/// queued. Generous for a personal single-user daemon.
+const MAX_CONCURRENT_CONNS: usize = 32;
+
+/// How long a spawned connection may wait for its first (or, on the ssh-agent
+/// socket, next) byte before it is dropped. Any real client sends immediately;
+/// this only bounds a connect-then-go-silent client. It never bounds the
+/// approval wait itself, which happens strictly after a message is read, so a
+/// legitimate multi-minute phone round trip is untouched.
+const CONN_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A bounded gate on concurrently-served connections. [`ConnGate::try_enter`]
+/// hands back a RAII [`ConnPermit`] that frees the slot on drop; `None` means
+/// the cap is hit and the caller must fail closed (drop the connection)
+/// rather than queue it.
+#[derive(Clone)]
+struct ConnGate(Arc<AtomicUsize>);
+
+struct ConnPermit(Arc<AtomicUsize>);
+
+impl ConnGate {
+    fn new() -> Self {
+        Self(Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn try_enter(&self) -> Option<ConnPermit> {
+        let mut current = self.0.load(Ordering::Acquire);
+        loop {
+            if current >= MAX_CONCURRENT_CONNS {
+                return None;
+            }
+            match self.0.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(ConnPermit(self.0.clone())),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for ConnPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Build a runtime and serve until interrupted. Blocks the calling thread.
 /// `args` are the `latch daemon` arguments (e.g. `--dev-insecure`).
 pub fn run(args: &[String]) -> anyhow::Result<()> {
@@ -510,6 +564,10 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
         eprintln!("latch daemon: shim drift: {issue}");
     }
 
+    // Shared across both sockets: they compete for the same blocking pool, so
+    // one cap bounds both.
+    let conns = ConnGate::new();
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -519,13 +577,23 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
             }
             accepted = listener.accept() => {
                 let (stream, _) = accepted.context("accept")?;
+                let Some(permit) = conns.try_enter() else {
+                    eprintln!(
+                        "latch daemon: refusing a control connection: at the concurrency cap ({MAX_CONCURRENT_CONNS})"
+                    );
+                    continue; // dropping `stream` closes it
+                };
                 let std_stream = stream.into_std().context("into_std")?;
                 std_stream.set_nonblocking(false).context("set_nonblocking")?;
+                std_stream
+                    .set_read_timeout(Some(CONN_READ_TIMEOUT))
+                    .context("set_read_timeout")?;
                 let core = core.clone();
                 // Per-connection work is blocking syscalls (recvmsg, spawn,
                 // waitpid) plus a possibly long approval wait; keep it off the
                 // async workers.
                 tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
                     if let Err(e) = handle_conn(core, std_stream) {
                         eprintln!("latch daemon: connection error: {e}");
                     }
@@ -533,13 +601,23 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
             }
             accepted = ssh_listener.accept() => {
                 let (stream, _) = accepted.context("ssh accept")?;
+                let Some(permit) = conns.try_enter() else {
+                    eprintln!(
+                        "latch daemon: refusing an ssh-agent connection: at the concurrency cap ({MAX_CONCURRENT_CONNS})"
+                    );
+                    continue;
+                };
                 let std_stream = stream.into_std().context("ssh into_std")?;
                 std_stream.set_nonblocking(false).context("ssh set_nonblocking")?;
+                std_stream
+                    .set_read_timeout(Some(CONN_READ_TIMEOUT))
+                    .context("ssh set_read_timeout")?;
                 let core = core.clone();
                 // An SSH connection is also blocking (per-signature fetch, spawn,
                 // approval wait); serve it on the blocking pool with the Core as
                 // the agent backend.
                 tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
                     if let Err(e) = sshagent::handle_connection(core.as_ref(), std_stream) {
                         eprintln!("latch daemon: ssh connection error: {e}");
                     }
@@ -3440,5 +3518,25 @@ mod tests {
         });
         assert!(out.is_none(), "a denied gate must yield no signature");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn conn_gate_refuses_past_the_cap_and_frees_slots_on_drop() {
+        let gate = ConnGate::new();
+        let mut permits = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CONNS {
+            permits.push(gate.try_enter().expect("under the cap must admit"));
+        }
+        assert!(
+            gate.try_enter().is_none(),
+            "the cap must refuse one more connection"
+        );
+
+        // Dropping one permit frees exactly one slot.
+        permits.pop();
+        assert!(
+            gate.try_enter().is_some(),
+            "a freed slot must admit a new connection"
+        );
     }
 }

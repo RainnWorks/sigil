@@ -34,6 +34,33 @@ pub enum KeystoreError {
     Secrets(#[from] secrets::SecretsError),
 }
 
+/// A short, actionable next step for a [`KeystoreError`] surfaced from
+/// provisioning or unwrapping the DEK. The raw `KeystoreError` is a fine log
+/// detail but a poor user-facing string on its own (it names no fix, and it
+/// pipes verbatim into the Mac app's error panels); callers should lead with
+/// this hint and demote the raw error to a trailing detail line, never the
+/// headline.
+pub fn dek_error_hint(e: &KeystoreError) -> &'static str {
+    match e {
+        KeystoreError::NeedsVerification(_) => {
+            "the Secure Enclave DEK path is not yet enabled on this Mac (task #24). \
+             For local development, set LATCH_DEV_KEYSTORE=file. Otherwise, a \
+             threshold account (latch account add <label> --threshold) does not \
+             need the DEK ceremony at all."
+        }
+        KeystoreError::Declined => "the Touch ID prompt was declined; try again and approve it.",
+        KeystoreError::NoDek => {
+            "no DEK has been provisioned yet; run: latch account add <label> --token-stdin"
+        }
+        KeystoreError::Backend(_) => {
+            "the Keychain backend failed; run `latch doctor` and check Keychain access for Latch."
+        }
+        KeystoreError::Secrets(_) => {
+            "the stored DEK envelope is malformed; remove and re-provision it."
+        }
+    }
+}
+
 /// Storage of encrypted blobs plus biometric-gated DEK unwrap. Implementations
 /// must be safe to share across daemon worker threads.
 pub trait Keystore: Send + Sync {
@@ -287,6 +314,35 @@ impl Keystore for DevFileKeystore {
     }
 }
 
+/// The loud, multi-line warning that must appear whenever `LATCH_DEV_KEYSTORE`
+/// is honored. Mirrors [`crate::factor::DEV_INSECURE_WARNING`] in shape: it
+/// names the concrete risk (DEK, and for `file` the token-decryption key, in
+/// plaintext on disk or in RAM with no biometric gate) so a dev config can
+/// never be mistaken for a safe one. `mode` is `"file"` or `"memory"`; `path`
+/// is the on-disk location for `file`, `None` for `memory`.
+fn dev_keystore_warning(mode: &str, path: Option<&std::path::Path>) -> String {
+    let where_line = match path {
+        Some(p) => format!("!!  DEK on disk in the clear at: {}\n", p.display()),
+        None => "!!  DEK held in plaintext RAM for this process only.\n".to_string(),
+    };
+    format!(
+        "\n\
+         !! ============================================================ !!\n\
+         !!  LATCH_DEV_KEYSTORE={mode} IS ACTIVE                          !!\n\
+         !! ------------------------------------------------------------ !!\n\
+         !!  The Secure Enclave / Keychain DEK envelope is bypassed.      !!\n\
+         {where_line}\
+         !!                                                              !!\n\
+         !!  RISK: anyone with access to this machine (or the file,      !!\n\
+         !!  for `file`) can read the DEK with no biometric gate, and     !!\n\
+         !!  for v1 accounts that DEK decrypts every stored token.        !!\n\
+         !!                                                              !!\n\
+         !!  Use this ONLY for local development. Unset                  !!\n\
+         !!  LATCH_DEV_KEYSTORE for a real hardware-backed keystore.      !!\n\
+         !! ============================================================ !!\n"
+    )
+}
+
 /// Select the keystore for the daemon and CLI. Both must agree so a token
 /// sealed by `latch account add` unwraps in the daemon.
 ///
@@ -295,6 +351,12 @@ impl Keystore for DevFileKeystore {
 /// * `LATCH_DEV_KEYSTORE=memory` -> [`MemoryKeystore`] (ephemeral; single process).
 /// * macOS default -> the Secure Enclave keystore (`MacKeystore`).
 /// * other platforms default -> [`MemoryKeystore`] until their fill lands.
+///
+/// Honoring either dev override prints a loud stderr warning outside tests,
+/// the same discipline `--dev-insecure` gets from
+/// [`crate::factor::warn_dev_insecure`]: this is a silent escape hatch
+/// otherwise, putting the DEK (and for `file`, the token-decryption key) in
+/// plaintext with zero user-facing signal.
 pub fn for_host() -> std::sync::Arc<dyn Keystore> {
     use std::sync::Arc;
     match std::env::var("LATCH_DEV_KEYSTORE").ok().as_deref() {
@@ -305,9 +367,16 @@ pub fn for_host() -> std::sync::Arc<dyn Keystore> {
                     std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".latch"))
                 })
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
-            Arc::new(DevFileKeystore::new(base.join("dev-keystore.json")))
+            let path = base.join("dev-keystore.json");
+            #[cfg(not(test))]
+            eprintln!("{}", dev_keystore_warning("file", Some(&path)));
+            Arc::new(DevFileKeystore::new(path))
         }
-        Some("memory") => Arc::new(MemoryKeystore::new()),
+        Some("memory") => {
+            #[cfg(not(test))]
+            eprintln!("{}", dev_keystore_warning("memory", None));
+            Arc::new(MemoryKeystore::new())
+        }
         _ => {
             #[cfg(target_os = "macos")]
             {
@@ -401,5 +470,34 @@ mod tests {
         assert_eq!(mode, 0o600);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dek_error_hint_names_a_concrete_next_step_for_every_variant() {
+        let variants = [
+            KeystoreError::NeedsVerification("test"),
+            KeystoreError::Declined,
+            KeystoreError::NoDek,
+            KeystoreError::Backend("test".into()),
+        ];
+        for e in &variants {
+            let hint = dek_error_hint(e);
+            assert!(!hint.is_empty());
+            // Every hint reads like an instruction, not a bare error echo.
+            assert_ne!(hint, e.to_string());
+        }
+    }
+
+    #[test]
+    fn dev_keystore_warning_names_the_concrete_risk() {
+        let file = dev_keystore_warning("file", Some(std::path::Path::new("/tmp/x.json")));
+        assert!(file.contains("LATCH_DEV_KEYSTORE=file"));
+        assert!(file.contains("/tmp/x.json"));
+        assert!(file.contains("no biometric gate"));
+        assert!(file.lines().count() > 5);
+
+        let memory = dev_keystore_warning("memory", None);
+        assert!(memory.contains("LATCH_DEV_KEYSTORE=memory"));
+        assert!(memory.contains("plaintext RAM"));
     }
 }

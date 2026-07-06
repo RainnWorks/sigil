@@ -14,8 +14,9 @@
 //!   drained batch and returning one envelope per call. This slot also carries an
 //!   unsolicited `PushRegister`; the caller demultiplexes it.
 //!
-//! Any transport error fails closed: the approval simply times out and the phone
-//! retries, exactly as the design intends.
+//! A transient poll error (network blip, a 5xx) is retried with backoff inside
+//! `recv` rather than failing the round trip outright; only running out the
+//! deadline with nothing received fails closed, exactly as the design intends.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -28,7 +29,12 @@ use crate::http::{HttpMailbox, Slot};
 use crate::wire;
 
 /// Delay between empty `to-daemon` polls, trading latency for request volume.
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
+const POLL_INTERVAL: Duration = Duration::from_millis(2000);
+
+/// Ceiling on the backoff after consecutive transient poll errors, so a
+/// prolonged relay outage still polls often enough to catch it recovering
+/// before the caller's deadline.
+const MAX_POLL_BACKOFF: Duration = Duration::from_secs(10);
 
 /// A daemon-side [`Transport`] over plain HTTP to the blind relay.
 pub struct DaemonRelay {
@@ -122,11 +128,20 @@ impl Transport for DaemonRelay {
             ));
         }
         let deadline = Instant::now() + timeout;
+        let mut backoff = self.poll_interval;
         loop {
             if let Some(env) = self.pop_buffered()? {
                 return Ok(Some(env));
             }
-            self.poll_to_daemon()?;
+            // A transient poll error (network blip, a 5xx) must not deny a
+            // legitimate approval outright: retry with backoff up to the
+            // deadline. Only a genuine timeout (nothing arrives by then)
+            // fails closed; `pop_buffered`'s own error (a poisoned mutex) is
+            // the one thing here that is never going to resolve by retrying.
+            match self.poll_to_daemon() {
+                Ok(()) => backoff = self.poll_interval,
+                Err(e) => eprintln!("latch relay: to-daemon poll failed, retrying: {e}"),
+            }
             if let Some(env) = self.pop_buffered()? {
                 return Ok(Some(env));
             }
@@ -134,7 +149,72 @@ impl Transport for DaemonRelay {
             if remaining.is_zero() {
                 return Ok(None);
             }
-            std::thread::sleep(self.poll_interval.min(remaining));
+            std::thread::sleep(backoff.min(remaining));
+            backoff = (backoff * 2).min(MAX_POLL_BACKOFF);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// A raw-socket fake relay that answers the first `to-daemon` GET with a
+    /// transient 500, then the second with a real envelope. No mocking crate
+    /// in the dependency tree, so this is hand-rolled HTTP/1.1 framing over a
+    /// `TcpListener`, `Connection: close` per response so parsing a request
+    /// need not go further than finding the blank line.
+    fn spawn_flaky_relay() -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake relay");
+        let addr = listener.local_addr().expect("local_addr");
+        let identity = latch_proto::identity::DeviceIdentity::generate();
+        let peer = identity.peer_identity();
+        let env = Envelope::seal(&"payload", [7u8; 32], 1, &identity.signing, &peer)
+            .expect("seal test envelope");
+        let env_json = serde_json::to_string(&env).expect("serialize test envelope");
+        let handle = std::thread::spawn(move || {
+            for ok in [false, true] {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf); // discard the request line/headers
+                let body = if ok {
+                    format!(
+                        "{{\"envelopes\":[{}]}}",
+                        serde_json::to_string(&env_json).unwrap()
+                    )
+                } else {
+                    String::new()
+                };
+                let status = if ok {
+                    "200 OK"
+                } else {
+                    "500 Internal Server Error"
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn recv_survives_one_transient_poll_error_and_returns_the_envelope() {
+        let (base, server) = spawn_flaky_relay();
+        let relay = DaemonRelay::new(&base, [7u8; 32])
+            .expect("build relay")
+            .with_poll_interval(Duration::from_millis(20));
+        let got = relay
+            .recv([7u8; 32], Direction::ToDaemon, Duration::from_secs(5))
+            .expect("recv must retry past the transient 500, not error out");
+        assert!(
+            got.is_some(),
+            "the envelope from the second poll must surface"
+        );
+        server.join().expect("fake relay thread");
     }
 }

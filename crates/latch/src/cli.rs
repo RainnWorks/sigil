@@ -563,13 +563,19 @@ fn account_add(args: &[String], json: bool) -> i32 {
     // Unwrap the DEK (biometric on macOS) and encrypt the token under it.
     let ks = keystore::for_host();
     if let Err(e) = ks.ensure_dek() {
-        eprintln!("latch: provisioning the DEK: {e}");
+        eprintln!(
+            "latch: provisioning the DEK: {}\n  (detail: {e})",
+            keystore::dek_error_hint(&e)
+        );
         return 1;
     }
     let dek = match ks.unwrap_dek(&format!("Add the {label} service-account token")) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("latch: unwrapping the DEK: {e}");
+            eprintln!(
+                "latch: unwrapping the DEK: {}\n  (detail: {e})",
+                keystore::dek_error_hint(&e)
+            );
             return 1;
         }
     };
@@ -757,13 +763,19 @@ fn account_rotate(args: &[String], json: bool) -> i32 {
 
     let ks = keystore::for_host();
     if let Err(e) = ks.ensure_dek() {
-        eprintln!("latch: provisioning the DEK: {e}");
+        eprintln!(
+            "latch: provisioning the DEK: {}\n  (detail: {e})",
+            keystore::dek_error_hint(&e)
+        );
         return 1;
     }
     let dek = match ks.unwrap_dek(&format!("Rotate the {id} service-account token")) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("latch: unwrapping the DEK: {e}");
+            eprintln!(
+                "latch: unwrapping the DEK: {}\n  (detail: {e})",
+                keystore::dek_error_hint(&e)
+            );
             return 1;
         }
     };
@@ -1284,13 +1296,21 @@ fn run_pairing(args: &[String]) -> i32 {
     // pair provisions it; a later account add reuses it (ensure_dek never
     // regenerates an existing DEK).
     if let Err(e) = ks.ensure_dek() {
-        eprintln!("{} provisioning the DEK: {e}", s.deny("\u{2717}"));
+        eprintln!(
+            "{} provisioning the DEK: {}\n  (detail: {e})",
+            s.deny("\u{2717}"),
+            keystore::dek_error_hint(&e)
+        );
         return 1;
     }
     let dek = match ks.unwrap_dek("Deliver the encryption key to your phone during pairing") {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("{} unwrapping the DEK: {e}", s.deny("\u{2717}"));
+            eprintln!(
+                "{} unwrapping the DEK: {}\n  (detail: {e})",
+                s.deny("\u{2717}"),
+                keystore::dek_error_hint(&e)
+            );
             return 1;
         }
     };
@@ -1407,7 +1427,9 @@ fn run_pairing_json(args: &[String]) -> i32 {
     if let Err(e) = ks.ensure_dek() {
         emit_ndjson(&serde_json::json!({
             "event": "failed",
-            "reason": format!("provisioning the DEK: {e}")
+            // The Mac app renders `reason` verbatim in its error panel, so it
+            // must lead with the actionable hint, never the raw error chain.
+            "reason": format!("provisioning the DEK: {}", keystore::dek_error_hint(&e))
         }));
         return 1;
     }
@@ -1416,7 +1438,7 @@ fn run_pairing_json(args: &[String]) -> i32 {
         Err(e) => {
             emit_ndjson(&serde_json::json!({
                 "event": "failed",
-                "reason": format!("unwrapping the DEK: {e}")
+                "reason": format!("unwrapping the DEK: {}", keystore::dek_error_hint(&e))
             }));
             return 1;
         }
@@ -3032,9 +3054,9 @@ fn cmd_mac_approvals(args: &[String], json: bool) -> i32 {
         Err(e) => {
             // Honest failure: the SE envelope could not be minted here.
             eprintln!(
-                "latch: cannot enable Mac approvals: {e}. \
-                 Secure Enclave minting is pending device verification (task #17); \
-                 the phone remains the approving factor."
+                "latch: cannot enable Mac approvals: {}. \
+                 The phone remains the approving factor.\n  (detail: {e})",
+                keystore::dek_error_hint(&e)
             );
             if json {
                 println!("{}", json::to_line(&json::MacApprovalsJson { ok: false }));

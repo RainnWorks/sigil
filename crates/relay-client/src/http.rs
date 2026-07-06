@@ -10,6 +10,7 @@
 //! Blocking, like the phone side always was: each party does one round trip at a
 //! time, so a synchronous client needs no runtime.
 
+use std::io::Read as _;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -21,6 +22,14 @@ use crate::mailbox_hex;
 /// Per-request HTTP timeout. A slot GET returns immediately with whatever is
 /// buffered (not a long-poll), so this only bounds a stalled connection.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Ceiling on a drained slot's response body. An honest relay bounds a
+/// mailbox to `MAX_QUEUE` (32) envelopes of at most `MAX_ENVELOPE_BYTES`
+/// (16 KiB) each (see `relay/shared/protocol.ts`), so a legitimate drain is a
+/// few hundred KiB at most; 2 MiB is generous headroom over that. A buggy or
+/// hostile relay ignoring its own limits must not be able to force unbounded
+/// client-side allocation just because we asked it to drain a mailbox.
+const MAX_DRAIN_BYTES: u64 = 2 * 1024 * 1024;
 
 /// A mailbox's two direction slots. `daemon -> phone` is `to-phone`;
 /// `phone -> daemon` is `to-daemon`.
@@ -105,7 +114,10 @@ impl HttpMailbox {
     }
 
     /// GET and drain every opaque payload currently buffered for a slot
-    /// (drain-on-read: the relay removes what it returns).
+    /// (drain-on-read: the relay removes what it returns). The body is read
+    /// through a hard cap ([`MAX_DRAIN_BYTES`]) rather than via `resp.text()`,
+    /// so a relay that ignores its own queue/size limits (buggy, or hostile)
+    /// cannot force this client to buffer an unbounded response.
     pub(crate) fn drain(&self, slot: Slot) -> Result<Vec<String>, TransportError> {
         let resp = self
             .client
@@ -119,11 +131,59 @@ impl HttpMailbox {
                 resp.status()
             )));
         }
-        let body = resp
-            .text()
+        let mut body = Vec::new();
+        resp.take(MAX_DRAIN_BYTES + 1)
+            .read_to_end(&mut body)
             .map_err(|e| TransportError::Backend(format!("reading {} body: {e}", slot.path())))?;
-        let parsed: Drained = serde_json::from_str(&body)
+        if body.len() as u64 > MAX_DRAIN_BYTES {
+            return Err(TransportError::Backend(format!(
+                "{} body exceeded {MAX_DRAIN_BYTES} bytes; refusing to buffer it",
+                slot.path()
+            )));
+        }
+        let parsed: Drained = serde_json::from_slice(&body)
             .map_err(|e| TransportError::Backend(format!("parsing {} body: {e}", slot.path())))?;
         Ok(parsed.envelopes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    /// A raw-socket fake relay that answers one `to-daemon` GET with a body
+    /// bigger than [`MAX_DRAIN_BYTES`]. Hand-rolled HTTP/1.1 framing (no
+    /// mocking crate in the tree), `Connection: close` so the client need not
+    /// pipeline a second request.
+    fn spawn_oversized_relay(body_len: usize) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake relay");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf); // discard the request line/headers
+            let resp_head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(resp_head.as_bytes());
+            let _ = stream.write_all(&vec![b' '; body_len]);
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn drain_refuses_a_body_past_the_cap_instead_of_buffering_it() {
+        let (base, server) = spawn_oversized_relay(MAX_DRAIN_BYTES as usize + 1024);
+        let mailbox = HttpMailbox::new(&base, [9u8; 32]).expect("build mailbox client");
+        let err = mailbox
+            .drain(Slot::ToDaemon)
+            .expect_err("an oversized body must be refused, not buffered");
+        assert!(
+            matches!(err, TransportError::Backend(ref m) if m.contains("exceeded")),
+            "expected the size-cap error, got: {err:?}"
+        );
+        server.join().expect("fake relay thread");
     }
 }

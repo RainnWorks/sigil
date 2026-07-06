@@ -121,9 +121,12 @@ const RENDEZVOUS_DOMAIN: &[u8] = b"latch.pairing.rendezvous.v1";
 /// label => distinct key => no key reuse across purposes.
 const SUBKEY_CONFIRM_LABEL: &[u8] = b"confirm-tag";
 
-/// Default lifetime of a pairing secret / QR, in milliseconds (180s). After
-/// this the daemon refuses any response and the human re-mints the QR.
-pub const PAIRING_SECRET_TTL_MS: u64 = 180_000;
+/// Default lifetime of a pairing secret / QR, in milliseconds (600s). After
+/// this the daemon refuses any response and the human re-mints the QR. Must
+/// match the CLI's pairing wait (`response_timeout` in `cli.rs`'s
+/// `run_pairing`/`run_pairing_json`, also 600s) or the QR looks alive on
+/// screen for longer than the secret backing it actually is.
+pub const PAIRING_SECRET_TTL_MS: u64 = 600_000;
 
 /// A 32-byte keyed BLAKE2b, used both as the KDF and as the MAC.
 ///

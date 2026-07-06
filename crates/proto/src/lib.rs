@@ -40,7 +40,15 @@ pub use threshold::{
 pub use transport::{Direction, LocalRelay, PushHint, Transport, TransportError};
 
 /// Maximum allowed clock skew between sender and receiver, in milliseconds.
-pub const REPLAY_WINDOW_MS: u64 = 90_000;
+///
+/// Must stay ahead of the daemon's approval round trip
+/// (`latch::approve::DEFAULT_APPROVAL_TIMEOUT`, 120s) with headroom, or a
+/// legitimate approval that takes the full timeout arrives with a
+/// now-stale envelope timestamp and gets rejected as a replay. 150s gives
+/// 30s of margin over the 120s default. The relay's own envelope TTL
+/// (`TTL_MS` in `relay/shared/protocol.ts`) should track this same target so
+/// the mailbox doesn't expire an envelope before this window would have.
+pub const REPLAY_WINDOW_MS: u64 = 150_000;
 
 /// Wall-clock now in unix milliseconds.
 pub fn now_ms() -> u64 {
