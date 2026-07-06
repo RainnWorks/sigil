@@ -40,9 +40,15 @@ pub fn mailbox_hex(mailbox: &[u8; 32]) -> String {
     s
 }
 
-/// Build the daemon's outbound WebSocket attach URL from an `http(s)://host`
-/// relay base. `http` -> `ws`, `https` -> `wss`; any other scheme is passed
-/// through unchanged (already a `ws(s)://` base).
+/// Build the outbound WebSocket attach URL from an `http(s)://host` relay base.
+/// `http` -> `ws`, `https` -> `wss`; any other scheme is passed through unchanged
+/// (already a `ws(s)://` base).
+///
+/// Path is `/attach/<mailbox_hex>`, the v3 stateless relay's single rendezvous
+/// endpoint (at most two sockets per mailbox, forwarded live, no buffer). This
+/// matches the phone's `attachUrl` in `apps/phone/src/transport/relay-attach.ts`
+/// byte-for-byte, and serves both the daemon approval socket ([`DaemonRelay`])
+/// and the pairing rendezvous ([`RendezvousWs`]).
 pub(crate) fn attach_url(base: &str, mailbox_hex: &str) -> String {
     let base = base.trim_end_matches('/');
     let ws_base = if let Some(rest) = base.strip_prefix("https://") {
@@ -52,7 +58,7 @@ pub(crate) fn attach_url(base: &str, mailbox_hex: &str) -> String {
     } else {
         base.to_string()
     };
-    format!("{ws_base}/mailbox/{mailbox_hex}/attach")
+    format!("{ws_base}/attach/{mailbox_hex}")
 }
 
 /// The opaque wire form of an envelope: the exact bytes the relay stores and
@@ -145,16 +151,13 @@ mod tests {
     fn attach_url_maps_scheme_to_ws() {
         assert_eq!(
             attach_url("https://relay.example", "ab"),
-            "wss://relay.example/mailbox/ab/attach"
+            "wss://relay.example/attach/ab"
         );
         assert_eq!(
             attach_url("http://127.0.0.1:8787/", "cd"),
-            "ws://127.0.0.1:8787/mailbox/cd/attach"
+            "ws://127.0.0.1:8787/attach/cd"
         );
-        assert_eq!(
-            attach_url("ws://host:1/", "ef"),
-            "ws://host:1/mailbox/ef/attach"
-        );
+        assert_eq!(attach_url("ws://host:1/", "ef"), "ws://host:1/attach/ef");
     }
 
     #[test]
