@@ -2855,10 +2855,11 @@ mod tests {
         ignore = "spawns an external bun relay; run: cargo test -p latch --features real-relay -- --test-threads=1"
     )]
     fn daemon_relay_resumes_after_the_relay_is_bounced() {
-        // Reconnect/resume: attach the daemon, drop the relay out from under it,
-        // bring a fresh relay up on the same port, and prove the approval loop
-        // still completes. The DaemonRelay pump redials with backoff and the
-        // outbound request buffered across the outage is flushed on reattach.
+        // Relay restart tolerance: build the daemon client, drop the relay out
+        // from under it, bring a fresh relay up on the same port, and prove the
+        // approval loop still completes. The v4 client is connectionless (each
+        // deposit/drain is its own HTTP request), so it transparently works
+        // against the fresh instance with no reconnect state to rebuild.
         // Only runnable when we control the relay process (spawn path).
         if std::env::var("LATCH_TEST_RELAY_URL").is_ok() {
             eprintln!("SKIPPED daemon_relay_resumes_after_the_relay_is_bounced: needs a bounceable relay (unset LATCH_TEST_RELAY_URL)");
