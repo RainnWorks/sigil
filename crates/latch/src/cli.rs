@@ -1261,20 +1261,27 @@ fn pair_list(json: bool) -> i32 {
 }
 
 /// The real pairing ceremony: mint a QR, wait on the relay for the phone, verify,
-/// confirm SAS, deliver the DEK, and persist. `--relay <url>` or `$LATCH_RELAY_URL`.
+/// confirm SAS, deliver the DEK, and persist. `--relay <url>` or `$LATCH_RELAY_URL`
+/// override; absent both, defaults to [`crate::pair::DEFAULT_RELAY_URL`] (the
+/// shared Sigil relay), announced out loud so the human always knows which
+/// relay a pairing crossed.
 fn run_pairing(args: &[String]) -> i32 {
     let s = Style::stdout();
-    let relay = flag_value(args, "--relay")
+    let relay = match flag_value(args, "--relay")
         .map(str::to_string)
-        .or_else(|| std::env::var("LATCH_RELAY_URL").ok());
-    let Some(relay) = relay else {
-        eprintln!(
-            "usage: latch pair --relay <url>   (or set LATCH_RELAY_URL)\n\
-             \n\
-             The relay is the blind mailbox the Mac and phone meet on. Use your\n\
-             own (self-hosted) relay URL, e.g. https://relay.example."
-        );
-        return 2;
+        .or_else(|| std::env::var("LATCH_RELAY_URL").ok())
+    {
+        Some(r) => r,
+        None => {
+            println!(
+                "  {}",
+                s.dim(&format!(
+                    "Using the Sigil relay ({})",
+                    crate::pair::DEFAULT_RELAY_URL
+                ))
+            );
+            crate::pair::DEFAULT_RELAY_URL.to_string()
+        }
     };
     let auto_yes = has_flag(args, "--yes") || has_flag(args, "-y");
     // --qr-png also writes the pairing payload as a scannable PNG, so a remote
@@ -1407,15 +1414,23 @@ fn run_pairing(args: &[String]) -> i32 {
 /// This is the real MITM backstop; auto-confirming here would seal and hand the
 /// DEK to whoever answered the QR before a human ever looked at the words.
 fn run_pairing_json(args: &[String]) -> i32 {
-    let relay = flag_value(args, "--relay")
+    let relay = match flag_value(args, "--relay")
         .map(str::to_string)
-        .or_else(|| std::env::var("LATCH_RELAY_URL").ok());
-    let Some(relay) = relay else {
-        emit_ndjson(&serde_json::json!({
-            "event": "failed",
-            "reason": "no relay: pass --relay <url> or set LATCH_RELAY_URL"
-        }));
-        return 2;
+        .or_else(|| std::env::var("LATCH_RELAY_URL").ok())
+    {
+        Some(r) => r,
+        None => {
+            // Not an NDJSON event: stdout here is a pure event stream the Mac
+            // app parses, so an ad hoc "using the default relay" line would
+            // either corrupt that stream or (if it added a new event kind)
+            // need app-side decoder changes outside this pathspec. stderr
+            // still makes the default honest and discoverable in logs.
+            eprintln!(
+                "latch: using the default relay ({})",
+                crate::pair::DEFAULT_RELAY_URL
+            );
+            crate::pair::DEFAULT_RELAY_URL.to_string()
+        }
     };
 
     let ks = keystore::for_host();
@@ -1607,15 +1622,11 @@ fn cmd_setup(args: &[String]) -> i32 {
         ),
     }
 
-    // 5. Pairing, if a relay was given; else point the way.
+    // 5. Pairing. A relay is now always available (an explicit --relay/
+    //    $LATCH_RELAY_URL override, or the baked-in default), so guided setup
+    //    always continues straight into the ceremony.
     println!();
-    if flag_value(args, "--relay").is_some() || std::env::var_os("LATCH_RELAY_URL").is_some() {
-        return run_pairing(args);
-    }
-    println!("  {}", s.dim("last step: pair your phone"));
-    println!("    {}", s.cobalt("latch pair --relay <url>"));
-    println!();
-    cmd_status()
+    run_pairing(args)
 }
 
 fn cmd_service(verb: &str) -> i32 {

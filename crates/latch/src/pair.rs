@@ -29,6 +29,15 @@ use latch_proto::{rendezvous_mailbox, PairingResponse, TransportError};
 
 use crate::pairing_store::{NewPairing, NewPhoneShare};
 
+/// The Sigil-operated shared relay, used when the operator gives neither
+/// `--relay <url>` nor `$LATCH_RELAY_URL`. It is a blind mailbox (opaque
+/// envelopes, key-hash mailboxes, no accounts -- see the design brief's Trust
+/// model), so defaulting to it costs nothing beyond routing metadata; a
+/// self-hosted relay via either override still takes priority. Callers that
+/// use this default must say so out loud (never silently), so the human
+/// always knows which relay a pairing crossed.
+pub const DEFAULT_RELAY_URL: &str = "https://relay.rainn.works";
+
 /// The opaque-string channel the pairing ceremony runs over: send toward the
 /// phone, receive from the phone. Implemented by the HTTP
 /// [`Rendezvous`](latch_relay_client::Rendezvous) for the real relay and by an
