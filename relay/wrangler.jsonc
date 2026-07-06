@@ -1,8 +1,12 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "latch-relay",
+  "name": "sigil-relay",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-04",
+  // Keep the workers.dev URL live alongside the custom domain, so the relay is
+  // reachable during DNS propagation and as a fallback. The default clients
+  // point at relay.rainn.works.
+  "workers_dev": true,
   // One Durable Object per mailbox, keyed by the 64-hex mailbox id. It holds
   // that mailbox's envelopes only in its own instance memory; it makes zero
   // storage writes (no persisted queue, no persisted counter). See
@@ -18,7 +22,11 @@
   "rules": [{ "type": "Text", "globs": ["**/*.html"] }],
   // Deliberately OFF. Request logs would record mailbox ids and timing, which is
   // exactly the metadata this relay promises never to retain. See README.
-  "observability": { "enabled": false }
+  "observability": { "enabled": false },
+  // The publisher's shared instance is served from this custom domain. The zone
+  // (rainn.works) must be in the same Cloudflare account; the record + edge cert
+  // are provisioned by `wrangler deploy`. See DEPLOY.md.
+  "routes": [{ "pattern": "relay.rainn.works", "custom_domain": true }]
   // APNS_KEY_P8 (the publisher's APNs .p8 signing key, PEM text) is a secret,
   // not a var: set it with `wrangler secret put APNS_KEY_P8`, never committed
   // here. Absent, the push doorbell is disabled and every deposit still
