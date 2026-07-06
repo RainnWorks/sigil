@@ -71,7 +71,7 @@ jobs:
         working-directory: apps/phone
         run: bun run proto:selftest
       - name: export rust test vectors
-        run: cargo run -p latch-proto --bin export-vectors
+        run: cargo run -p sigil-proto --bin export-vectors
       - name: verify JS protocol layer against the rust vectors
         working-directory: apps/phone
         run: bun run proto:vectors

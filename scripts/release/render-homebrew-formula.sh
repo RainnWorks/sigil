@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Render a Homebrew formula for the `latch` + `latch-config` CLI from the
+# Render a Homebrew formula for the `sigil` + `sigil-config` CLI from the
 # release tarballs package-cli.sh already built. Not published anywhere by
 # this repo: it writes sigil.rb to an output path, and it is on Tom to copy
 # that file into a tap repo (e.g. a new `rainnworks/homebrew-tap`, formula
@@ -10,8 +10,8 @@
 #
 # <dist-dir> must already hold the two release tarballs' .sha256 files, as
 # produced by package-cli.sh:
-#   <dist-dir>/latch-<version>-aarch64-apple-darwin.tar.gz.sha256
-#   <dist-dir>/latch-<version>-x86_64-apple-darwin.tar.gz.sha256
+#   <dist-dir>/sigil-<version>-aarch64-apple-darwin.tar.gz.sha256
+#   <dist-dir>/sigil-<version>-x86_64-apple-darwin.tar.gz.sha256
 set -euo pipefail
 
 if [[ $# -lt 4 ]]; then
@@ -24,8 +24,8 @@ REPO_SLUG="$2"
 OUT_FILE="$3"
 DIST_DIR="$4"
 
-ARM_SHA_FILE="$DIST_DIR/latch-${VERSION}-aarch64-apple-darwin.tar.gz.sha256"
-X86_SHA_FILE="$DIST_DIR/latch-${VERSION}-x86_64-apple-darwin.tar.gz.sha256"
+ARM_SHA_FILE="$DIST_DIR/sigil-${VERSION}-aarch64-apple-darwin.tar.gz.sha256"
+X86_SHA_FILE="$DIST_DIR/sigil-${VERSION}-x86_64-apple-darwin.tar.gz.sha256"
 
 for f in "$ARM_SHA_FILE" "$X86_SHA_FILE"; do
   [[ -f "$f" ]] || { echo "missing $f - run package-cli.sh for both targets first" >&2; exit 1; }
@@ -45,22 +45,22 @@ class Sigil < Formula
   version "${VERSION_NUM}"
 
   on_arm do
-    url "https://github.com/${REPO_SLUG}/releases/download/${VERSION}/latch-${VERSION}-aarch64-apple-darwin.tar.gz"
+    url "https://github.com/${REPO_SLUG}/releases/download/${VERSION}/sigil-${VERSION}-aarch64-apple-darwin.tar.gz"
     sha256 "${ARM_SHA}"
   end
 
   on_intel do
-    url "https://github.com/${REPO_SLUG}/releases/download/${VERSION}/latch-${VERSION}-x86_64-apple-darwin.tar.gz"
+    url "https://github.com/${REPO_SLUG}/releases/download/${VERSION}/sigil-${VERSION}-x86_64-apple-darwin.tar.gz"
     sha256 "${X86_SHA}"
   end
 
   def install
-    bin.install "latch"
-    bin.install "latch-config"
+    bin.install "sigil"
+    bin.install "sigil-config"
   end
 
   test do
-    system "#{bin}/latch", "--version"
+    system "#{bin}/sigil", "--version"
   end
 end
 EOF

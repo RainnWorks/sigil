@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------
-  # CLI: cross-compiled `latch` + `latch-config`, tarball + sha256 per arch.
+  # CLI: cross-compiled `sigil` + `sigil-config`, tarball + sha256 per arch.
   # No secrets needed - always runs.
   # ---------------------------------------------------------------------
   rust-cli:
