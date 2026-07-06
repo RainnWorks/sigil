@@ -581,11 +581,15 @@ fn handle_conn(core: Arc<Core>, mut stream: UnixStream) -> anyhow::Result<()> {
     let reply = match frame {
         Frame::Run { argv, cwd } => {
             log_request(&argv, &cwd, peer);
+            // The shim passes the caller's own stdin, stdout, stderr in that
+            // order (SCM_RIGHTS). The daemon only splices them to the child; it
+            // never reads any of them, so no caller byte enters daemon memory.
             let mut fds = fds.into_iter();
+            let stdin = fds.next();
             let stdout = fds.next();
             let stderr = fds.next();
             Reply::Exit {
-                code: fulfill(&core, &argv, &cwd, peer, stdout, stderr),
+                code: fulfill(&core, &argv, &cwd, peer, stdin, stdout, stderr),
             }
         }
         Frame::Approve { id, lease } => {
@@ -760,6 +764,7 @@ fn fulfill(
     argv: &[String],
     cwd: &str,
     peer: Option<i32>,
+    stdin: Option<OwnedFd>,
     stdout: Option<OwnedFd>,
     stderr: Option<OwnedFd>,
 ) -> i32 {
@@ -873,6 +878,7 @@ fn fulfill(
                 cwd,
                 credential: Some(&token),
                 source,
+                stdin,
                 stdout,
                 stderr,
             });
@@ -1011,6 +1017,7 @@ fn fulfill(
         cwd,
         credential: credential.as_ref(),
         source,
+        stdin,
         stdout,
         stderr,
     });
@@ -1267,7 +1274,7 @@ mod tests {
             "op://Engineering/.env/password".into(),
         ];
         // Empty cwd: the fake op runs in the test's own directory (a real path).
-        let code = fulfill(&core, &argv, "", None, Some(write_end), None);
+        let code = fulfill(&core, &argv, "", None, None, Some(write_end), None);
         assert_eq!(code, 0);
         assert_eq!(read_all(read_end), "known-secret-42");
         // No lease was requested, so none is held.
@@ -1320,7 +1327,10 @@ mod tests {
             "op://Engineering/.env/password".into(),
         ];
         // Empty cwd: the fake op runs in the test's own directory (a real path).
-        assert_eq!(fulfill(&core, &argv, "", None, Some(write_end), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, "", None, None, Some(write_end), None),
+            0
+        );
         assert_eq!(read_all(read_end), "secret-1");
 
         let hist = crate::audit::load();
@@ -1456,7 +1466,7 @@ mod tests {
         let (_r, w) = pipe();
         let worker = std::thread::spawn(move || {
             let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
-            fulfill(&park_core, &argv, "", None, Some(w), None)
+            fulfill(&park_core, &argv, "", None, None, Some(w), None)
         });
 
         // A subsequent event carries the parked request.
@@ -1508,14 +1518,14 @@ mod tests {
         let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
         // First request approves and leases.
         let (r1, w1) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, Some(w1), None), 0);
+        assert_eq!(fulfill(&core, &argv, "", None, None, Some(w1), None), 0);
         assert_eq!(read_all(r1), "secret-A");
         assert_eq!(core.leases.active(), 1);
 
         // With a live lease the second identical request must be served from the
         // lease, not a fresh approval.
         let (r2, w2) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, Some(w2), None), 0);
+        assert_eq!(fulfill(&core, &argv, "", None, None, Some(w2), None), 0);
         assert_eq!(read_all(r2), "secret-A");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1535,7 +1545,7 @@ mod tests {
         let (read_end, write_end) = pipe();
         let (err_r, err_w) = pipe();
         let argv = vec!["op".into(), "read".into(), "op://Engineering/x".into()];
-        let code = fulfill(&core, &argv, "/p", None, Some(write_end), Some(err_w));
+        let code = fulfill(&core, &argv, "/p", None, None, Some(write_end), Some(err_w));
         assert_eq!(code, 1, "deny must fail closed");
         assert_eq!(read_all(read_end), "", "no secret on a denied request");
         assert!(read_all(err_r).contains("denied"));
@@ -1556,7 +1566,10 @@ mod tests {
 
         let (read_end, write_end) = pipe();
         let argv = vec!["op".into(), "read".into(), "op://Engineering/x".into()];
-        assert_eq!(fulfill(&core, &argv, "/p", None, Some(write_end), None), 1);
+        assert_eq!(
+            fulfill(&core, &argv, "/p", None, None, Some(write_end), None),
+            1
+        );
         assert_eq!(read_all(read_end), "");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1576,7 +1589,7 @@ mod tests {
         let (read_end, write_end) = pipe();
         let (err_r, err_w) = pipe();
         let argv = vec!["gcloud".into(), "auth".into(), "print-access-token".into()];
-        let code = fulfill(&core, &argv, "", None, Some(write_end), Some(err_w));
+        let code = fulfill(&core, &argv, "", None, None, Some(write_end), Some(err_w));
         assert_eq!(code, 1, "an unconfigured command must fail closed");
         assert_eq!(read_all(read_end), "", "and produce no output");
         let err = read_all(err_r);
@@ -1638,7 +1651,15 @@ mod tests {
         }
         std::env::set_var("PATH", std::env::join_paths(search).unwrap());
         let (read_end, write_end) = pipe();
-        let code = fulfill(&core, &["faketool".into()], "", None, Some(write_end), None);
+        let code = fulfill(
+            &core,
+            &["faketool".into()],
+            "",
+            None,
+            None,
+            Some(write_end),
+            None,
+        );
         match prev {
             Some(v) => std::env::set_var("PATH", v),
             None => std::env::remove_var("PATH"),
@@ -1649,6 +1670,85 @@ mod tests {
         // A direct-injection provider is never leased (no credential to hold in
         // RAM across a TTL), even though the decision would allow it.
         assert_eq!(core.leases.active(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn caller_stdin_is_spliced_to_the_tool_child() {
+        // Interactive tools must read the CALLER's stdin. Prove the fd handed to
+        // fulfill reaches the child: a tool that reads a line from stdin and
+        // echoes it sees exactly the bytes we wrote to the caller-side pipe. The
+        // daemon only splices the fd; it never reads the bytes itself.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("stdin-splice");
+        let env_path = dir.join("s.env");
+        std::fs::write(&env_path, "MARK=ok\n").unwrap();
+        let bindir = dir.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = bindir.join("faketool");
+        // Reads one line from stdin, echoes it back tagged so we can assert it
+        // came from the caller's stdin fd (not the daemon's).
+        std::fs::write(&tool, "#!/bin/sh\nread line\nprintf 'stdin=%s' \"$line\"\n").unwrap();
+        std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let pending = Arc::new(PendingRegistry::new());
+        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+            .with_dev(DevMode::Approve)
+            .with_control_socket(true);
+        let config = env_file_config("faketool", env_path.to_str().unwrap());
+        let core = Arc::new(Core {
+            keystore,
+            accounts: Mutex::new(AccountStore::default()),
+            threshold: Mutex::new(Default::default()),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(approver)),
+            pending,
+            lockdown: AtomicBool::new(false),
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::with_defaults(),
+            config,
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::DevInsecure,
+            ssh_signers: Vec::new(),
+            audit: None,
+        });
+
+        let prev = std::env::var_os("PATH");
+        let mut search = vec![bindir.clone()];
+        if let Some(p) = &prev {
+            search.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
+
+        // The caller's stdin: write a line into the write end, hand the read end
+        // to fulfill as the caller stdin fd.
+        let (in_r, in_w) = pipe();
+        {
+            use std::io::Write as _;
+            let mut w = std::fs::File::from(in_w);
+            w.write_all(b"hello-from-caller\n").unwrap();
+        } // drop closes the write end so the child's `read` sees EOF after the line
+        let (out_r, out_w) = pipe();
+        let code = fulfill(
+            &core,
+            &["faketool".into()],
+            "",
+            None,
+            Some(in_r),
+            Some(out_w),
+            None,
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert_eq!(code, 0);
+        assert_eq!(read_all(out_r), "stdin=hello-from-caller");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1750,7 +1850,7 @@ mod tests {
                 argv,
                 cwd: String::new(),
             },
-            &[write_end.as_raw_fd()],
+            &[std::io::stdin().as_raw_fd(), write_end.as_raw_fd()],
         )
         .unwrap();
         drop(write_end);
@@ -1938,7 +2038,11 @@ mod tests {
                 argv,
                 cwd: String::new(),
             },
-            &[write_end.as_raw_fd(), err_w.as_raw_fd()],
+            &[
+                std::io::stdin().as_raw_fd(),
+                write_end.as_raw_fd(),
+                err_w.as_raw_fd(),
+            ],
         )
         .unwrap();
         drop(write_end);
@@ -1996,7 +2100,7 @@ mod tests {
             "read".into(),
             "op://Engineering/.env/password".into(),
         ];
-        let code = fulfill(&core, &argv, "", None, Some(write_end), Some(err_w));
+        let code = fulfill(&core, &argv, "", None, None, Some(write_end), Some(err_w));
 
         assert_eq!(code, 1, "a remote denial must fail closed");
         assert_eq!(read_all(read_end), "", "no secret on a denied request");
@@ -2132,7 +2236,11 @@ mod tests {
                 argv,
                 cwd: String::new(),
             },
-            &[write_end.as_raw_fd(), err_w.as_raw_fd()],
+            &[
+                std::io::stdin().as_raw_fd(),
+                write_end.as_raw_fd(),
+                err_w.as_raw_fd(),
+            ],
         )
         .unwrap();
         drop(write_end);
@@ -2191,7 +2299,7 @@ mod tests {
             "read".into(),
             "op://Engineering/.env/password".into(),
         ];
-        let code = fulfill(&core, &argv, "", None, Some(write_end), Some(err_w));
+        let code = fulfill(&core, &argv, "", None, None, Some(write_end), Some(err_w));
         assert_eq!(code, 1, "a v2 denial must fail closed");
         assert_eq!(read_all(read_end), "", "no secret on a denied v2 request");
         assert!(read_all(err_r).contains("denied"));
@@ -2288,7 +2396,7 @@ mod tests {
             "Engineering".into(),
             "op://Engineering/x".into(),
         ];
-        assert_eq!(fulfill(&core, &v2_argv, "", None, Some(w2), None), 0);
+        assert_eq!(fulfill(&core, &v2_argv, "", None, None, Some(w2), None), 0);
         assert_eq!(
             read_all(r2),
             "v2-token",
@@ -2304,7 +2412,7 @@ mod tests {
             "Legacy".into(),
             "op://Legacy/x".into(),
         ];
-        assert_eq!(fulfill(&core, &v1_argv, "", None, Some(w1), None), 0);
+        assert_eq!(fulfill(&core, &v1_argv, "", None, None, Some(w1), None), 0);
         assert_eq!(read_all(r1), "v1-token", "v1 vault must use the DEK path");
 
         shutdown.store(true, Ordering::SeqCst);
@@ -2483,7 +2591,11 @@ mod tests {
                 argv,
                 cwd: String::new(),
             },
-            &[write_end.as_raw_fd(), err_w.as_raw_fd()],
+            &[
+                std::io::stdin().as_raw_fd(),
+                write_end.as_raw_fd(),
+                err_w.as_raw_fd(),
+            ],
         )
         .unwrap();
         drop(write_end);
@@ -2576,7 +2688,7 @@ mod tests {
             "read".into(),
             "op://Engineering/.env/password".into(),
         ];
-        let code = fulfill(&core, &argv, "", None, Some(write_end), None);
+        let code = fulfill(&core, &argv, "", None, None, Some(write_end), None);
 
         assert_eq!(code, 0, "the loop must complete after a relay bounce");
         assert_eq!(read_all(read_end), "bounce-secret-55");
@@ -2631,7 +2743,7 @@ mod tests {
         let (read_end, write_end) = pipe();
         let (err_r, err_w) = pipe();
         let argv = vec!["op".into(), "read".into(), "op://Engineering/x".into()];
-        let code = fulfill(&core, &argv, "/p", None, Some(write_end), Some(err_w));
+        let code = fulfill(&core, &argv, "/p", None, None, Some(write_end), Some(err_w));
 
         assert_eq!(code, 1, "a daemon with no factor must fail closed");
         assert_eq!(read_all(read_end), "", "no secret without a real factor");
@@ -2833,7 +2945,7 @@ mod tests {
                 argv,
                 cwd: String::new(),
             },
-            &[write_end.as_raw_fd()],
+            &[std::io::stdin().as_raw_fd(), write_end.as_raw_fd()],
         )
         .unwrap();
         drop(write_end);
@@ -3006,7 +3118,15 @@ mod tests {
         }
         std::env::set_var("PATH", std::env::join_paths(search).unwrap());
         let (read_end, write_end) = pipe();
-        let code = fulfill(&core, &["faketool".into()], "", None, Some(write_end), None);
+        let code = fulfill(
+            &core,
+            &["faketool".into()],
+            "",
+            None,
+            None,
+            Some(write_end),
+            None,
+        );
         match prev {
             Some(v) => std::env::set_var("PATH", v),
             None => std::env::remove_var("PATH"),

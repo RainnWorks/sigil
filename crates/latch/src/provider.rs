@@ -67,6 +67,11 @@ pub struct ProviderRun<'a> {
     /// The provider-specific source string from the command config (the env-file
     /// path for [`EnvFileProvider`]). Empty when unused.
     pub source: &'a str,
+    /// The caller's stdin, wired straight to the child so interactive tools
+    /// (`op inject`, a prompt) read the caller's terminal. Like stdout/stderr it
+    /// is an fd the daemon splices to the child and NEVER reads itself, so no
+    /// input byte enters daemon memory (invariant #2 holds for input too).
+    pub stdin: Option<OwnedFd>,
     /// The caller's stdout, wired straight to the child.
     pub stdout: Option<OwnedFd>,
     /// The caller's stderr, wired straight to the child.
@@ -229,6 +234,9 @@ impl SecretProvider for OpProvider {
                 return 1;
             }
         }
+        if let Some(fd) = run.stdin {
+            cmd.stdin(Stdio::from(fd));
+        }
         if let Some(fd) = run.stdout {
             cmd.stdout(Stdio::from(fd));
         }
@@ -352,6 +360,9 @@ impl SecretProvider for EnvFileProvider {
         }
         for (k, v) in vars.iter() {
             cmd.env(k, v);
+        }
+        if let Some(fd) = run.stdin {
+            cmd.stdin(Stdio::from(fd));
         }
         if let Some(fd) = run.stdout {
             cmd.stdout(Stdio::from(fd));
@@ -562,6 +573,7 @@ mod tests {
             cwd: "",
             credential: Some(&credential),
             source: "",
+            stdin: None,
             stdout: Some(write_end),
             stderr: None,
         });
@@ -613,6 +625,7 @@ mod tests {
             cwd: "",
             credential: None,
             source: env_path.to_str().unwrap(),
+            stdin: None,
             stdout: Some(write_end),
             stderr: None,
         });
@@ -661,6 +674,7 @@ mod tests {
             cwd: "",
             credential: None,
             source: env_path.to_str().unwrap(),
+            stdin: None,
             stdout: Some(write_end),
             stderr: None,
         });

@@ -33,6 +33,19 @@ use crate::paths;
 /// past the gate once one exists. Only a *down* daemon triggers the transparent
 /// exec fallback.
 pub fn dispatch(argv: Vec<String>) -> ! {
+    // Recursion fuse: a bug in real-binary resolution (returning one of our own
+    // aliases) would fork-bomb. `find_real` excluding our aliases is the real
+    // guard; this converts any escape into a bounded, fail-closed abort. See
+    // `docs/design/proxy-aliasing.md` problem 1(b).
+    if crate::proxy::depth_exceeded() {
+        let cmd = argv.first().map(String::as_str).unwrap_or("latch");
+        eprintln!(
+            "{cmd}: latch proxy recursion guard tripped (depth {}); \
+             a real {cmd} could not be resolved apart from the proxy alias",
+            crate::proxy::current_depth()
+        );
+        process::exit(70);
+    }
     match UnixStream::connect(local::socket_path()) {
         Ok(stream) => match forward(stream, &argv) {
             Ok(code) => process::exit(code),
@@ -56,10 +69,17 @@ fn forward(stream: UnixStream, argv: &[String]) -> io::Result<i32> {
         cwd,
     };
 
-    // Hand the daemon our real stdout and stderr; the tool writes straight to them.
+    // Hand the daemon our real stdin, stdout, and stderr (in that order); the
+    // tool reads/writes straight to them so interactive prompts work, and no
+    // caller byte ever passes through the daemon.
+    let inp = io::stdin();
     let out = io::stdout();
     let err = io::stderr();
-    local::send_frame(&stream, &frame, &[out.as_raw_fd(), err.as_raw_fd()])?;
+    local::send_frame(
+        &stream,
+        &frame,
+        &[inp.as_raw_fd(), out.as_raw_fd(), err.as_raw_fd()],
+    )?;
     let mut stream = stream;
     match local::recv_reply(&mut stream)? {
         Reply::Exit { code } => Ok(code),
@@ -79,8 +99,14 @@ fn exec_real(argv: &[String]) -> ! {
         process::exit(127);
     };
     let args: Vec<OsString> = argv.iter().skip(1).map(OsString::from).collect();
+    // Carry the incremented recursion depth to the real tool. If resolution is
+    // buggy and `real` is actually one of our aliases, its dispatch entry sees a
+    // higher depth and eventually trips the fuse rather than looping forever.
     // exec replaces this process on success; the line after only runs on error.
-    let err = Command::new(&real).args(args).exec();
+    let err = Command::new(&real)
+        .args(args)
+        .env(crate::proxy::DEPTH_ENV, crate::proxy::next_depth_value())
+        .exec();
     eprintln!("{cmd}: failed to exec {}: {err}", real.display());
     process::exit(127);
 }

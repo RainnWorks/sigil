@@ -54,9 +54,10 @@ pub fn socket_path() -> PathBuf {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Frame {
     /// A gated command invocation: the original argv (argv[0] is the command
-    /// name) and the caller's cwd. The caller's stdout/stderr descriptors ride
-    /// alongside as SCM_RIGHTS. The daemon looks up the command config, gates it,
-    /// injects the provider's environment, and runs it.
+    /// name) and the caller's cwd. The caller's stdin, stdout, and stderr
+    /// descriptors ride alongside as SCM_RIGHTS (in that order). The daemon looks
+    /// up the command config, gates it, injects the provider's environment, and
+    /// runs it with those descriptors spliced to the child — it never reads them.
     Run { argv: Vec<String>, cwd: String },
     /// The full status report (armed state, factor, shim drift, relay, counts,
     /// lockdown). Returns [`Reply::Json`] of a `StatusJson`.
@@ -122,7 +123,9 @@ pub fn send_frame(stream: &UnixStream, frame: &Frame, fds: &[RawFd]) -> io::Resu
 /// quiet no-op.
 pub fn recv_frame(stream: &UnixStream) -> io::Result<(Frame, Vec<OwnedFd>)> {
     let mut buf = vec![0u8; 64 * 1024];
-    let (n, fds) = recv_with_fds(stream.as_raw_fd(), &mut buf, 2)?;
+    // Up to three descriptors ride a Run frame: the caller's stdin, stdout, and
+    // stderr, spliced straight to the tool child (never read by the daemon).
+    let (n, fds) = recv_with_fds(stream.as_raw_fd(), &mut buf, 3)?;
     if n == 0 {
         return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
     }
