@@ -584,16 +584,29 @@ fn handle_conn(core: Arc<Core>, mut stream: UnixStream) -> anyhow::Result<()> {
             cwd,
             proxy_depth,
         } => {
-            log_request(&argv, &cwd, peer);
-            // The shim passes the caller's own stdin, stdout, stderr in that
-            // order (SCM_RIGHTS). The daemon only splices them to the child; it
-            // never reads any of them, so no caller byte enters daemon memory.
-            let mut fds = fds.into_iter();
-            let stdin = fds.next();
-            let stdout = fds.next();
-            let stderr = fds.next();
-            Reply::Exit {
-                code: fulfill(&core, &argv, &cwd, peer, proxy_depth, stdin, stdout, stderr),
+            // Airtight invariant #2: a conforming shim always passes EXACTLY three
+            // descriptors (stdin, stdout, stderr). Reject any other count and fail
+            // closed. A short count from a non-conforming same-UID client would
+            // both misassign the fd slots AND leave a child stream defaulting to
+            // the daemon's own (inherited) stdio — a same-UID-readable launchd log
+            // — as a sink for the tool's secret output. We never let that happen.
+            if fds.len() != 3 {
+                eprintln!(
+                    "latch daemon: refusing a Run frame carrying {} descriptor(s); expected 3 (stdin, stdout, stderr)",
+                    fds.len()
+                );
+                Reply::Exit { code: 1 }
+            } else {
+                log_request(&argv, &cwd, peer);
+                // The daemon only splices these to the child; it never reads any
+                // of them, so no caller byte enters daemon memory.
+                let mut fds = fds.into_iter();
+                let stdin = fds.next();
+                let stdout = fds.next();
+                let stderr = fds.next();
+                Reply::Exit {
+                    code: fulfill(&core, &argv, &cwd, peer, proxy_depth, stdin, stdout, stderr),
+                }
             }
         }
         Frame::Approve { id, lease } => {
@@ -1275,6 +1288,50 @@ mod tests {
         let d = std::env::temp_dir().join(format!("latch-daemon-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn run_frame_with_wrong_fd_count_is_refused() {
+        // Airtight invariant #2: a Run frame that does not carry exactly three
+        // descriptors is refused (exit 1) before any tool spawns, so a short
+        // count can never misassign fd slots or let a child stream fall back to
+        // the daemon's inherited stdio as a sink for secret output.
+        let dir = tmpdir("fdcount");
+        let (core, _) = test_core(
+            &dir,
+            "expected-token-xyz",
+            "known-secret-42",
+            DevMode::Approve,
+            Duration::from_millis(50),
+        );
+
+        // Only two descriptors (stdin, stdout) — one short of the required three.
+        let (read_end, write_end) = pipe();
+        let (client, server) = UnixStream::pair().unwrap();
+        local::send_frame(
+            &client,
+            &Frame::Run {
+                argv: vec![
+                    "op".into(),
+                    "read".into(),
+                    "op://Engineering/.env/password".into(),
+                ],
+                cwd: String::new(),
+                proxy_depth: 0,
+            },
+            &[std::io::stdin().as_raw_fd(), write_end.as_raw_fd()],
+        )
+        .unwrap();
+        drop(write_end);
+        let h = std::thread::spawn(move || handle_conn(core, server).unwrap());
+        let mut client = client;
+        match local::recv_reply(&mut client).unwrap() {
+            Reply::Exit { code } => assert_eq!(code, 1, "a short fd count must fail closed"),
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        h.join().unwrap();
+        assert_eq!(read_all(read_end), "", "no tool output on a refused frame");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1983,7 +2040,11 @@ mod tests {
                 cwd: String::new(),
                 proxy_depth: 0,
             },
-            &[std::io::stdin().as_raw_fd(), write_end.as_raw_fd()],
+            &[
+                std::io::stdin().as_raw_fd(),
+                write_end.as_raw_fd(),
+                std::io::stderr().as_raw_fd(),
+            ],
         )
         .unwrap();
         drop(write_end);
@@ -3115,7 +3176,11 @@ mod tests {
                 cwd: String::new(),
                 proxy_depth: 0,
             },
-            &[std::io::stdin().as_raw_fd(), write_end.as_raw_fd()],
+            &[
+                std::io::stdin().as_raw_fd(),
+                write_end.as_raw_fd(),
+                std::io::stderr().as_raw_fd(),
+            ],
         )
         .unwrap();
         drop(write_end);

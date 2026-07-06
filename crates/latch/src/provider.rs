@@ -242,15 +242,13 @@ impl SecretProvider for OpProvider {
         // a Latch alias) carries the incremented depth so the alias's own guard
         // can bound a runaway loop. Harmless to a non-proxied tool.
         cmd.env(crate::proxy::DEPTH_ENV, run.proxy_depth.to_string());
-        if let Some(fd) = run.stdin {
-            cmd.stdin(Stdio::from(fd));
-        }
-        if let Some(fd) = run.stdout {
-            cmd.stdout(Stdio::from(fd));
-        }
-        if let Some(fd) = run.stderr {
-            cmd.stderr(Stdio::from(fd));
-        }
+        // Splice the caller's fds to the child. An ABSENT fd defaults to
+        // Stdio::null(), never inherit: the daemon's own stdio (a same-UID
+        // launchd log) must never become a sink for a tool's secret output
+        // (airtight invariant #2). The conforming path always supplies all three.
+        cmd.stdin(run.stdin.map_or_else(Stdio::null, Stdio::from));
+        cmd.stdout(run.stdout.map_or_else(Stdio::null, Stdio::from));
+        cmd.stderr(run.stderr.map_or_else(Stdio::null, Stdio::from));
 
         match cmd.status() {
             Ok(s) => s
@@ -373,15 +371,13 @@ impl SecretProvider for EnvFileProvider {
         // a Latch alias) carries the incremented depth so the alias's own guard
         // can bound a runaway loop. Harmless to a non-proxied tool.
         cmd.env(crate::proxy::DEPTH_ENV, run.proxy_depth.to_string());
-        if let Some(fd) = run.stdin {
-            cmd.stdin(Stdio::from(fd));
-        }
-        if let Some(fd) = run.stdout {
-            cmd.stdout(Stdio::from(fd));
-        }
-        if let Some(fd) = run.stderr {
-            cmd.stderr(Stdio::from(fd));
-        }
+        // Splice the caller's fds to the child. An ABSENT fd defaults to
+        // Stdio::null(), never inherit: the daemon's own stdio (a same-UID
+        // launchd log) must never become a sink for a tool's secret output
+        // (airtight invariant #2). The conforming path always supplies all three.
+        cmd.stdin(run.stdin.map_or_else(Stdio::null, Stdio::from));
+        cmd.stdout(run.stdout.map_or_else(Stdio::null, Stdio::from));
+        cmd.stderr(run.stderr.map_or_else(Stdio::null, Stdio::from));
 
         let code = match cmd.status() {
             Ok(s) => s
