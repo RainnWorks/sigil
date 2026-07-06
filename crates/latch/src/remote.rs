@@ -21,7 +21,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
@@ -30,10 +30,12 @@ use latch_proto::identity::DeviceIdentity;
 use latch_proto::ReplayGuard;
 use latch_proto::{
     mailbox_id, now_ms, ApprovalRequest, ApprovalResponse, Decision as ProtoDecision, Direction,
-    PeerIdentity, Provenance, Transport,
+    PeerIdentity, Provenance, PushRegister, ToDaemonMessage, Transport,
 };
 
+use crate::apns::ApnsDoorbell;
 use crate::approve::{ApprovalContext, ApprovalOutcome, Approver, Decision};
+use crate::push_store::PushStore;
 
 /// Default wait for a phone decision before failing closed.
 pub const DEFAULT_REMOTE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -49,10 +51,18 @@ pub struct RemoteApprover {
     pairing_id: [u8; 32],
     /// Daemon -> phone envelope counter (monotonic).
     counter: AtomicU64,
-    /// Phone -> daemon replay guard.
+    /// Phone -> daemon replay guard. Guards EVERY inbound envelope on the
+    /// ToDaemon channel, responses and push-registrations alike, since the phone
+    /// counts them on one monotonic sequence (see [`Self::classify`]).
     guard: Mutex<ReplayGuard>,
     timeout: Duration,
     machine: String,
+    /// Phone push registrations, keyed by mailbox. A registration arrives inline
+    /// on the ToDaemon channel and is recorded here; the doorbell reads it.
+    push_store: Arc<PushStore>,
+    /// The APNs doorbell sender, when one could be built. `None` disables the
+    /// doorbell entirely (approvals still work; the phone polls). Best-effort.
+    doorbell: Option<Arc<ApnsDoorbell>>,
 }
 
 impl RemoteApprover {
@@ -74,7 +84,27 @@ impl RemoteApprover {
             guard: Mutex::new(ReplayGuard::new()),
             timeout: DEFAULT_REMOTE_TIMEOUT,
             machine: hostname(),
+            // Default to an inert doorbell: an in-memory registration store and no
+            // sender. The production daemon replaces both via `with_push`; the
+            // softphone/local test loop runs with these no-ops and never touches
+            // the filesystem or the network.
+            push_store: Arc::new(PushStore::ephemeral()),
+            doorbell: None,
         }
+    }
+
+    /// Attach the persistent push registration store and the APNs doorbell sender.
+    /// The production `build_gate` wires the real, disk-backed store and a sender
+    /// (when a signing key is available); a `None` doorbell leaves registrations
+    /// recorded but never rung.
+    pub fn with_push(
+        mut self,
+        push_store: Arc<PushStore>,
+        doorbell: Option<Arc<ApnsDoorbell>>,
+    ) -> Self {
+        self.push_store = push_store;
+        self.doorbell = doorbell;
+        self
     }
 
     /// Override the wait for a phone decision (tests use a short one).
@@ -123,8 +153,19 @@ impl RemoteApprover {
     }
 
     /// The whole round trip, or `None` (fail closed) at the first misstep.
+    ///
+    /// The ToDaemon channel is shared: it carries the phone's approval responses
+    /// AND unsolicited push-registrations. This method demultiplexes it. Any
+    /// [`PushRegister`] it meets (buffered from an idle registration, or arriving
+    /// mid-wait) is recorded and skipped; only the [`ApprovalResponse`] correlating
+    /// to this request resolves the round trip. A registration can therefore never
+    /// be mistaken for a failed response, which would deny a legitimate approval.
     fn round_trip(&self, ctx: &ApprovalContext) -> Option<ApprovalOutcome> {
         let req = self.build_request(ctx);
+
+        // Drain any registration the phone sent while we were idle, so the
+        // doorbell below rings the freshest token. Non-blocking.
+        self.drain_pending();
 
         // Seal and send the request to the phone.
         let counter = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
@@ -140,23 +181,79 @@ impl RemoteApprover {
             .send(self.pairing_id, Direction::ToPhone, &env)
             .ok()?;
 
-        // Await the sealed response.
-        let resp_env = self
-            .transport
-            .recv(self.pairing_id, Direction::ToDaemon, self.timeout)
-            .ok()??;
-        let resp: ApprovalResponse = {
+        // Best-effort doorbell: wake the phone so it fetches this request without
+        // waiting for its poll interval. Fails open (never gates correctness).
+        self.ring_doorbell();
+
+        // Await the correlating response, handling any interleaved registration.
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None; // timed out: fail closed to deny
+            }
+            let env = self
+                .transport
+                .recv(self.pairing_id, Direction::ToDaemon, remaining)
+                .ok()??;
+            match self.classify(env) {
+                Some(ToDaemonMessage::Push(pr)) => {
+                    self.record_registration(&pr);
+                    continue;
+                }
+                Some(ToDaemonMessage::Response(resp)) => {
+                    // A response for a different request is stale (a prior wait
+                    // timed out); skip it and keep waiting for ours.
+                    if resp.request_id != req.request_id {
+                        continue;
+                    }
+                    return self.outcome_for(&req, resp);
+                }
+                // An envelope that would not open/decode (tamper, wrong key, a
+                // replayed counter) is dropped; keep waiting until the deadline.
+                None => continue,
+            }
+        }
+    }
+
+    /// Consume everything already buffered on the ToDaemon channel without
+    /// blocking, recording any registration. Used before a send so the doorbell
+    /// sees a token the phone registered while the daemon was idle.
+    fn drain_pending(&self) {
+        while let Ok(Some(env)) =
+            self.transport
+                .recv(self.pairing_id, Direction::ToDaemon, Duration::ZERO)
+        {
+            match self.classify(env) {
+                Some(ToDaemonMessage::Push(pr)) => self.record_registration(&pr),
+                // A buffered response with no in-flight request to match is stale;
+                // drop it.
+                Some(ToDaemonMessage::Response(_)) | None => {}
+            }
+        }
+    }
+
+    /// Verify, replay-check, decrypt, and classify one inbound envelope. Returns
+    /// `None` when it fails any of those (fail closed). The single [`ReplayGuard`]
+    /// covers responses and registrations together, matching the phone's single
+    /// monotonic outbound counter.
+    fn classify(&self, env: Envelope) -> Option<ToDaemonMessage> {
+        let value: serde_json::Value = {
             let mut guard = self.guard.lock().expect("remote guard poisoned");
-            resp_env
-                .open(&self.phone, &self.identity.agreement, &mut guard)
+            env.open(&self.phone, &self.identity.agreement, &mut guard)
                 .ok()?
         };
+        ToDaemonMessage::from_value(value).ok()
+    }
 
-        // Correlate: a response for a different request is not ours.
-        if resp.request_id != req.request_id {
-            return None;
-        }
-
+    /// Turn a correlated [`ApprovalResponse`] into an [`ApprovalOutcome`], applying
+    /// the same fail-closed rules as before: an approve must carry a DEK (v1) or a
+    /// partial for this exact account (v2); a deny carries neither.
+    fn outcome_for(
+        &self,
+        req: &ApprovalRequest,
+        resp: ApprovalResponse,
+    ) -> Option<ApprovalOutcome> {
         match resp.decision {
             ProtoDecision::Denied => Some(ApprovalOutcome::local(Decision::Deny)),
             ProtoDecision::Approved => {
@@ -179,6 +276,40 @@ impl RemoteApprover {
                     let dek = Zeroizing::new(*dek.as_bytes());
                     Some(ApprovalOutcome::with_dek(decision, dek))
                 }
+            }
+        }
+    }
+
+    /// Record a phone push registration for this pairing, persisted so it survives
+    /// a daemon restart. Re-registration overwrites (token rotation).
+    fn record_registration(&self, pr: &PushRegister) {
+        self.push_store
+            .register(self.pairing_id, &pr.token, &pr.platform, now_ms());
+    }
+
+    /// Ring the phone's push doorbell, if a token is registered and a sender was
+    /// built. Best-effort and fully swallowed: any failure logs and returns, since
+    /// the request already reached the relay and the phone's poll delivers it.
+    fn ring_doorbell(&self) {
+        let Some(reg) = self.push_store.get(self.pairing_id) else {
+            return; // no token yet: the phone polls
+        };
+        match reg.platform.as_str() {
+            "apns" => {
+                let Some(doorbell) = &self.doorbell else {
+                    return; // no sender configured
+                };
+                let now_secs = now_ms() / 1000;
+                if let Err(e) = doorbell.ring(&reg.token, now_secs) {
+                    eprintln!("latch daemon: apns doorbell not delivered ({e}); relying on the phone poll backstop");
+                }
+            }
+            // Android is a follow-up; the phone's poll backstop covers it today.
+            "fcm" => {
+                eprintln!("latch daemon: fcm push unsupported; relying on the phone poll backstop");
+            }
+            other => {
+                eprintln!("latch daemon: unknown push platform '{other}'; relying on the phone poll backstop");
             }
         }
     }
@@ -248,5 +379,124 @@ mod tests {
         assert_eq!(req.command, ctx.command);
         assert_eq!(req.secrets, ctx.secret_refs);
         assert_eq!(req.provenance.process_chain, vec!["zsh", "op"]);
+    }
+
+    use latch_proto::{Dek, LocalRelay};
+
+    /// Clone a device identity for a test (the approver takes ownership of one
+    /// copy while the test keeps another to act as the phone's peer).
+    fn clone_id(id: &DeviceIdentity) -> DeviceIdentity {
+        DeviceIdentity {
+            signing: id.signing.clone(),
+            agreement: id.agreement.clone(),
+        }
+    }
+
+    fn secret_ctx(id: &str) -> ApprovalContext {
+        ApprovalContext {
+            id: id.into(),
+            account: "Rowm".into(),
+            scope: "read op://Engineering/.env/password".into(),
+            grant_hex: "dead".into(),
+            provenance: "op".into(),
+            cwd: "/p".into(),
+            command: vec!["op".into(), "read".into()],
+            secret_refs: vec![],
+            kind: RequestKind::SecretRead,
+            risk: RiskLevel::Routine,
+            ssh: None,
+            threshold: None,
+        }
+    }
+
+    /// The correctness-critical demux: a phone that (re)registers its push token
+    /// on the same ToDaemon channel must not derail an approval. Here a
+    /// PushRegister is buffered before the approval, and the approve response
+    /// follows it; the daemon records the token AND still resolves the approval
+    /// with the delivered DEK. Without the demux, the registration would be read
+    /// as a malformed response and deny a legitimate request.
+    #[test]
+    fn push_register_interleaved_with_a_response_is_stored_and_does_not_break_approval() {
+        let relay = LocalRelay::new();
+        let daemon = DeviceIdentity::generate();
+        let phone = DeviceIdentity::generate();
+        let phone_pub = phone.peer_identity();
+        let mailbox = mailbox_id(&daemon.peer_identity(), &phone_pub);
+
+        let store = Arc::new(PushStore::ephemeral());
+        let approver = RemoteApprover::new(Arc::new(relay.clone()), clone_id(&daemon), phone_pub)
+            .with_push(store.clone(), None)
+            .with_timeout(Duration::from_secs(2));
+
+        // The phone registers its push token first (counter 1, ToDaemon).
+        let pr = PushRegister::new("cafef00d", "apns");
+        let pr_env =
+            Envelope::seal(&pr, mailbox, 1, &phone.signing, &daemon.peer_identity()).unwrap();
+        relay.send(mailbox, Direction::ToDaemon, &pr_env).unwrap();
+
+        // A phone thread waits for the request, then approves it (counter 2).
+        let phone_thread = {
+            let relay = relay.clone();
+            let daemon_pub = daemon.peer_identity();
+            std::thread::spawn(move || {
+                let _req = relay
+                    .recv(mailbox, Direction::ToPhone, Duration::from_secs(2))
+                    .unwrap()
+                    .expect("the daemon sent a request");
+                let resp = ApprovalResponse::approve("req-1", &Dek::from_bytes([9u8; 32]), 1);
+                let env = Envelope::seal(&resp, mailbox, 2, &phone.signing, &daemon_pub).unwrap();
+                relay.send(mailbox, Direction::ToDaemon, &env).unwrap();
+            })
+        };
+
+        let outcome = approver.decide(&secret_ctx("req-1"));
+        phone_thread.join().unwrap();
+
+        assert!(
+            outcome.decision.is_grant(),
+            "the approval must still succeed"
+        );
+        assert!(outcome.dek.is_some(), "the delivered DEK reaches the gate");
+        // The push token was recorded off the same channel.
+        let reg = store.get(mailbox).expect("the registration was stored");
+        assert_eq!(reg.token, "cafef00d");
+        assert_eq!(reg.platform, "apns");
+    }
+
+    /// A registration that arrives while the daemon is idle (no approval waiting)
+    /// is picked up by the next round trip's pre-drain, so its token is on file
+    /// for the doorbell even though it never rode alongside a response.
+    #[test]
+    fn an_idle_registration_is_drained_on_the_next_round_trip() {
+        let relay = LocalRelay::new();
+        let daemon = DeviceIdentity::generate();
+        let phone = DeviceIdentity::generate();
+        let mailbox = mailbox_id(&daemon.peer_identity(), &phone.peer_identity());
+
+        let store = Arc::new(PushStore::ephemeral());
+        let approver = RemoteApprover::new(
+            Arc::new(relay.clone()),
+            clone_id(&daemon),
+            phone.peer_identity(),
+        )
+        .with_push(store.clone(), None)
+        // A short timeout: no response ever comes, so the approval denies, but
+        // the pre-drain still records the buffered registration.
+        .with_timeout(Duration::from_millis(80));
+
+        let pr = PushRegister::new("beadfeed", "apns");
+        let pr_env =
+            Envelope::seal(&pr, mailbox, 1, &phone.signing, &daemon.peer_identity()).unwrap();
+        relay.send(mailbox, Direction::ToDaemon, &pr_env).unwrap();
+
+        let outcome = approver.decide(&secret_ctx("req-x"));
+        assert!(
+            !outcome.decision.is_grant(),
+            "no response arrives, so it denies"
+        );
+        assert_eq!(
+            store.get(mailbox).expect("registration drained").token,
+            "beadfeed"
+        );
     }
 }

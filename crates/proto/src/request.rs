@@ -332,6 +332,86 @@ impl ApprovalResponse {
     }
 }
 
+/// A phone -> daemon push-registration: the phone hands the daemon the platform
+/// device token so the daemon can ring a best-effort push "doorbell" when it
+/// enqueues a new approval request. See `crates/latch/src/apns.rs`.
+///
+/// **Wire contract (locked, shared with `apps/phone`).** Serializes with a
+/// `"type":"pushRegister"` discriminator so it can be told apart from an
+/// (untagged) [`ApprovalResponse`] on the same `ToDaemon` channel; `token` is the
+/// platform device token (APNs: lowercase hex), `platform` names the push
+/// service (`"apns"` implemented; `"fcm"` reserved for Android).
+///
+/// This rides the *established session box*, not the pairing ceremony: the phone
+/// seals it exactly like an [`ApprovalResponse`], with the same monotonic
+/// outbound counter, so it never enters the SAS/confirmation transcript and the
+/// phone may re-register at will (token rotation). It carries no request-specific
+/// or secret data; the token is not itself a credential (a stolen token lets a
+/// third party at most ring Tom's phone with the generic doorbell copy).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PushRegister {
+    /// The wire discriminator. Always [`PushRegister::TYPE`] on a conforming
+    /// message; validated by [`ToDaemonMessage::from_value`] before dispatch.
+    #[serde(rename = "type")]
+    pub message_type: String,
+    /// The platform device token (APNs: lowercase hex). Opaque to the daemon.
+    pub token: String,
+    /// The push service that token addresses: `"apns"` or `"fcm"`.
+    pub platform: String,
+}
+
+impl PushRegister {
+    /// The locked `type` discriminator value.
+    pub const TYPE: &'static str = "pushRegister";
+
+    /// Build a registration for `token` on `platform`, stamping the discriminator.
+    pub fn new(token: impl Into<String>, platform: impl Into<String>) -> Self {
+        Self {
+            message_type: Self::TYPE.to_string(),
+            token: token.into(),
+            platform: platform.into(),
+        }
+    }
+}
+
+/// A phone -> daemon message on an established session's `ToDaemon` channel.
+///
+/// Two shapes share this channel: the (untagged, legacy) [`ApprovalResponse`] and
+/// the tagged [`PushRegister`]. This is the single place the daemon decides which
+/// one an opened payload is. The discriminator is the `type` field:
+/// `"pushRegister"` selects [`PushRegister`]; anything else (in practice, its
+/// absence) is an [`ApprovalResponse`]. A hand-rolled peek is used deliberately
+/// instead of a `#[serde(untagged)]` enum so [`ApprovalResponse`]'s wire shape
+/// stays byte-for-byte unchanged (the v2 pairing transcript must not shift).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ToDaemonMessage {
+    /// A decision on a pending approval.
+    Response(ApprovalResponse),
+    /// A push-token (re)registration.
+    Push(PushRegister),
+}
+
+impl ToDaemonMessage {
+    /// Classify an already-decrypted payload [`serde_json::Value`] (the plaintext
+    /// an [`Envelope`](crate::Envelope) opened to). Fails closed: a value that is
+    /// neither a valid registration nor a valid response is an error the caller
+    /// drops. Opening at the [`Value`](serde_json::Value) layer keeps the single
+    /// envelope decrypt/verify/replay pass and lets the tag select the concrete
+    /// type without a second parse of the ciphertext.
+    pub fn from_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        let is_push = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|t| t == PushRegister::TYPE);
+        if is_push {
+            Ok(Self::Push(serde_json::from_value(value)?))
+        } else {
+            Ok(Self::Response(serde_json::from_value(value)?))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +564,47 @@ mod tests {
         assert!(!json.contains("wrappedDek"));
         let back: ApprovalResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ok);
+    }
+
+    #[test]
+    fn push_register_serializes_the_locked_wire_contract() {
+        let pr = PushRegister::new("a1b2c3", "apns");
+        let json = serde_json::to_string(&pr).unwrap();
+        assert!(json.contains("\"type\":\"pushRegister\""));
+        assert!(json.contains("\"token\":\"a1b2c3\""));
+        assert!(json.contains("\"platform\":\"apns\""));
+        let back: PushRegister = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, pr);
+    }
+
+    #[test]
+    fn to_daemon_message_classifies_by_the_type_tag() {
+        // A tagged registration is a Push; the same channel's untagged response is
+        // a Response. This is the daemon's demux decision, proven here.
+        let pr = PushRegister::new("deadbeef", "apns");
+        let push_val = serde_json::to_value(&pr).unwrap();
+        assert_eq!(
+            ToDaemonMessage::from_value(push_val).unwrap(),
+            ToDaemonMessage::Push(pr)
+        );
+
+        let dek = Dek::from_bytes([9u8; 32]);
+        let resp = ApprovalResponse::approve("req-9", &dek, 7);
+        let resp_val = serde_json::to_value(&resp).unwrap();
+        // An ApprovalResponse carries no `type`, so it classifies as a Response.
+        assert!(resp_val.get("type").is_none());
+        assert_eq!(
+            ToDaemonMessage::from_value(resp_val).unwrap(),
+            ToDaemonMessage::Response(resp)
+        );
+    }
+
+    #[test]
+    fn to_daemon_message_fails_closed_on_a_bogus_type() {
+        // A payload tagged as a push but missing the required fields is an error
+        // the caller drops, never a half-built registration.
+        let bogus = serde_json::json!({ "type": "pushRegister" });
+        assert!(ToDaemonMessage::from_value(bogus).is_err());
     }
 
     #[test]

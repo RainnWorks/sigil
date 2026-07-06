@@ -6,6 +6,7 @@
 //! and leases. They are `pub` so the trait surfaces and their unit tests are
 //! part of the crate's public API rather than dead code in a binary.
 
+pub mod apns;
 pub mod approve;
 pub mod audit;
 pub mod cli;
@@ -23,6 +24,7 @@ pub mod pairing_store;
 pub mod paths;
 pub mod provider;
 pub mod proxy;
+pub mod push_store;
 pub mod qr;
 pub mod remote;
 pub mod report;

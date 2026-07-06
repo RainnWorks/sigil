@@ -9,7 +9,8 @@
 //! product's core promise is broken.
 
 use latch_proto::{
-    DeviceIdentity, Envelope, OpenError, PeerIdentity, ReplayError, ReplayGuard, REPLAY_WINDOW_MS,
+    DeviceIdentity, Envelope, OpenError, PeerIdentity, PushRegister, ReplayError, ReplayGuard,
+    ToDaemonMessage, REPLAY_WINDOW_MS,
 };
 
 /// A paired sender (phone) and recipient (daemon), plus the honest replay guard
@@ -292,6 +293,69 @@ fn reordering_queued_envelopes_is_caught() {
             got: 1,
             last: 2
         }))
+    );
+}
+
+// --- the push-registration message type rides the same hostile-relay proofs ---
+
+#[test]
+fn push_register_rides_the_sealed_signed_replay_protected_envelope() {
+    // A PushRegister is not special to the envelope: sealed, it is confidential to
+    // the relay, its signature covers every field, and it is single-use. Delivered
+    // honestly it opens and classifies as a Push; a tampered or replayed copy is
+    // rejected exactly as any other payload.
+    let sender = DeviceIdentity::generate();
+    let recipient = DeviceIdentity::generate();
+    let pairing_id = [0x5a; 32];
+    let mut guard = ReplayGuard::new();
+
+    let pr = PushRegister::new("a1b2c3d4", "apns");
+    let env = Envelope::seal(
+        &pr,
+        pairing_id,
+        1,
+        &sender.signing,
+        &recipient.peer_identity(),
+    )
+    .expect("seal");
+
+    // The relay cannot read it: opened with a stranger's agreement secret it fails
+    // to decrypt even with the true sender's public key.
+    let stranger = DeviceIdentity::generate();
+    assert_eq!(
+        env.open::<PushRegister>(
+            &sender.peer_identity(),
+            &stranger.agreement,
+            &mut ReplayGuard::new()
+        ),
+        Err(OpenError::Decrypt)
+    );
+
+    // A bit-flip in the ciphertext breaks the signature.
+    let tampered = MaliciousRelay::flip_ciphertext(&env);
+    assert_eq!(
+        tampered.open::<PushRegister>(
+            &sender.peer_identity(),
+            &recipient.agreement,
+            &mut ReplayGuard::new()
+        ),
+        Err(OpenError::BadSignature)
+    );
+
+    // Honest delivery opens to a Value, and the daemon's demux classifies it as a
+    // Push carrying the registered token.
+    let value: serde_json::Value = env
+        .open(&sender.peer_identity(), &recipient.agreement, &mut guard)
+        .expect("open");
+    assert_eq!(
+        ToDaemonMessage::from_value(value).unwrap(),
+        ToDaemonMessage::Push(pr)
+    );
+
+    // The exact bytes replayed are rejected (single-use request id).
+    assert_eq!(
+        env.open::<serde_json::Value>(&sender.peer_identity(), &recipient.agreement, &mut guard),
+        Err(OpenError::Replay(ReplayError::DuplicateRequest))
     );
 }
 

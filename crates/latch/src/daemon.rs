@@ -149,11 +149,23 @@ fn build_gate(
             let cfg = remote.expect("phone factor implies a pairing config");
             let relay = DaemonRelay::connect(&cfg.relay_url, cfg.mailbox())
                 .map_err(|e| anyhow::anyhow!("attaching to relay {}: {e}", cfg.relay_url))?;
-            Box::new(RemoteApprover::new(
-                Arc::new(relay),
-                cfg.daemon_identity,
-                cfg.phone,
-            ))
+            // The push doorbell: a disk-backed registration store (survives
+            // restarts) plus an APNs sender when a signing key resolves. Both are
+            // best-effort; a daemon that cannot build the sender still approves,
+            // and the phone falls back to polling. The daemon is the ONLY push
+            // origin; the relay never sees the token.
+            let push_store = Arc::new(crate::push_store::PushStore::load());
+            let doorbell = match crate::apns::ApnsDoorbell::new() {
+                Ok(d) => Some(Arc::new(d)),
+                Err(e) => {
+                    eprintln!("latch daemon: apns doorbell disabled ({e}); the phone will poll");
+                    None
+                }
+            };
+            Box::new(
+                RemoteApprover::new(Arc::new(relay), cfg.daemon_identity, cfg.phone)
+                    .with_push(push_store, doorbell),
+            )
         }
         // The biometric unwrap is the only gate; an unresolved decision fails
         // closed (no control socket, no dev switch).

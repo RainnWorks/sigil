@@ -27,6 +27,13 @@ pub fn pairing_path() -> Option<PathBuf> {
     latch_home().map(|h| h.join("pairing.json"))
 }
 
+/// `<latch_home>/push.json`: the persisted phone push-notification
+/// registrations, keyed by mailbox id. See `push_store`. Beside `pairing.json`
+/// and, like it, 0600; a device token is not a credential but is kept private.
+pub fn push_path() -> Option<PathBuf> {
+    latch_home().map(|h| h.join("push.json"))
+}
+
 /// `<latch_home>/logs`, where the launchd agent's stdout/stderr are rotated.
 pub fn logs_dir() -> Option<PathBuf> {
     latch_home().map(|h| h.join("logs"))
