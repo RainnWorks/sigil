@@ -35,8 +35,13 @@ export const MAX_ENVELOPE_BYTES = 16_384;
  * per-envelope cap is enforced on `env` itself by {@link enqueue}. */
 export const MAX_BODY_BYTES = MAX_ENVELOPE_BYTES + 4_096;
 /** Per-mailbox operations allowed per {@link RATE_WINDOW_MS}. Held only in the
- * mailbox's in-memory record; never persisted. Non-load-bearing anti-abuse. */
-export const RATE_MAX = 120;
+ * mailbox's in-memory record; never persisted. Non-load-bearing anti-abuse.
+ * Sized for the current poll cadence: the daemon polls at ~2s, and the phone's
+ * pairing rendezvous at ~400ms (~150/min), so a two-sided active pairing is
+ * ~180/min; 300 leaves headroom. The long-poll rework (#44) makes the relay
+ * event-driven (one held GET per message), after which this drops to a low
+ * floor. */
+export const RATE_MAX = 300;
 export const RATE_WINDOW_MS = 60_000;
 /** A separate, tighter cap on pushes specifically, so a leaked push token
  * can't turn a mailbox into a doorbell-spam amplifier. Residual: this is
