@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use latch_proto::{PushHint, TransportError};
+use sigil_proto::{PushHint, TransportError};
 
 use crate::mailbox_hex;
 

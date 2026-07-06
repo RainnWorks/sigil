@@ -2,7 +2,7 @@
 //! pinned phone Secure-Enclave share `F`, the versioned v2 account store, and the
 //! per-request combine that opens a token from `m` plus the phone's partial
 //! `Z_F`. The shared crypto core (the combiner, the record format, the on-curve
-//! validator) lives in [`latch_proto::threshold`]; this module is the daemon's
+//! validator) lives in [`sigil_proto::threshold`]; this module is the daemon's
 //! custody, persistence, and residency layer around it.
 //!
 //! Full design and the independent review (R1-R5) are in
@@ -30,7 +30,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use latch_proto::threshold::{
+use sigil_proto::threshold::{
     aead_open, all_ephemerals_unique, combine, EcdhAlgo, MacShare, P256Point, ThresholdError,
     ThresholdRecord, TOKEN_NONCE_LEN, XCOORD_LEN,
 };
@@ -46,7 +46,7 @@ pub const MAC_SHARE_LABEL: &str = "threshold.mac-share.v2";
 pub const DEFAULT_SE_KEY_ID: &str = "phone-se.v2";
 
 /// The wire tag for an [`EcdhAlgo`], as the per-request challenge carries it to
-/// the phone. Matches the serde `rename`s in [`latch_proto::threshold::EcdhAlgo`].
+/// the phone. Matches the serde `rename`s in [`sigil_proto::threshold::EcdhAlgo`].
 pub fn ecdh_algo_tag(algo: EcdhAlgo) -> &'static str {
     match algo {
         EcdhAlgo::RawX => "raw-x",
@@ -71,7 +71,7 @@ pub enum ThresholdStoreError {
     Keystore(#[from] crate::keystore::KeystoreError),
     #[error("the stored Mac share is not a valid P-256 scalar; re-run v2 setup")]
     CorruptMacShare,
-    #[error("no v2 account routes vault {0:?}; add one with `latch account add --threshold`")]
+    #[error("no v2 account routes vault {0:?}; add one with `sigil account add --threshold`")]
     NoRoute(String),
     #[error("v2 account {0:?} already exists")]
     Duplicate(String),
@@ -118,7 +118,7 @@ impl MlockGuard {
         let rc = unsafe { libc::mlock(ptr, len) };
         if rc != 0 {
             eprintln!(
-                "latch daemon: mlock of {len} bytes of threshold key material failed \
+                "sigil daemon: mlock of {len} bytes of threshold key material failed \
                  (RLIMIT_MEMLOCK?); the buffer is still zeroized on drop but not page-locked"
             );
             Self {
@@ -248,7 +248,7 @@ impl ThresholdAccount {
     }
 }
 
-/// The v2 account catalogue, persisted at `~/.latch/threshold.db` as JSON. It
+/// The v2 account catalogue, persisted at `~/.sigil/threshold.db` as JSON. It
 /// holds token *ciphertext* and the plaintext routing only; no `K`, no `Z_M`, no
 /// `Z_F`, and crucially no `e`. It coexists with the v1
 /// [`AccountStore`](crate::secrets::AccountStore): the two share the AES-256-GCM
@@ -260,13 +260,13 @@ pub struct ThresholdStore {
 }
 
 impl ThresholdStore {
-    /// `~/.latch/threshold.db`, or `$LATCH_HOME/threshold.db` when set (tests).
+    /// `~/.sigil/threshold.db`, or `$SIGIL_HOME/threshold.db` when set (tests).
     pub fn path() -> Result<PathBuf, ThresholdStoreError> {
-        if let Some(dir) = std::env::var_os("LATCH_HOME") {
+        if let Some(dir) = std::env::var_os("SIGIL_HOME") {
             return Ok(PathBuf::from(dir).join("threshold.db"));
         }
         let home = std::env::var_os("HOME").ok_or(ThresholdStoreError::NoHome)?;
-        Ok(PathBuf::from(home).join(".latch").join("threshold.db"))
+        Ok(PathBuf::from(home).join(".sigil").join("threshold.db"))
     }
 
     /// Load the store, returning an empty one if the file does not exist.
@@ -422,7 +422,7 @@ pub fn decrypt(
 mod tests {
     use super::*;
     use crate::keystore::{Keystore, MemoryKeystore};
-    use latch_proto::threshold::THRESHOLD_RECORD_VERSION;
+    use sigil_proto::threshold::THRESHOLD_RECORD_VERSION;
 
     const TOKEN: &[u8] = b"ops_eyJzaWduSW5BZGRyZXNzIjoi.example.account.token";
 
@@ -613,9 +613,9 @@ mod tests {
         let _lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let tmp = std::env::temp_dir().join(format!("latch-thr-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("sigil-thr-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        std::env::set_var("LATCH_HOME", &tmp);
+        std::env::set_var("SIGIL_HOME", &tmp);
 
         let ks = MemoryKeystore::new();
         let m = load_or_create_mac_share(&ks).unwrap();
@@ -644,7 +644,7 @@ mod tests {
         let zf = phone_partial(&f, rec);
         assert_eq!(&decrypt(rec, &m, &zf).unwrap()[..], b"super-secret-token");
 
-        std::env::remove_var("LATCH_HOME");
+        std::env::remove_var("SIGIL_HOME");
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

@@ -1,10 +1,10 @@
 //! Persistence of phone push-notification registrations, keyed by mailbox id.
 //!
-//! The phone sends a sealed [`PushRegister`](latch_proto::PushRegister) over the
+//! The phone sends a sealed [`PushRegister`](sigil_proto::PushRegister) over the
 //! established session (see [`crate::remote`]); the daemon records the
 //! `{token, platform}` here so it can later ring a best-effort APNs "doorbell"
 //! ([`crate::apns`]) when it enqueues a new approval request. This survives a
-//! daemon restart on the same seam the pairing uses (`~/.latch`, mode 0600), so a
+//! daemon restart on the same seam the pairing uses (`~/.sigil`, mode 0600), so a
 //! phone that registered once does not have to re-register after every relaunch.
 //!
 //! ## What this is (and is not)
@@ -32,7 +32,7 @@ const PUSH_VERSION: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PushStoreError {
-    #[error("HOME is not set, so ~/.latch has no location")]
+    #[error("HOME is not set, so ~/.sigil has no location")]
     NoHome,
     #[error("push store io: {0}")]
     Io(#[from] std::io::Error),
@@ -64,7 +64,7 @@ struct Persisted {
 }
 
 /// The push-registration store: an in-memory map cached behind a mutex, written
-/// through to `~/.latch/push.json` on every change (unless [`ephemeral`], for
+/// through to `~/.sigil/push.json` on every change (unless [`ephemeral`], for
 /// tests). Cheap to read on the hot approval path; writes are rare (only on a
 /// phone (re)registration).
 ///
@@ -85,7 +85,7 @@ impl PushStore {
         let inner = match Self::read_file() {
             Ok(map) => map,
             Err(e) => {
-                eprintln!("latch daemon: ignoring an unreadable push store: {e}");
+                eprintln!("sigil daemon: ignoring an unreadable push store: {e}");
                 BTreeMap::new()
             }
         };
@@ -120,7 +120,7 @@ impl PushStore {
         };
         if self.persist {
             if let Err(e) = Self::write_file(&snapshot) {
-                eprintln!("latch daemon: could not persist push registration: {e}");
+                eprintln!("sigil daemon: could not persist push registration: {e}");
             }
         }
     }
@@ -170,7 +170,7 @@ impl PushStore {
 mod tests {
     use super::*;
 
-    /// A private LATCH_HOME for one test; restores the env on drop and holds the
+    /// A private SIGIL_HOME for one test; restores the env on drop and holds the
     /// process-wide env lock so parallel tests do not clobber it.
     struct HomeGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -183,13 +183,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let dir = std::env::temp_dir().join(format!(
-                "latch-pushstore-{tag}-{}-{:?}",
+                "sigil-pushstore-{tag}-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             ));
             std::fs::create_dir_all(&dir).unwrap();
-            let prev = std::env::var_os("LATCH_HOME");
-            std::env::set_var("LATCH_HOME", &dir);
+            let prev = std::env::var_os("SIGIL_HOME");
+            std::env::set_var("SIGIL_HOME", &dir);
             Self {
                 _lock: lock,
                 prev,
@@ -200,8 +200,8 @@ mod tests {
     impl Drop for HomeGuard {
         fn drop(&mut self) {
             match &self.prev {
-                Some(v) => std::env::set_var("LATCH_HOME", v),
-                None => std::env::remove_var("LATCH_HOME"),
+                Some(v) => std::env::set_var("SIGIL_HOME", v),
+                None => std::env::remove_var("SIGIL_HOME"),
             }
             std::fs::remove_dir_all(&self.dir).ok();
         }

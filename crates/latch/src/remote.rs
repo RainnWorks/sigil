@@ -25,10 +25,10 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
-use latch_proto::envelope::Envelope;
-use latch_proto::identity::DeviceIdentity;
-use latch_proto::ReplayGuard;
-use latch_proto::{
+use sigil_proto::envelope::Envelope;
+use sigil_proto::identity::DeviceIdentity;
+use sigil_proto::ReplayGuard;
+use sigil_proto::{
     mailbox_id, now_ms, ApprovalRequest, ApprovalResponse, Decision as ProtoDecision, Direction,
     PeerIdentity, Provenance, PushHint, PushRegister, ToDaemonMessage, Transport,
 };
@@ -310,13 +310,13 @@ fn hostname() -> String {
 mod tests {
     use super::*;
     use crate::approve::ApprovalContext;
-    use latch_proto::{RequestKind, RiskLevel, SecretRef};
+    use sigil_proto::{RequestKind, RiskLevel, SecretRef};
 
     #[test]
     fn build_request_is_provider_blind() {
         // The approver copies the provider-prepared fields verbatim; it contains
         // no op-specific parsing.
-        let transport = std::sync::Arc::new(latch_proto::LocalRelay::new());
+        let transport = std::sync::Arc::new(sigil_proto::LocalRelay::new());
         let daemon = DeviceIdentity::generate();
         let phone = DeviceIdentity::generate().peer_identity();
         let approver = RemoteApprover::new(transport, daemon, phone);
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(req.provenance.process_chain, vec!["zsh", "op"]);
     }
 
-    use latch_proto::{Dek, LocalRelay};
+    use sigil_proto::{Dek, LocalRelay};
 
     /// Clone a device identity for a test (the approver takes ownership of one
     /// copy while the test keeps another to act as the phone's peer).

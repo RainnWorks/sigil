@@ -4,7 +4,7 @@
 //!
 //! The daemon is the source of truth for the machine interface, so it answers
 //! `Frame::Status` / `Frame::Doctor` by calling these with its own runtime state
-//! ([`Runtime`]: lockdown + live lease count). The human `latch` CLI renders the
+//! ([`Runtime`]: lockdown + live lease count). The human `sigil` CLI renders the
 //! same shapes: when the daemon is up it renders the daemon's reply, and when
 //! the daemon is down it falls back to these builders locally (with a
 //! down/empty [`Runtime`]) so `status`/`doctor` still work headless. One builder,
@@ -117,7 +117,7 @@ pub fn doctor(daemon_up: bool) -> Vec<CheckJson> {
         if daemon_up {
             ""
         } else {
-            "daemon not running (latch start)"
+            "daemon not running (sigil start)"
         },
     );
 
@@ -135,7 +135,7 @@ pub fn doctor(daemon_up: bool) -> Vec<CheckJson> {
         (None, true) => (true, "hardware biometric (Secure Enclave)".to_string()),
         (None, false) => (
             false,
-            "no factor: fails closed. Run `latch pair`, or start `--dev-insecure` for dev".into(),
+            "no factor: fails closed. Run `sigil pair`, or start `--dev-insecure` for dev".into(),
         ),
     };
     push("approving factor resolved", factor_ok, &factor_hint);

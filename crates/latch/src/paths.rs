@@ -1,48 +1,48 @@
 //! Filesystem discovery: the real `op`, the shim install location, where the
-//! shim sits relative to `op` on `PATH`, and the `~/.latch` layout (config,
+//! shim sits relative to `op` on `PATH`, and the `~/.sigil` layout (config,
 //! logs, the launchd plist).
 
 use std::path::{Path, PathBuf};
 
-/// The Latch home directory: `$LATCH_HOME` when set (tests and alternate
-/// installs), else `~/.latch`. `None` only if neither `LATCH_HOME` nor `HOME`
+/// The Sigil home directory: `$SIGIL_HOME` when set (tests and alternate
+/// installs), else `~/.sigil`. `None` only if neither `SIGIL_HOME` nor `HOME`
 /// is set, which no real login shell allows.
-pub fn latch_home() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("LATCH_HOME") {
+pub fn sigil_home() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("SIGIL_HOME") {
         return Some(PathBuf::from(dir));
     }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".latch"))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".sigil"))
 }
 
-/// `~/.latch/bin`, where `latch shim install` drops the `op` symlink.
+/// `~/.sigil/bin`, where `sigil shim install` drops the `op` symlink.
 pub fn shim_bin_dir() -> Option<PathBuf> {
-    // Kept anchored to `~/.latch/bin` (not `latch_home()/bin`) so `LATCH_HOME`
+    // Kept anchored to `~/.sigil/bin` (not `sigil_home()/bin`) so `SIGIL_HOME`
     // test overrides never move the PATH entry a real profile points at.
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".latch").join("bin"))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".sigil").join("bin"))
 }
 
-/// `<latch_home>/pairing.json`: the persisted phone-pairing config (public
+/// `<sigil_home>/pairing.json`: the persisted phone-pairing config (public
 /// parts; the daemon identity lives in the keystore). See `pairing_store`.
 pub fn pairing_path() -> Option<PathBuf> {
-    latch_home().map(|h| h.join("pairing.json"))
+    sigil_home().map(|h| h.join("pairing.json"))
 }
 
-/// `<latch_home>/push.json`: the persisted phone push-notification
+/// `<sigil_home>/push.json`: the persisted phone push-notification
 /// registrations, keyed by mailbox id. See `push_store`. Beside `pairing.json`
 /// and, like it, 0600; a device token is not a credential but is kept private.
 pub fn push_path() -> Option<PathBuf> {
-    latch_home().map(|h| h.join("push.json"))
+    sigil_home().map(|h| h.join("push.json"))
 }
 
-/// `<latch_home>/logs`, where the launchd agent's stdout/stderr are rotated.
+/// `<sigil_home>/logs`, where the launchd agent's stdout/stderr are rotated.
 pub fn logs_dir() -> Option<PathBuf> {
-    latch_home().map(|h| h.join("logs"))
+    sigil_home().map(|h| h.join("logs"))
 }
 
 /// The launchd LaunchAgent plist for the daemon.
 pub fn launch_agent_plist() -> Option<PathBuf> {
     std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join("Library/LaunchAgents/co.rowm.latch.plist"))
+        .map(|h| PathBuf::from(h).join("Library/LaunchAgents/works.rainn.sigil.plist"))
 }
 
 /// True if `p` is a regular file with any execute bit set.
@@ -69,15 +69,15 @@ fn own_binary() -> Option<PathBuf> {
 ///
 /// Two independent exclusion rules, either sufficient (the design doc's "hard
 /// problem 1(a)"):
-///   1. the candidate canonicalises to a Latch binary an alias points at (the
-///      running binary, or the sibling `latch` runtime the manager installs
+///   1. the candidate canonicalises to a Sigil binary an alias points at (the
+///      running binary, or the sibling `sigil` runtime the manager installs
 ///      aliases at). Catches a symlink alias in any directory.
-///   2. the candidate lives inside the proxy dir (`~/.latch/bin`). Catches a
+///   2. the candidate lives inside the proxy dir (`~/.sigil/bin`). Catches a
 ///      NON-symlink alias too (a script, or a hard copy of the binary) that
-///      canonicalisation cannot see. Without this, a same-UID-planted non-latch
+///      canonicalisation cannot see. Without this, a same-UID-planted non-sigil
 ///      executable in the proxy dir would be spawned with the injected token
 ///      (sec-review-1 Finding A); it also keeps `list`/`doctor` diagnostics
-///      correct when called from the `latch-config` binary (Finding B).
+///      correct when called from the `sigil-config` binary (Finding B).
 pub fn find_real(cmd: &str) -> Option<PathBuf> {
     find_real_in(
         cmd,
@@ -90,8 +90,8 @@ pub fn find_real(cmd: &str) -> Option<PathBuf> {
 
 /// The pure core of [`find_real`]: everything reads from the explicit inputs plus
 /// the filesystem, so tests drive it with synthetic dirs and no process-global
-/// env mutation. `own`/`alias_target` are canonical Latch-binary paths to
-/// exclude (rule 1); `proxy_dir` is the canonical `~/.latch/bin` (rule 2).
+/// env mutation. `own`/`alias_target` are canonical Sigil-binary paths to
+/// exclude (rule 1); `proxy_dir` is the canonical `~/.sigil/bin` (rule 2).
 fn find_real_in(
     cmd: &str,
     path: Option<&std::ffi::OsStr>,
@@ -111,7 +111,7 @@ fn find_real_in(
             }
         }
         // Rule 1: an alias symlink living outside the proxy dir resolves to a
-        // Latch binary; exclude both the running binary and the alias target.
+        // Sigil binary; exclude both the running binary and the alias target.
         if let Ok(canon) = cand.canonicalize() {
             if own.as_ref() == Some(&canon) || alias_target.as_ref() == Some(&canon) {
                 continue;
@@ -131,24 +131,24 @@ pub fn find_real_op() -> Option<PathBuf> {
 
 /// The health of the `op` shim install, as seen from the running binary.
 ///
-/// The daemon and `latch doctor` read this to catch **shim drift**: the shim
+/// The daemon and `sigil doctor` read this to catch **shim drift**: the shim
 /// silently ceasing to be the `op` a shell resolves, which would route requests
 /// straight to the real `op` with no approval gate. Three drifts are caught: the
 /// link never installed / removed, another `op` winning on `PATH`, and the link
-/// pointing at a stale `latch` binary (e.g. after a rebuild to a new path).
+/// pointing at a stale `sigil` binary (e.g. after a rebuild to a new path).
 #[derive(Debug, Clone)]
 pub struct ShimStatus {
-    /// `~/.latch/bin/op` exists as a symlink.
+    /// `~/.sigil/bin/op` exists as a symlink.
     pub installed: bool,
-    /// `~/.latch/bin` is present somewhere on `PATH`.
+    /// `~/.sigil/bin` is present somewhere on `PATH`.
     pub dir_on_path: bool,
     /// The first `op` a `PATH` walk resolves lives in the shim dir (the shim
     /// wins over any real `op`).
     pub first_on_path: bool,
-    /// The shim link resolves to the currently running `latch` binary. `false`
+    /// The shim link resolves to the currently running `sigil` binary. `false`
     /// means it points at a stale binary or is broken.
     pub resolves_to_current: bool,
-    /// What `~/.latch/bin/op` canonicalises to, if it resolves.
+    /// What `~/.sigil/bin/op` canonicalises to, if it resolves.
     pub link_target: Option<PathBuf>,
     /// The first `op` on `PATH` that is not the shim, if any.
     pub real_op: Option<PathBuf>,
@@ -224,12 +224,12 @@ impl ShimStatus {
     /// when healthy.
     pub fn issue(&self) -> Option<String> {
         if !self.installed {
-            return Some("shim not installed (run: latch setup, or latch shim install)".into());
+            return Some("shim not installed (run: sigil setup, or sigil shim install)".into());
         }
         if !self.first_on_path {
             if !self.dir_on_path {
                 return Some(
-                    "~/.latch/bin is not on PATH (add it to your shell profile so the shim wins)"
+                    "~/.sigil/bin is not on PATH (add it to your shell profile so the shim wins)"
                         .into(),
                 );
             }
@@ -238,10 +238,10 @@ impl ShimStatus {
         if !self.resolves_to_current {
             return Some(match &self.link_target {
                 Some(t) => format!(
-                    "shim points at a stale binary ({}); re-run: latch shim install",
+                    "shim points at a stale binary ({}); re-run: sigil shim install",
                     t.display()
                 ),
-                None => "shim link is broken; re-run: latch shim install".into(),
+                None => "shim link is broken; re-run: sigil shim install".into(),
             });
         }
         None
@@ -292,7 +292,7 @@ mod tests {
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
-            "latch-shim-{tag}-{}-{:?}",
+            "sigil-shim-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -331,7 +331,7 @@ mod tests {
         // must.
         let root = tmp("findreal-planted");
         let proxy_dir = root.join("bin");
-        exe_in(&proxy_dir, "op"); // a plain script, not a symlink to latch
+        exe_in(&proxy_dir, "op"); // a plain script, not a symlink to sigil
         let real_dir = root.join("real");
         let real = exe_in(&real_dir, "op");
 
@@ -354,14 +354,14 @@ mod tests {
 
     #[test]
     fn find_real_excludes_via_own_and_alias_target() {
-        // Rule 1: a symlink alias OUTSIDE the proxy dir resolves to a Latch
-        // binary. From latch-config, `own` is the manager but the alias points at
+        // Rule 1: a symlink alias OUTSIDE the proxy dir resolves to a Sigil
+        // binary. From sigil-config, `own` is the manager but the alias points at
         // the sibling runtime (alias_target); excluding both is what keeps
         // resolution and diagnostics correct (Finding B).
         let root = tmp("findreal-alias");
-        let runtime = exe_in(&root, "latch"); // stand-in runtime binary
+        let runtime = exe_in(&root, "sigil"); // stand-in runtime binary
         let runtime = runtime.canonicalize().unwrap();
-        let manager = exe_in(&root, "latch-config").canonicalize().unwrap();
+        let manager = exe_in(&root, "sigil-config").canonicalize().unwrap();
 
         // A stray alias symlink to the runtime, in a dir on PATH (not the proxy
         // dir), plus the real op after it.
@@ -371,7 +371,7 @@ mod tests {
         let real = exe_in(&root.join("real"), "op");
 
         let path = path_of(&[&stray, &root.join("real")]);
-        // Called "from latch-config": own = manager, alias_target = runtime.
+        // Called "from sigil-config": own = manager, alias_target = runtime.
         let got = find_real_in(
             "op",
             Some(path.as_os_str()),
@@ -395,7 +395,7 @@ mod tests {
         std::fs::create_dir_all(&shim_dir).unwrap();
 
         // A stand-in "current binary" and the shim symlink pointing at it.
-        let current = root.join("latch-bin");
+        let current = root.join("sigil-bin");
         std::fs::write(&current, "#!/bin/sh\ntrue\n").unwrap();
         std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o755)).unwrap();
         let own = current.canonicalize().unwrap();
@@ -422,7 +422,7 @@ mod tests {
         let shim_dir = root.join("shimbin");
         let real_dir = op_in(&root.join("realbin"));
         std::fs::create_dir_all(&shim_dir).unwrap();
-        let current = root.join("latch-bin");
+        let current = root.join("sigil-bin");
         std::fs::write(&current, "x").unwrap();
         std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o755)).unwrap();
         let own = current.canonicalize().unwrap();
@@ -448,11 +448,11 @@ mod tests {
         std::fs::create_dir_all(&shim_dir).unwrap();
 
         // The shim points at an OLD binary; the daemon now runs a different one.
-        let old = root.join("latch-old");
+        let old = root.join("sigil-old");
         std::fs::write(&old, "old").unwrap();
         std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::os::unix::fs::symlink(old.canonicalize().unwrap(), shim_dir.join("op")).unwrap();
-        let current = root.join("latch-new");
+        let current = root.join("sigil-new");
         std::fs::write(&current, "new").unwrap();
         let own = current.canonicalize().unwrap();
 
@@ -472,7 +472,7 @@ mod tests {
         let shim_dir = root.join("shimbin");
         std::fs::create_dir_all(&shim_dir).unwrap();
         let path = path_of(&[&shim_dir]);
-        let s = ShimStatus::detect_with(Some(root.join("latch")), Some(shim_dir), Some(&path));
+        let s = ShimStatus::detect_with(Some(root.join("sigil")), Some(shim_dir), Some(&path));
         assert!(!s.installed);
         assert!(!s.healthy());
         assert!(s.issue().unwrap().contains("not installed"));
@@ -484,7 +484,7 @@ mod tests {
         let root = tmp("offpath");
         let shim_dir = root.join("shimbin");
         std::fs::create_dir_all(&shim_dir).unwrap();
-        let current = root.join("latch-bin");
+        let current = root.join("sigil-bin");
         std::fs::write(&current, "x").unwrap();
         std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o755)).unwrap();
         let own = current.canonicalize().unwrap();

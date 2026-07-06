@@ -73,7 +73,7 @@
 //! public, so anyone can wrap an arbitrary value to it. That is acceptable because
 //! the wrap is produced and consumed **locally** — the daemon wraps the DEK to the
 //! same Mac's SE key and the SE unwraps it under Touch ID — so forging or swapping
-//! the stored blob already requires same-UID write (outside Latch's boundary) and
+//! the stored blob already requires same-UID write (outside Sigil's boundary) and
 //! yields only a fail-closed denial, never a secret. **Design constraint for any
 //! future use:** if a wrapped-DEK-to-SE blob is ever delivered by a *remote* party
 //! (over the relay, or from the phone to a different machine), it MUST be carried

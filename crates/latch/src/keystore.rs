@@ -44,16 +44,16 @@ pub fn dek_error_hint(e: &KeystoreError) -> &'static str {
     match e {
         KeystoreError::NeedsVerification(_) => {
             "this Mac's Secure Enclave path has not been confirmed working on this \
-             hardware yet. For local development, set LATCH_DEV_KEYSTORE=file. \
-             Otherwise, a threshold account (latch account add <label> --threshold) \
+             hardware yet. For local development, set SIGIL_DEV_KEYSTORE=file. \
+             Otherwise, a threshold account (sigil account add <label> --threshold) \
              does not need the DEK ceremony at all."
         }
         KeystoreError::Declined => "the Touch ID prompt was declined; try again and approve it.",
         KeystoreError::NoDek => {
-            "no DEK has been provisioned yet; run: latch account add <label> --token-stdin"
+            "no DEK has been provisioned yet; run: sigil account add <label> --token-stdin"
         }
         KeystoreError::Backend(_) => {
-            "the Keychain backend failed; run `latch doctor` and check Keychain access for Latch."
+            "the Keychain backend failed; run `sigil doctor` and check Keychain access for Sigil."
         }
         KeystoreError::Secrets(_) => {
             "the stored DEK envelope is malformed; remove and re-provision it."
@@ -183,7 +183,7 @@ impl Keystore for MemoryKeystore {
 /// **not secure** (the DEK is on disk in the clear) and exists only to make the
 /// full gated loop runnable headlessly, standing in for the Secure Enclave the
 /// way the v0 plan calls for ("unwrap key stubbed behind local Touch ID"). It
-/// is selected only by `LATCH_DEV_KEYSTORE=file`, never by default.
+/// is selected only by `SIGIL_DEV_KEYSTORE=file`, never by default.
 pub struct DevFileKeystore {
     path: std::path::PathBuf,
     inner: std::sync::Mutex<()>,
@@ -314,7 +314,7 @@ impl Keystore for DevFileKeystore {
     }
 }
 
-/// The loud, multi-line warning that must appear whenever `LATCH_DEV_KEYSTORE`
+/// The loud, multi-line warning that must appear whenever `SIGIL_DEV_KEYSTORE`
 /// is honored. Mirrors [`crate::factor::DEV_INSECURE_WARNING`] in shape: it
 /// names the concrete risk (DEK, and for `file` the token-decryption key, in
 /// plaintext on disk or in RAM with no biometric gate) so a dev config can
@@ -328,7 +328,7 @@ fn dev_keystore_warning(mode: &str, path: Option<&std::path::Path>) -> String {
     format!(
         "\n\
          !! ============================================================ !!\n\
-         !!  LATCH_DEV_KEYSTORE={mode} IS ACTIVE                          !!\n\
+         !!  SIGIL_DEV_KEYSTORE={mode} IS ACTIVE                          !!\n\
          !! ------------------------------------------------------------ !!\n\
          !!  The Secure Enclave / Keychain DEK envelope is bypassed.      !!\n\
          {where_line}\
@@ -338,17 +338,17 @@ fn dev_keystore_warning(mode: &str, path: Option<&std::path::Path>) -> String {
          !!  for v1 accounts that DEK decrypts every stored token.        !!\n\
          !!                                                              !!\n\
          !!  Use this ONLY for local development. Unset                  !!\n\
-         !!  LATCH_DEV_KEYSTORE for a real hardware-backed keystore.      !!\n\
+         !!  SIGIL_DEV_KEYSTORE for a real hardware-backed keystore.      !!\n\
          !! ============================================================ !!\n"
     )
 }
 
 /// Select the keystore for the daemon and CLI. Both must agree so a token
-/// sealed by `latch account add` unwraps in the daemon.
+/// sealed by `sigil account add` unwraps in the daemon.
 ///
-/// * `LATCH_DEV_KEYSTORE=file` -> [`DevFileKeystore`] at `~/.latch/dev-keystore.json`
-///   (or `$LATCH_HOME/dev-keystore.json`). Headless demo of the full loop.
-/// * `LATCH_DEV_KEYSTORE=memory` -> [`MemoryKeystore`] (ephemeral; single process).
+/// * `SIGIL_DEV_KEYSTORE=file` -> [`DevFileKeystore`] at `~/.sigil/dev-keystore.json`
+///   (or `$SIGIL_HOME/dev-keystore.json`). Headless demo of the full loop.
+/// * `SIGIL_DEV_KEYSTORE=memory` -> [`MemoryKeystore`] (ephemeral; single process).
 /// * macOS default -> the Secure Enclave keystore (`MacKeystore`).
 /// * other platforms default -> [`MemoryKeystore`] until their fill lands.
 ///
@@ -359,12 +359,12 @@ fn dev_keystore_warning(mode: &str, path: Option<&std::path::Path>) -> String {
 /// plaintext with zero user-facing signal.
 pub fn for_host() -> std::sync::Arc<dyn Keystore> {
     use std::sync::Arc;
-    match std::env::var("LATCH_DEV_KEYSTORE").ok().as_deref() {
+    match std::env::var("SIGIL_DEV_KEYSTORE").ok().as_deref() {
         Some("file") => {
-            let base = std::env::var_os("LATCH_HOME")
+            let base = std::env::var_os("SIGIL_HOME")
                 .map(std::path::PathBuf::from)
                 .or_else(|| {
-                    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".latch"))
+                    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".sigil"))
                 })
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
             let path = base.join("dev-keystore.json");
@@ -447,7 +447,7 @@ mod tests {
 
     #[test]
     fn dev_file_keystore_persists_dek_across_instances() {
-        let dir = std::env::temp_dir().join(format!("latch-ks-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-ks-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dev-keystore.json");
 
@@ -491,13 +491,13 @@ mod tests {
     #[test]
     fn dev_keystore_warning_names_the_concrete_risk() {
         let file = dev_keystore_warning("file", Some(std::path::Path::new("/tmp/x.json")));
-        assert!(file.contains("LATCH_DEV_KEYSTORE=file"));
+        assert!(file.contains("SIGIL_DEV_KEYSTORE=file"));
         assert!(file.contains("/tmp/x.json"));
         assert!(file.contains("no biometric gate"));
         assert!(file.lines().count() > 5);
 
         let memory = dev_keystore_warning("memory", None);
-        assert!(memory.contains("LATCH_DEV_KEYSTORE=memory"));
+        assert!(memory.contains("SIGIL_DEV_KEYSTORE=memory"));
         assert!(memory.contains("plaintext RAM"));
     }
 }

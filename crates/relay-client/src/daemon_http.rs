@@ -28,8 +28,8 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use latch_proto::envelope::Envelope;
-use latch_proto::{Direction, PushHint, Transport, TransportError};
+use sigil_proto::envelope::Envelope;
+use sigil_proto::{Direction, PushHint, Transport, TransportError};
 
 use crate::http::{HttpMailbox, Slot};
 use crate::wire;
@@ -83,7 +83,7 @@ impl DaemonRelay {
         for s in drained {
             match wire::wire_to_envelope(&s) {
                 Ok(env) => buf.push_back(env),
-                Err(e) => eprintln!("latch relay: dropped an undecodable to-daemon envelope: {e}"),
+                Err(e) => eprintln!("sigil relay: dropped an undecodable to-daemon envelope: {e}"),
             }
         }
         Ok(())
@@ -165,7 +165,7 @@ impl Transport for DaemonRelay {
                     // resolve by retrying, hence the early `?` above.
                 }
                 Err(e) => {
-                    eprintln!("latch relay: to-daemon poll failed, retrying: {e}");
+                    eprintln!("sigil relay: to-daemon poll failed, retrying: {e}");
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Ok(None);
@@ -192,7 +192,7 @@ mod tests {
     fn spawn_flaky_relay() -> (String, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake relay");
         let addr = listener.local_addr().expect("local_addr");
-        let identity = latch_proto::identity::DeviceIdentity::generate();
+        let identity = sigil_proto::identity::DeviceIdentity::generate();
         let peer = identity.peer_identity();
         let env = Envelope::seal(&"payload", [7u8; 32], 1, &identity.signing, &peer)
             .expect("seal test envelope");

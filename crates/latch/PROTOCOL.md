@@ -1,13 +1,13 @@
-# The Latch daemon control protocol
+# The Sigil daemon control protocol
 
-This is the machine interface the Mac app (`apps/mac/Latch/Model/DaemonClient.swift`)
-speaks **directly** to the daemon over its unix control socket. The human `latch`
+This is the machine interface the Mac app (`apps/mac/Sigil/Model/DaemonClient.swift`)
+speaks **directly** to the daemon over its unix control socket. The human `sigil`
 CLI is a second renderer of the same protocol: for the read/report and
 runtime-control verbs it is a thin socket client. There is one interface, two
 renderers.
 
-The Rust definition is `crates/latch/src/local.rs` (`Frame` = request, `Reply` =
-response); the JSON payload shapes are the DTOs in `crates/latch/src/json.rs`
+The Rust definition is `crates/sigil/src/local.rs` (`Frame` = request, `Reply` =
+response); the JSON payload shapes are the DTOs in `crates/sigil/src/json.rs`
 (field-for-field the Swift decoder in `DaemonClient.swift`).
 
 ## Least-privilege split (why some things are NOT here)
@@ -19,11 +19,11 @@ operations so a compromised daemon cannot perform them. Therefore:
 
 - **Over this socket (daemon):** status, doctor, leases (list + revoke), pending
   (+ live subscription), history, lockdown (engage/clear), approve/deny.
-- **CLI-only mutations (the Mac app shells out to `latch … --json`):** account
+- **CLI-only mutations (the Mac app shells out to `sigil … --json`):** account
   add/rotate/remove, **command config** (`config add|list|remove`), settings
   get/set, wipe `--force`, mac-approvals `--enable|--phone-only`, shim
-  install/add, and **pairing** (`latch pair --relay <url> --json`, an NDJSON
-  ceremony stream). These write the keystore / `~/.latch` and so are deliberately
+  install/add, and **pairing** (`sigil pair --relay <url> --json`, an NDJSON
+  ceremony stream). These write the keystore / `~/.sigil` and so are deliberately
   not daemon capabilities. Their `--json` shapes are in `JSON.md`.
 
 Pairing note: the brief initially placed the pairing ceremony on the socket
@@ -36,7 +36,7 @@ daemon to drive pairing, the persist step is the only piece that must move.
 
 ## Framing
 
-The control socket lives at `$LATCH_SOCK` or `$TMPDIR/latch/daemon.sock`, mode
+The control socket lives at `$SIGIL_SOCK` or `$TMPDIR/sigil/daemon.sock`, mode
 **0600**, in a **0700** directory: only the owning user may connect. The daemon
 reads the **kernel-verified peer pid** (`LOCAL_PEERPID` on macOS, `SO_PEERCRED`
 on Linux) for its lease/provenance measurement; a client cannot spoof it.
@@ -137,11 +137,11 @@ detected. Drives the live menubar. The client parses each `event.body` as
 ### The run path (not part of the control surface)
 
 `{"kind":"run","argv":[str],"cwd":str}` with the caller's stdout/stderr passed as
-`SCM_RIGHTS` is the secret path for the `latch <cmd>` primitive (and its shim
-alias / `latch run -- <cmd>`). `argv[0]` is the command name; the daemon looks up
+`SCM_RIGHTS` is the secret path for the `sigil <cmd>` primitive (and its shim
+alias / `sigil run -- <cmd>`). `argv[0]` is the command name; the daemon looks up
 the command's config, gates it, injects the provider's environment, then splices
 the child's stdout to the caller fd. An *unconfigured* command is refused (a
-non-zero exit with a stderr pointer to `latch config add`), never run ungated.
+non-zero exit with a stderr pointer to `sigil config add`), never run ungated.
 Reply `{"kind":"exit","code":int}`. Clients of the control protocol never send
 this; it is the shim / primitive channel.
 
@@ -156,7 +156,7 @@ line(s), parse `body`):
 - A long-lived `subscribe_pending` connection feeding the menubar; reconnect on
   drop.
 
-**Shells out to `latch … --json`** (short-lived process; keystore/config
+**Shells out to `sigil … --json`** (short-lived process; keystore/config
 mutations that must not be daemon capabilities):
 - `addAccount`/`rotateAccount`/`removeAccount` → `account add|rotate|remove … --json`
 - `settings`/`saveSettings` → `settings get|set --json`

@@ -4,14 +4,14 @@
 //! this module is the local factor. [`LocalApprover`] resolves a decision in
 //! order:
 //!
-//! * `LATCH_DEV_AUTOAPPROVE` — headless auto-approve for the gated-loop tests
+//! * `SIGIL_DEV_AUTOAPPROVE` — headless auto-approve for the gated-loop tests
 //!   and dev. Only functions when the daemon enabled it via `with_dev`, which
 //!   happens **only** under `--dev-insecure` (see [`crate::factor`]).
 //! * a live Mac Secure Enclave DEK envelope — prompt Touch ID to unwrap it
 //!   (NEEDS-VERIFICATION; see [`crate::keystore_macos`]). A successful unwrap is
 //!   the biometric approving factor.
 //! * the control socket — register the request as pending and block until a
-//!   `latch approve --local --id <id>` (or `deny`) arrives, or the timeout fails
+//!   `sigil approve --local --id <id>` (or `deny`) arrives, or the timeout fails
 //!   closed. This path is same-UID forgeable (`docs/security-claims.md`
 //!   residual #1), so it is gated behind `with_control_socket`, enabled **only**
 //!   under `--dev-insecure`. Without it, an unresolved local decision fails
@@ -117,7 +117,7 @@ pub struct ApprovalContext {
     /// `read op://Engineering/.env`. Internal; the remote request carries the
     /// generic [`command`](Self::command)/[`secret_refs`](Self::secret_refs).
     pub scope: String,
-    /// Grant-key hex, for correlating with `latch lease list`.
+    /// Grant-key hex, for correlating with `sigil lease list`.
     pub grant_hex: String,
     /// Human process chain, e.g. `zsh → claude → op`.
     pub provenance: String,
@@ -126,21 +126,21 @@ pub struct ApprovalContext {
     pub command: Vec<String>,
     /// Provider-agnostic references the daemon's provider derived from the
     /// command, for the approver's readout. Empty for non-secret requests.
-    pub secret_refs: Vec<latch_proto::SecretRef>,
+    pub secret_refs: Vec<sigil_proto::SecretRef>,
     /// The display hint the provider assigned (how the approver should render).
-    pub kind: latch_proto::RequestKind,
+    pub kind: sigil_proto::RequestKind,
     /// The risk policy for this request (from the command config, or a provider
     /// default). Scales the approve friction on the phone; deny is always one tap.
-    pub risk: latch_proto::RiskLevel,
+    pub risk: sigil_proto::RiskLevel,
     /// Present for an `ssh_signature` request: the key label, derived
     /// destination, and data-to-sign fingerprint the approver renders. `None`
     /// for secret reads and control requests.
-    pub ssh: Option<latch_proto::SshChallenge>,
+    pub ssh: Option<sigil_proto::SshChallenge>,
     /// Present when the routed account is a v2 (threshold) account: the base
     /// point `E` the phone key-agrees against, plus the account binding it shows
     /// and consents to (R5). The remote approver copies this into the request; a
     /// v1 account leaves it `None` and takes the DEK path.
-    pub threshold: Option<latch_proto::ThresholdChallenge>,
+    pub threshold: Option<sigil_proto::ThresholdChallenge>,
 }
 
 /// Resolves an approval request to an [`ApprovalOutcome`]. Blocking; may time
@@ -159,7 +159,7 @@ struct Waiter {
     timeout_ms: u64,
 }
 
-/// A read-only view of one parked request, for `latch pending --json`.
+/// A read-only view of one parked request, for `sigil pending --json`.
 #[derive(Debug, Clone)]
 pub struct PendingSnapshot {
     pub ctx: ApprovalContext,
@@ -207,7 +207,7 @@ impl PendingRegistry {
             Waiter {
                 tx,
                 ctx: ctx.clone(),
-                queued_at_ms: latch_proto::now_ms(),
+                queued_at_ms: sigil_proto::now_ms(),
                 timeout_ms: timeout.as_millis() as u64,
             },
         );
@@ -299,10 +299,10 @@ pub enum DevMode {
 }
 
 impl DevMode {
-    /// Read `LATCH_DEV_AUTOAPPROVE`: `lease` -> a 15m session lease, any other
+    /// Read `SIGIL_DEV_AUTOAPPROVE`: `lease` -> a 15m session lease, any other
     /// non-empty value -> single-shot approve, unset/empty/`0` -> off.
     pub fn from_env() -> Self {
-        match std::env::var("LATCH_DEV_AUTOAPPROVE") {
+        match std::env::var("SIGIL_DEV_AUTOAPPROVE") {
             Ok(v) if v == "lease" => DevMode::Lease(Duration::from_secs(15 * 60)),
             Ok(v) if !v.is_empty() && v != "0" => DevMode::Approve,
             _ => DevMode::Off,
@@ -362,7 +362,7 @@ impl LocalApprover {
         self
     }
 
-    /// Enable the control-socket park (`latch approve|deny --local`). Only wired
+    /// Enable the control-socket park (`sigil approve|deny --local`). Only wired
     /// under `--dev-insecure`; off means an unresolved decision fails closed.
     pub fn with_control_socket(mut self, allow: bool) -> Self {
         self.allow_control_socket = allow;
@@ -378,7 +378,7 @@ pub struct NullApprover;
 impl Approver for NullApprover {
     fn decide(&self, ctx: &ApprovalContext) -> ApprovalOutcome {
         eprintln!(
-            "latch daemon: no approving factor (no paired phone, no hardware biometric); \
+            "sigil daemon: no approving factor (no paired phone, no hardware biometric); \
              refusing '{}' for {}. Pair a phone, or start with --dev-insecure for local dev.",
             ctx.scope, ctx.account
         );
@@ -423,7 +423,7 @@ impl LocalApprover {
             }
         }
 
-        // 3. Park until `latch approve|deny --local --id <ctx.id>` or timeout —
+        // 3. Park until `sigil approve|deny --local --id <ctx.id>` or timeout —
         //    but ONLY under --dev-insecure. The control socket is same-UID
         //    forgeable (residual #1), so without it the daemon fails closed here
         //    rather than offering a self-approvable gate.
@@ -431,7 +431,7 @@ impl LocalApprover {
             return Decision::Deny;
         }
         eprintln!(
-            "latch daemon: approval required · {} · {}\n            approve: latch approve --local --id {}\n            deny:    latch deny --local --id {}",
+            "sigil daemon: approval required · {} · {}\n            approve: sigil approve --local --id {}\n            deny:    sigil deny --local --id {}",
             ctx.account, ctx.scope, ctx.id, ctx.id
         );
         let rx = self.pending.park(ctx, self.timeout);
@@ -523,8 +523,8 @@ mod tests {
             cwd: "/p".into(),
             command: vec!["op".into(), "read".into()],
             secret_refs: Vec::new(),
-            kind: latch_proto::RequestKind::SecretRead,
-            risk: latch_proto::RiskLevel::Routine,
+            kind: sigil_proto::RequestKind::SecretRead,
+            risk: sigil_proto::RiskLevel::Routine,
             ssh: None,
             threshold: None,
         }
@@ -621,16 +621,16 @@ mod tests {
     fn dev_mode_from_env_parses() {
         // Isolated from other tests: this is the only test touching this var,
         // and it restores it before returning.
-        let prev = std::env::var("LATCH_DEV_AUTOAPPROVE").ok();
-        std::env::set_var("LATCH_DEV_AUTOAPPROVE", "lease");
+        let prev = std::env::var("SIGIL_DEV_AUTOAPPROVE").ok();
+        std::env::set_var("SIGIL_DEV_AUTOAPPROVE", "lease");
         assert!(matches!(DevMode::from_env(), DevMode::Lease(_)));
-        std::env::set_var("LATCH_DEV_AUTOAPPROVE", "1");
+        std::env::set_var("SIGIL_DEV_AUTOAPPROVE", "1");
         assert_eq!(DevMode::from_env(), DevMode::Approve);
-        std::env::set_var("LATCH_DEV_AUTOAPPROVE", "0");
+        std::env::set_var("SIGIL_DEV_AUTOAPPROVE", "0");
         assert_eq!(DevMode::from_env(), DevMode::Off);
         match prev {
-            Some(v) => std::env::set_var("LATCH_DEV_AUTOAPPROVE", v),
-            None => std::env::remove_var("LATCH_DEV_AUTOAPPROVE"),
+            Some(v) => std::env::set_var("SIGIL_DEV_AUTOAPPROVE", v),
+            None => std::env::remove_var("SIGIL_DEV_AUTOAPPROVE"),
         }
     }
 

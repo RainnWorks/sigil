@@ -21,8 +21,8 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use latch_proto::envelope::Envelope;
-use latch_proto::{Direction, Transport, TransportError};
+use sigil_proto::envelope::Envelope;
+use sigil_proto::{Direction, Transport, TransportError};
 
 use crate::http::{HttpMailbox, Slot};
 use crate::wire;
@@ -69,7 +69,7 @@ impl PhoneRelay {
         for s in drained {
             match wire::wire_to_envelope(&s) {
                 Ok(env) => buf.push_back(env),
-                Err(e) => eprintln!("latch relay: dropped an undecodable to-phone envelope: {e}"),
+                Err(e) => eprintln!("sigil relay: dropped an undecodable to-phone envelope: {e}"),
             }
         }
         Ok(())
@@ -135,7 +135,7 @@ impl Transport for PhoneRelay {
                     }
                 }
                 Err(e) => {
-                    eprintln!("latch relay: to-phone poll failed, retrying: {e}");
+                    eprintln!("sigil relay: to-phone poll failed, retrying: {e}");
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Ok(None);

@@ -1,11 +1,11 @@
-//! The install steps `latch setup` runs, factored out of the CLI so each is
+//! The install steps `sigil setup` runs, factored out of the CLI so each is
 //! testable and reusable.
 //!
 //! Setup is the guided first run: provision the keystore DEK, install the `op`
 //! shim, make it win on `PATH` for both interactive shells (the shell profile)
 //! and GUI-launched tools (the launchd plist `EnvironmentVariables`), load the
 //! launchd agent, then hand off to the pairing flow. Each step here is
-//! idempotent so re-running `latch setup` is safe.
+//! idempotent so re-running `sigil setup` is safe.
 
 use std::path::{Path, PathBuf};
 
@@ -14,27 +14,27 @@ use anyhow::{Context, Result};
 use crate::paths;
 use crate::service;
 
-/// The marker that brackets Latch's block in the shell profile, so we edit
+/// The marker that brackets Sigil's block in the shell profile, so we edit
 /// exactly our own lines and never duplicate them.
-const PROFILE_MARKER: &str = "# >>> latch shim (managed) >>>";
-const PROFILE_MARKER_END: &str = "# <<< latch shim (managed) <<<";
+const PROFILE_MARKER: &str = "# >>> sigil shim (managed) >>>";
+const PROFILE_MARKER_END: &str = "# <<< sigil shim (managed) <<<";
 
-/// Install the `op` shim: symlink `~/.latch/bin/op` at the running binary,
+/// Install the `op` shim: symlink `~/.sigil/bin/op` at the running binary,
 /// replacing any stale link. Returns `(link, target)`.
 pub fn install_shim() -> Result<(PathBuf, PathBuf)> {
     install_shim_for("op")
 }
 
-/// Install a transparent shim alias for `cmd`: symlink `~/.latch/bin/<cmd>` at
-/// the running binary so a bare `<cmd>` on PATH re-enters as `latch <cmd>`,
+/// Install a transparent shim alias for `cmd`: symlink `~/.sigil/bin/<cmd>` at
+/// the running binary so a bare `<cmd>` on PATH re-enters as `sigil <cmd>`,
 /// replacing any stale link. Returns `(link, target)`. This generalizes the shim
-/// beyond `op` so `latch shim add <cli>` can front any configured command for
+/// beyond `op` so `sigil shim add <cli>` can front any configured command for
 /// callers that cannot be modified.
 pub fn install_shim_for(cmd: &str) -> Result<(PathBuf, PathBuf)> {
     let bindir = paths::shim_bin_dir().context("HOME is not set")?;
     let target = std::env::current_exe()
         .and_then(|p| p.canonicalize())
-        .context("resolving the latch binary path")?;
+        .context("resolving the sigil binary path")?;
     std::fs::create_dir_all(&bindir).with_context(|| format!("creating {}", bindir.display()))?;
     let link = bindir.join(cmd);
     if link.exists() || link.symlink_metadata().is_ok() {
@@ -62,12 +62,12 @@ pub fn shell_profile() -> Option<PathBuf> {
 /// True if `contents` already puts the shim dir on `PATH` (our managed block, or
 /// a hand-written line the user added). Prevents a duplicate append.
 fn profile_has_shim(contents: &str) -> bool {
-    contents.contains(PROFILE_MARKER) || contents.contains(".latch/bin")
+    contents.contains(PROFILE_MARKER) || contents.contains(".sigil/bin")
 }
 
 /// The managed block appended to the profile.
 fn profile_block() -> String {
-    format!("{PROFILE_MARKER}\nexport PATH=\"$HOME/.latch/bin:$PATH\"\n{PROFILE_MARKER_END}\n")
+    format!("{PROFILE_MARKER}\nexport PATH=\"$HOME/.sigil/bin:$PATH\"\n{PROFILE_MARKER_END}\n")
 }
 
 /// Ensure the shim dir is on `PATH` in the shell profile. Returns `Ok(true)` if
@@ -111,7 +111,7 @@ mod tests {
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
-            "latch-setup-{tag}-{}-{:?}",
+            "sigil-setup-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -129,14 +129,14 @@ mod tests {
         assert!(ensure_profile_path_at(&rc).unwrap());
         let after = std::fs::read_to_string(&rc).unwrap();
         assert!(after.contains("export EDITOR=vim"), "existing content kept");
-        assert!(after.contains(".latch/bin"));
+        assert!(after.contains(".sigil/bin"));
         assert!(after.contains(PROFILE_MARKER));
 
         // Second run is a no-op: no duplicate block.
         assert!(!ensure_profile_path_at(&rc).unwrap());
         let after2 = std::fs::read_to_string(&rc).unwrap();
         assert_eq!(
-            after2.matches(".latch/bin").count(),
+            after2.matches(".sigil/bin").count(),
             1,
             "the PATH line must appear exactly once"
         );
@@ -149,7 +149,7 @@ mod tests {
         let rc = dir.join(".zshrc");
         assert!(ensure_profile_path_at(&rc).unwrap());
         assert!(rc.exists());
-        assert!(std::fs::read_to_string(&rc).unwrap().contains(".latch/bin"));
+        assert!(std::fs::read_to_string(&rc).unwrap().contains(".sigil/bin"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -157,7 +157,7 @@ mod tests {
     fn a_hand_written_path_line_is_respected() {
         let dir = tmp("handwritten");
         let rc = dir.join(".zshrc");
-        std::fs::write(&rc, "export PATH=\"$HOME/.latch/bin:$PATH\"\n").unwrap();
+        std::fs::write(&rc, "export PATH=\"$HOME/.sigil/bin:$PATH\"\n").unwrap();
         // Already references the shim dir: no managed block appended.
         assert!(!ensure_profile_path_at(&rc).unwrap());
         assert!(!std::fs::read_to_string(&rc)

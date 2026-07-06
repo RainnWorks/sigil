@@ -1,4 +1,4 @@
-//! The sealed, signed envelope: the only thing Latch ever puts on a wire.
+//! The sealed, signed envelope: the only thing Sigil ever puts on a wire.
 
 use crypto_box::aead::{Aead, AeadCore};
 use crypto_box::{PublicKey as BoxPublicKey, SalsaBox, SecretKey as BoxSecretKey};

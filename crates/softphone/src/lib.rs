@@ -1,5 +1,5 @@
 //! The softphone: a programmable, headless reference approver that speaks the
-//! phone side of the Latch protocol.
+//! phone side of the Sigil protocol.
 //!
 //! It exists to drive the full remote-approval loop with no device and no
 //! network relay, so the daemon's end-to-end behaviour can be tested headlessly
@@ -28,11 +28,11 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
-use latch_proto::envelope::Envelope;
-use latch_proto::identity::DeviceIdentity;
-use latch_proto::pairing::{Dek, PairingResponse};
-use latch_proto::threshold::{EcdhAlgo, MacShare, P256Point, ThresholdError};
-use latch_proto::{
+use sigil_proto::envelope::Envelope;
+use sigil_proto::identity::DeviceIdentity;
+use sigil_proto::pairing::{Dek, PairingResponse};
+use sigil_proto::threshold::{EcdhAlgo, MacShare, P256Point, ThresholdError};
+use sigil_proto::{
     mailbox_id, now_ms, ApprovalRequest, ApprovalResponse, Direction, HandshakeError, InstallLease,
     OpenError, PairingError, PairingPayload, PeerIdentity, PhonePairing, ReplayGuard, SealError,
     ThresholdChallenge, Transport, TransportError,
@@ -261,7 +261,7 @@ impl Softphone {
 
     /// The public threshold share `F = f·G` in ANSI X9.63 form, for the daemon to
     /// pin at pairing. `None` if this softphone holds no SE share.
-    pub fn phone_share_x963(&self) -> Option<[u8; latch_proto::threshold::P256_X963_POINT_LEN]> {
+    pub fn phone_share_x963(&self) -> Option<[u8; sigil_proto::threshold::P256_X963_POINT_LEN]> {
         self.phone_share
             .as_ref()
             .map(|s| *s.f.public_point().as_x963())
@@ -377,13 +377,13 @@ impl Softphone {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use latch_proto::pairing::DaemonPairing;
-    use latch_proto::{LocalRelay, RequestKind};
+    use sigil_proto::pairing::DaemonPairing;
+    use sigil_proto::{LocalRelay, RequestKind};
 
     const NOW: u64 = 1_720_000_000_000;
 
     fn endpoints() -> Vec<String> {
-        vec!["lan://latch.local:4823".to_string()]
+        vec!["lan://sigil.local:4823".to_string()]
     }
 
     /// Run the pairing ceremony in-process and return a paired softphone plus
@@ -410,7 +410,7 @@ mod tests {
     }
 
     fn sample_request(id: &str) -> ApprovalRequest {
-        use latch_proto::{Provenance, RiskLevel, SecretRef};
+        use sigil_proto::{Provenance, RiskLevel, SecretRef};
         ApprovalRequest {
             request_id: id.to_string(),
             kind: RequestKind::SecretRead,
@@ -470,7 +470,7 @@ mod tests {
         let resp: ApprovalResponse = resp_env
             .open(&phone_peer(&phone), &daemon_id.agreement, &mut guard)
             .unwrap();
-        assert_eq!(resp.decision, latch_proto::Decision::Approved);
+        assert_eq!(resp.decision, sigil_proto::Decision::Approved);
         assert_eq!(resp.dek().unwrap().as_bytes(), dek.as_bytes());
     }
 
@@ -488,7 +488,7 @@ mod tests {
         let resp: ApprovalResponse = resp_env
             .open(&phone_peer(&phone), &daemon_id.agreement, &mut guard)
             .unwrap();
-        assert_eq!(resp.decision, latch_proto::Decision::Denied);
+        assert_eq!(resp.decision, sigil_proto::Decision::Denied);
         assert!(resp.dek().is_none());
     }
 

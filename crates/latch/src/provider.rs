@@ -5,7 +5,7 @@
 //! pluggable. 1Password (`op` plus a service-account token) is provider #1; a
 //! plain **env-file** is provider #2, the reference impl that proves the seam is
 //! real and not op-shaped. bitwarden, aws-vault, and doppler are future fills of
-//! this same trait. The approval protocol ([`latch_proto::request`]) and the
+//! this same trait. The approval protocol ([`sigil_proto::request`]) and the
 //! approver (phone / softphone) are provider-blind: they carry opaque references
 //! and a display hint, never provider mechanics.
 //!
@@ -34,7 +34,7 @@ use std::process::{Command, Stdio};
 
 use zeroize::Zeroizing;
 
-use latch_proto::{RequestKind, SecretRef};
+use sigil_proto::{RequestKind, SecretRef};
 
 use crate::paths;
 use crate::secrets::{self, Token};
@@ -76,8 +76,8 @@ pub struct ProviderRun<'a> {
     pub stdout: Option<OwnedFd>,
     /// The caller's stderr, wired straight to the child.
     pub stderr: Option<OwnedFd>,
-    /// The value to set `LATCH_PROXY_DEPTH` to on the spawned child: the caller's
-    /// proxy depth + 1. A tool the child re-invokes through a Latch alias sees
+    /// The value to set `SIGIL_PROXY_DEPTH` to on the spawned child: the caller's
+    /// proxy depth + 1. A tool the child re-invokes through a Sigil alias sees
     /// this and the alias's own fuse bounds the chain (see [`crate::proxy`]).
     pub proxy_depth: u32,
 }
@@ -109,7 +109,7 @@ pub trait SecretProvider: Send + Sync {
     /// code. Secret VALUES never return here.
     fn run(&self, run: ProviderRun) -> i32;
 
-    /// Enumerate what a credential can serve (for `latch account add` setup).
+    /// Enumerate what a credential can serve (for `sigil account add` setup).
     /// Providers with no stored credential return [`ProviderError::Unsupported`].
     fn probe(&self, credential: &[u8]) -> Result<Vec<String>, ProviderError>;
 }
@@ -144,7 +144,7 @@ impl ProviderRegistry {
             .map(|b| b.as_ref())
     }
 
-    /// The registered provider ids (for `latch-config` guidance and diagnostics).
+    /// The registered provider ids (for `sigil-config` guidance and diagnostics).
     pub fn ids(&self) -> Vec<&str> {
         self.providers.iter().map(|p| p.id()).collect()
     }
@@ -212,13 +212,13 @@ impl SecretProvider for OpProvider {
 
     fn run(&self, run: ProviderRun) -> i32 {
         let Some(real) = self.resolve() else {
-            eprintln!("latch daemon: no real `op` found on PATH");
+            eprintln!("sigil daemon: no real `op` found on PATH");
             return 127;
         };
         // The op provider always drives the `op` binary (argv[0] is expected to
         // be `op`), injecting the SA token so the child resolves its own secrets.
         let Some(credential) = run.credential else {
-            eprintln!("latch daemon: the 1password provider requires an account credential");
+            eprintln!("sigil daemon: the 1password provider requires an account credential");
             return 1;
         };
 
@@ -234,12 +234,12 @@ impl SecretProvider for OpProvider {
                 cmd.env("OP_SERVICE_ACCOUNT_TOKEN", s);
             }
             Err(_) => {
-                eprintln!("latch daemon: token is not valid UTF-8");
+                eprintln!("sigil daemon: token is not valid UTF-8");
                 return 1;
             }
         }
         // The proxy recursion fuse: the child (and anything it re-invokes through
-        // a Latch alias) carries the incremented depth so the alias's own guard
+        // a Sigil alias) carries the incremented depth so the alias's own guard
         // can bound a runaway loop. Harmless to a non-proxied tool.
         cmd.env(crate::proxy::DEPTH_ENV, run.proxy_depth.to_string());
         // Splice the caller's fds to the child. An ABSENT fd defaults to
@@ -256,7 +256,7 @@ impl SecretProvider for OpProvider {
                 .or_else(|| s.signal().map(|sig| 128 + sig))
                 .unwrap_or(1),
             Err(e) => {
-                eprintln!("latch daemon: spawning op failed: {e}");
+                eprintln!("sigil daemon: spawning op failed: {e}");
                 127
             }
         }
@@ -319,11 +319,11 @@ impl SecretProvider for EnvFileProvider {
 
     fn run(&self, run: ProviderRun) -> i32 {
         if run.command.is_empty() {
-            eprintln!("latch daemon: env-file provider got an empty command");
+            eprintln!("sigil daemon: env-file provider got an empty command");
             return 1;
         }
         if run.source.is_empty() {
-            eprintln!("latch daemon: env-file provider has no source file configured");
+            eprintln!("sigil daemon: env-file provider has no source file configured");
             return 1;
         }
         // Read the source into a Zeroizing buffer and parse it. The values live
@@ -331,7 +331,7 @@ impl SecretProvider for EnvFileProvider {
         let contents = match std::fs::read(run.source) {
             Ok(bytes) => Zeroizing::new(bytes),
             Err(e) => {
-                eprintln!("latch daemon: reading env file {}: {e}", run.source);
+                eprintln!("sigil daemon: reading env file {}: {e}", run.source);
                 return 1;
             }
         };
@@ -340,14 +340,14 @@ impl SecretProvider for EnvFileProvider {
             // conversion would allocate a non-zeroized String holding the file's
             // secret bytes). No values are injected.
             eprintln!(
-                "latch daemon: env file {} is not valid UTF-8; refusing to inject",
+                "sigil daemon: env file {} is not valid UTF-8; refusing to inject",
                 run.source
             );
             return 1;
         };
         if vars.is_empty() {
             eprintln!(
-                "latch daemon: env file {} defined no KEY=VALUE pairs",
+                "sigil daemon: env file {} defined no KEY=VALUE pairs",
                 run.source
             );
         }
@@ -355,7 +355,7 @@ impl SecretProvider for EnvFileProvider {
         // Resolve the real underlying binary (skipping our own shim alias) so a
         // command named like a shimmed tool still runs the true executable.
         let Some(real) = paths::find_real(&run.command[0]) else {
-            eprintln!("latch daemon: no `{}` found on PATH to run", run.command[0]);
+            eprintln!("sigil daemon: no `{}` found on PATH to run", run.command[0]);
             return 127;
         };
 
@@ -368,7 +368,7 @@ impl SecretProvider for EnvFileProvider {
             cmd.env(k, v);
         }
         // The proxy recursion fuse: the child (and anything it re-invokes through
-        // a Latch alias) carries the incremented depth so the alias's own guard
+        // a Sigil alias) carries the incremented depth so the alias's own guard
         // can bound a runaway loop. Harmless to a non-proxied tool.
         cmd.env(crate::proxy::DEPTH_ENV, run.proxy_depth.to_string());
         // Splice the caller's fds to the child. An ABSENT fd defaults to
@@ -385,7 +385,7 @@ impl SecretProvider for EnvFileProvider {
                 .or_else(|| s.signal().map(|sig| 128 + sig))
                 .unwrap_or(1),
             Err(e) => {
-                eprintln!("latch daemon: spawning {} failed: {e}", run.command[0]);
+                eprintln!("sigil daemon: spawning {} failed: {e}", run.command[0]);
                 127
             }
         };
@@ -563,7 +563,7 @@ mod tests {
     #[test]
     fn run_streams_op_child_output_to_the_caller_fd() {
         // A fake `op` that echoes its token env so we can prove credential injection.
-        let dir = std::env::temp_dir().join(format!("latch-prov-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-prov-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let op = dir.join("op");
         std::fs::write(
@@ -621,7 +621,7 @@ mod tests {
     fn env_file_run_fails_closed_on_invalid_utf8() {
         // End to end through the provider: an invalid-UTF-8 source refuses (exit 1)
         // and injects nothing, before it ever resolves or spawns a target binary.
-        let dir = std::env::temp_dir().join(format!("latch-envbad-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-envbad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let env_path = dir.join("bad.env");
         std::fs::write(&env_path, b"API_KEY=live\n\xff\xfe\n").unwrap();
@@ -648,7 +648,7 @@ mod tests {
     fn env_file_provider_injects_the_vars_into_the_child() {
         // Prove the direct-injection path: a child sees the exact KEY=VALUEs from
         // the configured source file, and no account credential is involved.
-        let dir = std::env::temp_dir().join(format!("latch-envfile-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-envfile-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let env_path = dir.join("secrets.env");
         std::fs::write(&env_path, "API_KEY=live-key-42\nREGION=eu\n").unwrap();

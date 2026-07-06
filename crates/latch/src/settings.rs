@@ -1,13 +1,13 @@
-//! The user-facing settings store: `<latch_home>/settings.json`.
+//! The user-facing settings store: `<sigil_home>/settings.json`.
 //!
-//! These are the preferences the Mac app reads and writes over `latch settings
+//! These are the preferences the Mac app reads and writes over `sigil settings
 //! get|set --json`: the approval timeout, notification and motion prefs, the
 //! history retention window, the relay endpoint, and the `mac-approvals` mode.
 //! None of it is secret; the file is 0600 only for tidiness alongside the rest
-//! of `~/.latch`.
+//! of `~/.sigil`.
 //!
 //! `set` is a *merge*: only the keys present in the incoming patch change, so
-//! `latch settings set relay_url https://…` never disturbs `mac_approvals`, and
+//! `sigil settings set relay_url https://…` never disturbs `mac_approvals`, and
 //! the Mac app writing the five GUI fields never drops it either.
 
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,7 @@ pub const MAC_APPROVALS_PHONE_ONLY: &str = "phone_only";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
-    #[error("HOME is not set, so ~/.latch has no location")]
+    #[error("HOME is not set, so ~/.sigil has no location")]
     NoHome,
     #[error("settings io: {0}")]
     Io(#[from] std::io::Error),
@@ -79,9 +79,9 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// `<latch_home>/settings.json`.
+    /// `<sigil_home>/settings.json`.
     pub fn path() -> Result<std::path::PathBuf, SettingsError> {
-        paths::latch_home()
+        paths::sigil_home()
             .map(|h| h.join("settings.json"))
             .ok_or(SettingsError::NoHome)
     }
@@ -202,13 +202,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let dir = std::env::temp_dir().join(format!(
-                "latch-settings-{tag}-{}-{:?}",
+                "sigil-settings-{tag}-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             ));
             std::fs::create_dir_all(&dir).unwrap();
-            let prev = std::env::var_os("LATCH_HOME");
-            std::env::set_var("LATCH_HOME", &dir);
+            let prev = std::env::var_os("SIGIL_HOME");
+            std::env::set_var("SIGIL_HOME", &dir);
             Self {
                 _lock: lock,
                 prev,
@@ -219,8 +219,8 @@ mod tests {
     impl Drop for HomeGuard {
         fn drop(&mut self) {
             match &self.prev {
-                Some(v) => std::env::set_var("LATCH_HOME", v),
-                None => std::env::remove_var("LATCH_HOME"),
+                Some(v) => std::env::set_var("SIGIL_HOME", v),
+                None => std::env::remove_var("SIGIL_HOME"),
             }
             std::fs::remove_dir_all(&self.dir).ok();
         }

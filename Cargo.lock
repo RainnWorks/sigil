@@ -771,76 +771,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "latch"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "base64",
- "blake2",
- "core-foundation",
- "ed25519-dalek",
- "latch-proto",
- "latch-relay-client",
- "latch-softphone",
- "libc",
- "qrcode",
- "rand_core 0.6.4",
- "security-framework",
- "security-framework-sys",
- "serde",
- "serde_json",
- "sha2",
- "signature",
- "ssh-key",
- "thiserror",
- "tokio",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "latch-proto"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "base64",
- "blake2",
- "crypto_box",
- "ed25519-dalek",
- "p256",
- "rand_core 0.6.4",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "latch-relay-client"
-version = "0.1.0"
-dependencies = [
- "latch-proto",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "latch-softphone"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "latch-proto",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1365,6 +1295,76 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "sigil"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "base64",
+ "blake2",
+ "core-foundation",
+ "ed25519-dalek",
+ "libc",
+ "qrcode",
+ "rand_core 0.6.4",
+ "security-framework",
+ "security-framework-sys",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sigil-proto",
+ "sigil-relay-client",
+ "sigil-softphone",
+ "signature",
+ "ssh-key",
+ "thiserror",
+ "tokio",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "sigil-proto"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "base64",
+ "blake2",
+ "crypto_box",
+ "ed25519-dalek",
+ "p256",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "sigil-relay-client"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sigil-proto",
+ "thiserror",
+]
+
+[[package]]
+name = "sigil-softphone"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "serde_json",
+ "sigil-proto",
+ "thiserror",
+]
 
 [[package]]
 name = "signal-hook-registry"

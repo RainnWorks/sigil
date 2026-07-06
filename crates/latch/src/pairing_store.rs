@@ -13,7 +13,7 @@
 //!   on macOS. It never touches the plaintext config file.
 //! * The **public** parts — the phone's pinned [`PeerIdentity`], the relay URL,
 //!   the pairing time, and the six SAS words (for `list-paired-devices`) — go
-//!   into `~/.latch/pairing.json`, mode 0600.
+//!   into `~/.sigil/pairing.json`, mode 0600.
 //!
 //! Crucially, **no DEK is persisted.** The DEK lives only on the phone; it
 //! arrives per-approval inside a sealed [`ApprovalResponse`] and is zeroized
@@ -23,7 +23,7 @@
 //! the tokens are AES-256-GCM ciphertext under the DEK the daemon does not hold.
 //! An attacker who steals the whole disk gains only the ability to send the
 //! phone a request — which the phone answers only after Tom's hardware-gated
-//! approval, exactly the gate Latch exists to enforce. Nothing releasable at
+//! approval, exactly the gate Sigil exists to enforce. Nothing releasable at
 //! rest, by construction.
 //!
 //! Flagged to security-reviewer: the persisted set is `{daemon private identity
@@ -34,9 +34,9 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-use latch_proto::identity::DeviceIdentity;
-use latch_proto::threshold::EcdhAlgo;
-use latch_proto::PeerIdentity;
+use sigil_proto::identity::DeviceIdentity;
+use sigil_proto::threshold::EcdhAlgo;
+use sigil_proto::PeerIdentity;
 
 use crate::daemon::RemotePairingConfig;
 use crate::keystore::{Keystore, KeystoreError};
@@ -52,7 +52,7 @@ const PAIRING_VERSION: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PairingStoreError {
-    #[error("HOME is not set, so ~/.latch has no location")]
+    #[error("HOME is not set, so ~/.sigil has no location")]
     NoHome,
     #[error("pairing config io: {0}")]
     Io(#[from] std::io::Error),
@@ -62,9 +62,9 @@ pub enum PairingStoreError {
     Keystore(#[from] KeystoreError),
     #[error("unsupported pairing config version {0} (this build understands {PAIRING_VERSION})")]
     Version(u32),
-    #[error("the daemon identity is missing from the keystore; re-pair with `latch pair`")]
+    #[error("the daemon identity is missing from the keystore; re-pair with `sigil pair`")]
     MissingIdentity,
-    #[error("the stored daemon identity is corrupt; re-pair with `latch pair`")]
+    #[error("the stored daemon identity is corrupt; re-pair with `sigil pair`")]
     CorruptIdentity,
     #[error("the persisted phone Secure-Enclave share F is not a valid P-256 point; re-pair")]
     CorruptPhoneShare,
@@ -269,7 +269,7 @@ mod tests {
     use super::*;
     use crate::keystore::MemoryKeystore;
 
-    /// A private LATCH_HOME for one test, plus a guard that restores the env.
+    /// A private SIGIL_HOME for one test, plus a guard that restores the env.
     /// Holds the process-wide env lock so parallel tests do not clobber it.
     struct HomeGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -282,13 +282,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let dir = std::env::temp_dir().join(format!(
-                "latch-pairstore-{tag}-{}-{:?}",
+                "sigil-pairstore-{tag}-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             ));
             std::fs::create_dir_all(&dir).unwrap();
-            let prev = std::env::var_os("LATCH_HOME");
-            std::env::set_var("LATCH_HOME", &dir);
+            let prev = std::env::var_os("SIGIL_HOME");
+            std::env::set_var("SIGIL_HOME", &dir);
             Self {
                 _lock: lock,
                 prev,
@@ -299,8 +299,8 @@ mod tests {
     impl Drop for HomeGuard {
         fn drop(&mut self) {
             match &self.prev {
-                Some(v) => std::env::set_var("LATCH_HOME", v),
-                None => std::env::remove_var("LATCH_HOME"),
+                Some(v) => std::env::set_var("SIGIL_HOME", v),
+                None => std::env::remove_var("SIGIL_HOME"),
             }
             std::fs::remove_dir_all(&self.dir).ok();
         }
@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn v2_pairing_persists_and_revalidates_the_phone_share_f() {
-        use latch_proto::threshold::{EcdhAlgo, MacShare};
+        use sigil_proto::threshold::{EcdhAlgo, MacShare};
         let _home = HomeGuard::new("v2-share");
         let ks = MemoryKeystore::new();
         let (_i, _p, mut np) = new_pairing();
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_persisted_phone_share_fails_closed_on_load() {
-        use latch_proto::threshold::EcdhAlgo;
+        use sigil_proto::threshold::EcdhAlgo;
         let _home = HomeGuard::new("v2-corrupt");
         let ks = MemoryKeystore::new();
         let (_i, _p, mut np) = new_pairing();

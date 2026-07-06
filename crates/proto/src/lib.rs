@@ -1,6 +1,6 @@
-//! Latch protocol core.
+//! Sigil protocol core.
 //!
-//! Everything that crosses a network hop in Latch is an [`Envelope`]: sealed
+//! Everything that crosses a network hop in Sigil is an [`Envelope`]: sealed
 //! with crypto_box (X25519 + XSalsa20-Poly1305) to the pinned recipient key,
 //! signed with Ed25519 by the pinned sender key, and replay-protected by a
 //! single-use uuidv7 request id, a per-pairing monotonic counter, and a
@@ -42,7 +42,7 @@ pub use transport::{Direction, LocalRelay, PushHint, Transport, TransportError};
 /// Maximum allowed clock skew between sender and receiver, in milliseconds.
 ///
 /// Must stay ahead of the daemon's approval round trip
-/// (`latch::approve::DEFAULT_APPROVAL_TIMEOUT`, 120s) with headroom, or a
+/// (`sigil::approve::DEFAULT_APPROVAL_TIMEOUT`, 120s) with headroom, or a
 /// legitimate approval that takes the full timeout arrives with a
 /// now-stale envelope timestamp and gets rejected as a replay. 150s gives
 /// 30s of margin over the 120s default. The relay's own envelope TTL

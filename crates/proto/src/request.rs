@@ -125,7 +125,7 @@ pub struct ThresholdChallenge {
     pub label: String,
     /// The account's fixed ECDH base point `E = e·G`, ANSI X9.63 (65 bytes),
     /// standard-base64. The phone validates it on-curve, then computes
-    /// `Z_F = x(f·E)` against it. (`latch-proto`'s
+    /// `Z_F = x(f·E)` against it. (`sigil-proto`'s
     /// [`P256Point`](crate::threshold::P256Point) is the canonical validator; the
     /// phone MUST use the equivalent validating decoder — R2.)
     pub ephemeral_pub: String,
@@ -334,7 +334,7 @@ impl ApprovalResponse {
 
 /// A phone -> daemon push-registration: the phone hands the daemon the platform
 /// device token so the daemon can ring a best-effort push "doorbell" when it
-/// enqueues a new approval request. See `crates/latch/src/apns.rs`.
+/// enqueues a new approval request. See `crates/sigil/src/apns.rs`.
 ///
 /// **Wire contract (locked, shared with `apps/phone`).** Serializes with a
 /// `"type":"pushRegister"` discriminator so it can be told apart from an

@@ -5,7 +5,7 @@
 //! and `svg` render backends (and the whole `image` dependency stack) never
 //! enter the single binary. This module supplies its own renderers instead:
 //! unicode half-blocks for the terminal, and a from-scratch PNG encoder (grayscale,
-//! DEFLATE *stored* blocks, hand-computed CRC-32 and Adler-32) so a `latch qr
+//! DEFLATE *stored* blocks, hand-computed CRC-32 and Adler-32) so a `sigil qr
 //! --png` writes a real, scannable image with no compression dependency.
 //!
 //! Two invariants make the output actually scan:
@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn module_side_scales_with_input_length() {
         let (small, _) = encode("hi").unwrap();
-        let (large, _) = encode(&"LATCH-PAIRING-PAYLOAD-".repeat(20)).unwrap();
+        let (large, _) = encode(&"SIGIL-PAIRING-PAYLOAD-".repeat(20)).unwrap();
         assert!(small >= 21, "smallest QR is version 1 (21 modules)");
         assert!(
             large > small,
@@ -254,7 +254,7 @@ mod tests {
     /// and the whole first row is blank margin.
     #[test]
     fn terminal_render_has_block_glyphs_and_quiet_zone() {
-        let art = render_terminal("LATCH-QR-TEST-payload-123").unwrap();
+        let art = render_terminal("SIGIL-QR-TEST-payload-123").unwrap();
         assert!(
             art.contains('\u{2588}') || art.contains('\u{2580}') || art.contains('\u{2584}'),
             "terminal QR must use half-block glyphs"
@@ -280,10 +280,10 @@ mod tests {
     /// exactly (n + 2*quiet) * scale pixels on each side.
     #[test]
     fn png_is_written_with_expected_dimensions() {
-        let data = "LATCH-PNG-TEST-payload";
+        let data = "SIGIL-PNG-TEST-payload";
         let scale = 6u32;
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("latch-qr-test-{}.png", std::process::id()));
+        let path = dir.join(format!("sigil-qr-test-{}.png", std::process::id()));
         write_png(data, &path, scale).unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
@@ -308,8 +308,8 @@ mod tests {
     /// least one dark module rect.
     #[test]
     fn svg_has_padded_viewbox_and_modules() {
-        let svg = render_svg("LATCH-SVG-TEST", 8).unwrap();
-        let side = png_side_px("LATCH-SVG-TEST", 8).unwrap();
+        let svg = render_svg("SIGIL-SVG-TEST", 8).unwrap();
+        let side = png_side_px("SIGIL-SVG-TEST", 8).unwrap();
         assert!(svg.contains(&format!("viewBox=\"0 0 {side} {side}\"")));
         assert!(svg.contains("<rect"));
         assert!(svg.ends_with("</svg>"));

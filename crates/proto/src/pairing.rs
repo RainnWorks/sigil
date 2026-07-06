@@ -114,9 +114,9 @@ impl PairingPayload {
 // ===========================================================================
 
 /// Domain separation for everything the pairing handshake hashes or MACs.
-const PAIRING_DOMAIN: &[u8] = b"latch.pairing.v1";
+const PAIRING_DOMAIN: &[u8] = b"sigil.pairing.v1";
 /// Domain for the pairing rendezvous mailbox (message 1 and 3 transport).
-const RENDEZVOUS_DOMAIN: &[u8] = b"latch.pairing.rendezvous.v1";
+const RENDEZVOUS_DOMAIN: &[u8] = b"sigil.pairing.rendezvous.v1";
 /// Label deriving the confirmation-MAC subkey from the pairing secret. Distinct
 /// label => distinct key => no key reuse across purposes.
 const SUBKEY_CONFIRM_LABEL: &[u8] = b"confirm-tag";
@@ -844,7 +844,7 @@ mod tests {
         PairingPayload {
             daemon: DeviceIdentity::generate().peer_identity(),
             endpoints: vec![
-                "lan://latch.local:4823".to_string(),
+                "lan://sigil.local:4823".to_string(),
                 "https://tide.example.net:4823".to_string(),
             ],
             secret: PairingSecret::generate(),
@@ -888,7 +888,7 @@ mod tests {
 
     fn endpoints() -> Vec<String> {
         vec![
-            "lan://latch.local:4823".to_string(),
+            "lan://sigil.local:4823".to_string(),
             "https://tide.example.net:4823".to_string(),
         ]
     }
@@ -1314,7 +1314,7 @@ mod tests {
         let secret = PairingSecret(fixed32(50));
         let daemon = fixed_peer(100);
         let endpoints = vec![
-            "lan://latch.local:4823".to_string(),
+            "lan://sigil.local:4823".to_string(),
             "https://tide.example.net:4823".to_string(),
         ];
         let phone = fixed_peer(150);
@@ -1332,11 +1332,11 @@ mod tests {
 
         assert_eq!(
             hex32(&transcript),
-            "220b0509dc40bd9b16138e28a5fce5eb5a8c2d7aa8e31aec604e55a691ab3229"
+            "f1a8f19e2002b71a0fdca390517b2cc3c05234eda904f16f2ec1377b0ba07b94"
         );
         assert_eq!(
             hex32(&tag),
-            "b45431db69921ba821d8cb1e9ae216ed152bb79aeffe54d2c3c963ba7fd54d35"
+            "ef0eb993b98128976025b3c7c321cdb406ad4b98551855bf16f640eded4b4062"
         );
     }
 
@@ -1345,7 +1345,7 @@ mod tests {
         let secret = PairingSecret(fixed32(50));
         let daemon = fixed_peer(100);
         let endpoints = vec![
-            "lan://latch.local:4823".to_string(),
+            "lan://sigil.local:4823".to_string(),
             "https://tide.example.net:4823".to_string(),
         ];
         let phone = fixed_peer(150);
@@ -1379,11 +1379,11 @@ mod tests {
 
         assert_eq!(
             hex32(&transcript),
-            "be21a2c8e3a44e7885e34aa4f4a01089a3c8504b622e9a76aa80206cc220210c"
+            "e435b82a46fe6c627352176d0fe1a049cc972c621bb3b34f07710b0637f8fba4"
         );
         assert_eq!(
             hex32(&tag),
-            "4e4ee41e8258419c059f82617e302d5d0967dff04c9f8a346058ec0675479ddf"
+            "350d87be9991f987497bd1c3dd2cbcb8ab4f226608b95bee7718a3966c58f53d"
         );
     }
 }

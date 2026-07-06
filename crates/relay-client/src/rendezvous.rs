@@ -2,12 +2,12 @@
 //!
 //! The steady-state [`DaemonRelay`](crate::DaemonRelay) /
 //! [`PhoneRelay`](crate::PhoneRelay) transports (de)serialize
-//! [`Envelope`](latch_proto::Envelope)s, but the first pairing message (the
+//! [`Envelope`](sigil_proto::Envelope)s, but the first pairing message (the
 //! phone's `PairingResponse`) is authenticated by its own MAC, not by an envelope
 //! seal, so it cannot ride those typed transports. This client speaks the same
 //! two relay slots (`POST`/`GET /mailbox/{id}/to-phone` and `.../to-daemon`) with
 //! an entirely opaque payload, on the
-//! [`rendezvous_mailbox`](latch_proto::rendezvous_mailbox), distinct from any
+//! [`rendezvous_mailbox`](sigil_proto::rendezvous_mailbox), distinct from any
 //! steady-state mailbox.
 //!
 //! Direction is role-fixed, mirroring the steady state: the daemon side sends
@@ -26,7 +26,7 @@
 
 use std::time::{Duration, Instant};
 
-use latch_proto::TransportError;
+use sigil_proto::TransportError;
 
 use crate::http::{HttpMailbox, Slot};
 
@@ -98,7 +98,7 @@ impl Rendezvous {
                 // and go straight back to the top for the next GET.
                 Ok(_) => backoff = ERROR_BACKOFF_INITIAL,
                 Err(e) => {
-                    eprintln!("latch relay: rendezvous poll failed, retrying: {e}");
+                    eprintln!("sigil relay: rendezvous poll failed, retrying: {e}");
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Ok(None);

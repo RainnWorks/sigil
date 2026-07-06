@@ -48,11 +48,11 @@ use crate::secrets::{self, AccountStore};
 use crate::service;
 use crate::sshagent::{self, ServedIdentity, SignRequest, SshBackend, SshSigner};
 
-use latch_proto::{RiskLevel, SshChallenge};
+use sigil_proto::{RiskLevel, SshChallenge};
 
-use latch_proto::identity::DeviceIdentity;
-use latch_proto::{mailbox_id, PeerIdentity};
-use latch_relay_client::DaemonRelay;
+use sigil_proto::identity::DeviceIdentity;
+use sigil_proto::{mailbox_id, PeerIdentity};
+use sigil_relay_client::DaemonRelay;
 
 /// Default session-lease TTL granted by an "approve for this session" decision.
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
@@ -82,19 +82,19 @@ pub struct Core {
     /// The approving factor resolved at arm time (residual #1 mitigation).
     factor: Factor,
     /// The pluggable SSH key sources this daemon serves on the agent socket,
-    /// resolved from `~/.latch/ssh-keys.json` at arm time. Empty means the agent
-    /// advertises no keys (and `ssh-add -l` shows none). Latch is the phone-gate
+    /// resolved from `~/.sigil/ssh-keys.json` at arm time. Empty means the agent
+    /// advertises no keys (and `ssh-add -l` shows none). Sigil is the phone-gate
     /// regardless of which signer holds the key.
     ssh_signers: Vec<Box<dyn SshSigner>>,
     /// Audit logging: `Some(retention_days)` appends a metadata-only line per
     /// decision to `history.jsonl` (pruned to the window); `None` disables it.
     /// The real daemon enables it; tests leave it off so they never write to a
-    /// developer's `~/.latch`.
+    /// developer's `~/.sigil`.
     audit: Option<u32>,
 }
 
 /// A persisted daemon<->phone pairing: everything needed to reach the phone as
-/// the approving factor over the blind relay. `latch pair` persists this (see
+/// the approving factor over the blind relay. `sigil pair` persists this (see
 /// [`crate::pairing_store`]) and [`load_remote_pairing`] reconstructs it, so a
 /// paired daemon auto-selects the phone factor; a daemon with neither a pairing
 /// nor a biometric fails closed unless started `--dev-insecure`.
@@ -118,17 +118,17 @@ impl RemotePairingConfig {
     }
 }
 
-/// Load a persisted phone pairing, if one exists, from `~/.latch/pairing.json`
+/// Load a persisted phone pairing, if one exists, from `~/.sigil/pairing.json`
 /// plus the daemon identity in `ks`. A present-but-unreadable pairing (corrupt
 /// file, missing keystore identity) is logged and treated as "no pairing" so the
 /// daemon still arms and fails closed rather than refusing to start; the fault
-/// surfaces in `latch doctor`. See [`crate::pairing_store`] for the on-disk
+/// surfaces in `sigil doctor`. See [`crate::pairing_store`] for the on-disk
 /// format and why it stays inert at rest.
 fn load_remote_pairing(ks: &Arc<dyn Keystore>) -> Option<RemotePairingConfig> {
     match crate::pairing_store::load(ks.as_ref()) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("latch daemon: ignoring an unreadable pairing config: {e}");
+            eprintln!("sigil daemon: ignoring an unreadable pairing config: {e}");
             None
         }
     }
@@ -187,7 +187,7 @@ impl Core {
         let threshold = match crate::threshold::ThresholdStore::load() {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("latch daemon: ignoring an unreadable threshold store: {e}");
+                eprintln!("sigil daemon: ignoring an unreadable threshold store: {e}");
                 crate::threshold::ThresholdStore::default()
             }
         };
@@ -202,13 +202,13 @@ impl Core {
         let factor = factor::resolve(&inputs);
         let gate = build_gate(factor, remote, &keystore, &pending)?;
 
-        // Load the served SSH identities from ~/.latch/ssh-keys.json and build a
+        // Load the served SSH identities from ~/.sigil/ssh-keys.json and build a
         // signer per source (op-fetch + file-based). A bad config is logged and
         // treated as "no keys" so the daemon still arms.
         let ssh_signers = match sshagent::SshKeyConfig::load() {
             Ok(cfg) => build_ssh_signers(&cfg, None),
             Err(e) => {
-                eprintln!("latch daemon: ignoring an unreadable ssh-keys config: {e}");
+                eprintln!("sigil daemon: ignoring an unreadable ssh-keys config: {e}");
                 Vec::new()
             }
         };
@@ -219,7 +219,7 @@ impl Core {
         let config = match Config::load() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("latch daemon: ignoring an unreadable config: {e}");
+                eprintln!("sigil daemon: ignoring an unreadable config: {e}");
                 Config::default()
             }
         };
@@ -275,7 +275,7 @@ impl Core {
     fn record_audit(
         &self,
         id: &str,
-        kind: latch_proto::RequestKind,
+        kind: sigil_proto::RequestKind,
         label: &str,
         account: &str,
         process: &str,
@@ -293,7 +293,7 @@ impl Core {
                 cwd,
                 decision,
                 None,
-                latch_proto::now_ms(),
+                sigil_proto::now_ms(),
                 via,
             );
             crate::audit::append(&entry, retention);
@@ -348,7 +348,7 @@ impl SshBackend for Core {
     }
 
     /// Gate one SSH signature on the phone and, on approval, delegate to the
-    /// signer that owns the key. Latch is the phone-gate regardless of key source:
+    /// signer that owns the key. Sigil is the phone-gate regardless of key source:
     /// the gate here is the same approval path as an `op` secret, with two
     /// differences the security review must weigh (see `sshagent` module docs):
     /// every signature is gated (no lease short-circuit in v1), and for the
@@ -357,7 +357,7 @@ impl SshBackend for Core {
     /// way the key never reaches the SSH client.
     fn approve_and_sign(&self, req: SignRequest<'_>) -> Option<Vec<u8>> {
         if self.lockdown.load(Ordering::SeqCst) {
-            eprintln!("latch daemon: ssh sign refused; latch is locked down");
+            eprintln!("sigil daemon: ssh sign refused; sigil is locked down");
             return None;
         }
 
@@ -402,7 +402,7 @@ impl SshBackend for Core {
             cwd: String::new(),
             command: vec!["ssh-sign".to_string(), req.id.label.clone()],
             secret_refs: Vec::new(),
-            kind: latch_proto::RequestKind::SshSignature,
+            kind: sigil_proto::RequestKind::SshSignature,
             // A signature is an authentication event: elevated by default.
             risk: RiskLevel::Elevated,
             ssh: Some(challenge),
@@ -445,7 +445,7 @@ impl SshBackend for Core {
 /// (control socket and ssh-agent socket share one gate: both compete for the
 /// same pool). A stalled or hostile same-UID client opening connections
 /// faster than they close cannot pin every slot and starve legitimate
-/// `latch`/ssh traffic; past the cap a new connection is refused rather than
+/// `sigil`/ssh traffic; past the cap a new connection is refused rather than
 /// queued. Generous for a personal single-user daemon.
 const MAX_CONCURRENT_CONNS: usize = 32;
 
@@ -496,7 +496,7 @@ impl Drop for ConnPermit {
 }
 
 /// Build a runtime and serve until interrupted. Blocks the calling thread.
-/// `args` are the `latch daemon` arguments (e.g. `--dev-insecure`).
+/// `args` are the `sigil daemon` arguments (e.g. `--dev-insecure`).
 pub fn run(args: &[String]) -> anyhow::Result<()> {
     let dev_insecure = factor::dev_insecure_requested(args);
     let core = Arc::new(Core::for_host(dev_insecure)?);
@@ -516,7 +516,7 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
     // A truncated socket path means clients and the daemon bind different names
     // and never meet; surface it loudly (the bind below would appear to succeed).
     if let Err(e) = service::socket_path_fits() {
-        eprintln!("latch daemon: {e}");
+        eprintln!("sigil daemon: {e}");
     }
     prepare_socket(&sock)?;
     let listener =
@@ -546,12 +546,12 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
         .accounts
         .len();
     eprintln!(
-        "latch daemon: armed on {} · {accounts} account(s) · factor: {}",
+        "sigil daemon: armed on {} · {accounts} account(s) · factor: {}",
         sock.display(),
         core.factor.label()
     );
     eprintln!(
-        "latch daemon: ssh-agent on {} · {} key(s) served · export SSH_AUTH_SOCK={}",
+        "sigil daemon: ssh-agent on {} · {} key(s) served · export SSH_AUTH_SOCK={}",
         ssh_sock.display(),
         core.identities().len(),
         ssh_sock.display()
@@ -561,7 +561,7 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
     // installed, out-ordered on PATH, or pointing at a stale binary), requests
     // would bypass the gate entirely. Warn loudly at every start.
     if let Some(issue) = ShimStatus::detect().issue() {
-        eprintln!("latch daemon: shim drift: {issue}");
+        eprintln!("sigil daemon: shim drift: {issue}");
     }
 
     // Shared across both sockets: they compete for the same blocking pool, so
@@ -571,7 +571,7 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                eprintln!("latch daemon: shutting down (leases zeroized)");
+                eprintln!("sigil daemon: shutting down (leases zeroized)");
                 core.leases.clear();
                 break;
             }
@@ -579,7 +579,7 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
                 let (stream, _) = accepted.context("accept")?;
                 let Some(permit) = conns.try_enter() else {
                     eprintln!(
-                        "latch daemon: refusing a control connection: at the concurrency cap ({MAX_CONCURRENT_CONNS})"
+                        "sigil daemon: refusing a control connection: at the concurrency cap ({MAX_CONCURRENT_CONNS})"
                     );
                     continue; // dropping `stream` closes it
                 };
@@ -595,7 +595,7 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
                 tokio::task::spawn_blocking(move || {
                     let _permit = permit;
                     if let Err(e) = handle_conn(core, std_stream) {
-                        eprintln!("latch daemon: connection error: {e}");
+                        eprintln!("sigil daemon: connection error: {e}");
                     }
                 });
             }
@@ -603,7 +603,7 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
                 let (stream, _) = accepted.context("ssh accept")?;
                 let Some(permit) = conns.try_enter() else {
                     eprintln!(
-                        "latch daemon: refusing an ssh-agent connection: at the concurrency cap ({MAX_CONCURRENT_CONNS})"
+                        "sigil daemon: refusing an ssh-agent connection: at the concurrency cap ({MAX_CONCURRENT_CONNS})"
                     );
                     continue;
                 };
@@ -619,7 +619,7 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
                 tokio::task::spawn_blocking(move || {
                     let _permit = permit;
                     if let Err(e) = sshagent::handle_connection(core.as_ref(), std_stream) {
-                        eprintln!("latch daemon: ssh connection error: {e}");
+                        eprintln!("sigil daemon: ssh connection error: {e}");
                     }
                 });
             }
@@ -675,7 +675,7 @@ fn handle_conn(core: Arc<Core>, mut stream: UnixStream) -> anyhow::Result<()> {
             // — as a sink for the tool's secret output. We never let that happen.
             if fds.len() != 3 {
                 eprintln!(
-                    "latch daemon: refusing a Run frame carrying {} descriptor(s); expected 3 (stdin, stdout, stderr)",
+                    "sigil daemon: refusing a Run frame carrying {} descriptor(s); expected 3 (stdin, stdout, stderr)",
                     fds.len()
                 );
                 Reply::Exit { code: 1 }
@@ -789,7 +789,7 @@ fn json_reply<T: serde::Serialize>(value: &T) -> Reply {
 /// `now` plus each lease's age/remaining. `caller` is empty: a lease retains the
 /// grant key, not the provenance that derived it (see JSON.md).
 fn leases_json(core: &Core) -> Vec<crate::json::LeaseJson> {
-    let now = latch_proto::now_ms();
+    let now = sigil_proto::now_ms();
     core.leases
         .list()
         .into_iter()
@@ -847,7 +847,7 @@ fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
         .collect()
 }
 
-/// The gated fulfillment path for `latch <cmd>` (and the shim alias / `latch run`).
+/// The gated fulfillment path for `sigil <cmd>` (and the shim alias / `sigil run`).
 /// Returns the exit code to mirror to the caller. Every failure path here fails
 /// closed (a non-zero code with a stderr line), so the caller behaves like a
 /// denied invocation.
@@ -857,7 +857,7 @@ fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
 /// routes a 1Password account, unwraps the DEK, decrypts the one token, and
 /// injects it; a direct-injection provider (`env-file`) needs no account and is
 /// gated on every run (no leasing, so resolved values never sit in RAM across a
-/// TTL). An *unconfigured* command is refused with a pointer to `latch-config
+/// TTL). An *unconfigured* command is refused with a pointer to `sigil-config
 /// add`, never run ungated.
 #[allow(clippy::too_many_arguments)]
 fn fulfill(
@@ -871,7 +871,7 @@ fn fulfill(
     stderr: Option<OwnedFd>,
 ) -> i32 {
     if core.lockdown.load(Ordering::SeqCst) {
-        return fail_closed(stderr, "latch is locked down; no secrets served\n");
+        return fail_closed(stderr, "sigil is locked down; no secrets served\n");
     }
 
     // Proxy recursion fuse: the caller's depth reached us over the socket (the
@@ -881,25 +881,25 @@ fn fulfill(
     if proxy_depth >= crate::proxy::MAX_DEPTH {
         return fail_closed(
             stderr,
-            "latch: proxy recursion limit reached; refusing to run (loop?)\n",
+            "sigil: proxy recursion limit reached; refusing to run (loop?)\n",
         );
     }
     // The depth the spawned child (and anything it re-invokes) will carry.
     let child_depth = proxy_depth.saturating_add(1);
 
     let Some(cmd) = argv.first() else {
-        return fail_closed(stderr, "latch: empty command\n");
+        return fail_closed(stderr, "sigil: empty command\n");
     };
 
     // Evaluate the rules against this whole invocation. An invocation that no
-    // rule matches is refused (never run ungated) with a pointer to `latch
+    // rule matches is refused (never run ungated) with a pointer to `sigil
     // config`; the core holds no built-in rule for any command, `op` included.
     let Some(action) = core.config.resolve(argv) else {
         return fail_closed(
             stderr,
             &format!(
-                "latch: '{cmd}' is not configured (no rule matches); Latch will not run it ungated.\n  \
-                 configure it: latch-config add {cmd} --provider <id>\n"
+                "sigil: '{cmd}' is not configured (no rule matches); Sigil will not run it ungated.\n  \
+                 configure it: sigil-config add {cmd} --provider <id>\n"
             ),
         );
     };
@@ -907,7 +907,7 @@ fn fulfill(
         return fail_closed(
             stderr,
             &format!(
-                "latch: rule '{}' names an unknown provider '{}'\n",
+                "sigil: rule '{}' names an unknown provider '{}'\n",
                 action.rule, action.provider
             ),
         );
@@ -964,9 +964,9 @@ fn fulfill(
             match store.route(vault.as_deref()) {
                 Ok(acct) => match acct.ciphertext() {
                     Ok(ct) => (acct.label.clone(), Some(ct)),
-                    Err(e) => return fail_closed(stderr, &format!("latch account error: {e}\n")),
+                    Err(e) => return fail_closed(stderr, &format!("sigil account error: {e}\n")),
                 },
-                Err(e) => return fail_closed(stderr, &format!("latch: {e}\n")),
+                Err(e) => return fail_closed(stderr, &format!("sigil: {e}\n")),
             }
         }
         None => (String::new(), None),
@@ -1007,7 +1007,7 @@ fn fulfill(
     // envelope; the phone validates it on-curve before its Secure-Enclave op.
     let threshold = v2
         .as_ref()
-        .map(|(label, record)| latch_proto::ThresholdChallenge {
+        .map(|(label, record)| sigil_proto::ThresholdChallenge {
             account_id: record.account_id.clone(),
             label: label.clone(),
             ephemeral_pub: record.ephemeral_pub.clone(),
@@ -1062,7 +1062,7 @@ fn fulfill(
             None => {
                 return fail_closed(
                     stderr,
-                    "latch: v2 approval carried no threshold partial; no phone factor?\n",
+                    "sigil: v2 approval carried no threshold partial; no phone factor?\n",
                 )
             }
         };
@@ -1071,14 +1071,14 @@ fn fulfill(
             Ok(None) => {
                 return fail_closed(
                     stderr,
-                    "latch: no Mac threshold share on this daemon; re-pair for v2\n",
+                    "sigil: no Mac threshold share on this daemon; re-pair for v2\n",
                 )
             }
-            Err(e) => return fail_closed(stderr, &format!("latch: {e}\n")),
+            Err(e) => return fail_closed(stderr, &format!("sigil: {e}\n")),
         };
         let token = match crate::threshold::decrypt(record, &m, zf) {
             Ok(t) => t,
-            Err(e) => return fail_closed(stderr, &format!("latch token decrypt failed: {e}\n")),
+            Err(e) => return fail_closed(stderr, &format!("sigil token decrypt failed: {e}\n")),
         };
         drop(m); // the Mac share is held only for the one combine
         if let Some(ttl) = decision.lease_ttl() {
@@ -1095,13 +1095,13 @@ fn fulfill(
             {
                 Ok(dek) => dek,
                 Err(e) => {
-                    return fail_closed(stderr, &format!("latch could not unwrap the key: {e}\n"))
+                    return fail_closed(stderr, &format!("sigil could not unwrap the key: {e}\n"))
                 }
             },
         };
         let token = match secrets::decrypt_token(&dek, ciphertext) {
             Ok(t) => t,
-            Err(e) => return fail_closed(stderr, &format!("latch token decrypt failed: {e}\n")),
+            Err(e) => return fail_closed(stderr, &format!("sigil token decrypt failed: {e}\n")),
         };
         drop(dek);
         if let Some(ttl) = decision.lease_ttl() {
@@ -1144,7 +1144,7 @@ fn fulfill(
 
 /// The brightest audit label for an op request: the first secret ref's item
 /// label, or the scope string when the provider named none.
-fn audit_label(refs: &[latch_proto::SecretRef], scope: &str) -> String {
+fn audit_label(refs: &[sigil_proto::SecretRef], scope: &str) -> String {
     refs.first()
         .map(|r| r.label.clone())
         .unwrap_or_else(|| scope.to_string())
@@ -1167,7 +1167,7 @@ fn log_request(argv: &[String], cwd: &str, peer: Option<i32>) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     eprintln!(
-        "latch daemon: [{ts}] op {} · cwd {} · pid {}",
+        "sigil daemon: [{ts}] op {} · cwd {} · pid {}",
         argv.iter().skip(1).cloned().collect::<Vec<_>>().join(" "),
         cwd,
         peer.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
@@ -1368,7 +1368,7 @@ mod tests {
     }
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("latch-daemon-{tag}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("sigil-daemon-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -1446,7 +1446,7 @@ mod tests {
     #[test]
     fn approved_request_is_recorded_in_the_audit_log() {
         // The daemon appends one metadata-only line per decision. Build a
-        // dev-approve core with auditing enabled to a private LATCH_HOME and
+        // dev-approve core with auditing enabled to a private SIGIL_HOME and
         // prove the approved request lands in history.jsonl with the right
         // decision/account/via.
         let _home = HomeGuard::new("audit-approve");
@@ -1773,7 +1773,7 @@ mod tests {
         assert_eq!(read_all(read_end), "", "and produce no output");
         let err = read_all(err_r);
         assert!(err.contains("not configured"), "err: {err}");
-        assert!(err.contains("latch-config add gcloud"), "err: {err}");
+        assert!(err.contains("sigil-config add gcloud"), "err: {err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1935,7 +1935,7 @@ mod tests {
 
     #[test]
     fn proxy_depth_is_incremented_on_the_child_and_fuses_at_the_limit() {
-        // The recursion fuse: the spawned child carries LATCH_PROXY_DEPTH =
+        // The recursion fuse: the spawned child carries SIGIL_PROXY_DEPTH =
         // caller_depth + 1, and a caller already at the limit is refused before a
         // child is spawned. Prove both with an env-file faketool that echoes the
         // depth env it received.
@@ -1950,7 +1950,7 @@ mod tests {
         let tool = bindir.join("faketool");
         std::fs::write(
             &tool,
-            "#!/bin/sh\nprintf 'depth=%s' \"$LATCH_PROXY_DEPTH\"\n",
+            "#!/bin/sh\nprintf 'depth=%s' \"$SIGIL_PROXY_DEPTH\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2028,7 +2028,7 @@ mod tests {
     fn ssh_file_signer_signs_when_gated() {
         // The pluggable SSH signer seam through the daemon gate: a file-backed
         // signer (no account) produces a verifiable signature only after the gate
-        // grants, proving Latch is the phone-gate regardless of key source.
+        // grants, proving Sigil is the phone-gate regardless of key source.
         let dir = tmpdir("ssh-file-signer");
         let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
             .unwrap();
@@ -2169,11 +2169,11 @@ mod tests {
     // daemon's keystore is a fresh MemoryKeystore with no DEK provisioned.
 
     use crate::remote::RemoteApprover;
-    use latch_proto::identity::DeviceIdentity;
-    use latch_proto::pairing::{DaemonPairing, Dek as ProtoDek};
-    use latch_proto::{LocalRelay, PairingState};
-    use latch_relay_client::{DaemonRelay, PhoneRelay};
-    use latch_softphone::{Pairing, Policy, Softphone};
+    use sigil_proto::identity::DeviceIdentity;
+    use sigil_proto::pairing::{DaemonPairing, Dek as ProtoDek};
+    use sigil_proto::{LocalRelay, PairingState};
+    use sigil_relay_client::{DaemonRelay, PhoneRelay};
+    use sigil_softphone::{Pairing, Policy, Softphone};
     use zeroize::Zeroizing;
 
     const REMOTE_NOW: u64 = 1_720_000_000_000;
@@ -2193,7 +2193,7 @@ mod tests {
         let daemon_id = DeviceIdentity::generate();
         let daemon_for_approver = clone_device(&daemon_id);
         let (mut daemon, payload) =
-            DaemonPairing::mint(daemon_id, vec!["lan://latch.local:4823".into()], REMOTE_NOW);
+            DaemonPairing::mint(daemon_id, vec!["lan://sigil.local:4823".into()], REMOTE_NOW);
 
         let phone_id = DeviceIdentity::generate();
         let (mut pairing, resp) =
@@ -2222,8 +2222,8 @@ mod tests {
     fn remote_core(
         dir: &Path,
         daemon_id: DeviceIdentity,
-        phone: latch_proto::PeerIdentity,
-        transport: Arc<dyn latch_proto::Transport>,
+        phone: sigil_proto::PeerIdentity,
+        transport: Arc<dyn sigil_proto::Transport>,
         timeout: Duration,
         dek_bytes: [u8; 32],
         token: &str,
@@ -2339,7 +2339,7 @@ mod tests {
 
         // The phone->daemon queue is drained; nothing left buffered.
         assert_eq!(
-            relay.depth(mailbox, latch_proto::Direction::ToDaemon),
+            relay.depth(mailbox, sigil_proto::Direction::ToDaemon),
             0,
             "the response was consumed by the daemon"
         );
@@ -2409,11 +2409,11 @@ mod tests {
     ) -> (
         DeviceIdentity,
         Softphone,
-        [u8; latch_proto::threshold::P256_X963_POINT_LEN],
+        [u8; sigil_proto::threshold::P256_X963_POINT_LEN],
         &'static str,
     ) {
         let (daemon_for_approver, softphone, _dek) = pair_softphone(policy);
-        let f = latch_proto::threshold::MacShare::generate();
+        let f = sigil_proto::threshold::MacShare::generate();
         let se_key_id = "se-key-1";
         let softphone = softphone.with_phone_share(f, se_key_id);
         let f_x963 = softphone
@@ -2430,8 +2430,8 @@ mod tests {
     fn remote_core_v2(
         dir: &Path,
         daemon_id: DeviceIdentity,
-        phone: latch_proto::PeerIdentity,
-        transport: Arc<dyn latch_proto::Transport>,
+        phone: sigil_proto::PeerIdentity,
+        transport: Arc<dyn sigil_proto::Transport>,
         timeout: Duration,
         f_x963: &[u8],
         se_key_id: &str,
@@ -2445,7 +2445,7 @@ mod tests {
         let phone_share = crate::threshold::PhoneShare::from_x963(
             se_key_id,
             f_x963,
-            latch_proto::threshold::EcdhAlgo::RawX,
+            sigil_proto::threshold::EcdhAlgo::RawX,
         )
         .unwrap();
         let mut store = crate::threshold::ThresholdStore::default();
@@ -2545,7 +2545,7 @@ mod tests {
             Reply::Exit { code: 0 }
         );
         assert_eq!(
-            relay.depth(mailbox, latch_proto::Direction::ToDaemon),
+            relay.depth(mailbox, sigil_proto::Direction::ToDaemon),
             0,
             "the v2 partial response was consumed by the daemon"
         );
@@ -2625,7 +2625,7 @@ mod tests {
         // path while a v2 account in the same store decrypts via the two-party
         // combine. The path is chosen by the at-rest record, and one paired phone
         // (holding both the DEK and the SE share f) answers either kind.
-        use latch_proto::threshold::{EcdhAlgo, MacShare};
+        use sigil_proto::threshold::{EcdhAlgo, MacShare};
 
         let dir = tmpdir("remote-mixed");
         let relay = LocalRelay::new();
@@ -2810,11 +2810,11 @@ mod tests {
         None
     }
 
-    /// Resolve a relay base URL for the e2e test. Prefers `$LATCH_TEST_RELAY_URL`
+    /// Resolve a relay base URL for the e2e test. Prefers `$SIGIL_TEST_RELAY_URL`
     /// (an already-running relay); otherwise spawns the Bun relay if `bun` is
     /// available. Returns `None` to soft-skip when no relay can be obtained.
     fn obtain_relay() -> Option<(String, Option<RelayServer>)> {
-        if let Ok(url) = std::env::var("LATCH_TEST_RELAY_URL") {
+        if let Ok(url) = std::env::var("SIGIL_TEST_RELAY_URL") {
             return Some((url, None));
         }
         let port = free_port();
@@ -2825,14 +2825,14 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "real-relay"),
-        ignore = "spawns an external bun relay; run: cargo test -p latch --features real-relay -- --test-threads=1"
+        ignore = "spawns an external bun relay; run: cargo test -p sigil --features real-relay -- --test-threads=1"
     )]
     fn remote_approval_over_the_real_relay_delivers_the_secret() {
         let Some((base, _server)) = obtain_relay() else {
             eprintln!(
                 "SKIPPED remote_approval_over_the_real_relay_delivers_the_secret: no relay. \
-                 Install bun, or start one and set LATCH_TEST_RELAY_URL, e.g.\n  \
-                 PORT=8787 bun run relay/bun/server.ts   (then LATCH_TEST_RELAY_URL=http://127.0.0.1:8787)"
+                 Install bun, or start one and set SIGIL_TEST_RELAY_URL, e.g.\n  \
+                 PORT=8787 bun run relay/bun/server.ts   (then SIGIL_TEST_RELAY_URL=http://127.0.0.1:8787)"
             );
             return;
         };
@@ -2930,7 +2930,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "real-relay"),
-        ignore = "spawns an external bun relay; run: cargo test -p latch --features real-relay -- --test-threads=1"
+        ignore = "spawns an external bun relay; run: cargo test -p sigil --features real-relay -- --test-threads=1"
     )]
     fn daemon_relay_resumes_after_the_relay_is_bounced() {
         // Relay restart tolerance: build the daemon client, drop the relay out
@@ -2939,8 +2939,8 @@ mod tests {
         // deposit/drain is its own HTTP request), so it transparently works
         // against the fresh instance with no reconnect state to rebuild.
         // Only runnable when we control the relay process (spawn path).
-        if std::env::var("LATCH_TEST_RELAY_URL").is_ok() {
-            eprintln!("SKIPPED daemon_relay_resumes_after_the_relay_is_bounced: needs a bounceable relay (unset LATCH_TEST_RELAY_URL)");
+        if std::env::var("SIGIL_TEST_RELAY_URL").is_ok() {
+            eprintln!("SKIPPED daemon_relay_resumes_after_the_relay_is_bounced: needs a bounceable relay (unset SIGIL_TEST_RELAY_URL)");
             return;
         }
         let port = free_port();
@@ -3070,8 +3070,8 @@ mod tests {
 
     use crate::pairing_store::{self, NewPairing};
 
-    /// A private LATCH_HOME for one test, restored on drop. Isolates the
-    /// `pairing.json` location from the real `~/.latch` and other tests.
+    /// A private SIGIL_HOME for one test, restored on drop. Isolates the
+    /// `pairing.json` location from the real `~/.sigil` and other tests.
     struct HomeGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         prev: Option<std::ffi::OsString>,
@@ -3083,13 +3083,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let dir = std::env::temp_dir().join(format!(
-                "latch-daemon-home-{tag}-{}-{:?}",
+                "sigil-daemon-home-{tag}-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             ));
             std::fs::create_dir_all(&dir).unwrap();
-            let prev = std::env::var_os("LATCH_HOME");
-            std::env::set_var("LATCH_HOME", &dir);
+            let prev = std::env::var_os("SIGIL_HOME");
+            std::env::set_var("SIGIL_HOME", &dir);
             Self {
                 _lock: lock,
                 prev,
@@ -3100,18 +3100,18 @@ mod tests {
     impl Drop for HomeGuard {
         fn drop(&mut self) {
             match &self.prev {
-                Some(v) => std::env::set_var("LATCH_HOME", v),
-                None => std::env::remove_var("LATCH_HOME"),
+                Some(v) => std::env::set_var("SIGIL_HOME", v),
+                None => std::env::remove_var("SIGIL_HOME"),
             }
             std::fs::remove_dir_all(&self.dir).ok();
         }
     }
 
     fn sas_of(
-        daemon: &latch_proto::PeerIdentity,
-        phone: &latch_proto::PeerIdentity,
+        daemon: &sigil_proto::PeerIdentity,
+        phone: &sigil_proto::PeerIdentity,
     ) -> [String; 6] {
-        let w = latch_proto::fingerprint_words(daemon, phone);
+        let w = sigil_proto::fingerprint_words(daemon, phone);
         std::array::from_fn(|i| w[i].to_string())
     }
 
@@ -3181,7 +3181,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "real-relay"),
-        ignore = "spawns an external bun relay; run: cargo test -p latch --features real-relay -- --test-threads=1"
+        ignore = "spawns an external bun relay; run: cargo test -p sigil --features real-relay -- --test-threads=1"
     )]
     fn reloaded_pairing_serves_a_secret_over_the_real_relay() {
         // The end-to-end proof of the critical path: persist a pairing, reload
@@ -3192,7 +3192,7 @@ mod tests {
         let Some((base, _server)) = obtain_relay() else {
             eprintln!(
                 "SKIPPED reloaded_pairing_serves_a_secret_over_the_real_relay: no relay. \
-                 Install bun, or set LATCH_TEST_RELAY_URL."
+                 Install bun, or set SIGIL_TEST_RELAY_URL."
             );
             return;
         };
@@ -3286,25 +3286,25 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "real-relay"),
-        ignore = "spawns an external bun relay; run: cargo test -p latch --features real-relay -- --test-threads=1"
+        ignore = "spawns an external bun relay; run: cargo test -p sigil --features real-relay -- --test-threads=1"
     )]
-    fn latch_pair_completes_the_ceremony_over_the_real_relay() {
-        // Drive the real `latch pair` ceremony end to end over the blind relay:
+    fn sigil_pair_completes_the_ceremony_over_the_real_relay() {
+        // Drive the real `sigil pair` ceremony end to end over the blind relay:
         // the daemon side uses the HTTP rendezvous (`Rendezvous::daemon` via
         // `pair::relay_channel`), the phone side the mirror (`Rendezvous::phone`),
         // and they meet on the rendezvous mailbox. Proves the pairing transport,
         // the message framing, and the QR round-trip against a real relay process.
         let Some((base, _server)) = obtain_relay() else {
             eprintln!(
-                "SKIPPED latch_pair_completes_the_ceremony_over_the_real_relay: no relay. \
-                 Install bun, or set LATCH_TEST_RELAY_URL."
+                "SKIPPED sigil_pair_completes_the_ceremony_over_the_real_relay: no relay. \
+                 Install bun, or set SIGIL_TEST_RELAY_URL."
             );
             return;
         };
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
-        use latch_proto::{now_ms, rendezvous_mailbox, Envelope, PairingPayload};
-        use latch_relay_client::Rendezvous;
+        use sigil_proto::{now_ms, rendezvous_mailbox, Envelope, PairingPayload};
+        use sigil_relay_client::Rendezvous;
 
         let (qr_tx, qr_rx) = std::sync::mpsc::channel::<String>();
 

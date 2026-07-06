@@ -1,4 +1,4 @@
-//! Latch: the daemon, the `op` shim, and the `latch` CLI as one library, driven
+//! Sigil: the daemon, the `op` shim, and the `sigil` CLI as one library, driven
 //! by a thin multicall `main`.
 //!
 //! The modules here are the seams and machinery: the local socket protocol, the
@@ -42,7 +42,7 @@ pub mod style;
 pub mod threshold;
 
 /// A process-wide lock serializing tests that mutate global environment
-/// variables (`LATCH_HOME` in particular). Cargo runs a crate's tests in
+/// variables (`SIGIL_HOME` in particular). Cargo runs a crate's tests in
 /// parallel threads of one process, so any test that sets a global env var must
 /// hold this for its duration or it will clobber (and be clobbered by) another.
 #[cfg(test)]

@@ -5,7 +5,7 @@
 //! the keystore seam (Secure Enclave on macOS, the phone in the full product)
 //! and is unwrapped per-approval, used, and zeroized. This module owns the pure
 //! crypto (DEK generation, encrypt/decrypt) and the on-disk account catalogue
-//! (`~/.latch/latch.db`), which holds token *ciphertext* and the plaintext
+//! (`~/.sigil/sigil.db`), which holds token *ciphertext* and the plaintext
 //! vault-routing list only. No plaintext token is ever written to disk, and
 //! every decrypted buffer is `Zeroizing`.
 
@@ -44,9 +44,9 @@ pub enum SecretsError {
     Json(#[from] serde_json::Error),
     #[error("base64 decode: {0}")]
     Base64(#[from] base64::DecodeError),
-    #[error("no account routes vault {0:?}; add one with `latch account add`")]
+    #[error("no account routes vault {0:?}; add one with `sigil account add`")]
     NoRoute(String),
-    #[error("no accounts configured; run `latch account add`")]
+    #[error("no accounts configured; run `sigil account add`")]
     NoAccounts,
     #[error("account {0:?} already exists")]
     Duplicate(String),
@@ -112,7 +112,7 @@ impl Account {
     }
 }
 
-/// The account catalogue persisted at `~/.latch/latch.db` as JSON.
+/// The account catalogue persisted at `~/.sigil/sigil.db` as JSON.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AccountStore {
     #[serde(default)]
@@ -120,13 +120,13 @@ pub struct AccountStore {
 }
 
 impl AccountStore {
-    /// `~/.latch/latch.db`, or `$LATCH_HOME/latch.db` when set (tests).
+    /// `~/.sigil/sigil.db`, or `$SIGIL_HOME/sigil.db` when set (tests).
     pub fn path() -> Result<PathBuf, SecretsError> {
-        if let Some(dir) = std::env::var_os("LATCH_HOME") {
-            return Ok(PathBuf::from(dir).join("latch.db"));
+        if let Some(dir) = std::env::var_os("SIGIL_HOME") {
+            return Ok(PathBuf::from(dir).join("sigil.db"));
         }
         let home = std::env::var_os("HOME").ok_or(SecretsError::NoHome)?;
-        Ok(PathBuf::from(home).join(".latch").join("latch.db"))
+        Ok(PathBuf::from(home).join(".sigil").join("sigil.db"))
     }
 
     /// Load the store, returning an empty one if the file does not exist.
@@ -237,8 +237,8 @@ impl AccountStore {
 /// can serve nothing useful yet.
 ///
 /// NEEDS-VERIFICATION: requires a live `op` and network. Exercised by
-/// `latch account add` and the ignored `probe_vaults_live` test; confirm with
-///   OP_SERVICE_ACCOUNT_TOKEN=… cargo test -p latch probe_vaults_live -- --ignored --nocapture
+/// `sigil account add` and the ignored `probe_vaults_live` test; confirm with
+///   OP_SERVICE_ACCOUNT_TOKEN=… cargo test -p sigil probe_vaults_live -- --ignored --nocapture
 pub fn probe_vaults(op: &std::path::Path, token: &[u8]) -> Result<Vec<String>, SecretsError> {
     #[derive(Deserialize)]
     struct VaultRow {
@@ -379,13 +379,13 @@ mod tests {
 
     #[test]
     fn store_persists_ciphertext_only() {
-        // Serialize with the other LATCH_HOME-mutating tests (parallel by default).
+        // Serialize with the other SIGIL_HOME-mutating tests (parallel by default).
         let _lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let tmp = std::env::temp_dir().join(format!("latch-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("sigil-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        std::env::set_var("LATCH_HOME", &tmp);
+        std::env::set_var("SIGIL_HOME", &tmp);
 
         let dek = generate_dek();
         let mut store = AccountStore::default();
@@ -411,7 +411,7 @@ mod tests {
         let pt = decrypt_token(&dek, &acct.ciphertext().unwrap()).unwrap();
         assert_eq!(&pt[..], b"super-secret-token");
 
-        std::env::remove_var("LATCH_HOME");
+        std::env::remove_var("SIGIL_HOME");
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

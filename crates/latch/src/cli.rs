@@ -1,10 +1,10 @@
-//! The `latch` subcommands. Hand-rolled dispatch: v0 has a handful of verbs
+//! The `sigil` subcommands. Hand-rolled dispatch: v0 has a handful of verbs
 //! with no flags worth a parser dependency.
 
 use std::io::Read;
 use std::os::unix::net::UnixStream;
 
-use latch_proto::DeviceIdentity;
+use sigil_proto::DeviceIdentity;
 use zeroize::Zeroizing;
 
 use crate::daemon;
@@ -19,11 +19,11 @@ use crate::style::Style;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Dispatch the lean `latch` binary: the runtime/daemon verbs and the
-/// `latch <cmd>` gating primitive. Configuration management (rules, sources,
-/// accounts, settings, wipe) is NOT here — it lives in the `latch-config`
+/// Dispatch the lean `sigil` binary: the runtime/daemon verbs and the
+/// `sigil <cmd>` gating primitive. Configuration management (rules, sources,
+/// accounts, settings, wipe) is NOT here — it lives in the `sigil-config`
 /// binary ([`run_config`]), so a program literally named `config`/`account`/…
-/// stays gateable as `latch <that-name> …`.
+/// stays gateable as `sigil <that-name> …`.
 ///
 /// `--json` is a global flag: it is stripped from the args once here (so each
 /// subcommand's own flag parsing is unchanged) and threaded to the emitting
@@ -51,7 +51,7 @@ pub fn run_gating() -> i32 {
         "shim" => cmd_shim(&args[1..], json),
         "run" => cmd_run(&args[1..]),
         "version" | "--version" | "-V" => {
-            println!("latch {VERSION}");
+            println!("sigil {VERSION}");
             0
         }
         "help" | "--help" | "-h" => {
@@ -59,7 +59,7 @@ pub fn run_gating() -> i32 {
             0
         }
         other => {
-            // Not a reserved verb: the `latch <cmd> [args]` primitive. A leading
+            // Not a reserved verb: the `sigil <cmd> [args]` primitive. A leading
             // '-' is a flag typo, not a command, so show help instead of trying
             // to gate a "command" named like an option.
             debug_assert!(
@@ -67,7 +67,7 @@ pub fn run_gating() -> i32 {
                 "a reserved verb reached command dispatch; the match above must handle it"
             );
             if other.starts_with('-') {
-                eprintln!("latch: unknown option '{other}'\n");
+                eprintln!("sigil: unknown option '{other}'\n");
                 print_help();
                 return 2;
             }
@@ -76,10 +76,10 @@ pub fn run_gating() -> i32 {
     }
 }
 
-/// Dispatch the `latch-config` binary: all configuration management. Its verbs
+/// Dispatch the `sigil-config` binary: all configuration management. Its verbs
 /// are the config engine (`source`/`rule`/`list`/`export`/`import`) plus
 /// `account`, `settings`, `mac-approvals`, and `wipe`. It never gates a command;
-/// an unknown verb is an error, not a `latch <cmd>` invocation.
+/// an unknown verb is an error, not a `sigil <cmd>` invocation.
 pub fn run_config() -> i32 {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let json = extract_flag(&mut args, "--json");
@@ -98,7 +98,7 @@ pub fn run_config() -> i32 {
         "mac-approvals" => cmd_mac_approvals(&args[1..], json),
         "wipe" => cmd_wipe(&args[1..], json),
         "version" | "--version" | "-V" => {
-            println!("latch-config {VERSION}");
+            println!("sigil-config {VERSION}");
             0
         }
         "help" | "--help" | "-h" => {
@@ -106,19 +106,19 @@ pub fn run_config() -> i32 {
             0
         }
         other => {
-            eprintln!("latch-config: unknown command '{other}'\n");
+            eprintln!("sigil-config: unknown command '{other}'\n");
             print_config_help();
             2
         }
     }
 }
 
-/// Whether `cmd` is a reserved verb in the lean `latch` binary (handled by
-/// [`run_gating`]) and therefore takes precedence over the `latch <cmd>`
+/// Whether `cmd` is a reserved verb in the lean `sigil` binary (handled by
+/// [`run_gating`]) and therefore takes precedence over the `sigil <cmd>`
 /// primitive. The management verbs (config/account/settings/mac-approvals/wipe)
-/// are deliberately NOT reserved here — they moved to `latch-config`, which frees
+/// are deliberately NOT reserved here — they moved to `sigil-config`, which frees
 /// those names to be gated. The escape hatch for a tool named like a residual
-/// reserved verb is `latch run -- <cmd>`.
+/// reserved verb is `sigil run -- <cmd>`.
 pub fn is_reserved_verb(cmd: &str) -> bool {
     matches!(
         cmd,
@@ -151,31 +151,31 @@ pub fn is_reserved_verb(cmd: &str) -> bool {
     )
 }
 
-/// Forward a `latch <cmd> [args]` invocation to the daemon (gated), or exec the
+/// Forward a `sigil <cmd> [args]` invocation to the daemon (gated), or exec the
 /// real tool if the daemon is down. `argv[0]` is the command name. Shared by the
-/// primitive dispatch, `latch run -- <cmd>`, and the transparent shim alias
+/// primitive dispatch, `sigil run -- <cmd>`, and the transparent shim alias
 /// (via [`crate::shim::dispatch`]). Never returns.
 fn dispatch_command(argv: &[String]) -> ! {
     crate::shim::dispatch(argv.to_vec())
 }
 
-/// `latch run [--] <cmd> [args]`: the unambiguous escape hatch for a command that
-/// collides with a reserved verb (or whose args look like latch flags). Strips a
-/// leading `--`, then dispatches the rest exactly like the `latch <cmd>`
+/// `sigil run [--] <cmd> [args]`: the unambiguous escape hatch for a command that
+/// collides with a reserved verb (or whose args look like sigil flags). Strips a
+/// leading `--`, then dispatches the rest exactly like the `sigil <cmd>`
 /// primitive. Never returns (the child's exit code becomes ours).
 fn cmd_run(args: &[String]) -> i32 {
     let rest = strip_run_prefix(args);
     if rest.is_empty() {
-        eprintln!("usage: latch run [--] <cmd> [args...]");
+        eprintln!("usage: sigil run [--] <cmd> [args...]");
         return 2;
     }
     dispatch_command(rest)
 }
 
-/// Strip an optional leading `--` from `latch run`'s arguments, yielding the
-/// command and its args. `latch run -- op ...` and `latch run op ...` are
+/// Strip an optional leading `--` from `sigil run`'s arguments, yielding the
+/// command and its args. `sigil run -- op ...` and `sigil run op ...` are
 /// equivalent; the `--` only matters when the tool's own args would otherwise be
-/// eaten as latch flags.
+/// eaten as sigil flags.
 fn strip_run_prefix(args: &[String]) -> &[String] {
     match args.first().map(String::as_str) {
         Some("--") => &args[1..],
@@ -200,14 +200,14 @@ fn emit_local_control(result: &ControlResult) -> i32 {
 
 fn print_help() {
     println!(
-        "latch {VERSION} \u{b7} remote-approval instrument: gate any CLI on your phone
+        "sigil {VERSION} \u{b7} remote-approval instrument: gate any CLI on your phone
 
-usage: latch <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
-       latch <verb>            a reserved runtime verb (below)
+usage: sigil <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
+       sigil <verb>            a reserved runtime verb (below)
 
   <cmd> [args...]   run a command gated on your phone when a rule matches it
-                    (e.g. latch op read op://…, latch gcloud …). An unmatched
-                    command is refused; configure one with: latch-config add <cmd>
+                    (e.g. sigil op read op://…, sigil gcloud …). An unmatched
+                    command is refused; configure one with: sigil-config add <cmd>
   run -- <cmd>      escape hatch: run <cmd> even if it collides with a verb
   status            instrument panel: daemon, shim, op, factor
   setup             guided first run: shim, PATH, launchd, then pair
@@ -234,15 +234,15 @@ usage: latch <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
   ssh add-file      serve a local key file (--path <key>, signs from ~/.ssh/…)
   ssh list          list the SSH keys the agent serves
   ssh remove <item> stop serving an SSH key
-  sshagent          print the SSH_AUTH_SOCK to point ssh/git at Latch
-  shim install      symlink ~/.latch/bin/op at this binary
+  sshagent          print the SSH_AUTH_SOCK to point ssh/git at Sigil
+  shim install      symlink ~/.sigil/bin/op at this binary
   shim add <cmd>    drop a transparent alias binary for a configured command
   version           print version
   help              print this message
 
 Configuration (rules, sources, accounts, settings, wipe) lives in a separate
-binary: run `latch-config help`. Keeping it off this binary means a program
-literally named `config`/`account`/… stays gateable as `latch <that-name> …`.
+binary: run `sigil-config help`. Keeping it off this binary means a program
+literally named `config`/`account`/… stays gateable as `sigil <that-name> …`.
 
 The Mac app speaks the daemon control socket directly (see PROTOCOL.md):
 status, doctor, lease, lockdown, approve, deny, history, and pending are
@@ -250,12 +250,12 @@ socket queries the human CLI renders."
     );
 }
 
-/// Help for the `latch-config` management binary.
+/// Help for the `sigil-config` management binary.
 fn print_config_help() {
     println!(
-        "latch-config {VERSION} \u{b7} Latch configuration management
+        "sigil-config {VERSION} \u{b7} Sigil configuration management
 
-usage: latch-config <cmd> [args...]   author rules/sources, manage accounts
+usage: sigil-config <cmd> [args...]   author rules/sources, manage accounts
 
   add <cmd> --provider <id> [--source <p>] [--account <l>] [--risk <r>]
                     convenience: author a source + rule for one command
@@ -270,7 +270,7 @@ usage: latch-config <cmd> [args...]   author rules/sources, manage accounts
   export            print the whole config as JSON (for the desktop to load)
   import            replace the whole config from JSON on stdin
   remove <cmd>      forget a command's rule (and its like-named source)
-  proxy add <cmd>   install a transparent PATH alias so a bare <cmd> hits Latch;
+  proxy add <cmd>   install a transparent PATH alias so a bare <cmd> hits Sigil;
                     also: proxy remove <cmd> [--purge] | list | status |
                     doctor [<cmd>] | env [--shell zsh|bash|fish|nu]
   account add       add a service-account token (reads token from stdin)
@@ -285,13 +285,13 @@ usage: latch-config <cmd> [args...]   author rules/sources, manage accounts
 
 --json is for the CLI-only mutation commands the Mac app shells out for
 (source/rule/list/export/import, account, settings, wipe, mac-approvals).
-Re-run `latch restart` to apply a config change."
+Re-run `sigil restart` to apply a config change."
     );
 }
 
 /// Fetch the status report. When the daemon is up it is the source of truth
 /// (`Frame::Status`); when it is down the CLI computes the host-side view locally
-/// via the same [`crate::report`] builder so `latch status` still works headless.
+/// via the same [`crate::report`] builder so `sigil status` still works headless.
 fn fetch_status() -> json::StatusJson {
     if let Ok(Reply::Json { body }) = send_control(&Frame::Status) {
         if let Ok(st) = serde_json::from_str::<json::StatusJson>(&body) {
@@ -314,7 +314,7 @@ fn cmd_status() -> i32 {
     } else {
         s.deny("down")
     };
-    println!("{} {} {}", s.cobalt("latch"), s.faint("\u{b7}"), head);
+    println!("{} {} {}", s.cobalt("sigil"), s.faint("\u{b7}"), head);
     println!();
 
     // daemon
@@ -369,7 +369,7 @@ fn cmd_status() -> i32 {
         (
             s.brass("\u{2717}"),
             "none",
-            s.dim("run: latch account add --token-stdin --label <name>"),
+            s.dim("run: sigil account add --token-stdin --label <name>"),
         )
     };
     println!("  {} {glyph} {}  {note}", s.dim("accounts"), pad(label, 13));
@@ -392,7 +392,7 @@ fn cmd_status() -> i32 {
         _ => (
             s.brass("\u{2717}"),
             "fail closed",
-            s.brass("no factor; run: latch pair"),
+            s.brass("no factor; run: sigil pair"),
         ),
     };
     println!("  {}   {glyph} {}  {note}", s.dim("factor"), pad(label, 13));
@@ -407,14 +407,14 @@ fn cmd_status() -> i32 {
             s.ok("\u{25cf}"),
             "serving",
             s.dim(&format!(
-                "{ssh_count} key(s) \u{b7} point SSH_AUTH_SOCK: latch sshagent"
+                "{ssh_count} key(s) \u{b7} point SSH_AUTH_SOCK: sigil sshagent"
             )),
         )
     } else {
         (
             s.dim("\u{25cb}"),
             "no keys",
-            s.dim("add one: latch ssh add --vault <V> --item <I> --pubkey-file <p>"),
+            s.dim("add one: sigil ssh add --vault <V> --item <I> --pubkey-file <p>"),
         )
     };
     println!("  {}     {glyph} {}  {note}", s.dim("ssh"), pad(label, 13));
@@ -450,11 +450,11 @@ fn print_control(reply: std::io::Result<Reply>) -> i32 {
             i32::from(!ok)
         }
         Ok(other) => {
-            eprintln!("latch: unexpected reply: {other:?}");
+            eprintln!("sigil: unexpected reply: {other:?}");
             1
         }
         Err(e) => {
-            eprintln!("latch: daemon unreachable ({e}); is it running?");
+            eprintln!("sigil: daemon unreachable ({e}); is it running?");
             1
         }
     }
@@ -504,7 +504,7 @@ fn cmd_account(args: &[String], json: bool) -> i32 {
         Some("rotate") => account_rotate(&args[1..], json),
         Some("remove") | Some("rm") => account_remove(&args[1..], json),
         _ => {
-            eprintln!("usage: latch account <add|list|rotate|remove>");
+            eprintln!("usage: sigil account <add|list|rotate|remove>");
             2
         }
     }
@@ -529,14 +529,14 @@ fn account_json(a: &crate::secrets::Account) -> json::AccountJson {
 fn read_token_stdin() -> Option<Zeroizing<Vec<u8>>> {
     let mut token = Zeroizing::new(Vec::new());
     if let Err(e) = std::io::stdin().read_to_end(&mut token) {
-        eprintln!("latch: reading token from stdin: {e}");
+        eprintln!("sigil: reading token from stdin: {e}");
         return None;
     }
     while matches!(token.last(), Some(b'\n' | b'\r')) {
         token.pop();
     }
     if token.is_empty() {
-        eprintln!("latch: empty token on stdin");
+        eprintln!("sigil: empty token on stdin");
         return None;
     }
     Some(token)
@@ -545,11 +545,11 @@ fn read_token_stdin() -> Option<Zeroizing<Vec<u8>>> {
 fn account_add(args: &[String], json: bool) -> i32 {
     let s = Style::stdout();
     let Some(label) = flag_value(args, "--label").map(str::to_string) else {
-        eprintln!("usage: latch account add --token-stdin --label <name>");
+        eprintln!("usage: sigil account add --token-stdin --label <name>");
         return 2;
     };
     if !has_flag(args, "--token-stdin") {
-        eprintln!("latch: refusing to read a token from argv; pass --token-stdin");
+        eprintln!("sigil: refusing to read a token from argv; pass --token-stdin");
         return 2;
     }
     // A v2 (threshold) account is sealed under the two-party key, not a DEK.
@@ -564,7 +564,7 @@ fn account_add(args: &[String], json: bool) -> i32 {
     let ks = keystore::for_host();
     if let Err(e) = ks.ensure_dek() {
         eprintln!(
-            "latch: provisioning the DEK: {}\n  (detail: {e})",
+            "sigil: provisioning the DEK: {}\n  (detail: {e})",
             keystore::dek_error_hint(&e)
         );
         return 1;
@@ -573,7 +573,7 @@ fn account_add(args: &[String], json: bool) -> i32 {
         Ok(d) => d,
         Err(e) => {
             eprintln!(
-                "latch: unwrapping the DEK: {}\n  (detail: {e})",
+                "sigil: unwrapping the DEK: {}\n  (detail: {e})",
                 keystore::dek_error_hint(&e)
             );
             return 1;
@@ -594,7 +594,7 @@ fn account_add(args: &[String], json: bool) -> i32 {
     let mut store = match AccountStore::load() {
         Ok(st) => st,
         Err(e) => {
-            eprintln!("latch: loading account store: {e}");
+            eprintln!("sigil: loading account store: {e}");
             return 1;
         }
     };
@@ -635,11 +635,11 @@ fn account_add(args: &[String], json: bool) -> i32 {
         }
     }
     if let Err(e) = store.add(&label, &dek, &token, vaults.clone()) {
-        eprintln!("latch: {e}");
+        eprintln!("sigil: {e}");
         return 1;
     }
     if let Err(e) = store.save() {
-        eprintln!("latch: saving account store: {e}");
+        eprintln!("sigil: saving account store: {e}");
         return 1;
     }
 
@@ -673,18 +673,18 @@ fn account_add_v2(label: &str, json: bool) -> i32 {
             Some(share) => share,
             None => {
                 eprintln!(
-                    "latch: this pairing has no phone Secure-Enclave share; \
+                    "sigil: this pairing has no phone Secure-Enclave share; \
                      re-pair for v2 threshold accounts"
                 );
                 return 1;
             }
         },
         Ok(None) => {
-            eprintln!("latch: no phone is paired; run `latch pair` first");
+            eprintln!("sigil: no phone is paired; run `sigil pair` first");
             return 1;
         }
         Err(e) => {
-            eprintln!("latch: loading the pairing: {e}");
+            eprintln!("sigil: loading the pairing: {e}");
             return 1;
         }
     };
@@ -698,7 +698,7 @@ fn account_add_v2(label: &str, json: bool) -> i32 {
     let m = match crate::threshold::load_or_create_mac_share(ks.as_ref()) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("latch: provisioning the Mac threshold share: {e}");
+            eprintln!("sigil: provisioning the Mac threshold share: {e}");
             return 1;
         }
     };
@@ -708,19 +708,19 @@ fn account_add_v2(label: &str, json: bool) -> i32 {
     let mut store = match crate::threshold::ThresholdStore::load() {
         Ok(st) => st,
         Err(e) => {
-            eprintln!("latch: loading the threshold store: {e}");
+            eprintln!("sigil: loading the threshold store: {e}");
             return 1;
         }
     };
     if let Err(e) =
         crate::threshold::seal_account(&mut store, label, &m, &phone, &token, vaults.clone())
     {
-        eprintln!("latch: {e}");
+        eprintln!("sigil: {e}");
         return 1;
     }
     drop(m);
     if let Err(e) = store.save() {
-        eprintln!("latch: saving the threshold store: {e}");
+        eprintln!("sigil: saving the threshold store: {e}");
         return 1;
     }
 
@@ -754,7 +754,7 @@ fn account_add_v2(label: &str, json: bool) -> i32 {
 fn account_rotate(args: &[String], json: bool) -> i32 {
     let s = Style::stdout();
     let Some(id) = flag_value(args, "--id").map(str::to_string) else {
-        eprintln!("usage: latch account rotate --id <id> --token-stdin");
+        eprintln!("usage: sigil account rotate --id <id> --token-stdin");
         return 2;
     };
     let Some(token) = read_token_stdin() else {
@@ -764,7 +764,7 @@ fn account_rotate(args: &[String], json: bool) -> i32 {
     let ks = keystore::for_host();
     if let Err(e) = ks.ensure_dek() {
         eprintln!(
-            "latch: provisioning the DEK: {}\n  (detail: {e})",
+            "sigil: provisioning the DEK: {}\n  (detail: {e})",
             keystore::dek_error_hint(&e)
         );
         return 1;
@@ -773,7 +773,7 @@ fn account_rotate(args: &[String], json: bool) -> i32 {
         Ok(d) => d,
         Err(e) => {
             eprintln!(
-                "latch: unwrapping the DEK: {}\n  (detail: {e})",
+                "sigil: unwrapping the DEK: {}\n  (detail: {e})",
                 keystore::dek_error_hint(&e)
             );
             return 1;
@@ -787,16 +787,16 @@ fn account_rotate(args: &[String], json: bool) -> i32 {
     let mut store = match AccountStore::load() {
         Ok(st) => st,
         Err(e) => {
-            eprintln!("latch: loading account store: {e}");
+            eprintln!("sigil: loading account store: {e}");
             return 1;
         }
     };
     if let Err(e) = store.rotate(&id, &dek, &token, vaults) {
-        eprintln!("latch: {e}");
+        eprintln!("sigil: {e}");
         return 1;
     }
     if let Err(e) = store.save() {
-        eprintln!("latch: saving account store: {e}");
+        eprintln!("sigil: saving account store: {e}");
         return 1;
     }
 
@@ -812,20 +812,20 @@ fn account_rotate(args: &[String], json: bool) -> i32 {
 
 fn account_remove(args: &[String], json: bool) -> i32 {
     let Some(id) = flag_value(args, "--id").map(str::to_string) else {
-        eprintln!("usage: latch account remove --id <id>");
+        eprintln!("usage: sigil account remove --id <id>");
         return 2;
     };
     let mut store = match AccountStore::load() {
         Ok(st) => st,
         Err(e) => {
-            eprintln!("latch: loading account store: {e}");
+            eprintln!("sigil: loading account store: {e}");
             return 1;
         }
     };
     let mut removed = store.remove(&id);
     if removed {
         if let Err(e) = store.save() {
-            eprintln!("latch: saving account store: {e}");
+            eprintln!("sigil: saving account store: {e}");
             return 1;
         }
     }
@@ -834,7 +834,7 @@ fn account_remove(args: &[String], json: bool) -> i32 {
         if v2.remove(&id) {
             removed = true;
             if let Err(e) = v2.save() {
-                eprintln!("latch: saving the threshold store: {e}");
+                eprintln!("sigil: saving the threshold store: {e}");
                 return 1;
             }
         }
@@ -864,7 +864,7 @@ fn account_list(json: bool) -> i32 {
     let store = match AccountStore::load() {
         Ok(st) => st,
         Err(e) => {
-            eprintln!("latch: loading account store: {e}");
+            eprintln!("sigil: loading account store: {e}");
             return 1;
         }
     };
@@ -884,7 +884,7 @@ fn account_list(json: bool) -> i32 {
         return 0;
     }
     if store.accounts.is_empty() && v2.accounts.is_empty() {
-        println!("  {}", s.dim("no accounts; run: latch account add"));
+        println!("  {}", s.dim("no accounts; run: sigil account add"));
         return 0;
     }
     println!("{}", s.cobalt("accounts"));
@@ -934,7 +934,7 @@ fn cmd_lease(args: &[String]) -> i32 {
                 println!("  {}", s.dim("no active leases"));
                 return 0;
             }
-            let now = latch_proto::now_ms();
+            let now = sigil_proto::now_ms();
             println!("{}", s.cobalt("leases"));
             println!();
             for l in &leases {
@@ -951,7 +951,7 @@ fn cmd_lease(args: &[String]) -> i32 {
         }
         Some("revoke") => {
             let Some(prefix) = args.get(1) else {
-                eprintln!("usage: latch lease revoke <grant-hex-prefix>");
+                eprintln!("usage: sigil lease revoke <grant-hex-prefix>");
                 return 2;
             };
             print_control(send_control(&Frame::LeaseRevoke {
@@ -959,7 +959,7 @@ fn cmd_lease(args: &[String]) -> i32 {
             }))
         }
         _ => {
-            eprintln!("usage: latch lease <list|revoke <prefix>>");
+            eprintln!("usage: sigil lease <list|revoke <prefix>>");
             2
         }
     }
@@ -973,7 +973,7 @@ fn cmd_lockdown(args: &[String]) -> i32 {
 
 fn cmd_approve(args: &[String]) -> i32 {
     let Some(id) = flag_value(args, "--id").map(str::to_string) else {
-        eprintln!("usage: latch approve --local --id <id> [--lease]");
+        eprintln!("usage: sigil approve --local --id <id> [--lease]");
         return 2;
     };
     print_control(send_control(&Frame::Approve {
@@ -984,13 +984,13 @@ fn cmd_approve(args: &[String]) -> i32 {
 
 fn cmd_deny(args: &[String]) -> i32 {
     let Some(id) = flag_value(args, "--id").map(str::to_string) else {
-        eprintln!("usage: latch deny --local --id <id>");
+        eprintln!("usage: sigil deny --local --id <id>");
         return 2;
     };
     print_control(send_control(&Frame::Deny { id }))
 }
 
-/// `latch history`: the decision audit log, newest-first. Read from the daemon
+/// `sigil history`: the decision audit log, newest-first. Read from the daemon
 /// (`Frame::History`) when up, else directly from the on-disk log so it works
 /// headless (the log is a read-only file the daemon owns as writer).
 fn cmd_history() -> i32 {
@@ -1019,7 +1019,7 @@ fn cmd_history() -> i32 {
     0
 }
 
-/// `latch pending`: the requests parked for a local decision. A socket query;
+/// `sigil pending`: the requests parked for a local decision. A socket query;
 /// the Mac app subscribes to `Frame::SubscribePending` for live updates instead.
 fn cmd_pending() -> i32 {
     let s = Style::stdout();
@@ -1043,7 +1043,7 @@ fn cmd_daemon(args: &[String]) -> i32 {
     match daemon::run(args) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("latch daemon: {e:#}");
+            eprintln!("sigil daemon: {e:#}");
             1
         }
     }
@@ -1051,7 +1051,7 @@ fn cmd_daemon(args: &[String]) -> i32 {
 
 /// Fetch the doctor checks. Source of truth is the daemon (`Frame::Doctor`) when
 /// up; otherwise the CLI runs the same [`crate::report`] builder locally so
-/// `latch doctor` still diagnoses a down daemon.
+/// `sigil doctor` still diagnoses a down daemon.
 fn fetch_doctor() -> Vec<json::CheckJson> {
     if let Ok(Reply::Json { body }) = send_control(&Frame::Doctor) {
         if let Ok(checks) = serde_json::from_str::<Vec<json::CheckJson>>(&body) {
@@ -1064,7 +1064,7 @@ fn fetch_doctor() -> Vec<json::CheckJson> {
 fn cmd_doctor() -> i32 {
     let checks = fetch_doctor();
     let s = Style::stdout();
-    println!("{}", s.cobalt("latch doctor"));
+    println!("{}", s.cobalt("sigil doctor"));
     println!();
     let mut ok = true;
     for (i, c) in checks.iter().enumerate() {
@@ -1115,7 +1115,7 @@ fn cmd_pair(args: &[String], json: bool) -> i32 {
     run_pairing(args)
 }
 
-/// `latch qr <data> [--stdin] [--png <path>] [--out svg] [--scale <n>]`: render
+/// `sigil qr <data> [--stdin] [--png <path>] [--out svg] [--scale <n>]`: render
 /// arbitrary data as a QR. The terminal (or SVG, with `--out svg`) rendering goes
 /// to stdout; `--png <path>` additionally writes a scannable PNG. Data comes from
 /// the first positional argument, or from stdin with `--stdin` (preferred for
@@ -1141,8 +1141,8 @@ fn cmd_qr(args: &[String]) -> i32 {
             Some(d) => d,
             None => {
                 eprintln!(
-                    "usage: latch qr <data> [--png <path>] [--out svg] [--scale <n>]\n\
-                     \x20      latch qr --stdin [--png <path>]   (read data from stdin)"
+                    "usage: sigil qr <data> [--png <path>] [--out svg] [--scale <n>]\n\
+                     \x20      sigil qr --stdin [--png <path>]   (read data from stdin)"
                 );
                 return 2;
             }
@@ -1186,7 +1186,7 @@ fn cmd_qr(args: &[String]) -> i32 {
     0
 }
 
-/// The first non-flag positional argument to `latch qr`, skipping the value-taking
+/// The first non-flag positional argument to `sigil qr`, skipping the value-taking
 /// flags (`--png`, `--out`, `--scale`) and their values and any boolean flag. Kept
 /// separate from [`flag_value`] because the QR data is a bare positional, not a
 /// flag value.
@@ -1211,7 +1211,7 @@ fn qr_positional(args: &[String]) -> Option<String> {
     None
 }
 
-/// `latch pair list`: show the persisted pairing. The device name is not
+/// `sigil pair list`: show the persisted pairing. The device name is not
 /// captured by the ceremony, so the JSON form reports a fixed `iPhone` (gap).
 fn pair_list(json: bool) -> i32 {
     let s = Style::stdout();
@@ -1249,19 +1249,19 @@ fn pair_list(json: bool) -> i32 {
         Ok(None) => {
             println!(
                 "  {}",
-                s.dim("no paired phone; run: latch pair --relay <url>")
+                s.dim("no paired phone; run: sigil pair --relay <url>")
             );
             0
         }
         Err(e) => {
-            eprintln!("latch: reading pairing: {e}");
+            eprintln!("sigil: reading pairing: {e}");
             1
         }
     }
 }
 
 /// The real pairing ceremony: mint a QR, wait on the relay for the phone, verify,
-/// confirm SAS, deliver the DEK, and persist. `--relay <url>` or `$LATCH_RELAY_URL`
+/// confirm SAS, deliver the DEK, and persist. `--relay <url>` or `$SIGIL_RELAY_URL`
 /// override; absent both, defaults to [`crate::pair::DEFAULT_RELAY_URL`] (the
 /// shared Sigil relay), announced out loud so the human always knows which
 /// relay a pairing crossed.
@@ -1269,7 +1269,7 @@ fn run_pairing(args: &[String]) -> i32 {
     let s = Style::stdout();
     let relay = match flag_value(args, "--relay")
         .map(str::to_string)
-        .or_else(|| std::env::var("LATCH_RELAY_URL").ok())
+        .or_else(|| std::env::var("SIGIL_RELAY_URL").ok())
     {
         Some(r) => r,
         None => {
@@ -1292,7 +1292,7 @@ fn run_pairing(args: &[String]) -> i32 {
         println!(
             "  {}",
             s.brass(
-                "a phone is already paired; re-pairing will replace it (latch unpair to remove)"
+                "a phone is already paired; re-pairing will replace it (sigil unpair to remove)"
             )
         );
     }
@@ -1311,7 +1311,7 @@ fn run_pairing(args: &[String]) -> i32 {
         );
         return 1;
     }
-    // Unwraps the SAME key `latch account add` seals tokens under. Called by
+    // Unwraps the SAME key `sigil account add` seals tokens under. Called by
     // `run_ceremony` only after the human confirms the SAS, never before: on a
     // Secure Enclave keystore that is where Touch ID fires, so the biometric
     // gates authorizing this specific confirmed device.
@@ -1322,11 +1322,11 @@ fn run_pairing(args: &[String]) -> i32 {
     let daemon_identity = DeviceIdentity::generate();
 
     let mut present_qr = |unicode: &str, b64: &str| {
-        println!("{}", s.cobalt("latch pair"));
+        println!("{}", s.cobalt("sigil pair"));
         println!();
         println!(
             "  {}",
-            s.dim("Scan this with the Latch approver on your phone:")
+            s.dim("Scan this with the Sigil approver on your phone:")
         );
         println!();
         println!("{unicode}");
@@ -1368,7 +1368,7 @@ fn run_pairing(args: &[String]) -> i32 {
         // the QR must not outlive the secret backing it.
         response_timeout: std::time::Duration::from_secs(600),
         flush_grace: std::time::Duration::from_millis(750),
-        now: &latch_proto::now_ms,
+        now: &sigil_proto::now_ms,
         make_channel: &mut make_channel,
         present_qr: &mut present_qr,
         confirm_sas: &mut confirm,
@@ -1399,12 +1399,12 @@ fn run_pairing(args: &[String]) -> i32 {
     );
     println!(
         "  {}",
-        s.faint("restart the daemon to arm it: latch restart")
+        s.faint("restart the daemon to arm it: sigil restart")
     );
     0
 }
 
-/// `latch pair --relay <url> --json`: run the ceremony, streaming NDJSON events
+/// `sigil pair --relay <url> --json`: run the ceremony, streaming NDJSON events
 /// (`qr`, `sas`, `paired`, `failed`) one object per line so the GUI renders it
 /// live. After the `sas` event this BLOCKS on one line of stdin: the DEK is
 /// only sealed and sent once that line reads `confirm` (case-insensitive),
@@ -1416,7 +1416,7 @@ fn run_pairing(args: &[String]) -> i32 {
 fn run_pairing_json(args: &[String]) -> i32 {
     let relay = match flag_value(args, "--relay")
         .map(str::to_string)
-        .or_else(|| std::env::var("LATCH_RELAY_URL").ok())
+        .or_else(|| std::env::var("SIGIL_RELAY_URL").ok())
     {
         Some(r) => r,
         None => {
@@ -1426,7 +1426,7 @@ fn run_pairing_json(args: &[String]) -> i32 {
             // need app-side decoder changes outside this pathspec. stderr
             // still makes the default honest and discoverable in logs.
             eprintln!(
-                "latch: using the default relay ({})",
+                "sigil: using the default relay ({})",
                 crate::pair::DEFAULT_RELAY_URL
             );
             crate::pair::DEFAULT_RELAY_URL.to_string()
@@ -1435,7 +1435,7 @@ fn run_pairing_json(args: &[String]) -> i32 {
 
     let ks = keystore::for_host();
     // Same key discipline as the interactive path: the ceremony delivers the
-    // keystore DEK that `latch account add` seals tokens under, provisioned
+    // keystore DEK that `sigil account add` seals tokens under, provisioned
     // idempotently here so a first-time pair still arms the daemon. This is a
     // public-key-only operation on a Secure Enclave keystore (no Touch ID
     // yet); the actual unwrap happens later, gated on the SAS confirm below.
@@ -1448,7 +1448,7 @@ fn run_pairing_json(args: &[String]) -> i32 {
         }));
         return 1;
     }
-    // Unwraps the SAME key `latch account add` seals tokens under. Called by
+    // Unwraps the SAME key `sigil account add` seals tokens under. Called by
     // `run_ceremony` only after the human writes "confirm" below, never
     // before: on a Secure Enclave keystore that is where Touch ID fires, so
     // the biometric gates authorizing this specific confirmed device.
@@ -1482,7 +1482,7 @@ fn run_pairing_json(args: &[String]) -> i32 {
         // the QR must not outlive the secret backing it.
         response_timeout: std::time::Duration::from_secs(600),
         flush_grace: std::time::Duration::from_millis(750),
-        now: &latch_proto::now_ms,
+        now: &sigil_proto::now_ms,
         make_channel: &mut make_channel,
         present_qr: &mut present_qr,
         confirm_sas: &mut confirm,
@@ -1544,7 +1544,7 @@ fn cmd_unpair(json: bool) -> i32 {
                     "the daemon will fail closed until you pair again or provision a biometric"
                 )
             );
-            println!("  {}", s.faint("restart to apply: latch restart"));
+            println!("  {}", s.faint("restart to apply: sigil restart"));
             0
         }
         Ok(false) => {
@@ -1552,7 +1552,7 @@ fn cmd_unpair(json: bool) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("latch: unpair failed: {e}");
+            eprintln!("sigil: unpair failed: {e}");
             1
         }
     }
@@ -1560,7 +1560,7 @@ fn cmd_unpair(json: bool) -> i32 {
 
 fn cmd_setup(args: &[String]) -> i32 {
     let s = Style::stdout();
-    println!("{}", s.cobalt("latch setup"));
+    println!("{}", s.cobalt("sigil setup"));
     println!();
 
     // 1. Keystore DEK. On macOS this needs the Secure Enclave (NEEDS
@@ -1596,7 +1596,7 @@ fn cmd_setup(args: &[String]) -> i32 {
     // 3. Put the shim on PATH for interactive shells.
     match crate::setup::ensure_profile_path() {
         Ok(true) => println!(
-            "  {} added ~/.latch/bin to your shell profile (open a new shell)",
+            "  {} added ~/.sigil/bin to your shell profile (open a new shell)",
             s.ok("\u{2713}")
         ),
         Ok(false) => println!("  {} shell profile already has the shim", s.ok("\u{2713}")),
@@ -1618,12 +1618,12 @@ fn cmd_setup(args: &[String]) -> i32 {
             "  {} launchd: {} {}",
             s.brass("\u{2717}"),
             s.dim(&e.to_string()),
-            s.faint("(you can load it later with: latch start)")
+            s.faint("(you can load it later with: sigil start)")
         ),
     }
 
     // 5. Pairing. A relay is now always available (an explicit --relay/
-    //    $LATCH_RELAY_URL override, or the baked-in default), so guided setup
+    //    $SIGIL_RELAY_URL override, or the baked-in default), so guided setup
     //    always continues straight into the ceremony.
     println!();
     run_pairing(args)
@@ -1666,20 +1666,20 @@ fn cmd_ssh(args: &[String]) -> i32 {
         Some("list") | None => ssh_list(),
         Some("remove") | Some("rm") => ssh_remove(args.get(1).map(String::as_str)),
         _ => {
-            eprintln!("usage: latch ssh <add|add-file|list|remove>");
+            eprintln!("usage: sigil ssh <add|add-file|list|remove>");
             2
         }
     }
 }
 
-/// `latch ssh add-file --path <private-key> [--comment <c>]`: serve a local
+/// `sigil ssh add-file --path <private-key> [--comment <c>]`: serve a local
 /// OpenSSH key file (the file-based signer). The sibling `<path>.pub` supplies
 /// the public key; the private key is read only at sign time. For users who do
 /// not keep their SSH keys in 1Password. v1 serves ed25519 only.
 fn ssh_add_file(args: &[String]) -> i32 {
     let s = Style::stdout();
     let Some(path) = flag_value(args, "--path").map(str::to_string) else {
-        eprintln!("usage: latch ssh add-file --path <private-key-path> [--comment <c>]");
+        eprintln!("usage: sigil ssh add-file --path <private-key-path> [--comment <c>]");
         return 2;
     };
     let comment = flag_value(args, "--comment").unwrap_or("").to_string();
@@ -1699,17 +1699,17 @@ fn ssh_add_file(args: &[String]) -> i32 {
     let mut cfg = match crate::sshagent::SshKeyConfig::load() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("latch: loading ssh-keys config: {e}");
+            eprintln!("sigil: loading ssh-keys config: {e}");
             return 1;
         }
     };
     if cfg.files.iter().any(|f| f.path == path) {
-        eprintln!("latch: {path} is already served (remove it first to replace)");
+        eprintln!("sigil: {path} is already served (remove it first to replace)");
         return 1;
     }
     cfg.files.push(entry);
     if let Err(e) = cfg.save() {
-        eprintln!("latch: saving ssh-keys config: {e}");
+        eprintln!("sigil: saving ssh-keys config: {e}");
         return 1;
     }
 
@@ -1718,12 +1718,12 @@ fn ssh_add_file(args: &[String]) -> i32 {
     println!("  {}  {}", s.dim("file"), s.dim(&path));
     println!(
         "  {}",
-        s.faint("restart the daemon to serve it: latch restart")
+        s.faint("restart the daemon to serve it: sigil restart")
     );
     0
 }
 
-/// `latch ssh add --vault <V> --item <I> [--field <f>] [--comment <c>]
+/// `sigil ssh add --vault <V> --item <I> [--field <f>] [--comment <c>]
 /// (--pubkey-file <path> | --pubkey-stdin)`: register a 1Password SSH key for the
 /// agent to serve. Only the public key (not secret) is provided here; the private
 /// key is fetched per-signature. v1 accepts ed25519 only.
@@ -1734,7 +1734,7 @@ fn ssh_add(args: &[String]) -> i32 {
         flag_value(args, "--item").map(str::to_string),
     ) else {
         eprintln!(
-            "usage: latch ssh add --vault <V> --item <I> [--field <f>] [--comment <c>] \
+            "usage: sigil ssh add --vault <V> --item <I> [--field <f>] [--comment <c>] \
              (--pubkey-file <path> | --pubkey-stdin)"
         );
         return 2;
@@ -1749,19 +1749,19 @@ fn ssh_add(args: &[String]) -> i32 {
         match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("latch: reading {path}: {e}");
+                eprintln!("sigil: reading {path}: {e}");
                 return 1;
             }
         }
     } else if has_flag(args, "--pubkey-stdin") {
         let mut buf = String::new();
         if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-            eprintln!("latch: reading public key from stdin: {e}");
+            eprintln!("sigil: reading public key from stdin: {e}");
             return 1;
         }
         buf
     } else {
-        eprintln!("latch: provide the public key with --pubkey-file <path> or --pubkey-stdin");
+        eprintln!("sigil: provide the public key with --pubkey-file <path> or --pubkey-stdin");
         return 2;
     };
     let public_key = public_key.trim().to_string();
@@ -1785,17 +1785,17 @@ fn ssh_add(args: &[String]) -> i32 {
     let mut cfg = match crate::sshagent::SshKeyConfig::load() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("latch: loading ssh-keys config: {e}");
+            eprintln!("sigil: loading ssh-keys config: {e}");
             return 1;
         }
     };
     if cfg.keys.iter().any(|k| k.vault == vault && k.item == item) {
-        eprintln!("latch: op://{vault}/{item} is already served (remove it first to replace)");
+        eprintln!("sigil: op://{vault}/{item} is already served (remove it first to replace)");
         return 1;
     }
     cfg.keys.push(entry);
     if let Err(e) = cfg.save() {
-        eprintln!("latch: saving ssh-keys config: {e}");
+        eprintln!("sigil: saving ssh-keys config: {e}");
         return 1;
     }
 
@@ -1804,7 +1804,7 @@ fn ssh_add(args: &[String]) -> i32 {
     println!("  {}  {}", s.dim("ref"), s.dim(&id.key_ref));
     println!(
         "  {}",
-        s.faint("restart the daemon to serve it: latch restart")
+        s.faint("restart the daemon to serve it: sigil restart")
     );
     0
 }
@@ -1814,14 +1814,14 @@ fn ssh_list() -> i32 {
     let cfg = match crate::sshagent::SshKeyConfig::load() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("latch: loading ssh-keys config: {e}");
+            eprintln!("sigil: loading ssh-keys config: {e}");
             return 1;
         }
     };
     if cfg.keys.is_empty() && cfg.files.is_empty() {
         println!(
             "  {}",
-            s.dim("no SSH keys served; add one: latch ssh add --vault <V> --item <I> --pubkey-file <p>  (or: latch ssh add-file --path <key>)")
+            s.dim("no SSH keys served; add one: sigil ssh add --vault <V> --item <I> --pubkey-file <p>  (or: sigil ssh add-file --path <key>)")
         );
         return 0;
     }
@@ -1870,13 +1870,13 @@ fn ssh_list() -> i32 {
 fn ssh_remove(item: Option<&str>) -> i32 {
     let s = Style::stdout();
     let Some(item) = item else {
-        eprintln!("usage: latch ssh remove <item>");
+        eprintln!("usage: sigil ssh remove <item>");
         return 2;
     };
     let mut cfg = match crate::sshagent::SshKeyConfig::load() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("latch: loading ssh-keys config: {e}");
+            eprintln!("sigil: loading ssh-keys config: {e}");
             return 1;
         }
     };
@@ -1887,18 +1887,18 @@ fn ssh_remove(item: Option<&str>) -> i32 {
         return 0;
     }
     if let Err(e) = cfg.save() {
-        eprintln!("latch: saving ssh-keys config: {e}");
+        eprintln!("sigil: saving ssh-keys config: {e}");
         return 1;
     }
     println!("{} stopped serving {}", s.ok("\u{2713}"), s.cobalt(item));
     println!(
         "  {}",
-        s.faint("restart the daemon to apply: latch restart")
+        s.faint("restart the daemon to apply: sigil restart")
     );
     0
 }
 
-/// `latch sshagent`: print the SSH_AUTH_SOCK a user points `ssh`/`git` at, plus
+/// `sigil sshagent`: print the SSH_AUTH_SOCK a user points `ssh`/`git` at, plus
 /// the served-key count and a guidance line.
 fn cmd_sshagent() -> i32 {
     let s = Style::stdout();
@@ -1906,7 +1906,7 @@ fn cmd_sshagent() -> i32 {
     let count = crate::sshagent::SshKeyConfig::load()
         .map(|c| c.keys.len())
         .unwrap_or(0);
-    println!("{}", s.cobalt("latch ssh-agent"));
+    println!("{}", s.cobalt("sigil ssh-agent"));
     println!();
     println!(
         "  {}  {}",
@@ -1917,7 +1917,7 @@ fn cmd_sshagent() -> i32 {
     println!();
     println!(
         "  {}",
-        s.dim("Point ssh and git at Latch by exporting this in your shell profile:")
+        s.dim("Point ssh and git at Sigil by exporting this in your shell profile:")
     );
     println!();
     println!(
@@ -1937,21 +1937,21 @@ fn cmd_shim(args: &[String], json: bool) -> i32 {
         Some("install") => shim_install(json),
         Some("add") => shim_add(args.get(1).map(String::as_str), json),
         _ => {
-            eprintln!("usage: latch shim <install | add <cmd>>");
+            eprintln!("usage: sigil shim <install | add <cmd>>");
             2
         }
     }
 }
 
-/// `latch shim add <cmd>`: drop a transparent alias binary (`~/.latch/bin/<cmd>`)
-/// so a bare `<cmd>` on PATH re-enters as `latch <cmd>`. For callers that cannot
+/// `sigil shim add <cmd>`: drop a transparent alias binary (`~/.sigil/bin/<cmd>`)
+/// so a bare `<cmd>` on PATH re-enters as `sigil <cmd>`. For callers that cannot
 /// be modified (a launcher shelling out to a bare tool, `git` reaching the SSH
 /// agent, an AI agent that only knows the real name). The command should already
-/// be configured (`latch-config add <cmd>`); a warning notes it if not.
+/// be configured (`sigil-config add <cmd>`); a warning notes it if not.
 fn shim_add(cmd: Option<&str>, json: bool) -> i32 {
     let s = Style::stdout();
     let Some(cmd) = cmd else {
-        eprintln!("usage: latch shim add <cmd>");
+        eprintln!("usage: sigil shim add <cmd>");
         return 2;
     };
     let configured = crate::config::Config::load()
@@ -1966,7 +1966,7 @@ fn shim_add(cmd: Option<&str>, json: bool) -> i32 {
                     format!("shim add failed: {e:#}"),
                 ));
             }
-            eprintln!("latch: {e:#}");
+            eprintln!("sigil: {e:#}");
             return 1;
         }
     };
@@ -1978,7 +1978,7 @@ fn shim_add(cmd: Option<&str>, json: bool) -> i32 {
         ];
         if !configured {
             lines.push(format!(
-                "warning: {cmd} is not configured; run latch-config add {cmd}"
+                "warning: {cmd} is not configured; run sigil-config add {cmd}"
             ));
         }
         return emit_local_control(&ControlResult::ok(lines));
@@ -1999,13 +1999,13 @@ fn shim_add(cmd: Option<&str>, json: bool) -> i32 {
             "  {} {}",
             s.brass("\u{2717}"),
             s.dim(&format!(
-                "{cmd} is not configured yet; run: latch-config add {cmd} --provider <id>"
+                "{cmd} is not configured yet; run: sigil-config add {cmd} --provider <id>"
             ))
         );
     }
     println!(
         "  {}",
-        s.faint("ensure ~/.latch/bin is first on PATH so the alias wins")
+        s.faint("ensure ~/.sigil/bin is first on PATH so the alias wins")
     );
     0
 }
@@ -2021,7 +2021,7 @@ fn shim_install(json: bool) -> i32 {
                     format!("shim install failed: {e:#}"),
                 ));
             }
-            eprintln!("latch: {e:#}");
+            eprintln!("sigil: {e:#}");
             return 1;
         }
     };
@@ -2031,7 +2031,7 @@ fn shim_install(json: bool) -> i32 {
             "shim installed".to_string(),
             format!("link {}", link.display()),
             format!("-> {}", target.display()),
-            "add ~/.latch/bin to PATH so the shim wins".to_string(),
+            "add ~/.sigil/bin to PATH so the shim wins".to_string(),
         ]));
     }
 
@@ -2044,19 +2044,19 @@ fn shim_install(json: bool) -> i32 {
         s.dim("Add this to your shell profile so the shim wins on PATH:")
     );
     println!();
-    println!("    {}", s.cobalt("export PATH=\"$HOME/.latch/bin:$PATH\""));
+    println!("    {}", s.cobalt("export PATH=\"$HOME/.sigil/bin:$PATH\""));
     println!();
     println!(
         "  {}",
-        s.faint("or run `latch setup`, which edits your profile and loads the daemon.")
+        s.faint("or run `sigil setup`, which edits your profile and loads the daemon.")
     );
     0
 }
 
-/// `latch-config proxy <add|remove|list|status|doctor|env>`: manage the
+/// `sigil-config proxy <add|remove|list|status|doctor|env>`: manage the
 /// transparent PATH aliases that let an unmodifiable caller (an agent, a
-/// launcher's bare `op`, `git` reaching the SSH agent) hit Latch without knowing
-/// it exists. An alias is a symlink in `~/.latch/bin` at the `latch` runtime
+/// launcher's bare `op`, `git` reaching the SSH agent) hit Sigil without knowing
+/// it exists. An alias is a symlink in `~/.sigil/bin` at the `sigil` runtime
 /// binary; running the command resolves the alias, which gates on the phone and
 /// execs the real tool. See `docs/design/proxy-aliasing.md`.
 fn cmd_proxy(args: &[String], json: bool) -> i32 {
@@ -2069,7 +2069,7 @@ fn cmd_proxy(args: &[String], json: bool) -> i32 {
         Some("env") => proxy_env(&args[1..]),
         _ => {
             eprintln!(
-                "usage: latch-config proxy <add <cmd> | remove <cmd> [--purge] | list | status | doctor [<cmd>] | env [--shell zsh|bash|fish|nu]>"
+                "usage: sigil-config proxy <add <cmd> | remove <cmd> [--purge] | list | status | doctor [<cmd>] | env [--shell zsh|bash|fish|nu]>"
             );
             2
         }
@@ -2083,7 +2083,7 @@ fn cmd_proxy(args: &[String], json: bool) -> i32 {
 fn proxy_add(args: &[String], json: bool) -> i32 {
     let s = Style::stdout();
     let Some(cmd) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
-        eprintln!("usage: latch-config proxy add <cmd> [--force]");
+        eprintln!("usage: sigil-config proxy add <cmd> [--force]");
         return 2;
     };
 
@@ -2102,7 +2102,7 @@ fn proxy_add(args: &[String], json: bool) -> i32 {
                     format!("proxy add failed: {e}"),
                 ));
             }
-            eprintln!("latch-config: {e}");
+            eprintln!("sigil-config: {e}");
             return 1;
         }
     };
@@ -2128,11 +2128,11 @@ fn proxy_add(args: &[String], json: bool) -> i32 {
         ];
         if !gated {
             lines.push(format!(
-                "warning: no rule gates {cmd}; every call is refused until you run latch-config add {cmd}"
+                "warning: no rule gates {cmd}; every call is refused until you run sigil-config add {cmd}"
             ));
         }
         if let Some((file, true)) = &path_added {
-            lines.push(format!("added ~/.latch/bin to {}", file.display()));
+            lines.push(format!("added ~/.sigil/bin to {}", file.display()));
         }
         return emit_local_control(&ControlResult::ok(lines));
     }
@@ -2163,17 +2163,17 @@ fn proxy_add(args: &[String], json: bool) -> i32 {
             "  {} {}",
             s.brass("\u{2717}"),
             s.brass(&format!(
-                "no rule gates {cmd}: every call is refused until you configure it (latch-config add {cmd} --provider <id>)"
+                "no rule gates {cmd}: every call is refused until you configure it (sigil-config add {cmd} --provider <id>)"
             ))
         );
     }
     match &path_added {
         Some((file, true)) => println!(
-            "  {} added ~/.latch/bin to {}",
+            "  {} added ~/.sigil/bin to {}",
             s.ok("\u{2713}"),
             s.dim(&file.display().to_string())
         ),
-        Some((_, false)) => println!("  {} ~/.latch/bin already on PATH", s.ok("\u{2713}")),
+        Some((_, false)) => println!("  {} ~/.sigil/bin already on PATH", s.ok("\u{2713}")),
         None => {}
     }
     println!();
@@ -2181,7 +2181,7 @@ fn proxy_add(args: &[String], json: bool) -> i32 {
     println!("    {}", s.cobalt(&format!("eval \"$({session_line})\"")));
     println!(
         "  {}",
-        s.faint("for an agent that inherits env without an rc file, put ~/.latch/bin first in its launcher's PATH (latch-config proxy env)")
+        s.faint("for an agent that inherits env without an rc file, put ~/.sigil/bin first in its launcher's PATH (sigil-config proxy env)")
     );
     0
 }
@@ -2190,7 +2190,7 @@ fn proxy_add(args: &[String], json: bool) -> i32 {
 /// `--purge`, once no aliases remain, also strip the managed PATH block.
 fn proxy_remove(args: &[String], json: bool) -> i32 {
     let Some(cmd) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
-        eprintln!("usage: latch-config proxy remove <cmd> [--purge]");
+        eprintln!("usage: sigil-config proxy remove <cmd> [--purge]");
         return 2;
     };
     let removed = match crate::proxy::remove_alias(&cmd) {
@@ -2216,14 +2216,14 @@ fn proxy_remove(args: &[String], json: bool) -> i32 {
             if let Some((file, _)) = crate::proxy::primary_rc_file() {
                 match crate::proxy::strip_path_in(&file) {
                     Ok(true) => {
-                        lines.push(format!("stripped ~/.latch/bin from {}", file.display()))
+                        lines.push(format!("stripped ~/.sigil/bin from {}", file.display()))
                     }
                     Ok(false) => {}
                     Err(e) => lines.push(format!("could not strip PATH block: {e}")),
                 }
             }
         } else {
-            lines.push("kept ~/.latch/bin on PATH (other aliases remain)".to_string());
+            lines.push("kept ~/.sigil/bin on PATH (other aliases remain)".to_string());
         }
     }
     print_config_result(&ControlResult::ok(lines), json)
@@ -2236,7 +2236,7 @@ fn proxy_list(json: bool) -> i32 {
     let aliases = match crate::proxy::list_aliases() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("latch-config: listing proxy aliases: {e}");
+            eprintln!("sigil-config: listing proxy aliases: {e}");
             return 1;
         }
     };
@@ -2260,7 +2260,7 @@ fn proxy_list(json: bool) -> i32 {
     if aliases.is_empty() {
         println!(
             "  {}",
-            s.dim("no proxy aliases; add one: latch-config proxy add <cmd>")
+            s.dim("no proxy aliases; add one: sigil-config proxy add <cmd>")
         );
         return 0;
     }
@@ -2318,7 +2318,7 @@ fn proxy_status(json: bool) -> i32 {
     } else {
         (
             s.deny("\u{25cb}"),
-            s.brass("not on PATH in this shell (latch-config proxy env)"),
+            s.brass("not on PATH in this shell (sigil-config proxy env)"),
         )
     };
     println!("  {}  {glyph} {note}", s.dim("proxy dir"));
@@ -2383,7 +2383,7 @@ fn proxy_doctor(cmd: Option<&str>, json: bool) -> i32 {
             println!(
                 "      {}",
                 s.brass(&format!(
-                    "no rule gates {c}; it refuses every call (latch-config add {c})"
+                    "no rule gates {c}; it refuses every call (sigil-config add {c})"
                 ))
             );
         }
@@ -2412,7 +2412,7 @@ fn proxy_env(args: &[String]) -> i32 {
         Some(name) => match crate::proxy::Shell::parse(name) {
             Some(sh) => sh,
             None => {
-                eprintln!("latch-config: unknown shell '{name}'; use zsh, bash, fish, or nu");
+                eprintln!("sigil-config: unknown shell '{name}'; use zsh, bash, fish, or nu");
                 return 2;
             }
         },
@@ -2427,7 +2427,7 @@ fn load_config() -> Option<crate::config::Config> {
     match crate::config::Config::load() {
         Ok(c) => Some(c),
         Err(e) => {
-            eprintln!("latch: loading config: {e}");
+            eprintln!("sigil: loading config: {e}");
             None
         }
     }
@@ -2436,7 +2436,7 @@ fn load_config() -> Option<crate::config::Config> {
 /// Save the config store, printing an error and returning false on failure.
 fn save_config(cfg: &crate::config::Config) -> bool {
     if let Err(e) = cfg.save() {
-        eprintln!("latch: saving config: {e}");
+        eprintln!("sigil: saving config: {e}");
         return false;
     }
     true
@@ -2466,7 +2466,7 @@ fn cmd_config_source(args: &[String], json: bool) -> i32 {
         Some("remove") | Some("rm") => config_source_remove(args.get(1).map(String::as_str), json),
         _ => {
             eprintln!(
-                "usage: latch-config source <add <name> --provider <id> | list | remove <name>>"
+                "usage: sigil-config source <add <name> --provider <id> | list | remove <name>>"
             );
             2
         }
@@ -2479,7 +2479,7 @@ fn known_provider(provider: &str) -> bool {
     let registry = crate::provider::ProviderRegistry::with_defaults();
     if registry.get(provider).is_none() {
         eprintln!(
-            "latch: unknown provider '{provider}'; known providers: {}",
+            "sigil: unknown provider '{provider}'; known providers: {}",
             registry.ids().join(", ")
         );
         return false;
@@ -2490,12 +2490,12 @@ fn known_provider(provider: &str) -> bool {
 fn config_source_add(args: &[String], json: bool) -> i32 {
     let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
         eprintln!(
-            "usage: latch-config source add <name> --provider <id> [--account <label>] [--path <file>]"
+            "usage: sigil-config source add <name> --provider <id> [--account <label>] [--path <file>]"
         );
         return 2;
     };
     let Some(provider) = flag_value(args, "--provider").map(str::to_string) else {
-        eprintln!("latch: --provider <id> is required (e.g. 1password, env-file)");
+        eprintln!("sigil: --provider <id> is required (e.g. 1password, env-file)");
         return 2;
     };
     if !known_provider(&provider) {
@@ -2505,7 +2505,7 @@ fn config_source_add(args: &[String], json: bool) -> i32 {
     let path = flag_value(args, "--path").map(str::to_string);
     // env-file needs a path; refuse a source that could never inject anything.
     if provider == crate::provider::EnvFileProvider::ID && path.is_none() {
-        eprintln!("latch: the env-file provider needs --path <file> to the KEY=VALUE file");
+        eprintln!("sigil: the env-file provider needs --path <file> to the KEY=VALUE file");
         return 2;
     }
 
@@ -2520,7 +2520,7 @@ fn config_source_add(args: &[String], json: bool) -> i32 {
         path,
     };
     if let Err(e) = cfg.add_source(src) {
-        eprintln!("latch: {e}");
+        eprintln!("sigil: {e}");
         return 1;
     }
     if !save_config(&cfg) {
@@ -2545,7 +2545,7 @@ fn config_source_list(json: bool) -> i32 {
     if cfg.sources.is_empty() {
         println!(
             "  {}",
-            s.dim("no sources; add one: latch-config source add <name> --provider <id>")
+            s.dim("no sources; add one: sigil-config source add <name> --provider <id>")
         );
         return 0;
     }
@@ -2570,7 +2570,7 @@ fn config_source_list(json: bool) -> i32 {
 
 fn config_source_remove(name: Option<&str>, json: bool) -> i32 {
     let Some(name) = name else {
-        eprintln!("usage: latch-config source remove <name>");
+        eprintln!("usage: sigil-config source remove <name>");
         return 2;
     };
     let mut cfg = match load_config() {
@@ -2596,20 +2596,20 @@ fn cmd_config_rule(args: &[String], json: bool) -> i32 {
         Some("list") | None => config_rule_list(json),
         Some("remove") | Some("rm") => config_rule_remove(args.get(1).map(String::as_str), json),
         _ => {
-            eprintln!("usage: latch-config rule <add <name> --source <src> [match...] | list | remove <name>>");
+            eprintln!("usage: sigil-config rule <add <name> --source <src> [match...] | list | remove <name>>");
             2
         }
     }
 }
 
 /// Parse the risk flag, defaulting to routine. `Err` on an unknown value.
-fn risk_flag(args: &[String]) -> Result<latch_proto::RiskLevel, i32> {
+fn risk_flag(args: &[String]) -> Result<sigil_proto::RiskLevel, i32> {
     match flag_value(args, "--risk") {
         Some(r) => crate::config::parse_risk(r).ok_or_else(|| {
-            eprintln!("latch: unknown risk '{r}'; use routine, elevated, or critical");
+            eprintln!("sigil: unknown risk '{r}'; use routine, elevated, or critical");
             2
         }),
-        None => Ok(latch_proto::RiskLevel::Routine),
+        None => Ok(sigil_proto::RiskLevel::Routine),
     }
 }
 
@@ -2623,7 +2623,7 @@ fn build_match(args: &[String]) -> Result<crate::config::Match, i32> {
                 value: v.to_string(),
             }),
             None => {
-                eprintln!("latch: --flag-eq expects <flag>=<value>, got '{fe}'");
+                eprintln!("sigil: --flag-eq expects <flag>=<value>, got '{fe}'");
                 Err(2)
             }
         })
@@ -2641,14 +2641,14 @@ fn build_match(args: &[String]) -> Result<crate::config::Match, i32> {
 fn config_rule_add(args: &[String], json: bool) -> i32 {
     let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
         eprintln!(
-            "usage: latch-config rule add <name> --source <src> [--command <c>] [--subcommand <s>] \
+            "usage: sigil-config rule add <name> --source <src> [--command <c>] [--subcommand <s>] \
              [--argv-contains <str> ...] [--flag <f> ...] [--flag-eq <f>=<v> ...] \
              [--risk routine|elevated|critical] [--timeout <sec>]"
         );
         return 2;
     };
     let Some(source) = flag_value(args, "--source").map(str::to_string) else {
-        eprintln!("latch: --source <name> is required (the source this rule injects from)");
+        eprintln!("sigil: --source <name> is required (the source this rule injects from)");
         return 2;
     };
     let match_ = match build_match(args) {
@@ -2659,7 +2659,7 @@ fn config_rule_add(args: &[String], json: bool) -> i32 {
     // rule that sets it would silently never match, so refuse it at authoring.
     if match_.arg_regex.is_some() {
         eprintln!(
-            "latch: --regex is not implemented yet (needs the regex dependency); \
+            "sigil: --regex is not implemented yet (needs the regex dependency); \
              use --command/--subcommand/--argv-contains/--flag/--flag-eq"
         );
         return 2;
@@ -2672,7 +2672,7 @@ fn config_rule_add(args: &[String], json: bool) -> i32 {
         Some(t) => match t.parse::<u32>() {
             Ok(n) => Some(n),
             Err(_) => {
-                eprintln!("latch: --timeout expects a whole number of seconds, got '{t}'");
+                eprintln!("sigil: --timeout expects a whole number of seconds, got '{t}'");
                 return 2;
             }
         },
@@ -2693,7 +2693,7 @@ fn config_rule_add(args: &[String], json: bool) -> i32 {
         },
     };
     if let Err(e) = cfg.add_rule(rule) {
-        eprintln!("latch: {e}");
+        eprintln!("sigil: {e}");
         return 1;
     }
     if !save_config(&cfg) {
@@ -2703,7 +2703,7 @@ fn config_rule_add(args: &[String], json: bool) -> i32 {
     if !json {
         println!(
             "  {}",
-            s.faint("restart the daemon to apply, then: latch <cmd> <args>")
+            s.faint("restart the daemon to apply, then: sigil <cmd> <args>")
         );
     }
     print_config_result(
@@ -2725,7 +2725,7 @@ fn config_rule_list(json: bool) -> i32 {
     if cfg.rules.is_empty() {
         println!(
             "  {}",
-            s.dim("no rules; add one: latch-config rule add <name> --source <src> --command <cmd>")
+            s.dim("no rules; add one: sigil-config rule add <name> --source <src> --command <cmd>")
         );
         return 0;
     }
@@ -2776,7 +2776,7 @@ fn describe_match(m: &crate::config::Match) -> String {
 
 fn config_rule_remove(name: Option<&str>, json: bool) -> i32 {
     let Some(name) = name else {
-        eprintln!("usage: latch-config rule remove <name>");
+        eprintln!("usage: sigil-config rule remove <name>");
         return 2;
     };
     let mut cfg = match load_config() {
@@ -2795,7 +2795,7 @@ fn config_rule_remove(name: Option<&str>, json: bool) -> i32 {
     print_config_result(&result, json)
 }
 
-/// `latch-config export`: the whole config as pretty JSON on stdout, for the
+/// `sigil-config export`: the whole config as pretty JSON on stdout, for the
 /// desktop to load or a human to inspect. Inherently machine-readable, so it
 /// ignores `--json` and always emits JSON.
 fn config_export() -> i32 {
@@ -2807,22 +2807,22 @@ fn config_export() -> i32 {
     0
 }
 
-/// `latch-config import`: replace the whole config from a JSON object on stdin
+/// `sigil-config import`: replace the whole config from a JSON object on stdin
 /// (the form `export` emits), so the desktop can save an edited config wholesale.
 fn config_import(json: bool) -> i32 {
     let mut buf = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-        eprintln!("latch: reading the config from stdin: {e}");
+        eprintln!("sigil: reading the config from stdin: {e}");
         return 1;
     }
     if buf.trim().is_empty() {
-        eprintln!("latch: empty config on stdin (pipe the JSON `latch-config export` emits)");
+        eprintln!("sigil: empty config on stdin (pipe the JSON `sigil-config export` emits)");
         return 2;
     }
     let cfg: crate::config::Config = match serde_json::from_str(&buf) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("latch: parsing the config: {e}");
+            eprintln!("sigil: parsing the config: {e}");
             return 2;
         }
     };
@@ -2831,12 +2831,12 @@ fn config_import(json: bool) -> i32 {
     // on every request or dispatch to a non-existent source.
     for rule in &cfg.rules {
         if rule.match_.is_empty() {
-            eprintln!("latch: imported rule {} has no match conditions", rule.name);
+            eprintln!("sigil: imported rule {} has no match conditions", rule.name);
             return 2;
         }
         if cfg.source(&rule.action.source).is_none() {
             eprintln!(
-                "latch: imported rule {} references unknown source {}",
+                "sigil: imported rule {} references unknown source {}",
                 rule.name, rule.action.source
             );
             return 2;
@@ -2858,7 +2858,7 @@ fn config_import(json: bool) -> i32 {
     )
 }
 
-/// `latch-config add <cmd> --provider <id> …`: the convenience desugar. Authors a
+/// `sigil-config add <cmd> --provider <id> …`: the convenience desugar. Authors a
 /// source named `<cmd>` plus a rule named `<cmd>` matching `command == <cmd>`, so
 /// the common "gate this one command" case stays a one-liner. Equivalent to a
 /// `config source add <cmd>` + `config rule add <cmd> --command <cmd>`.
@@ -2866,12 +2866,12 @@ fn config_add(args: &[String], json: bool) -> i32 {
     let s = Style::stdout();
     let Some(cmd) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
         eprintln!(
-            "usage: latch-config add <cmd> --provider <id> [--source <path>] [--account <label>] [--risk routine|elevated|critical]"
+            "usage: sigil-config add <cmd> --provider <id> [--source <path>] [--account <label>] [--risk routine|elevated|critical]"
         );
         return 2;
     };
     let Some(provider) = flag_value(args, "--provider").map(str::to_string) else {
-        eprintln!("latch: --provider <id> is required (e.g. 1password, env-file)");
+        eprintln!("sigil: --provider <id> is required (e.g. 1password, env-file)");
         return 2;
     };
     if !known_provider(&provider) {
@@ -2888,7 +2888,7 @@ fn config_add(args: &[String], json: bool) -> i32 {
         Err(code) => return code,
     };
     if provider == crate::provider::EnvFileProvider::ID && path.is_none() {
-        eprintln!("latch: the env-file provider needs --source <path> to the KEY=VALUE file");
+        eprintln!("sigil: the env-file provider needs --source <path> to the KEY=VALUE file");
         return 2;
     }
 
@@ -2903,7 +2903,7 @@ fn config_add(args: &[String], json: bool) -> i32 {
         path: path.clone(),
     };
     if let Err(e) = cfg.add_source(src) {
-        eprintln!("latch: {e}");
+        eprintln!("sigil: {e}");
         return 1;
     }
     let rule = crate::config::Rule {
@@ -2919,7 +2919,7 @@ fn config_add(args: &[String], json: bool) -> i32 {
         },
     };
     if let Err(e) = cfg.add_rule(rule) {
-        eprintln!("latch: {e}");
+        eprintln!("sigil: {e}");
         return 1;
     }
     if !save_config(&cfg) {
@@ -2942,13 +2942,13 @@ fn config_add(args: &[String], json: bool) -> i32 {
     println!(
         "  {}",
         s.faint(&format!(
-            "restart the daemon to apply, then: latch {cmd} <args>  (or: latch shim add {cmd})"
+            "restart the daemon to apply, then: sigil {cmd} <args>  (or: sigil shim add {cmd})"
         ))
     );
     0
 }
 
-/// `latch-config list`: a human summary of sources and rules (JSON = the whole
+/// `sigil-config list`: a human summary of sources and rules (JSON = the whole
 /// config, the same shape `export` emits).
 fn config_list(json: bool) -> i32 {
     if json {
@@ -2962,7 +2962,7 @@ fn config_list(json: bool) -> i32 {
         let s = Style::stdout();
         println!(
             "  {}",
-            s.dim("nothing configured; add a command: latch-config add <cmd> --provider <id>")
+            s.dim("nothing configured; add a command: sigil-config add <cmd> --provider <id>")
         );
         return 0;
     }
@@ -2971,12 +2971,12 @@ fn config_list(json: bool) -> i32 {
     config_rule_list(false)
 }
 
-/// `latch-config remove <cmd>`: the desugar's inverse. Removes the rule named
+/// `sigil-config remove <cmd>`: the desugar's inverse. Removes the rule named
 /// `<cmd>` and then its like-named source (best effort), so a `config add <cmd>`
 /// is fully undone by one command.
 fn config_remove(cmd: Option<&str>, json: bool) -> i32 {
     let Some(cmd) = cmd else {
-        eprintln!("usage: latch-config remove <cmd>");
+        eprintln!("usage: sigil-config remove <cmd>");
         return 2;
     };
     let mut cfg = match load_config() {
@@ -2997,7 +2997,7 @@ fn config_remove(cmd: Option<&str>, json: bool) -> i32 {
     print_config_result(&result, json)
 }
 
-/// `latch mac-approvals --enable | --phone-only`: toggle the Mac local-approval
+/// `sigil mac-approvals --enable | --phone-only`: toggle the Mac local-approval
 /// factor / hardened mode. `--phone-only` persists the hardened intent (every
 /// approval degrades to the phone). `--enable` needs the Mac Secure Enclave DEK
 /// envelope, whose minting is not yet verified on hardware (task #17): it
@@ -3008,14 +3008,14 @@ fn cmd_mac_approvals(args: &[String], json: bool) -> i32 {
     let enable = has_flag(args, "--enable");
     let phone_only = has_flag(args, "--phone-only");
     if enable == phone_only {
-        eprintln!("usage: latch mac-approvals --enable | --phone-only");
+        eprintln!("usage: sigil mac-approvals --enable | --phone-only");
         return 2;
     }
 
     let mut settings = match Settings::load() {
         Ok(st) => st,
         Err(e) => {
-            eprintln!("latch: loading settings: {e}");
+            eprintln!("sigil: loading settings: {e}");
             return 1;
         }
     };
@@ -3025,7 +3025,7 @@ fn cmd_mac_approvals(args: &[String], json: bool) -> i32 {
         // Secure Enclave envelope teardown itself defers to task #17.
         settings.mac_approvals = settings::MAC_APPROVALS_PHONE_ONLY.to_string();
         if let Err(e) = settings.save() {
-            eprintln!("latch: saving settings: {e}");
+            eprintln!("sigil: saving settings: {e}");
             return 1;
         }
         if json {
@@ -3048,7 +3048,7 @@ fn cmd_mac_approvals(args: &[String], json: bool) -> i32 {
         Ok(()) => {
             settings.mac_approvals = settings::MAC_APPROVALS_ENABLED.to_string();
             if let Err(e) = settings.save() {
-                eprintln!("latch: saving settings: {e}");
+                eprintln!("sigil: saving settings: {e}");
                 return 1;
             }
             if json {
@@ -3064,7 +3064,7 @@ fn cmd_mac_approvals(args: &[String], json: bool) -> i32 {
         Err(e) => {
             // Honest failure: the SE envelope could not be minted here.
             eprintln!(
-                "latch: cannot enable Mac approvals: {}. \
+                "sigil: cannot enable Mac approvals: {}. \
                  The phone remains the approving factor.\n  (detail: {e})",
                 keystore::dek_error_hint(&e)
             );
@@ -3076,7 +3076,7 @@ fn cmd_mac_approvals(args: &[String], json: bool) -> i32 {
     }
 }
 
-/// `latch settings get|set`: read or change preferences. `set` takes either a
+/// `sigil settings get|set`: read or change preferences. `set` takes either a
 /// `<key> <value>` pair or, with `--json`, a JSON object patch on stdin (the
 /// form the Mac app uses); a patch is *merged*, so unlisted keys are untouched.
 fn cmd_settings(args: &[String], json: bool) -> i32 {
@@ -3084,7 +3084,7 @@ fn cmd_settings(args: &[String], json: bool) -> i32 {
         Some("get") | None => settings_get(json),
         Some("set") => settings_set(&args[1..], json),
         _ => {
-            eprintln!("usage: latch settings <get|set <key> <value>>");
+            eprintln!("usage: sigil settings <get|set <key> <value>>");
             2
         }
     }
@@ -3094,7 +3094,7 @@ fn settings_get(json: bool) -> i32 {
     let settings = match Settings::load() {
         Ok(st) => st,
         Err(e) => {
-            eprintln!("latch: loading settings: {e}");
+            eprintln!("sigil: loading settings: {e}");
             return 1;
         }
     };
@@ -3138,7 +3138,7 @@ fn settings_set(args: &[String], json: bool) -> i32 {
     let mut settings = match Settings::load() {
         Ok(st) => st,
         Err(e) => {
-            eprintln!("latch: loading settings: {e}");
+            eprintln!("sigil: loading settings: {e}");
             return 1;
         }
     };
@@ -3152,7 +3152,7 @@ fn settings_set(args: &[String], json: bool) -> i32 {
             if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
                 Err(format!("reading the settings patch from stdin: {e}"))
             } else if buf.trim().is_empty() {
-                Err("usage: latch settings set <key> <value>  (or pipe a JSON patch)".to_string())
+                Err("usage: sigil settings set <key> <value>  (or pipe a JSON patch)".to_string())
             } else {
                 serde_json::from_str::<serde_json::Value>(&buf)
                     .map_err(|e| format!("parsing the settings patch: {e}"))
@@ -3162,11 +3162,11 @@ fn settings_set(args: &[String], json: bool) -> i32 {
     };
 
     if let Err(msg) = outcome {
-        eprintln!("latch: {msg}");
+        eprintln!("sigil: {msg}");
         return 2;
     }
     if let Err(e) = settings.save() {
-        eprintln!("latch: saving settings: {e}");
+        eprintln!("sigil: saving settings: {e}");
         return 1;
     }
 
@@ -3178,7 +3178,7 @@ fn settings_set(args: &[String], json: bool) -> i32 {
     0
 }
 
-/// `latch wipe [--force]`: remove the pairing, accounts, keys, and settings.
+/// `sigil wipe [--force]`: remove the pairing, accounts, keys, and settings.
 /// The destructive path is explicit: without `--force` it refuses.
 fn cmd_wipe(args: &[String], json: bool) -> i32 {
     let s = Style::stdout();
@@ -3189,8 +3189,8 @@ fn cmd_wipe(args: &[String], json: bool) -> i32 {
             ]));
         }
         eprintln!(
-            "{} latch wipe removes the pairing, accounts, SSH keys, command config, settings, and history.\n  \
-             Re-run with --force to confirm: latch wipe --force",
+            "{} sigil wipe removes the pairing, accounts, SSH keys, command config, settings, and history.\n  \
+             Re-run with --force to confirm: sigil wipe --force",
             s.brass("\u{2717}")
         );
         return 2;
@@ -3206,10 +3206,10 @@ fn cmd_wipe(args: &[String], json: bool) -> i32 {
         Err(e) => lines.push(format!("pairing: {e}")),
     }
 
-    // The remaining ~/.latch state files.
-    if let Some(home) = paths::latch_home() {
+    // The remaining ~/.sigil state files.
+    if let Some(home) = paths::sigil_home() {
         for (name, path) in [
-            ("accounts", home.join("latch.db")),
+            ("accounts", home.join("sigil.db")),
             ("ssh keys", home.join("ssh-keys.json")),
             ("config", home.join("config.json")),
             ("legacy command config", home.join("commands.json")),
@@ -3237,7 +3237,7 @@ fn cmd_wipe(args: &[String], json: bool) -> i32 {
     }
     println!(
         "  {}",
-        s.faint("restart the daemon to apply: latch restart")
+        s.faint("restart the daemon to apply: sigil restart")
     );
     0
 }
@@ -3259,14 +3259,14 @@ mod tests {
     #[test]
     fn reserved_verbs_take_precedence_over_command_dispatch() {
         // A runtime verb is reserved in the lean binary; a bare tool name (op,
-        // gcloud) is not, so it falls through to the `latch <cmd>` primitive.
+        // gcloud) is not, so it falls through to the `sigil <cmd>` primitive.
         for v in [
             "status", "daemon", "pair", "run", "ssh", "shim", "help", "version",
         ] {
             assert!(is_reserved_verb(v), "{v} must be a reserved verb");
         }
-        // Management verbs moved to latch-config, so they are NOT reserved in the
-        // lean binary — which frees those names to be gated as `latch <name>`.
+        // Management verbs moved to sigil-config, so they are NOT reserved in the
+        // lean binary — which frees those names to be gated as `sigil <name>`.
         for c in [
             "op",
             "gcloud",
@@ -3285,13 +3285,13 @@ mod tests {
 
     #[test]
     fn run_escape_hatch_strips_the_optional_double_dash() {
-        // `latch run -- status ...` runs a tool named `status`, not the verb.
+        // `sigil run -- status ...` runs a tool named `status`, not the verb.
         let with = vec!["--".to_string(), "status".to_string(), "-l".to_string()];
         assert_eq!(
             strip_run_prefix(&with),
             &["status".to_string(), "-l".to_string()]
         );
-        // `latch run op read` (no --) is equivalent for a non-colliding name.
+        // `sigil run op read` (no --) is equivalent for a non-colliding name.
         let without = vec!["op".to_string(), "read".to_string()];
         assert_eq!(strip_run_prefix(&without), &without[..]);
     }

@@ -1,9 +1,9 @@
 [package]
-name = "latch-proto"
+name = "sigil-proto"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Latch protocol core: sealed/signed envelopes, pairing, fingerprints"
+description = "Sigil protocol core: sealed/signed envelopes, pairing, fingerprints"
 
 [dependencies]
 crypto_box.workspace = true

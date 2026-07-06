@@ -176,7 +176,7 @@ fn read_message<R: Read>(stream: &mut R) -> io::Result<Option<Vec<u8>>> {
 
 // --- served identities and the backend seam ---------------------------------
 
-/// One SSH identity Latch serves: the public-key wire blob and comment for
+/// One SSH identity Sigil serves: the public-key wire blob and comment for
 /// `IDENTITIES_ANSWER`, plus the 1Password reference used to fetch the private
 /// key per-signature and the display fields for the approval screen.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,7 +193,7 @@ pub struct ServedIdentity {
     pub key_ref: String,
     /// The item label, shown brightest on the approval screen.
     pub label: String,
-    /// The public key's `SHA256:…` fingerprint, for `latch ssh list`.
+    /// The public key's `SHA256:…` fingerprint, for `sigil ssh list`.
     pub fingerprint: String,
 }
 
@@ -241,7 +241,7 @@ pub struct SignRequest<'a> {
 
 /// A pluggable SSH key SOURCE. SSH is a distinct integration — its event is a
 /// signature, not an env injection — but the *key source* is as pluggable as the
-/// [`SecretProvider`](crate::provider::SecretProvider) seam is for secrets. Latch
+/// [`SecretProvider`](crate::provider::SecretProvider) seam is for secrets. Sigil
 /// stays the universal phone-gate regardless of where the key lives: the daemon
 /// applies the approval gate, then delegates the key-source-specific signing to
 /// the owning signer here.
@@ -509,9 +509,9 @@ fn derive_host(bound_hostkey: Option<&[u8]>) -> HostContext {
     }
 }
 
-/// `~/.ssh/known_hosts`, overridable with `LATCH_KNOWN_HOSTS` (tests).
+/// `~/.ssh/known_hosts`, overridable with `SIGIL_KNOWN_HOSTS` (tests).
 fn known_hosts_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("LATCH_KNOWN_HOSTS") {
+    if let Some(p) = std::env::var_os("SIGIL_KNOWN_HOSTS") {
         return PathBuf::from(p);
     }
     std::env::var_os("HOME")
@@ -667,7 +667,7 @@ fn encode_signature(sig: &ssh_key::Signature) -> Vec<u8> {
     w.buf
 }
 
-// --- the served-key config (`~/.latch/ssh-keys.json`) -----------------------
+// --- the served-key config (`~/.sigil/ssh-keys.json`) -----------------------
 
 /// One configured SSH identity on disk. Holds only public material and 1Password
 /// coordinates — never key bytes — so the store stays inert like the account
@@ -708,7 +708,7 @@ pub struct SshFileEntry {
     pub comment: String,
 }
 
-/// The persisted list of served SSH identities, at `~/.latch/ssh-keys.json`.
+/// The persisted list of served SSH identities, at `~/.sigil/ssh-keys.json`.
 /// Two sources: `keys` (fetched from 1Password per signature) and `files` (local
 /// key files). Each becomes a distinct [`SshSigner`] at arm time.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -720,9 +720,9 @@ pub struct SshKeyConfig {
 }
 
 impl SshKeyConfig {
-    /// `~/.latch/ssh-keys.json`, or `$LATCH_HOME/ssh-keys.json` (tests).
+    /// `~/.sigil/ssh-keys.json`, or `$SIGIL_HOME/ssh-keys.json` (tests).
     pub fn path() -> Option<PathBuf> {
-        crate::paths::latch_home().map(|h| h.join("ssh-keys.json"))
+        crate::paths::sigil_home().map(|h| h.join("ssh-keys.json"))
     }
 
     /// Load the config, returning an empty one if the file is absent.
@@ -739,10 +739,10 @@ impl SshKeyConfig {
     }
 
     /// Persist the config, parent dir 0700 and file 0600 (public data, but kept
-    /// consistent with the rest of `~/.latch`).
+    /// consistent with the rest of `~/.sigil`).
     pub fn save(&self) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
-        let path = Self::path().ok_or_else(|| io::Error::other("no LATCH_HOME/HOME for config"))?;
+        let path = Self::path().ok_or_else(|| io::Error::other("no SIGIL_HOME/HOME for config"))?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
@@ -765,7 +765,7 @@ impl SshKeyConfig {
                 Some(id) => Some(id),
                 None => {
                     eprintln!(
-                        "latch sshagent: skipping key op://{}/{} (not a usable ed25519 public key)",
+                        "sigil sshagent: skipping key op://{}/{} (not a usable ed25519 public key)",
                         e.vault, e.item
                     );
                     None
@@ -784,7 +784,7 @@ impl SshKeyConfig {
                 Some(id) => Some((id, PathBuf::from(&e.path))),
                 None => {
                     eprintln!(
-                        "latch sshagent: skipping file key {} (need an ed25519 key with a sibling .pub)",
+                        "sigil sshagent: skipping file key {} (need an ed25519 key with a sibling .pub)",
                         e.path
                     );
                     None
@@ -796,7 +796,7 @@ impl SshKeyConfig {
 
 /// Parse one config entry's public-key line into a served identity. Returns
 /// `None` if the line does not parse or is not ed25519 (v1 serves ed25519 only).
-/// Public so `latch ssh add` can validate an entry before persisting it.
+/// Public so `sigil ssh add` can validate an entry before persisting it.
 pub fn resolve_identity(e: &SshKeyEntry) -> Option<ServedIdentity> {
     let pk = ssh_key::PublicKey::from_openssh(&e.public_key).ok()?;
     if pk.algorithm() != ssh_key::Algorithm::Ed25519 {
@@ -821,7 +821,7 @@ pub fn resolve_identity(e: &SshKeyEntry) -> Option<ServedIdentity> {
 /// reading the private key. Returns `None` if the `.pub` is missing/unparseable
 /// or not ed25519 (v1 serves ed25519 only). For a file identity `key_ref` holds
 /// the file path (display only; the [`FileSshSigner`] signs from the file, not an
-/// op reference). Public so `latch ssh add-file` can validate before persisting.
+/// op reference). Public so `sigil ssh add-file` can validate before persisting.
 pub fn resolve_file_identity(e: &SshFileEntry) -> Option<ServedIdentity> {
     let pub_path = format!("{}.pub", e.path);
     let line = std::fs::read_to_string(&pub_path).ok()?;
@@ -852,17 +852,17 @@ pub fn resolve_file_identity(e: &SshFileEntry) -> Option<ServedIdentity> {
 
 // --- socket path ------------------------------------------------------------
 
-/// Where the agent listens. `LATCH_SSH_SOCK` overrides; otherwise it sits beside
-/// the daemon socket at `$TMPDIR/latch/ssh-agent.sock` (falling back to `/tmp`).
+/// Where the agent listens. `SIGIL_SSH_SOCK` overrides; otherwise it sits beside
+/// the daemon socket at `$TMPDIR/sigil/ssh-agent.sock` (falling back to `/tmp`).
 /// This is the value a user points `SSH_AUTH_SOCK` at.
 pub fn socket_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("LATCH_SSH_SOCK") {
+    if let Some(p) = std::env::var_os("SIGIL_SSH_SOCK") {
         return PathBuf::from(p);
     }
     let base = std::env::var_os("TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("latch").join("ssh-agent.sock")
+    base.join("sigil").join("ssh-agent.sock")
 }
 
 #[cfg(test)]
@@ -932,7 +932,7 @@ mod tests {
             let pk = key.public_key();
             let identity = ServedIdentity {
                 key_blob: pk.to_bytes().unwrap(),
-                comment: "tom@latch-test".to_string(),
+                comment: "tom@sigil-test".to_string(),
                 key_ref: "op://Engineering/Test/private key".to_string(),
                 label: "Test".to_string(),
                 fingerprint: pk.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
@@ -991,7 +991,7 @@ mod tests {
         assert_eq!(body[0], SSH2_AGENT_IDENTITIES_ANSWER);
         assert_eq!(r.u32(), Some(1), "one identity");
         assert_eq!(r.string(), Some(&backend.identity.key_blob[..]));
-        assert_eq!(r.string(), Some(&b"tom@latch-test"[..]));
+        assert_eq!(r.string(), Some(&b"tom@sigil-test"[..]));
     }
 
     // --- sign happy path: the signature verifies ----------------------------
@@ -1088,7 +1088,7 @@ mod tests {
                 .unwrap();
         let host_blob = host_key.public_key().to_bytes().unwrap();
 
-        let dir = std::env::temp_dir().join(format!("latch-kh-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-kh-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let kh = dir.join("known_hosts");
         let line = host_key.public_key().to_openssh().unwrap(); // "ssh-ed25519 AAAA..."
@@ -1107,12 +1107,12 @@ mod tests {
         assert_eq!(reply, single(SSH_AGENT_SUCCESS), "session-bind is acked");
         assert_eq!(bound.as_deref(), Some(&host_blob[..]), "host key recorded");
 
-        // With LATCH_KNOWN_HOSTS pointed at the synthetic file, a sign derives it.
+        // With SIGIL_KNOWN_HOSTS pointed at the synthetic file, a sign derives it.
         let _lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("LATCH_KNOWN_HOSTS");
-        std::env::set_var("LATCH_KNOWN_HOSTS", &kh);
+        let prev = std::env::var_os("SIGIL_KNOWN_HOSTS");
+        std::env::set_var("SIGIL_KNOWN_HOSTS", &kh);
         respond(
             &backend,
             &sign_request_msg(&backend.identity.key_blob, b"data"),
@@ -1124,8 +1124,8 @@ mod tests {
             Some("github.example.com")
         );
         match prev {
-            Some(v) => std::env::set_var("LATCH_KNOWN_HOSTS", v),
-            None => std::env::remove_var("LATCH_KNOWN_HOSTS"),
+            Some(v) => std::env::set_var("SIGIL_KNOWN_HOSTS", v),
+            None => std::env::remove_var("SIGIL_KNOWN_HOSTS"),
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1177,7 +1177,7 @@ mod tests {
             ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
                 .unwrap();
         let host_blob = host_key.public_key().to_bytes().unwrap();
-        let dir = std::env::temp_dir().join(format!("latch-kh-hash-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-kh-hash-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let kh = dir.join("known_hosts");
         // A hashed entry cannot be reversed even though its key would match.
@@ -1197,7 +1197,7 @@ mod tests {
             ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
                 .unwrap();
         let host_blob = host_key.public_key().to_bytes().unwrap();
-        let dir = std::env::temp_dir().join(format!("latch-kh-ca-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-kh-ca-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let kh = dir.join("known_hosts");
         let line = host_key.public_key().to_openssh().unwrap();
@@ -1240,7 +1240,7 @@ mod tests {
             .unwrap();
         let pem = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
 
-        let dir = std::env::temp_dir().join(format!("latch-fetchsign-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-fetchsign-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let op = write_fake_op(&dir, "tok-xyz", &pem);
 
@@ -1261,7 +1261,7 @@ mod tests {
         let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
             .unwrap();
         let pem = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
-        let dir = std::env::temp_dir().join(format!("latch-fetchsign-bad-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-fetchsign-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let op = write_fake_op(&dir, "the-right-token", &pem);
         // A wrong token makes the fake op exit 1; we must get None, not a panic.
@@ -1359,7 +1359,7 @@ mod tests {
         }
 
         let backend = std::sync::Arc::new(FakeBackend::new(true));
-        let dir = std::env::temp_dir().join(format!("latch-sshadd-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-sshadd-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock_path = dir.join("agent.sock");
         let listener = UnixListener::bind(&sock_path).unwrap();
@@ -1392,7 +1392,7 @@ mod tests {
             "ssh-add -l should list our key fingerprint.\nwant contains: {want}\ngot: {stdout}\nstderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(stdout.contains("tom@latch-test"), "and its comment");
+        assert!(stdout.contains("tom@sigil-test"), "and its comment");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1418,7 +1418,7 @@ mod tests {
         // The second reference signer: sign from a local OpenSSH key file, no
         // 1Password, no account credential.
         let (key, id) = gen_identity("/does/not/matter");
-        let dir = std::env::temp_dir().join(format!("latch-filesign-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-filesign-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("id_ed25519");
         std::fs::write(&path, key.to_openssh(ssh_key::LineEnding::LF).unwrap()).unwrap();
@@ -1444,7 +1444,7 @@ mod tests {
         // token, then sign. Proves the same seam the file signer implements.
         let (key, id) = gen_identity("op://Engineering/Seam/private key");
         let pem = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
-        let dir = std::env::temp_dir().join(format!("latch-opsign-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-opsign-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let op = write_fake_op(&dir, "tok-xyz", &pem);
 
@@ -1493,7 +1493,7 @@ mod tests {
     /// daemon would, verify the signature against the item's real public key, and
     /// delete the item. Ignored by default (needs `OP_SERVICE_ACCOUNT_TOKEN` and
     /// network); run with:
-    ///   OP_SERVICE_ACCOUNT_TOKEN=… cargo test -p latch fetch_and_sign_live_op -- --ignored --nocapture
+    ///   OP_SERVICE_ACCOUNT_TOKEN=… cargo test -p sigil fetch_and_sign_live_op -- --ignored --nocapture
     #[test]
     #[ignore = "needs a live OP_SERVICE_ACCOUNT_TOKEN and network"]
     fn fetch_and_sign_live_op() {
@@ -1505,7 +1505,7 @@ mod tests {
         };
         let op = crate::paths::find_real_op().expect("a real op on PATH");
         let vault = "Engineering";
-        let title = format!("latch-agent-livetest-{}-DELETE-ME", std::process::id());
+        let title = format!("sigil-agent-livetest-{}-DELETE-ME", std::process::id());
 
         // Create the throwaway key and arrange for its deletion no matter what.
         let created = Command::new(&op)

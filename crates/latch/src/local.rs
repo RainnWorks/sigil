@@ -1,11 +1,11 @@
-//! The local unix-socket protocol between the `op` shim, the `latch` CLI, and
+//! The local unix-socket protocol between the `op` shim, the `sigil` CLI, and
 //! the daemon.
 //!
 //! This is deliberately *not* the end-to-end envelope layer: it is a trusted,
 //! same-machine, same-user channel (the socket is 0600). It carries two kinds
 //! of traffic, distinguished by a tagged [`Frame`]:
 //!
-//! * a **run request** from the shim / `latch <cmd>` primitive, which also passes
+//! * a **run request** from the shim / `sigil <cmd>` primitive, which also passes
 //!   the caller's own stdout/stderr file descriptors over SCM_RIGHTS, so the
 //!   underlying tool's child writes secrets straight to the caller's terminal or
 //!   pipe and the daemon never sees output; and
@@ -23,29 +23,29 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Where the daemon listens. `LATCH_SOCK` overrides; otherwise it is
-/// `$TMPDIR/latch/daemon.sock` (falling back to `/tmp`).
+/// Where the daemon listens. `SIGIL_SOCK` overrides; otherwise it is
+/// `$TMPDIR/sigil/daemon.sock` (falling back to `/tmp`).
 pub fn socket_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("LATCH_SOCK") {
+    if let Some(p) = std::env::var_os("SIGIL_SOCK") {
         return PathBuf::from(p);
     }
     let base = std::env::var_os("TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("latch").join("daemon.sock")
+    base.join("sigil").join("daemon.sock")
 }
 
 /// A request frame from a client. Tagged so op traffic and the control protocol
 /// share one socket unambiguously.
 ///
 /// This is the daemon control protocol — the single machine interface the Mac
-/// app speaks directly and the human CLI renders (see `crates/latch/PROTOCOL.md`).
+/// app speaks directly and the human CLI renders (see `crates/sigil/PROTOCOL.md`).
 /// It splits into three groups: read/report queries that return a
 /// [`Reply::Json`] body (`Status`, `Doctor`, `LeaseList`, `Pending`, `History`),
 /// runtime-control commands that return a [`Reply::Control`] result (`Lockdown`,
 /// `LeaseRevoke`, `Approve`, `Deny`), and the [`Frame::SubscribePending`] stream
 /// that emits a [`Reply::Event`] per pending-set change. The `Run` variant is the
-/// shim / `latch <cmd>` separate SCM_RIGHTS secret path and is untouched by the
+/// shim / `sigil <cmd>` separate SCM_RIGHTS secret path and is untouched by the
 /// control surface. Keystore/config *mutations* (account add/rotate/remove,
 /// command config, settings, wipe, mac-approvals, shim install, pairing) are
 /// deliberately NOT here: they stay short-lived CLI operations so a compromised
@@ -59,7 +59,7 @@ pub enum Frame {
     /// up the command config, gates it, injects the provider's environment, and
     /// runs it with those descriptors spliced to the child — it never reads them.
     ///
-    /// `proxy_depth` is the caller's `LATCH_PROXY_DEPTH` (0 when unset), carried so
+    /// `proxy_depth` is the caller's `SIGIL_PROXY_DEPTH` (0 when unset), carried so
     /// the daemon can spawn the tool child at depth+1 and fail closed past the
     /// proxy recursion limit — the daemon has no other view of the caller's depth.
     Run {

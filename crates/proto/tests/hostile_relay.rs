@@ -1,4 +1,4 @@
-//! The hostile-relay proof suite: Latch's trust argument, executed.
+//! The hostile-relay proof suite: Sigil's trust argument, executed.
 //!
 //! The relay (and every network hop) is assumed fully malicious. It sees every
 //! [`Envelope`], can store, reorder, drop, duplicate, mutate, or manufacture
@@ -8,7 +8,7 @@
 //! relay simply cannot read the payload. If any assertion here regresses, the
 //! product's core promise is broken.
 
-use latch_proto::{
+use sigil_proto::{
     DeviceIdentity, Envelope, OpenError, PeerIdentity, PushRegister, ReplayError, ReplayGuard,
     ToDaemonMessage, REPLAY_WINDOW_MS,
 };

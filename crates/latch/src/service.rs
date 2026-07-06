@@ -3,10 +3,10 @@
 //!
 //! The daemon must be up whenever Tom is, and must restart itself if it crashes,
 //! without a terminal babysitting it. That is a per-user launchd LaunchAgent
-//! (`~/Library/LaunchAgents/co.rowm.latch.plist`): `RunAtLoad` starts it at
+//! (`~/Library/LaunchAgents/works.rainn.sigil.plist`): `RunAtLoad` starts it at
 //! login, `KeepAlive { Crashed }` respawns it after a crash but leaves it down
-//! after a clean `latch stop`. The plist's `EnvironmentVariables` also pins a
-//! `PATH` with `~/.latch/bin` first, so a tool a GUI app launches (which does
+//! after a clean `sigil stop`. The plist's `EnvironmentVariables` also pins a
+//! `PATH` with `~/.sigil/bin` first, so a tool a GUI app launches (which does
 //! not read the shell profile) still resolves the shim ahead of the real `op`.
 //!
 //! Plist generation and the socket-length check are pure and unit-tested. The
@@ -20,14 +20,14 @@ use anyhow::{Context, Result};
 use crate::paths;
 
 /// The LaunchAgent label. Also the launchd service name under `gui/<uid>`.
-pub const LABEL: &str = "co.rowm.latch";
+pub const LABEL: &str = "works.rainn.sigil";
 
 /// macOS `sun_path` capacity. A unix socket path at or above this length is
 /// silently truncated by `bind(2)`, so the daemon and clients would disagree.
 const SUN_PATH_MAX: usize = 104;
 
 /// Directories a GUI-launched tool must search to find both the shim (first)
-/// and a real `op` (Homebrew, system). Prepended with `~/.latch/bin`.
+/// and a real `op` (Homebrew, system). Prepended with `~/.sigil/bin`.
 const BASE_PATH_DIRS: &[&str] = &[
     "/opt/homebrew/bin",
     "/usr/local/bin",
@@ -38,21 +38,21 @@ const BASE_PATH_DIRS: &[&str] = &[
 ];
 
 /// Build the `PATH` value for the plist: the shim dir first, then the standard
-/// tool locations. `shim_dir` is `~/.latch/bin`.
+/// tool locations. `shim_dir` is `~/.sigil/bin`.
 fn plist_path_value(shim_dir: &Path) -> String {
     let mut parts = vec![shim_dir.display().to_string()];
     parts.extend(BASE_PATH_DIRS.iter().map(|s| s.to_string()));
     parts.join(":")
 }
 
-/// Render the LaunchAgent plist for a daemon at `latch_bin`, logging into
+/// Render the LaunchAgent plist for a daemon at `sigil_bin`, logging into
 /// `logs_dir`, with the shim `PATH` rooted at `shim_dir`.
 ///
 /// Pure and deterministic so it can be unit-tested and diffed. `RunAtLoad`
 /// starts the daemon immediately; `KeepAlive.Crashed` respawns after a crash but
-/// not after a clean exit, so `latch stop` (a bootout) stays stopped.
-pub fn render_plist(latch_bin: &Path, logs_dir: &Path, shim_dir: &Path) -> String {
-    let program = latch_bin.display();
+/// not after a clean exit, so `sigil stop` (a bootout) stays stopped.
+pub fn render_plist(sigil_bin: &Path, logs_dir: &Path, shim_dir: &Path) -> String {
+    let program = sigil_bin.display();
     let out_log = logs_dir.join("daemon.out.log");
     let err_log = logs_dir.join("daemon.err.log");
     let path_value = plist_path_value(shim_dir);
@@ -96,12 +96,12 @@ pub fn render_plist(latch_bin: &Path, logs_dir: &Path, shim_dir: &Path) -> Strin
     )
 }
 
-/// Write the plist to `~/Library/LaunchAgents/co.rowm.latch.plist`, creating the
+/// Write the plist to `~/Library/LaunchAgents/works.rainn.sigil.plist`, creating the
 /// logs dir. Returns the plist path. Does not (un)load it; that is [`bootstrap`].
 pub fn install_plist() -> Result<PathBuf> {
-    let latch_bin = std::env::current_exe()
+    let sigil_bin = std::env::current_exe()
         .and_then(|p| p.canonicalize())
-        .context("resolving the latch binary path")?;
+        .context("resolving the sigil binary path")?;
     let logs = paths::logs_dir().context("HOME is not set")?;
     let shim_dir = paths::shim_bin_dir().context("HOME is not set")?;
     std::fs::create_dir_all(&logs).with_context(|| format!("creating {}", logs.display()))?;
@@ -110,7 +110,7 @@ pub fn install_plist() -> Result<PathBuf> {
     if let Some(dir) = plist_path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let body = render_plist(&latch_bin, &logs, &shim_dir);
+    let body = render_plist(&sigil_bin, &logs, &shim_dir);
     std::fs::write(&plist_path, body)
         .with_context(|| format!("writing {}", plist_path.display()))?;
     Ok(plist_path)
@@ -128,21 +128,21 @@ fn gui_domain() -> String {
 /// fatal.
 ///
 /// NEEDS VERIFICATION (Mac runtime): confirm with
-///   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/co.rowm.latch.plist
-///   launchctl print gui/$(id -u)/co.rowm.latch
+///   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/works.rainn.sigil.plist
+///   launchctl print gui/$(id -u)/works.rainn.sigil
 pub fn bootstrap(plist: &Path) -> Result<()> {
     run_launchctl(&["bootstrap", &gui_domain(), &plist.display().to_string()])
 }
 
 /// Unload the agent (`launchctl bootout`). A "not loaded" result is not an
-/// error. NEEDS VERIFICATION: `launchctl bootout gui/$(id -u)/co.rowm.latch`.
+/// error. NEEDS VERIFICATION: `launchctl bootout gui/$(id -u)/works.rainn.sigil`.
 pub fn bootout() -> Result<()> {
     let target = format!("{}/{LABEL}", gui_domain());
     run_launchctl(&["bootout", &target])
 }
 
 /// Restart the running daemon in place (`launchctl kickstart -k`). NEEDS
-/// VERIFICATION: `launchctl kickstart -k gui/$(id -u)/co.rowm.latch`.
+/// VERIFICATION: `launchctl kickstart -k gui/$(id -u)/works.rainn.sigil`.
 pub fn kickstart() -> Result<()> {
     let target = format!("{}/{LABEL}", gui_domain());
     run_launchctl(&["kickstart", "-k", &target])
@@ -227,26 +227,26 @@ mod tests {
     #[test]
     fn plist_has_the_reliability_keys_and_shim_first_path() {
         let plist = render_plist(
-            Path::new("/Users/tom/.cargo/bin/latch"),
-            Path::new("/Users/tom/.latch/logs"),
-            Path::new("/Users/tom/.latch/bin"),
+            Path::new("/Users/tom/.cargo/bin/sigil"),
+            Path::new("/Users/tom/.sigil/logs"),
+            Path::new("/Users/tom/.sigil/bin"),
         );
-        assert!(plist.contains("<string>co.rowm.latch</string>"));
-        assert!(plist.contains("<string>/Users/tom/.cargo/bin/latch</string>"));
+        assert!(plist.contains("<string>works.rainn.sigil</string>"));
+        assert!(plist.contains("<string>/Users/tom/.cargo/bin/sigil</string>"));
         assert!(plist.contains("<string>daemon</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
         assert!(plist.contains("<key>KeepAlive</key>"));
         assert!(plist.contains("<key>Crashed</key>"));
         // The shim dir must be the FIRST PATH entry so it wins over a real op.
-        assert!(plist.contains("<string>/Users/tom/.latch/bin:/opt/homebrew/bin"));
+        assert!(plist.contains("<string>/Users/tom/.sigil/bin:/opt/homebrew/bin"));
         assert!(plist.contains("daemon.out.log"));
         assert!(plist.contains("daemon.err.log"));
     }
 
     #[test]
     fn path_value_puts_the_shim_dir_first() {
-        let p = plist_path_value(Path::new("/home/x/.latch/bin"));
-        assert!(p.starts_with("/home/x/.latch/bin:"));
+        let p = plist_path_value(Path::new("/home/x/.sigil/bin"));
+        assert!(p.starts_with("/home/x/.sigil/bin:"));
         assert!(p.contains("/usr/bin"));
     }
 
@@ -260,12 +260,12 @@ mod tests {
 
     #[test]
     fn socket_length_check_passes_for_a_short_path() {
-        assert!(path_fits(Path::new("/tmp/latch/d.sock")).is_ok());
+        assert!(path_fits(Path::new("/tmp/sigil/d.sock")).is_ok());
     }
 
     #[test]
     fn log_rotation_moves_an_oversized_file() {
-        let dir = std::env::temp_dir().join(format!("latch-logrot-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-logrot-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("daemon.err.log");
         std::fs::write(&f, vec![b'x'; 100]).unwrap();

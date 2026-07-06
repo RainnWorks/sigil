@@ -2,7 +2,7 @@
 //! commands.
 //!
 //! These are the payload shapes the Mac app decodes. They serve two surfaces
-//! (see the least-privilege split in `crates/latch/PROTOCOL.md`):
+//! (see the least-privilege split in `crates/sigil/PROTOCOL.md`):
 //!
 //! * the **daemon control socket** carries the read/report shapes as
 //!   [`Reply::Json`](crate::local::Reply)/[`Reply::Event`](crate::local::Reply)
@@ -13,7 +13,7 @@
 //!   [`PairListJson`]/[`PairedJson`], and [`ControlResult`].
 //!
 //! Field names, nesting, and value spellings match the Swift decoder in
-//! `apps/mac/Latch/Model/DaemonClient.swift` field-for-field. `PROTOCOL.md`
+//! `apps/mac/Sigil/Model/DaemonClient.swift` field-for-field. `PROTOCOL.md`
 //! (socket) and `JSON.md` (CLI mutations) are the human indices; keep them in
 //! sync with this file. Enum-like fields are plain `String` so the exact wire
 //! spelling is explicit here; [`request_kind_str`] and [`risk_str`] map the
@@ -107,7 +107,7 @@ pub struct AccountJson {
 }
 
 // The rule/source config JSON is the serialized `crate::config` domain types
-// (`Config`, `Source`, `Rule`), emitted directly by `latch-config export` and
+// (`Config`, `Source`, `Rule`), emitted directly by `sigil-config export` and
 // the `--json` config verbs; there is no separate DTO here.
 
 // --- leases ----------------------------------------------------------------
@@ -225,10 +225,10 @@ pub struct MacApprovalsJson {
 
 // --- helpers ---------------------------------------------------------------
 
-/// The snake_case wire spelling of a [`RequestKind`](latch_proto::RequestKind),
+/// The snake_case wire spelling of a [`RequestKind`](sigil_proto::RequestKind),
 /// matching the phone/Swift `RequestKind` raw values.
-pub fn request_kind_str(kind: latch_proto::RequestKind) -> &'static str {
-    use latch_proto::RequestKind::*;
+pub fn request_kind_str(kind: sigil_proto::RequestKind) -> &'static str {
+    use sigil_proto::RequestKind::*;
     match kind {
         SecretRead => "secret_read",
         SshSignature => "ssh_signature",
@@ -237,9 +237,9 @@ pub fn request_kind_str(kind: latch_proto::RequestKind) -> &'static str {
     }
 }
 
-/// The lowercase wire spelling of a [`RiskLevel`](latch_proto::RiskLevel).
-pub fn risk_str(risk: latch_proto::RiskLevel) -> &'static str {
-    use latch_proto::RiskLevel::*;
+/// The lowercase wire spelling of a [`RiskLevel`](sigil_proto::RiskLevel).
+pub fn risk_str(risk: sigil_proto::RiskLevel) -> &'static str {
+    use sigil_proto::RiskLevel::*;
     match risk {
         Routine => "routine",
         Elevated => "elevated",
@@ -291,15 +291,15 @@ mod tests {
     #[test]
     fn request_kind_spellings_match_the_contract() {
         assert_eq!(
-            request_kind_str(latch_proto::RequestKind::SecretRead),
+            request_kind_str(sigil_proto::RequestKind::SecretRead),
             "secret_read"
         );
         assert_eq!(
-            request_kind_str(latch_proto::RequestKind::SshSignature),
+            request_kind_str(sigil_proto::RequestKind::SshSignature),
             "ssh_signature"
         );
         assert_eq!(
-            request_kind_str(latch_proto::RequestKind::LockdownClear),
+            request_kind_str(sigil_proto::RequestKind::LockdownClear),
             "lockdown_clear"
         );
     }
@@ -317,7 +317,7 @@ mod tests {
     fn status_json_carries_the_contract_fields() {
         let s = StatusJson {
             daemon_up: true,
-            socket: "/tmp/latch/daemon.sock".into(),
+            socket: "/tmp/sigil/daemon.sock".into(),
             shim: ShimJson {
                 kind: "healthy".into(),
                 path: Some("/x/op".into()),

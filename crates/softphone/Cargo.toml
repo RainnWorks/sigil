@@ -1,22 +1,22 @@
 [package]
-name = "latch-softphone"
+name = "sigil-softphone"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Headless reference approver: the phone side of the Latch protocol, as a library and CLI"
+description = "Headless reference approver: the phone side of the Sigil protocol, as a library and CLI"
 
 # The library holds the approver logic (pairing consumption, request open,
 # policy, response seal) so both the CLI and the daemon's e2e test drive it.
 [lib]
-name = "latch_softphone"
+name = "sigil_softphone"
 path = "src/lib.rs"
 
 [[bin]]
-name = "latch-softphone"
+name = "sigil-softphone"
 path = "src/main.rs"
 
 [dependencies]
-latch-proto = { path = "../proto" }
+sigil-proto = { path = "../proto" }
 # thiserror: typed library errors across the proto seams (pairing, envelope,
 # transport). anyhow only at the binary edge, per house rules.
 thiserror.workspace = true

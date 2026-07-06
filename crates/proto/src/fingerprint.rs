@@ -11,8 +11,8 @@ use blake2::{Blake2b512, Digest};
 
 use crate::identity::PeerIdentity;
 
-const FINGERPRINT_DOMAIN: &[u8] = b"latch.fingerprint.v1";
-const MAILBOX_DOMAIN: &[u8] = b"latch.mailbox.v1";
+const FINGERPRINT_DOMAIN: &[u8] = b"sigil.fingerprint.v1";
+const MAILBOX_DOMAIN: &[u8] = b"sigil.mailbox.v1";
 
 /// Six short, phonetically distinct English words with harbor flavour. The
 /// list is exactly 256 entries so each output byte maps to one word.

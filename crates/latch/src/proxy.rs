@@ -1,15 +1,15 @@
-//! The auto-aliasing proxy: the Latch-managed shim directory, PATH durability,
+//! The auto-aliasing proxy: the Sigil-managed shim directory, PATH durability,
 //! per-command drift detection, and the recursion fuse.
 //!
 //! A caller that cannot be modified (an AI agent, a launcher shelling out to a
-//! bare `op`, `git` reaching the SSH agent) hits Latch transparently: the proxy
-//! directory `~/.latch/bin` sits first on `PATH` and holds one symlink alias per
+//! bare `op`, `git` reaching the SSH agent) hits Sigil transparently: the proxy
+//! directory `~/.sigil/bin` sits first on `PATH` and holds one symlink alias per
 //! intercepted command, each pointing at the multicall binary. Running `op`
-//! resolves the alias, which re-enters as `latch op ...` (see `main.rs` /
+//! resolves the alias, which re-enters as `sigil op ...` (see `main.rs` /
 //! `shim::dispatch`), gates on the phone, and execs the *real* `op`. The caller
-//! sees `op` behaving normally and never learns Latch is there.
+//! sees `op` behaving normally and never learns Sigil is there.
 //!
-//! This module is the management + diagnosis layer behind `latch proxy
+//! This module is the management + diagnosis layer behind `sigil proxy
 //! add|remove|list|status|doctor|env`. The individual alias install/removal
 //! reuses [`crate::setup::install_shim_for`] and [`crate::paths`]; what lives
 //! here is the generality the `op`-specific helpers lack: per-command drift
@@ -24,14 +24,14 @@ use crate::paths;
 
 /// The inherited depth counter that fuses a resolution-bug fork-bomb into a
 /// bounded, fail-closed error. Read at alias dispatch entry; set to `n+1` on the
-/// process Latch execs next. See `docs/design/proxy-aliasing.md` problem 1(b).
+/// process Sigil execs next. See `docs/design/proxy-aliasing.md` problem 1(b).
 ///
 /// This is a liveness fuse, never the recursion *mechanism*: correctness rests
 /// on [`paths::find_real`] excluding our own aliases. The fuse only guarantees a
 /// bug there loops finitely rather than forever.
-pub const DEPTH_ENV: &str = "LATCH_PROXY_DEPTH";
+pub const DEPTH_ENV: &str = "SIGIL_PROXY_DEPTH";
 
-/// The depth past which Latch aborts a proxy dispatch. Legitimate nesting (a
+/// The depth past which Sigil aborts a proxy dispatch. Legitimate nesting (a
 /// gated tool invoking another gated tool) is realistically < 5 deep; a
 /// resolution bug reaches this in milliseconds.
 pub const MAX_DEPTH: u32 = 40;
@@ -46,36 +46,36 @@ pub fn current_depth() -> u32 {
 }
 
 /// Whether the depth fuse has blown: this dispatch is at or past [`MAX_DEPTH`],
-/// so Latch must fail closed rather than exec another layer.
+/// so Sigil must fail closed rather than exec another layer.
 pub fn depth_exceeded() -> bool {
     current_depth() >= MAX_DEPTH
 }
 
-/// The value to set [`DEPTH_ENV`] to on the process Latch execs next: the current
+/// The value to set [`DEPTH_ENV`] to on the process Sigil execs next: the current
 /// depth plus one, saturating so it can never wrap.
 pub fn next_depth_value() -> String {
     current_depth().saturating_add(1).to_string()
 }
 
-/// The path a proxy alias should point at: the `latch` **runtime** binary that
+/// The path a proxy alias should point at: the `sigil` **runtime** binary that
 /// serves the gating hot path. Every alias is a symlink to it, so canonical
 /// equality against this both excludes aliases from real-binary resolution and
 /// tells drift detection that an alias is current.
 ///
-/// The runtime binary is named `latch` and installed as a sibling of
-/// `latch-config` in the same directory (post-split convention). So we resolve
-/// the sibling `latch` next to the running binary: in the manager
-/// (`latch-config`) that is the runtime; in the runtime itself it is the running
-/// binary. An alias installed by `latch-config` must exec the runtime, never the
+/// The runtime binary is named `sigil` and installed as a sibling of
+/// `sigil-config` in the same directory (post-split convention). So we resolve
+/// the sibling `sigil` next to the running binary: in the manager
+/// (`sigil-config`) that is the runtime; in the runtime itself it is the running
+/// binary. An alias installed by `sigil-config` must exec the runtime, never the
 /// manager, which is why this is not simply `current_exe`. Centralised so the
 /// convention lives in one function.
 ///
-/// `None` when the sibling `latch` cannot be resolved (e.g. an unusual layout);
+/// `None` when the sibling `sigil` cannot be resolved (e.g. an unusual layout);
 /// callers fail closed with a clear error rather than pointing an alias at the
 /// wrong binary.
 pub fn alias_target() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
-    let sibling = exe.parent()?.join("latch");
+    let sibling = exe.parent()?.join("sigil");
     sibling.canonicalize().ok()
 }
 
@@ -89,7 +89,7 @@ fn is_executable(p: &Path) -> bool {
 }
 
 /// Per-command health of the proxy install, generalising the `op`-specific
-/// `paths::ShimStatus` to any intercepted command for `latch proxy doctor`.
+/// `paths::ShimStatus` to any intercepted command for `sigil proxy doctor`.
 ///
 /// The security-relevant drift is `first_on_path == false`: a real `<cmd>`
 /// preceding the alias routes an intercepted command **ungated**.
@@ -97,7 +97,7 @@ fn is_executable(p: &Path) -> bool {
 pub struct ProxyStatus {
     /// The command this status is about.
     pub cmd: String,
-    /// `~/.latch/bin/<cmd>` exists as a symlink.
+    /// `~/.sigil/bin/<cmd>` exists as a symlink.
     pub installed: bool,
     /// The proxy dir is present somewhere on `PATH`.
     pub dir_on_path: bool,
@@ -193,13 +193,13 @@ impl ProxyStatus {
         let cmd = &self.cmd;
         if !self.installed {
             return Some(format!(
-                "no proxy alias for {cmd} (run: latch-config proxy add {cmd})"
+                "no proxy alias for {cmd} (run: sigil-config proxy add {cmd})"
             ));
         }
         if !self.first_on_path {
             if !self.dir_on_path {
                 return Some(
-                    "~/.latch/bin is not on PATH (run: latch-config proxy env, then re-source)"
+                    "~/.sigil/bin is not on PATH (run: sigil-config proxy env, then re-source)"
                         .into(),
                 );
             }
@@ -210,10 +210,10 @@ impl ProxyStatus {
         if !self.resolves_to_current {
             return Some(match &self.link_target {
                 Some(t) => format!(
-                    "the {cmd} alias points at a stale binary ({}); re-run: latch-config proxy add {cmd}",
+                    "the {cmd} alias points at a stale binary ({}); re-run: sigil-config proxy add {cmd}",
                     t.display()
                 ),
-                None => format!("the {cmd} alias is broken; re-run: latch-config proxy add {cmd}"),
+                None => format!("the {cmd} alias is broken; re-run: sigil-config proxy add {cmd}"),
             });
         }
         None
@@ -234,7 +234,7 @@ pub struct Alias {
     pub gated: bool,
 }
 
-/// Every installed proxy alias: the entries of `~/.latch/bin` that are symlinks
+/// Every installed proxy alias: the entries of `~/.sigil/bin` that are symlinks
 /// to this binary. Sorted by command for stable output. `Ok(vec![])` when the
 /// proxy dir does not exist yet.
 pub fn list_aliases() -> std::io::Result<Vec<Alias>> {
@@ -254,7 +254,7 @@ pub fn list_aliases() -> std::io::Result<Vec<Alias>> {
     let mut aliases = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        // Only symlinks that resolve to our own binary are Latch aliases.
+        // Only symlinks that resolve to our own binary are Sigil aliases.
         if path
             .symlink_metadata()
             .map(|m| !m.file_type().is_symlink())
@@ -283,7 +283,7 @@ pub fn list_aliases() -> std::io::Result<Vec<Alias>> {
     Ok(aliases)
 }
 
-/// A shell whose PATH-prepend syntax Latch knows how to emit.
+/// A shell whose PATH-prepend syntax Sigil knows how to emit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shell {
     /// zsh, bash, and POSIX `sh` all share `export PATH=...`.
@@ -327,17 +327,17 @@ impl Shell {
 /// absolute path) so it stays portable across machines and users.
 pub fn env_line(shell: Shell) -> String {
     match shell {
-        Shell::Posix => "export PATH=\"$HOME/.latch/bin:$PATH\"".to_string(),
-        Shell::Fish => "fish_add_path --prepend $HOME/.latch/bin".to_string(),
+        Shell::Posix => "export PATH=\"$HOME/.sigil/bin:$PATH\"".to_string(),
+        Shell::Fish => "fish_add_path --prepend $HOME/.sigil/bin".to_string(),
         Shell::Nushell => {
-            "$env.PATH = ($env.PATH | prepend $\"($env.HOME)/.latch/bin\")".to_string()
+            "$env.PATH = ($env.PATH | prepend $\"($env.HOME)/.sigil/bin\")".to_string()
         }
     }
 }
 
 /// The current shell's primary startup file plus the [`Shell`] whose prepend
-/// syntax it uses, chosen from `$SHELL`. `latch-config proxy add` edits this one
-/// file (conservative, like `latch setup`) and points at the env line + the
+/// syntax it uses, chosen from `$SHELL`. `sigil-config proxy add` edits this one
+/// file (conservative, like `sigil setup`) and points at the env line + the
 /// agent-env story for anything else. `None` only if `$HOME` is unset.
 pub fn primary_rc_file() -> Option<(PathBuf, Shell)> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
@@ -379,18 +379,18 @@ pub fn rc_files_for(shell: Shell, home: &Path) -> Vec<PathBuf> {
     }
 }
 
-/// The marker that brackets Latch's managed block, so edits target exactly our
+/// The marker that brackets Sigil's managed block, so edits target exactly our
 /// own lines and never duplicate them. Kept byte-compatible with the legacy
-/// `setup.rs` block via the `.latch/bin` idempotency check below.
-const BLOCK_START: &str = "# >>> latch proxy (managed) >>>";
-const BLOCK_END: &str = "# <<< latch proxy (managed) <<<";
+/// `setup.rs` block via the `.sigil/bin` idempotency check below.
+const BLOCK_START: &str = "# >>> sigil proxy (managed) >>>";
+const BLOCK_END: &str = "# <<< sigil proxy (managed) <<<";
 
 /// True if `contents` already puts the proxy dir on `PATH`: our managed block,
 /// the legacy `setup.rs` block, or a hand-written line. Prevents a duplicate
-/// append. Matching the bare `.latch/bin` substring keeps us from fighting the
-/// older `# >>> latch shim (managed) >>>` block.
+/// append. Matching the bare `.sigil/bin` substring keeps us from fighting the
+/// older `# >>> sigil shim (managed) >>>` block.
 fn block_present(contents: &str) -> bool {
-    contents.contains(BLOCK_START) || contents.contains(".latch/bin")
+    contents.contains(BLOCK_START) || contents.contains(".sigil/bin")
 }
 
 /// The managed block for `shell`.
@@ -425,7 +425,7 @@ pub fn ensure_path_in(file: &Path, shell: Shell) -> std::io::Result<bool> {
 
 /// Strip our own managed block from `contents`, returning the new text if it
 /// changed. Only our `BLOCK_START..BLOCK_END` block is removed; a hand-written
-/// `.latch/bin` line or the legacy `# >>> latch shim (managed) >>>` block is
+/// `.sigil/bin` line or the legacy `# >>> sigil shim (managed) >>>` block is
 /// left alone, because we cannot know the user did not add those deliberately.
 fn strip_block(contents: &str) -> Option<String> {
     let start = contents.find(BLOCK_START)?;
@@ -476,15 +476,15 @@ fn install_alias_in(dir: &Path, target: &Path, cmd: &str) -> std::io::Result<Pat
     Ok(link)
 }
 
-/// Install a transparent proxy alias for `cmd` in `~/.latch/bin`, pointing at the
-/// [`alias_target`] (the `latch` runtime binary). Returns `(link, target)`. This
-/// is what `latch-config proxy add` calls; the caller is responsible for the
+/// Install a transparent proxy alias for `cmd` in `~/.sigil/bin`, pointing at the
+/// [`alias_target`] (the `sigil` runtime binary). Returns `(link, target)`. This
+/// is what `sigil-config proxy add` calls; the caller is responsible for the
 /// PATH edit ([`ensure_path_in`]) and the gating-rule coverage warning.
 pub fn install_alias(cmd: &str) -> std::io::Result<(PathBuf, PathBuf)> {
     let dir = paths::shim_bin_dir()
-        .ok_or_else(|| std::io::Error::other("HOME is not set; cannot locate ~/.latch/bin"))?;
+        .ok_or_else(|| std::io::Error::other("HOME is not set; cannot locate ~/.sigil/bin"))?;
     let target = alias_target()
-        .ok_or_else(|| std::io::Error::other("cannot resolve the latch runtime binary path"))?;
+        .ok_or_else(|| std::io::Error::other("cannot resolve the sigil runtime binary path"))?;
     let link = install_alias_in(&dir, &target, cmd)?;
     Ok((link, target))
 }
@@ -515,7 +515,7 @@ fn remove_alias_in(dir: &Path, target: Option<&Path>, cmd: &str) -> std::io::Res
     Ok(false)
 }
 
-/// Remove the proxy alias for `cmd` from `~/.latch/bin`, if present and ours.
+/// Remove the proxy alias for `cmd` from `~/.sigil/bin`, if present and ours.
 /// Returns whether one was removed. Never touches the real binary.
 pub fn remove_alias(cmd: &str) -> std::io::Result<bool> {
     let Some(dir) = paths::shim_bin_dir() else {
@@ -531,7 +531,7 @@ mod tests {
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
-            "latch-proxy-{tag}-{}-{:?}",
+            "sigil-proxy-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -560,7 +560,7 @@ mod tests {
         exe_in(&real_dir, "gcloud");
         std::fs::create_dir_all(&shim_dir).unwrap();
 
-        let current = exe_in(&root, "latch-bin");
+        let current = exe_in(&root, "sigil-bin");
         let own = current.canonicalize().unwrap();
         std::os::unix::fs::symlink(&own, shim_dir.join("gcloud")).unwrap();
 
@@ -581,7 +581,7 @@ mod tests {
         let real_dir = root.join("realbin");
         exe_in(&real_dir, "op");
         std::fs::create_dir_all(&shim_dir).unwrap();
-        let current = exe_in(&root, "latch-bin");
+        let current = exe_in(&root, "sigil-bin");
         let own = current.canonicalize().unwrap();
         std::os::unix::fs::symlink(&own, shim_dir.join("op")).unwrap();
 
@@ -603,7 +603,7 @@ mod tests {
         let root = tmp("stray");
         let shim_dir = root.join("shimbin");
         std::fs::create_dir_all(&shim_dir).unwrap();
-        let current = exe_in(&root, "latch-bin");
+        let current = exe_in(&root, "sigil-bin");
         let own = current.canonicalize().unwrap();
         std::os::unix::fs::symlink(&own, shim_dir.join("op")).unwrap();
 
@@ -642,8 +642,8 @@ mod tests {
 
     #[test]
     fn env_line_per_shell() {
-        assert!(env_line(Shell::Posix).contains("export PATH=\"$HOME/.latch/bin:$PATH\""));
-        assert!(env_line(Shell::Fish).contains("fish_add_path --prepend $HOME/.latch/bin"));
+        assert!(env_line(Shell::Posix).contains("export PATH=\"$HOME/.sigil/bin:$PATH\""));
+        assert!(env_line(Shell::Fish).contains("fish_add_path --prepend $HOME/.sigil/bin"));
         assert!(env_line(Shell::Nushell).contains("prepend"));
     }
 
@@ -667,13 +667,13 @@ mod tests {
         assert!(ensure_path_in(&cfg, Shell::Fish).unwrap());
         assert!(cfg.exists());
         let body = std::fs::read_to_string(&cfg).unwrap();
-        assert!(body.contains("fish_add_path --prepend $HOME/.latch/bin"));
+        assert!(body.contains("fish_add_path --prepend $HOME/.sigil/bin"));
         // Second run is a no-op.
         assert!(!ensure_path_in(&cfg, Shell::Fish).unwrap());
         assert_eq!(
             std::fs::read_to_string(&cfg)
                 .unwrap()
-                .matches(".latch/bin")
+                .matches(".sigil/bin")
                 .count(),
             1
         );
@@ -682,13 +682,13 @@ mod tests {
 
     #[test]
     fn path_edit_defers_to_a_legacy_shim_block() {
-        // The older setup.rs block uses the same `.latch/bin` line; we must not
+        // The older setup.rs block uses the same `.sigil/bin` line; we must not
         // append a second block over it.
         let dir = tmp("legacy");
         let rc = dir.join(".zshrc");
         std::fs::write(
             &rc,
-            "# >>> latch shim (managed) >>>\nexport PATH=\"$HOME/.latch/bin:$PATH\"\n# <<< latch shim (managed) <<<\n",
+            "# >>> sigil shim (managed) >>>\nexport PATH=\"$HOME/.sigil/bin:$PATH\"\n# <<< sigil shim (managed) <<<\n",
         )
         .unwrap();
         assert!(!ensure_path_in(&rc, Shell::Posix).unwrap());
@@ -714,12 +714,12 @@ mod tests {
         let stripped = strip_block(&rc).expect("our block is present");
         assert!(stripped.contains("export EDITOR=vim"));
         assert!(stripped.contains("alias ll='ls -l'"));
-        assert!(!stripped.contains(".latch/bin"), "our line is gone");
+        assert!(!stripped.contains(".sigil/bin"), "our line is gone");
         assert!(!stripped.contains(BLOCK_START));
         // A file without our block is unchanged (None).
         assert!(strip_block("export EDITOR=vim\n").is_none());
         // The legacy shim block is NOT ours to strip.
-        let legacy = "# >>> latch shim (managed) >>>\nexport PATH=\"$HOME/.latch/bin:$PATH\"\n# <<< latch shim (managed) <<<\n";
+        let legacy = "# >>> sigil shim (managed) >>>\nexport PATH=\"$HOME/.sigil/bin:$PATH\"\n# <<< sigil shim (managed) <<<\n";
         assert!(strip_block(legacy).is_none());
     }
 
@@ -727,7 +727,7 @@ mod tests {
     fn install_then_remove_alias_round_trips_and_spares_real_binaries() {
         let root = tmp("install");
         let proxy_dir = root.join("bin");
-        let target = exe_in(&root, "latch-bin");
+        let target = exe_in(&root, "sigil-bin");
         let target = target.canonicalize().unwrap();
 
         // Install: the alias is a symlink to the target.
@@ -761,7 +761,7 @@ mod tests {
         let root = tmp("broken");
         let proxy_dir = root.join("bin");
         std::fs::create_dir_all(&proxy_dir).unwrap();
-        std::os::unix::fs::symlink(root.join("gone-latch"), proxy_dir.join("op")).unwrap();
+        std::os::unix::fs::symlink(root.join("gone-sigil"), proxy_dir.join("op")).unwrap();
         assert!(proxy_dir.join("op").canonicalize().is_err(), "dangling");
         assert!(
             remove_alias_in(&proxy_dir, Some(&root.join("some-target")), "op").unwrap(),

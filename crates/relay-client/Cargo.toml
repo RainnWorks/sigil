@@ -1,16 +1,16 @@
 [package]
-name = "latch-relay-client"
+name = "sigil-relay-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "HTTP Transport impls for the Latch blind relay (v4): daemon + phone slots, pairing rendezvous"
+description = "HTTP Transport impls for the Sigil blind relay (v4): daemon + phone slots, pairing rendezvous"
 
 [lib]
-name = "latch_relay_client"
+name = "sigil_relay_client"
 path = "src/lib.rs"
 
 [dependencies]
-latch-proto = { path = "../proto" }
+sigil-proto = { path = "../proto" }
 # serde_json: (de)serialize the opaque proto::Envelope and build the small slot
 # request/response JSON bodies the relay carries.
 serde_json.workspace = true

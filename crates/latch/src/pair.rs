@@ -1,21 +1,21 @@
 //! The daemon side of a real, cross-process pairing over the blind relay.
 //!
-//! `latch pair` mints a fresh daemon identity and a one-time pairing secret,
-//! renders the [`PairingPayload`](latch_proto::PairingPayload) as a scannable QR
+//! `sigil pair` mints a fresh daemon identity and a one-time pairing secret,
+//! renders the [`PairingPayload`](sigil_proto::PairingPayload) as a scannable QR
 //! (and a base64url line),
 //! waits on the relay rendezvous mailbox for the phone's `PairingResponse`,
 //! verifies its MAC (pinning the phone), has the human confirm the six SAS
-//! words, seals the keystore's DEK to the phone (the same key `latch account
+//! words, seals the keystore's DEK to the phone (the same key `sigil account
 //! add` encrypts tokens under, so a later approval returns a DEK that actually
 //! decrypts them), and persists the result so the daemon can arm the phone
 //! factor with no `--dev-insecure` (see [`crate::pairing_store`]).
 //!
 //! The ceremony is written against a [`PairChannel`] so it is exercised
 //! end-to-end headlessly (in-process, with the softphone) as well as over the
-//! real relay via the HTTP [`Rendezvous`](latch_relay_client::Rendezvous). The
+//! real relay via the HTTP [`Rendezvous`](sigil_relay_client::Rendezvous). The
 //! transport is never the security layer: message 1 (the response) is
 //! authenticated by its pairing MAC, and message 3 (the DEK) is a standard sealed
-//! [`Envelope`](latch_proto::Envelope).
+//! [`Envelope`](sigil_proto::Envelope).
 
 use std::time::{Duration, Instant};
 
@@ -23,14 +23,14 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
-use latch_proto::identity::DeviceIdentity;
-use latch_proto::pairing::{DaemonPairing, Dek};
-use latch_proto::{rendezvous_mailbox, PairingResponse, TransportError};
+use sigil_proto::identity::DeviceIdentity;
+use sigil_proto::pairing::{DaemonPairing, Dek};
+use sigil_proto::{rendezvous_mailbox, PairingResponse, TransportError};
 
 use crate::pairing_store::{NewPairing, NewPhoneShare};
 
 /// The Sigil-operated shared relay, used when the operator gives neither
-/// `--relay <url>` nor `$LATCH_RELAY_URL`. It is a blind mailbox (opaque
+/// `--relay <url>` nor `$SIGIL_RELAY_URL`. It is a blind mailbox (opaque
 /// envelopes, key-hash mailboxes, no accounts -- see the design brief's Trust
 /// model), so defaulting to it costs nothing beyond routing metadata; a
 /// self-hosted relay via either override still takes priority. Callers that
@@ -40,25 +40,25 @@ pub const DEFAULT_RELAY_URL: &str = "https://relay.rainn.works";
 
 /// The opaque-string channel the pairing ceremony runs over: send toward the
 /// phone, receive from the phone. Implemented by the HTTP
-/// [`Rendezvous`](latch_relay_client::Rendezvous) for the real relay and by an
+/// [`Rendezvous`](sigil_relay_client::Rendezvous) for the real relay and by an
 /// in-memory pair in tests.
 pub trait PairChannel {
     fn send(&self, payload: String) -> Result<(), TransportError>;
     fn recv(&self, timeout: Duration) -> Result<Option<String>, TransportError>;
 }
 
-impl PairChannel for latch_relay_client::Rendezvous {
+impl PairChannel for sigil_relay_client::Rendezvous {
     fn send(&self, payload: String) -> Result<(), TransportError> {
-        latch_relay_client::Rendezvous::send(self, &payload)
+        sigil_relay_client::Rendezvous::send(self, &payload)
     }
     fn recv(&self, timeout: Duration) -> Result<Option<String>, TransportError> {
-        latch_relay_client::Rendezvous::recv(self, timeout)
+        sigil_relay_client::Rendezvous::recv(self, timeout)
     }
 }
 
 /// Render a QR payload string as a terminal QR using unicode half-blocks, with a
 /// quiet zone so a phone camera can lock on. Delegates to [`crate::qr`], the one
-/// place QR rendering lives, so the pairing QR, `latch qr`, and the PNG output
+/// place QR rendering lives, so the pairing QR, `sigil qr`, and the PNG output
 /// all come from the same matrix (error-correction Q, 4-module quiet zone).
 pub fn render_qr(data: &str) -> Result<String> {
     crate::qr::render_terminal(data)
@@ -104,7 +104,7 @@ pub struct CeremonyOpts<'a> {
     /// ceremony: a same-UID process that can drive the pipe up to this point
     /// still cannot complete a pairing without a live biometric at the moment
     /// the human has already compared the SAS words. Must return the SAME key
-    /// `latch account add` seals tokens under: sealing under one DEK and
+    /// `sigil account add` seals tokens under: sealing under one DEK and
     /// unlocking with another is exactly the divergence this exists to
     /// prevent, so it is never a freshly generated key.
     pub unwrap_dek: &'a mut dyn FnMut() -> Result<crate::secrets::Dek>,
@@ -171,7 +171,7 @@ pub fn run_ceremony(daemon_identity: DeviceIdentity, opts: CeremonyOpts<'_>) -> 
     let keystore_dek = (opts.unwrap_dek)().context("unwrapping the DEK for delivery")?;
 
     // 5. Deliver the KEYSTORE's DEK, sealed to the phone (message 3), then erase
-    //    the transport copy. This must be the same key `latch account add` seals
+    //    the transport copy. This must be the same key `sigil account add` seals
     //    tokens under, never a fresh one, or a real approval would return a DEK
     //    that cannot decrypt the stored token. `Dek::from_bytes` copies into a
     //    proto `Dek`, which is `ZeroizeOnDrop`; the keystore's own copy is the
@@ -218,7 +218,7 @@ pub fn run_ceremony(daemon_identity: DeviceIdentity, opts: CeremonyOpts<'_>) -> 
 /// `relay_url` for the rendezvous `mailbox` (send `to-phone`, receive
 /// `to-daemon`).
 pub fn relay_channel(relay_url: &str, mailbox: [u8; 32]) -> Result<Box<dyn PairChannel>> {
-    let rv = latch_relay_client::Rendezvous::daemon(relay_url, mailbox)
+    let rv = sigil_relay_client::Rendezvous::daemon(relay_url, mailbox)
         .map_err(|e| anyhow::anyhow!("reaching relay {relay_url}: {e}"))?;
     Ok(Box::new(rv))
 }
@@ -229,8 +229,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
-    use latch_proto::Envelope;
-    use latch_softphone::{Pairing, Policy};
+    use sigil_proto::Envelope;
+    use sigil_softphone::{Pairing, Policy};
 
     const NOW: u64 = 1_720_000_000_000;
 
@@ -328,7 +328,7 @@ mod tests {
         assert_eq!(np.daemon_identity.peer_identity(), daemon_pub);
         assert_eq!(np.relay_url, "ws://relay.test");
         // The recorded SAS words are the real fingerprint of the pinned pair.
-        let expected = latch_proto::fingerprint_words(&daemon_pub, &phone_pub);
+        let expected = sigil_proto::fingerprint_words(&daemon_pub, &phone_pub);
         let recorded: Vec<&str> = np.sas_words.iter().map(String::as_str).collect();
         assert_eq!(recorded, expected.to_vec());
     }
@@ -450,7 +450,7 @@ mod tests {
     }
 
     /// The regression for the DEK-divergence bug: the ceremony must deliver the
-    /// *keystore* DEK (the one `latch account add` seals tokens under), not a
+    /// *keystore* DEK (the one `sigil account add` seals tokens under), not a
     /// fresh key. This drives the real seam end to end — provision a keystore
     /// DEK, seal a known token under it, run the ceremony passing that DEK, have
     /// the phone recover the delivered DEK, and assert the recovered DEK
@@ -463,14 +463,14 @@ mod tests {
     fn delivered_dek_decrypts_a_token_sealed_under_the_keystore_dek() {
         use crate::keystore::{Keystore, MemoryKeystore};
         use crate::secrets::{decrypt_token, encrypt_token};
-        use latch_proto::pairing::PhonePairing;
-        use latch_proto::{PairingPayload, ReplayGuard};
+        use sigil_proto::pairing::PhonePairing;
+        use sigil_proto::{PairingPayload, ReplayGuard};
         use zeroize::Zeroizing;
 
         const TOKEN: &[u8] = b"ops_eyJzaWduSW5BZGRyZXNzIjoi.example.account.token";
 
         // 1. Provision the keystore DEK and seal a known token under it, exactly
-        //    as `latch account add` does.
+        //    as `sigil account add` does.
         let ks = MemoryKeystore::new();
         ks.ensure_dek().unwrap();
         let keystore_dek = ks.unwrap_dek("seal the account token").unwrap();
@@ -554,9 +554,9 @@ mod tests {
         // and on-curve-validated in receive_response), run_ceremony persists it in
         // the returned NewPairing so v2 account-add can wrap tokens to it.
         use base64::engine::general_purpose::STANDARD as B64S;
-        use latch_proto::pairing::PhonePairing;
-        use latch_proto::threshold::MacShare;
-        use latch_proto::PairingPayload;
+        use sigil_proto::pairing::PhonePairing;
+        use sigil_proto::threshold::MacShare;
+        use sigil_proto::PairingPayload;
 
         // The phone's SE share f (software stand-in) and its public F.
         let f = MacShare::generate();
@@ -616,7 +616,7 @@ mod tests {
 
     #[test]
     fn render_qr_produces_scannable_block_output() {
-        let qr = render_qr("LATCH-TEST-PAYLOAD-abc123").unwrap();
+        let qr = render_qr("SIGIL-TEST-PAYLOAD-abc123").unwrap();
         assert!(!qr.is_empty());
         // Unicode half-block glyphs are what a terminal QR is made of.
         assert!(qr.contains('\u{2588}') || qr.contains('\u{2580}') || qr.contains('\u{2584}'));

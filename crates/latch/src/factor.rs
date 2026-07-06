@@ -3,7 +3,7 @@
 //! This closes the finding recorded in `docs/security-claims.md` residual #1.
 //! The local control-socket approver is **not** an adversarial gate: the request
 //! id it waits on is same-UID readable, so a rogue same-UID peer (the exact
-//! adversary Latch exists to stop) could self-approve. So the daemon must decide,
+//! adversary Sigil exists to stop) could self-approve. So the daemon must decide,
 //! before it will serve any gated request, which real approving factor it has:
 //!
 //! * [`Factor::Phone`] — a paired phone reachable over a [`Transport`]. Its
@@ -13,15 +13,15 @@
 //!   ([`Keystore::is_biometric`](crate::keystore::Keystore::is_biometric)). The
 //!   Secure Enclave unwrap *is* the biometric.
 //! * [`Factor::DevInsecure`] — neither of the above, but the operator explicitly
-//!   passed `--dev-insecure` (or `LATCH_DEV_INSECURE=1`). Only here do
-//!   `LATCH_DEV_AUTOAPPROVE` and the bare control-socket approval function, and
+//!   passed `--dev-insecure` (or `SIGIL_DEV_INSECURE=1`). Only here do
+//!   `SIGIL_DEV_AUTOAPPROVE` and the bare control-socket approval function, and
 //!   only here does the daemon print the loud warning below.
 //! * [`Factor::NoFactor`] — none of the above. The daemon **fails closed**: it
 //!   arms (so `status`, pairing, and diagnostics work) but refuses every gated
 //!   request. It is never silently self-approvable.
 //!
-//! [`Transport`]: latch_proto::Transport
-//! [`ApprovalResponse`]: latch_proto::ApprovalResponse
+//! [`Transport`]: sigil_proto::Transport
+//! [`ApprovalResponse`]: sigil_proto::ApprovalResponse
 
 /// The approving factor the daemon resolved at arm time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +59,7 @@ impl Factor {
 /// is a pure function, unit-testable without a keystore or a relay.
 #[derive(Debug, Clone, Copy)]
 pub struct ArmInputs {
-    /// `--dev-insecure` flag or `LATCH_DEV_INSECURE=1`.
+    /// `--dev-insecure` flag or `SIGIL_DEV_INSECURE=1`.
     pub dev_insecure: bool,
     /// A persisted phone pairing exists and a transport can be built to it.
     pub phone_paired: bool,
@@ -84,12 +84,12 @@ pub fn resolve(inputs: &ArmInputs) -> Factor {
 }
 
 /// True if the operator asked for the insecure dev path, via the `--dev-insecure`
-/// argument or `LATCH_DEV_INSECURE` set to a truthy value.
+/// argument or `SIGIL_DEV_INSECURE` set to a truthy value.
 pub fn dev_insecure_requested(args: &[String]) -> bool {
     if args.iter().any(|a| a == "--dev-insecure") {
         return true;
     }
-    matches!(std::env::var("LATCH_DEV_INSECURE"), Ok(v) if v == "1" || v == "true")
+    matches!(std::env::var("SIGIL_DEV_INSECURE"), Ok(v) if v == "1" || v == "true")
 }
 
 /// The loud, multi-line warning that must appear on every start under
@@ -98,16 +98,16 @@ pub fn dev_insecure_requested(args: &[String]) -> bool {
 /// its content is testable; [`warn_dev_insecure`] is what actually prints it.
 pub const DEV_INSECURE_WARNING: &str = "\n\
 !! ============================================================ !!\n\
-!!  LATCH IS RUNNING IN --dev-insecure MODE                     !!\n\
+!!  SIGIL IS RUNNING IN --dev-insecure MODE                     !!\n\
 !! ------------------------------------------------------------ !!\n\
 !!  No paired phone and no hardware biometric are configured,   !!\n\
 !!  so the ONLY approving factor is the local control socket    !!\n\
-!!  (and LATCH_DEV_AUTOAPPROVE, if set).                        !!\n\
+!!  (and SIGIL_DEV_AUTOAPPROVE, if set).                        !!\n\
 !!                                                              !!\n\
 !!  RISK: any process running as YOUR user can approve its own  !!\n\
 !!  secret requests (same-UID self-approval). A rogue agent     !!\n\
 !!  such as a compromised `claude` or `op` is exactly the       !!\n\
-!!  adversary Latch exists to stop, and this mode does not.     !!\n\
+!!  adversary Sigil exists to stop, and this mode does not.     !!\n\
 !!                                                              !!\n\
 !!  Use this ONLY for local development. Pair a phone or        !!\n\
 !!  provision a Secure Enclave biometric for a real gate.       !!\n\

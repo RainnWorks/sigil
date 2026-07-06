@@ -5,7 +5,7 @@
 //! `docs/design/threshold-v2.md`. This module is the **shared crypto core** that
 //! both the daemon (Mac) and the phone build on; the combiner it defines is
 //! mirrored byte-for-byte by the phone's TypeScript
-//! (`apps/phone/src/protocol/__vectors__/latch-vectors.json` locks the two
+//! (`apps/phone/src/protocol/__vectors__/sigil-vectors.json` locks the two
 //! together — see `bin/export-vectors.rs`, the `combiner` category).
 //!
 //! # The construction (§3 of the design)
@@ -16,7 +16,7 @@
 //! ```text
 //! Z_M = x(m · E)     // the Mac's partial, full software (RustCrypto p256)
 //! Z_F = x(f · E)     // the phone's partial, exactly what the Secure Enclave emits
-//! K   = BLAKE2b( "latch.threshold.v2" ‖ len·Z_M ‖ len·Z_F ‖ len·E_x963 ‖ len·account_id )
+//! K   = BLAKE2b( "sigil.threshold.v2" ‖ len·Z_M ‖ len·Z_F ‖ len·E_x963 ‖ len·account_id )
 //! token_ct = AES-256-GCM(token; K)
 //! ```
 //!
@@ -30,7 +30,7 @@
 //!
 //! `combine` computes an **unkeyed BLAKE2b with a 32-byte digest** over, in order:
 //!
-//! 1. the raw domain constant [`THRESHOLD_DOMAIN`] (`b"latch.threshold.v2"`, 18
+//! 1. the raw domain constant [`THRESHOLD_DOMAIN`] (`b"sigil.threshold.v2"`, 18
 //!    bytes, no length prefix — a fixed leading constant, exactly as
 //!    [`crate::pairing::rendezvous_mailbox`] absorbs its domain);
 //! 2. `Z_M`, length-prefixed;
@@ -68,7 +68,7 @@ use zeroize::Zeroizing;
 
 /// Domain separator folded into every combiner hash. Distinct from the pairing
 /// domains, so threshold key material can never collide with a pairing subkey.
-pub const THRESHOLD_DOMAIN: &[u8] = b"latch.threshold.v2";
+pub const THRESHOLD_DOMAIN: &[u8] = b"sigil.threshold.v2";
 
 /// Combiner identifier persisted in the record's `kdf_algo`, for future-proofing.
 pub const KDF_ALGO_ID: &str = "blake2b-v2";
@@ -523,7 +523,7 @@ mod tests {
         let got = *combine(&zm, &zf, &e, "id");
 
         let mut h = Blake2b256::new();
-        h.update(b"latch.threshold.v2");
+        h.update(b"sigil.threshold.v2");
         h.update(32u64.to_be_bytes());
         h.update(zm);
         h.update(32u64.to_be_bytes());

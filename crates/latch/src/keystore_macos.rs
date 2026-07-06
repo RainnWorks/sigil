@@ -3,12 +3,12 @@
 //! Two layers:
 //!
 //! * **Blob storage** uses the login Keychain via `security-framework` generic
-//!   password items (service `com.rowm.latch`, account = blob label).
+//!   password items (service `works.rainn.sigil`, account = blob label).
 //! * **The DEK envelope** is a P-256 key generated *inside* the Secure Enclave
 //!   with an access control of `.privateKeyUsage | .biometryCurrentSet`, so
 //!   unwrapping the DEK demands a live Touch ID. `ensure_dek` mints the key and
 //!   wraps a fresh DEK to its public half in pure Rust
-//!   ([`latch_proto::wrap_dek_p256`], byte-compatible with Apple's
+//!   ([`sigil_proto::wrap_dek_p256`], byte-compatible with Apple's
 //!   `SecKeyCreateEncryptedData` for this algorithm -- confirmed by
 //!   `apps/mac/Tools/se-selftest.swift`); `unwrap_dek` re-finds the persisted
 //!   key and asks the Secure Enclave to decrypt, which is where Touch ID fires.
@@ -19,7 +19,7 @@
 //! round-trip test below:
 //!
 //! ```text
-//! cargo test -p latch --lib keystore_macos::tests::se_dek_round_trips_through_a_real_touch_id \
+//! cargo test -p sigil --lib keystore_macos::tests::se_dek_round_trips_through_a_real_touch_id \
 //!     -- --ignored --nocapture
 //! ```
 //!
@@ -52,17 +52,17 @@ use security_framework_sys::key::SecKeyCreateDecryptedData;
 use crate::keystore::{Keystore, KeystoreError};
 use crate::secrets::{self, Dek};
 
-/// Keychain service under which all Latch blobs are stored.
-const SERVICE: &str = "com.rowm.latch";
+/// Keychain service under which all Sigil blobs are stored.
+const SERVICE: &str = "works.rainn.sigil";
 /// The blob label under which the sealed (Secure-Enclave-wrapped) DEK lives in
 /// production. This is ciphertext at rest; it needs no ACL of its own; the
 /// wrap alone is useless without the SE private key.
 const DEK_ENVELOPE_LABEL: &str = "dek.se-envelope.v1";
 /// `kSecAttrLabel` of the production Secure Enclave key that wraps the DEK.
 /// `unwrap_dek` re-finds the persisted key by this label across process
-/// restarts (the daemon and every `latch` CLI invocation are separate
+/// restarts (the daemon and every `sigil` CLI invocation are separate
 /// processes).
-const SE_KEY_LABEL: &str = "com.rowm.latch.dek";
+const SE_KEY_LABEL: &str = "works.rainn.sigil.dek";
 
 /// `errSecItemNotFound`: the Keychain has no item matching the query.
 const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
@@ -177,7 +177,7 @@ impl Keystore for MacKeystore {
         //    `create_with_protection` (not `create_with_flags`, which passes a
         //    NULL protection class) pins `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`,
         //    matching every Swift counterpart (se-selftest.swift,
-        //    SecureEnclaveApprover.swift, the phone's LatchSeModule.swift) and
+        //    SecureEnclaveApprover.swift, the phone's SigilSeModule.swift) and
         //    apps/mac/RESEARCH.md. Security-review finding (P2, docs/security-claims.md).
         let access_control = SecAccessControl::create_with_protection(
             Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
@@ -205,7 +205,7 @@ impl Keystore for MacKeystore {
         // 3. Wrap a fresh DEK to the SE key's PUBLIC half. This is a
         //    public-key operation (anyone can wrap to a public key), so it
         //    needs no Touch ID; the biometric only gates the later decrypt.
-        //    Done in pure Rust (`latch_proto::wrap_dek_p256`, independently
+        //    Done in pure Rust (`sigil_proto::wrap_dek_p256`, independently
         //    reviewed) rather than via `SecKeyCreateEncryptedData`, so the DEK
         //    plaintext is only ever built here and immediately zeroized, never
         //    round-tripped through Security.framework unencrypted.
@@ -220,8 +220,8 @@ impl Keystore for MacKeystore {
             .to_vec();
 
         let dek = secrets::generate_dek();
-        let proto_dek = latch_proto::pairing::Dek::from_bytes(*dek);
-        let sealed = latch_proto::wrap_dek_p256(&proto_dek, &pub_x963)
+        let proto_dek = sigil_proto::pairing::Dek::from_bytes(*dek);
+        let sealed = sigil_proto::wrap_dek_p256(&proto_dek, &pub_x963)
             .map_err(|e| KeystoreError::Backend(format!("sealing the DEK to the SE key: {e}")))?;
         drop(proto_dek);
         drop(dek);
@@ -329,13 +329,13 @@ mod tests {
 
     // Keychain writes touch the real login Keychain and may raise an ACL
     // prompt, so this is opt-in. Confirm blob storage on device with:
-    //   cargo test -p latch --lib keystore_macos::tests::keychain_blob_roundtrip \
+    //   cargo test -p sigil --lib keystore_macos::tests::keychain_blob_roundtrip \
     //     -- --ignored --nocapture
     #[test]
     #[ignore = "writes to the real login Keychain; run manually on the Mac"]
     fn keychain_blob_roundtrip() {
         let ks = MacKeystore::new();
-        let label = "test.blob.latch";
+        let label = "test.blob.sigil";
         ks.delete_blob(label).unwrap();
         assert!(ks.load_blob(label).unwrap().is_none());
         ks.store_blob(label, b"enclave-envelope-bytes").unwrap();
@@ -352,7 +352,7 @@ mod tests {
     // Apple-silicon hardware with an enrolled biometric (fails on a VM or the
     // Simulator) and a human present to approve the prompt, so this is opt-in
     // and NOT part of `cargo test`'s default run. Run on the Mac with:
-    //   cargo test -p latch --lib keystore_macos::tests::se_dek_round_trips_through_a_real_touch_id \
+    //   cargo test -p sigil --lib keystore_macos::tests::se_dek_round_trips_through_a_real_touch_id \
     //     -- --ignored --nocapture
     //
     // ISOLATION: this uses `.selftest`-suffixed labels via `MacKeystore::for_test`,
@@ -365,7 +365,7 @@ mod tests {
     #[ignore = "mints a real Secure Enclave key and prompts Touch ID; run manually on the Mac"]
     fn se_dek_round_trips_through_a_real_touch_id() {
         const TEST_DEK_ENVELOPE_LABEL: &str = "dek.se-envelope.v1.selftest";
-        const TEST_SE_KEY_LABEL: &str = "com.rowm.latch.dek.selftest";
+        const TEST_SE_KEY_LABEL: &str = "works.rainn.sigil.dek.selftest";
 
         let ks = MacKeystore::for_test(TEST_DEK_ENVELOPE_LABEL, TEST_SE_KEY_LABEL);
         // Clean slate: a leftover envelope/key from a prior (e.g. panicked) run
@@ -381,12 +381,12 @@ mod tests {
 
             eprintln!("expect a Touch ID prompt now...");
             let dek_a = ks
-                .unwrap_dek("latch: hardware round-trip test")
+                .unwrap_dek("sigil: hardware round-trip test")
                 .expect("unwrapping the DEK (approve the Touch ID prompt)");
 
             eprintln!("expect a second Touch ID prompt now...");
             let dek_b = ks
-                .unwrap_dek("latch: hardware round-trip test, second unwrap")
+                .unwrap_dek("sigil: hardware round-trip test, second unwrap")
                 .expect("second unwrap must also succeed");
 
             assert_eq!(*dek_a, *dek_b, "every unwrap must recover the same DEK");

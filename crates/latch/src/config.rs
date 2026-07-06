@@ -1,6 +1,6 @@
 //! The generic if-this-then-that config store: rules and sources.
 //!
-//! Latch is "gated env-var injection + phone approval for ANY CLI", not an `op`
+//! Sigil is "gated env-var injection + phone approval for ANY CLI", not an `op`
 //! tool. This module is the core of that generality and holds **zero** concept
 //! of 1Password. An invocation (argv) is matched against an ordered list of
 //! [`Rule`]s; the first whose [`Match`] holds selects an [`Action`], which names
@@ -11,13 +11,13 @@
 //!
 //! A configured invocation is gated on the phone and its source's provider
 //! injects the approved environment; an *unmatched* invocation is refused with a
-//! pointer to `latch-config` and never run ungated (a silent pass-through would
+//! pointer to `sigil-config` and never run ungated (a silent pass-through would
 //! be false security).
 //!
 //! This is a config *mutation* surface, so — like the account and pairing stores
-//! — it lives CLI-side (`latch-config …`). The daemon only *reads* it, loaded at
+//! — it lives CLI-side (`sigil-config …`). The daemon only *reads* it, loaded at
 //! arm time (a compromised always-on daemon must not be able to rewrite which
-//! commands are gated). Re-run `latch restart` to apply a change.
+//! commands are gated). Re-run `sigil restart` to apply a change.
 //!
 //! See `docs/design/config-rule-engine.md` for the full design and migration.
 
@@ -26,7 +26,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use latch_proto::RiskLevel;
+use sigil_proto::RiskLevel;
 
 /// The current on-disk config schema version. Bumped only on a breaking layout
 /// change; the loader tolerates a missing field via `serde(default)`.
@@ -232,14 +232,14 @@ impl Default for Config {
 }
 
 impl Config {
-    /// `~/.latch/config.json`, or `$LATCH_HOME/config.json` (tests).
+    /// `~/.sigil/config.json`, or `$SIGIL_HOME/config.json` (tests).
     pub fn path() -> Option<PathBuf> {
-        crate::paths::latch_home().map(|h| h.join("config.json"))
+        crate::paths::sigil_home().map(|h| h.join("config.json"))
     }
 
     /// The legacy per-command store path (`commands.json`), migrated on load.
     fn legacy_path() -> Option<PathBuf> {
-        crate::paths::latch_home().map(|h| h.join("commands.json"))
+        crate::paths::sigil_home().map(|h| h.join("commands.json"))
     }
 
     /// Load the config. If `config.json` is absent but the legacy
@@ -335,10 +335,10 @@ impl Config {
     }
 
     /// Persist the config, parent dir 0700 and file 0600 (public data, kept
-    /// consistent with the rest of `~/.latch`).
+    /// consistent with the rest of `~/.sigil`).
     pub fn save(&self) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
-        let path = Self::path().ok_or_else(|| io::Error::other("no LATCH_HOME/HOME for config"))?;
+        let path = Self::path().ok_or_else(|| io::Error::other("no SIGIL_HOME/HOME for config"))?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
@@ -370,14 +370,14 @@ impl Config {
 
     /// Resolve the first rule that matches `argv`, flattened with its source into
     /// a [`ResolvedAction`]. `None` means "refuse" — the daemon fails closed and
-    /// points at `latch-config`.
+    /// points at `sigil-config`.
     ///
     /// A rule whose action names an **unknown source** makes the whole resolution
     /// fail closed (`None`), it does NOT fall through to a later, broader rule.
     /// Falling through would be a fail-OPEN downgrade: a malformed or hand-edited
     /// high-priority rule could silently route the command to a broader rule the
     /// author did not intend for it. Invariant #5 ("everything fails closed") wins
-    /// over convenience here; `latch-config` and `import` validate referential
+    /// over convenience here; `sigil-config` and `import` validate referential
     /// integrity up front, so a dangling source only arises from a hand-edit, and
     /// the safe answer to a hand-edited-broken rule is to refuse.
     pub fn resolve(&self, argv: &[String]) -> Option<ResolvedAction> {

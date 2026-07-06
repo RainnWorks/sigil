@@ -1,6 +1,6 @@
 //! The pairing-MITM proof suite: the root of trust, executed adversarially.
 //!
-//! Everything Latch does after pairing (every secret release, every SSH
+//! Everything Sigil does after pairing (every secret release, every SSH
 //! signature, every lease) rests on the two keys pinned during the ceremony. If
 //! the return channel (`PairingResponse`, phone -> Mac, over a hostile network)
 //! can be made to pin an attacker's key, the attacker approves its own requests
@@ -23,7 +23,7 @@
 //!
 //! If any `#[test]` here starts failing, the product's root of trust is broken.
 
-use latch_proto::{
+use sigil_proto::{
     fingerprint_words, open_dek, seal_dek, verify_sas, DaemonPairing, Dek, DeviceIdentity,
     HandshakeError, OpenError, PairingPayload, PairingResponse, PairingState, PhonePairing,
     ReplayGuard, PAIRING_SECRET_TTL_MS,
@@ -33,7 +33,7 @@ const NOW: u64 = 1_720_000_000_000;
 
 fn endpoints() -> Vec<String> {
     vec![
-        "lan://latch.local:4823".to_string(),
+        "lan://sigil.local:4823".to_string(),
         "https://tide.example.net:4823".to_string(),
     ]
 }
@@ -196,7 +196,7 @@ fn response_built_without_the_qr_secret_is_rejected() {
     let forged_payload = PairingPayload {
         daemon: daemon_pub,
         endpoints: endpoints(),
-        secret: latch_proto::PairingSecret::generate(),
+        secret: sigil_proto::PairingSecret::generate(),
         created_at: NOW,
     };
     let attacker_phone = DeviceIdentity::generate();

@@ -1,13 +1,13 @@
-//! Network [`Transport`] implementations for the Latch blind relay.
+//! Network [`Transport`] implementations for the Sigil blind relay.
 //!
-//! The in-process [`LocalRelay`](latch_proto::LocalRelay) proves the approval
+//! The in-process [`LocalRelay`](sigil_proto::LocalRelay) proves the approval
 //! loop headlessly; these two impls carry the same opaque [`Envelope`]s over the
 //! real relay's wire (`relay/README.md`, `relay/shared/protocol.ts`). The relay
 //! is never the security layer: both impls move ciphertext only, exactly as
 //! `LocalRelay` does, and every guarantee still rests on the envelope.
 //!
 //! The relay has two asymmetric faces, so this crate has two typed [`Transport`]
-//! impls, each mapping the [`Direction`](latch_proto::Direction) pair onto the
+//! impls, each mapping the [`Direction`](sigil_proto::Direction) pair onto the
 //! slot that role owns on the v4 relay:
 //!
 //! | impl | role | `send` | `recv` | relay route |
@@ -30,7 +30,7 @@ pub use daemon_http::DaemonRelay;
 pub use phone_http::PhoneRelay;
 pub use rendezvous::Rendezvous;
 
-use latch_proto::envelope::Envelope;
+use sigil_proto::envelope::Envelope;
 
 /// Lowercase hex of the 32-byte mailbox id, the relay's URL path segment.
 pub fn mailbox_hex(mailbox: &[u8; 32]) -> String {

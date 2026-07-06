@@ -9,8 +9,8 @@
 //! here, never through this process.
 //!
 //! Two entry points funnel here: the transparent PATH shim (a binary named `op`,
-//! `gcloud`, … whose argv[0] stem is the command) and the `latch <cmd>` primitive
-//! (and its `latch run -- <cmd>` escape hatch). Both are thin fronts over the one
+//! `gcloud`, … whose argv[0] stem is the command) and the `sigil <cmd>` primitive
+//! (and its `sigil run -- <cmd>` escape hatch). Both are thin fronts over the one
 //! [`dispatch`] path; the daemon behind them looks up the command's config and
 //! decides whether it is gated.
 
@@ -38,9 +38,9 @@ pub fn dispatch(argv: Vec<String>) -> ! {
     // guard; this converts any escape into a bounded, fail-closed abort. See
     // `docs/design/proxy-aliasing.md` problem 1(b).
     if crate::proxy::depth_exceeded() {
-        let cmd = argv.first().map(String::as_str).unwrap_or("latch");
+        let cmd = argv.first().map(String::as_str).unwrap_or("sigil");
         eprintln!(
-            "{cmd}: latch proxy recursion guard tripped (depth {}); \
+            "{cmd}: sigil proxy recursion guard tripped (depth {}); \
              a real {cmd} could not be resolved apart from the proxy alias",
             crate::proxy::current_depth()
         );
@@ -50,8 +50,8 @@ pub fn dispatch(argv: Vec<String>) -> ! {
         Ok(stream) => match forward(stream, &argv) {
             Ok(code) => process::exit(code),
             Err(e) => {
-                let cmd = argv.first().map(String::as_str).unwrap_or("latch");
-                eprintln!("{cmd}: latch daemon request failed: {e}");
+                let cmd = argv.first().map(String::as_str).unwrap_or("sigil");
+                eprintln!("{cmd}: sigil daemon request failed: {e}");
                 process::exit(70);
             }
         },
@@ -98,7 +98,7 @@ fn forward(stream: UnixStream, argv: &[String]) -> io::Result<i32> {
 fn exec_real(argv: &[String]) -> ! {
     let cmd = argv.first().map(String::as_str).unwrap_or("");
     let Some(real) = paths::find_real(cmd) else {
-        eprintln!("{cmd}: no `{cmd}` found on PATH (latch shim active, daemon down)");
+        eprintln!("{cmd}: no `{cmd}` found on PATH (sigil shim active, daemon down)");
         process::exit(127);
     };
     let args: Vec<OsString> = argv.iter().skip(1).map(OsString::from).collect();

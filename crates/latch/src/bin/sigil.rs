@@ -1,12 +1,12 @@
-//! The lean Latch binary: the transparent shim multicall, the `latch <cmd>`
+//! The lean Sigil binary: the transparent shim multicall, the `sigil <cmd>`
 //! gating primitive, and the runtime/daemon verbs. All configuration management
-//! lives in the sibling `latch-config` binary, so this one stays
+//! lives in the sibling `sigil-config` binary, so this one stays
 //! reserved-verb-minimal — a program literally named `config`, `account`, or
-//! `proxy` is still gateable as `latch <that-name> …`.
+//! `proxy` is still gateable as `sigil <that-name> …`.
 //!
-//! Invoked under its own name (`latch`) it dispatches the gating CLI. Invoked
+//! Invoked under its own name (`sigil`) it dispatches the gating CLI. Invoked
 //! under any *other* name (argv[0] stem — the PATH alias symlinked as `op`,
-//! `gcloud`, …) it is a thin forwarder that re-enters as `latch <stem> <args>`.
+//! `gcloud`, …) it is a thin forwarder that re-enters as `sigil <stem> <args>`.
 //! The alias path is std-only and synchronous so its cold start stays near zero;
 //! only the `daemon` subcommand ever builds a runtime.
 
@@ -19,13 +19,13 @@ fn main() {
         .and_then(|s| s.to_str())
         .unwrap_or("");
 
-    // Any name other than `latch` is a transparent command alias: `op read x`
-    // becomes `latch op read x`. This is the only thing the PATH alias does.
-    if !stem.is_empty() && stem != "latch" {
+    // Any name other than `sigil` is a transparent command alias: `op read x`
+    // becomes `sigil op read x`. This is the only thing the PATH alias does.
+    if !stem.is_empty() && stem != "sigil" {
         let mut argv = vec![stem.to_string()];
         argv.extend(std::env::args().skip(1));
-        latch_core::shim::dispatch(argv); // never returns
+        sigil_core::shim::dispatch(argv); // never returns
     }
 
-    std::process::exit(latch_core::cli::run_gating());
+    std::process::exit(sigil_core::cli::run_gating());
 }

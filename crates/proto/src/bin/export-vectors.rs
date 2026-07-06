@@ -1,17 +1,17 @@
 //! Export the shared Rust<->TS test vectors.
 //!
-//! Writes `apps/phone/src/protocol/__vectors__/latch-vectors.json` exactly per
+//! Writes `apps/phone/src/protocol/__vectors__/sigil-vectors.json` exactly per
 //! `apps/phone/src/protocol/vectors.contract.ts`. The phone's
 //! `verify-vectors.ts` replays the file through the TypeScript protocol
 //! implementation; agreement byte-for-byte is the interop gate.
 //!
-//! Bin, not xtask: the export needs only `latch-proto`'s own public API plus
+//! Bin, not xtask: the export needs only `sigil-proto`'s own public API plus
 //! `serde_json` (already a dependency), so a `[[bin]]` in this crate is simpler
 //! than a separate workspace member with a cargo alias — no new manifest, no new
 //! dependency, and the code sits next to the types it serializes. Run with:
 //!
 //! ```sh
-//! cargo run -p latch-proto --bin export-vectors
+//! cargo run -p sigil-proto --bin export-vectors
 //! ```
 //!
 //! The five categories:
@@ -42,11 +42,11 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use latch_proto::envelope::Envelope;
-use latch_proto::identity::DeviceIdentity;
-use latch_proto::pairing::{PairingPayload, PairingSecret};
-use latch_proto::threshold::{aead_seal, combine, EcdhAlgo, MacShare};
-use latch_proto::{
+use sigil_proto::envelope::Envelope;
+use sigil_proto::identity::DeviceIdentity;
+use sigil_proto::pairing::{PairingPayload, PairingSecret};
+use sigil_proto::threshold::{aead_seal, combine, EcdhAlgo, MacShare};
+use sigil_proto::{
     fingerprint_words, mailbox_id, PeerIdentity, ReplayError, ReplayGuard, REPLAY_WINDOW_MS,
 };
 
@@ -165,7 +165,7 @@ fn pairing_qr_vectors() -> Vec<Value> {
     };
     let secret = PairingSecret(fixed32(120));
     let endpoints = vec![
-        "lan://latch.local:4823".to_string(),
+        "lan://sigil.local:4823".to_string(),
         "https://tide.example.net:4823".to_string(),
     ];
     let created_at = 1_720_000_000_000u64;
@@ -201,7 +201,7 @@ fn pairing_transcript_vectors() -> Vec<Value> {
         agreement: fixed32(101),
     };
     let endpoints = vec![
-        "lan://latch.local:4823".to_string(),
+        "lan://sigil.local:4823".to_string(),
         "https://tide.example.net:4823".to_string(),
     ];
     let created_at = 1_720_000_000_000u64;
@@ -225,7 +225,7 @@ fn pairing_transcript_vectors() -> Vec<Value> {
     ]
     .into_iter()
     .map(|(name, share)| {
-        let (transcript, tag) = latch_proto::pairing_confirmation_vector(
+        let (transcript, tag) = sigil_proto::pairing_confirmation_vector(
             &secret, &daemon, &endpoints, created_at, &phone, &nonce, share,
         );
         json!({
@@ -466,7 +466,7 @@ fn main() {
     });
 
     let out = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../apps/phone/src/protocol/__vectors__/latch-vectors.json");
+        .join("../../apps/phone/src/protocol/__vectors__/sigil-vectors.json");
     if let Some(dir) = out.parent() {
         std::fs::create_dir_all(dir).expect("create __vectors__ dir");
     }

@@ -1,4 +1,4 @@
-//! `latch-softphone`: the headless reference approver as a command-line tool.
+//! `sigil-softphone`: the headless reference approver as a command-line tool.
 //!
 //! Two subcommands:
 //!
@@ -7,7 +7,7 @@
 //!   base64url line the daemon verifies) to stdout and the six SAS words to
 //!   stderr. This is the phone-to-Mac message of the handshake; completing the
 //!   pairing (SAS confirm + DEK delivery) needs the daemon on a shared
-//!   transport. The network transport now exists (`latch-relay-client`'s
+//!   transport. The network transport now exists (`sigil-relay-client`'s
 //!   `PhoneRelay`/`DaemonRelay`, exercised end to end by the daemon's
 //!   `remote_approval_over_the_real_relay_delivers_the_secret` test); what
 //!   remains for a fully cross-process `pair` is persisting the pinned keys on
@@ -20,7 +20,7 @@
 //!   the DEK from the sealed response. This is the runnable, human-inspectable
 //!   demonstration of the protocol.
 //!
-//! Arg parsing is hand-rolled (no `clap`), matching the `latch` CLI house style.
+//! Arg parsing is hand-rolled (no `clap`), matching the `sigil` CLI house style.
 
 use std::time::Duration;
 
@@ -28,14 +28,14 @@ use anyhow::{bail, Context};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
-use latch_proto::envelope::Envelope;
-use latch_proto::identity::DeviceIdentity;
-use latch_proto::pairing::{DaemonPairing, Dek};
-use latch_proto::{
+use sigil_proto::envelope::Envelope;
+use sigil_proto::identity::DeviceIdentity;
+use sigil_proto::pairing::{DaemonPairing, Dek};
+use sigil_proto::{
     now_ms, ApprovalRequest, Direction, LocalRelay, Provenance, RequestKind, RiskLevel, SecretRef,
     Transport,
 };
-use latch_softphone::{Pairing, Policy};
+use sigil_softphone::{Pairing, Policy};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(other) => {
-            eprintln!("latch-softphone: unknown command '{other}'\n");
+            eprintln!("sigil-softphone: unknown command '{other}'\n");
             print_help();
             std::process::exit(2);
         }
@@ -56,11 +56,11 @@ fn main() -> anyhow::Result<()> {
 
 fn print_help() {
     eprintln!(
-        "latch-softphone: headless reference approver\n\
+        "sigil-softphone: headless reference approver\n\
          \n\
          USAGE:\n\
-         \x20 latch-softphone pair --qr <base64url> [--policy approve|deny|lease] [--now <ms>]\n\
-         \x20 latch-softphone demo [--policy approve|deny|lease]\n\
+         \x20 sigil-softphone pair --qr <base64url> [--policy approve|deny|lease] [--now <ms>]\n\
+         \x20 sigil-softphone demo [--policy approve|deny|lease]\n\
          \n\
          pair  scan a daemon QR, print the pairing response + SAS words\n\
          demo  run the whole pair + approve loop in-process against a local relay"
@@ -135,7 +135,7 @@ fn cmd_demo(args: &[String]) -> anyhow::Result<()> {
     let policy_label = flag(&flags, "policy").unwrap_or("approve").to_string();
     let now = now_ms();
 
-    println!("latch-softphone demo · policy = {policy_label}");
+    println!("sigil-softphone demo · policy = {policy_label}");
     println!("--------------------------------------------------");
 
     // 0. Mock daemon mints a QR.
@@ -145,7 +145,7 @@ fn cmd_demo(args: &[String]) -> anyhow::Result<()> {
         agreement: daemon_id.agreement.clone(),
     };
     let (mut daemon, payload) =
-        DaemonPairing::mint(daemon_id, vec!["lan://latch.local:4823".to_string()], now);
+        DaemonPairing::mint(daemon_id, vec!["lan://sigil.local:4823".to_string()], now);
     let qr = payload.to_qr_string().context("qr encode")?;
     println!("1. daemon minted QR ({} chars)", qr.len());
 
@@ -228,8 +228,8 @@ fn cmd_demo(args: &[String]) -> anyhow::Result<()> {
     let resp_env = relay
         .recv(mailbox, Direction::ToDaemon, Duration::from_millis(500))?
         .context("no response from softphone")?;
-    let mut guard = latch_proto::ReplayGuard::new();
-    let response: latch_proto::ApprovalResponse = resp_env
+    let mut guard = sigil_proto::ReplayGuard::new();
+    let response: sigil_proto::ApprovalResponse = resp_env
         .open(
             &phone.phone_identity(),
             &daemon_id_keep.agreement,

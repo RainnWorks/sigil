@@ -34,7 +34,7 @@ use crate::secrets::Token;
 
 type Blake2b256 = Blake2b<U32>;
 
-const GRANT_DOMAIN: &[u8] = b"latch.grant.v1";
+const GRANT_DOMAIN: &[u8] = b"sigil.grant.v1";
 /// Cap the ancestry walk so a pathological or looping process table cannot spin.
 const MAX_ANCESTRY_DEPTH: usize = 64;
 
@@ -139,7 +139,7 @@ struct Lease {
     expires: Instant,
 }
 
-/// A read-only view of an active lease for `latch lease list`.
+/// A read-only view of an active lease for `sigil lease list`.
 #[derive(Debug, Clone)]
 pub struct LeaseInfo {
     pub grant_hex: String,

@@ -1,9 +1,9 @@
-//! The decision audit log: `<latch_home>/history.jsonl`.
+//! The decision audit log: `<sigil_home>/history.jsonl`.
 //!
 //! The daemon appends one line per resolved request (approved, denied, or the
 //! lease-served fast path) so the History view has something to read; it is
 //! exposed over the daemon control socket (`Frame::History`) and, for a headless
-//! `latch history`, read directly from this file. Like every other Latch log, it
+//! `sigil history`, read directly from this file. Like every other Sigil log, it
 //! records **names
 //! and metadata only** — the account label, the requested scope/item names, the
 //! caller provenance, the decision, and how it was decided — and never a secret
@@ -28,7 +28,7 @@ pub const HISTORY_READ_CAP: usize = 500;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub id: String,
-    /// A [`RequestKind`](latch_proto::RequestKind) snake_case spelling.
+    /// A [`RequestKind`](sigil_proto::RequestKind) snake_case spelling.
     pub kind: String,
     /// The brightest display label (item name, or SSH host).
     pub label: String,
@@ -63,9 +63,9 @@ impl AuditEntry {
     }
 }
 
-/// `<latch_home>/history.jsonl`.
+/// `<sigil_home>/history.jsonl`.
 pub fn path() -> Option<std::path::PathBuf> {
-    paths::latch_home().map(|h| h.join("history.jsonl"))
+    paths::sigil_home().map(|h| h.join("history.jsonl"))
 }
 
 /// Append one entry, best-effort. Never returns an error to the hot path: an
@@ -157,7 +157,7 @@ fn write_replace_0600(path: &std::path::Path, bytes: &[u8]) {
 #[allow(clippy::too_many_arguments)]
 pub fn entry(
     id: &str,
-    kind: latch_proto::RequestKind,
+    kind: sigil_proto::RequestKind,
     label: &str,
     account: &str,
     process: &str,
@@ -196,13 +196,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let dir = std::env::temp_dir().join(format!(
-                "latch-audit-{tag}-{}-{:?}",
+                "sigil-audit-{tag}-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             ));
             std::fs::create_dir_all(&dir).unwrap();
-            let prev = std::env::var_os("LATCH_HOME");
-            std::env::set_var("LATCH_HOME", &dir);
+            let prev = std::env::var_os("SIGIL_HOME");
+            std::env::set_var("SIGIL_HOME", &dir);
             Self {
                 _lock: lock,
                 prev,
@@ -213,8 +213,8 @@ mod tests {
     impl Drop for HomeGuard {
         fn drop(&mut self) {
             match &self.prev {
-                Some(v) => std::env::set_var("LATCH_HOME", v),
-                None => std::env::remove_var("LATCH_HOME"),
+                Some(v) => std::env::set_var("SIGIL_HOME", v),
+                None => std::env::remove_var("SIGIL_HOME"),
             }
             std::fs::remove_dir_all(&self.dir).ok();
         }
@@ -223,7 +223,7 @@ mod tests {
     fn mk(id: &str, at_ms: u64, decision: &str) -> AuditEntry {
         entry(
             id,
-            latch_proto::RequestKind::SecretRead,
+            sigil_proto::RequestKind::SecretRead,
             "Engineering/.env",
             "Rowm",
             "zsh \u{2192} op",

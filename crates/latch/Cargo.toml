@@ -1,9 +1,9 @@
 [package]
-name = "latch"
+name = "sigil"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Latch daemon, op shim, and CLI as one multicall binary"
+description = "Sigil daemon, op shim, and CLI as one multicall binary"
 
 # A library target holds all the modules so unit tests and the seam traits are
 # public API (a binary-only crate would flag every test-only helper as dead).
@@ -13,34 +13,34 @@ description = "Latch daemon, op shim, and CLI as one multicall binary"
 # for two reasons: they need `bun` + the relay script on the box, and several of
 # them contend on ephemeral ports / relay processes and deadlock when run in
 # parallel with each other. Run them serially on a Mac that has bun:
-#   cargo test -p latch --features real-relay -- --test-threads=1
+#   cargo test -p sigil --features real-relay -- --test-threads=1
 real-relay = []
 
 # The shared core: rule engine, providers, gating/daemon, keystore, transport,
 # proxy. Both binaries below depend on it; zero logic is duplicated between them.
 [lib]
-name = "latch_core"
+name = "sigil_core"
 path = "src/lib.rs"
 
 # The lean hot-path + runtime binary: the transparent shim multicall, the
-# `latch <cmd>` gating primitive, and the runtime/daemon verbs. Reserved-verb
+# `sigil <cmd>` gating primitive, and the runtime/daemon verbs. Reserved-verb
 # surface is kept small so a program named `config`/`account`/… stays gateable.
 [[bin]]
-name = "latch"
-path = "src/bin/latch.rs"
+name = "sigil"
+path = "src/bin/sigil.rs"
 
 # The configuration-management CLI the desktop shells out to: the rule/source
 # config engine plus account/settings/mac-approvals/wipe. Genuinely separate
 # artifact, same shared core.
 [[bin]]
-name = "latch-config"
-path = "src/bin/latch-config.rs"
+name = "sigil-config"
+path = "src/bin/sigil-config.rs"
 
 [dependencies]
-latch-proto = { path = "../proto" }
-# latch-relay-client: the daemon's outbound-WebSocket Transport to the blind
+sigil-proto = { path = "../proto" }
+# sigil-relay-client: the daemon's outbound-WebSocket Transport to the blind
 # relay, wired behind the phone approving factor at arm time.
-latch-relay-client = { path = "../relay-client" }
+sigil-relay-client = { path = "../relay-client" }
 serde.workspace = true
 serde_json.workspace = true
 # anyhow only at the binary edge, per house rules.
@@ -68,9 +68,9 @@ uuid.workspace = true
 # tokio: async accept loop for the daemon only; the shim path never builds a
 # runtime. Feature set kept to the listener plus signal handling.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
-# latch-relay-client already provides the daemon WS transport; the softphone is
+# sigil-relay-client already provides the daemon WS transport; the softphone is
 # a dev-dep. The pairing rendezvous uses relay-client's raw Rendezvous client.
-# qrcode: encode the module matrix for `latch qr` and the pairing QR.
+# qrcode: encode the module matrix for `sigil qr` and the pairing QR.
 # default-features off drops the `image`/`svg` render backends and the whole
 # `image` dependency stack; we use only the matrix (`QrCode::to_colors`) and
 # render it ourselves in `src/qr.rs` (unicode half-blocks, a from-scratch
@@ -90,12 +90,12 @@ signature = "2"
 sha2 = "0.10"
 # NOTE: the daemon no longer signs/sends APNs (the v4 relay does), so the reqwest
 # + p256 deps that `src/apns.rs` used are gone. The daemon reaches the relay only
-# through `latch-relay-client` (plain HTTP), and carries zero Apple secret.
+# through `sigil-relay-client` (plain HTTP), and carries zero Apple secret.
 
-# latch-softphone: the reference approver, used by the remote e2e integration
+# sigil-softphone: the reference approver, used by the remote e2e integration
 # test to stand in for a paired phone. Dev-only; never linked into the daemon.
 [dev-dependencies]
-latch-softphone = { path = "../softphone" }
+sigil-softphone = { path = "../softphone" }
 # ed25519-dalek: cryptographically verify the agent's SSH signatures in tests
 # (raw ed25519 over the challenge), against the served public key. Already in the
 # tree via ssh-key/proto; a dev-dep so it never adds to the shipped binary.
