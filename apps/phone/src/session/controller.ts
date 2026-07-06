@@ -136,12 +136,12 @@ export async function sendPushRegister(token: string): Promise<PushRegisterOutco
 }
 
 /**
- * Force an immediate relay drain outside the backstop cadence, e.g. right
- * after a notification tap, so the approval sheet does not wait out the 30s
- * poll interval. A no-op when unarmed.
+ * Attach to the relay right now, e.g. right after a notification tap, so the
+ * approval sheet does not wait out the foreground backstop interval. A no-op
+ * when unarmed.
  */
 export async function nudgeTransport(): Promise<void> {
-  await live?.transport.pollNow();
+  await live?.transport.wake();
 }
 
 export type ApproveOutcome = "sent" | "refused" | "no-session" | "error";
