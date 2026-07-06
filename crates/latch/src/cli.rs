@@ -592,6 +592,42 @@ fn account_add(args: &[String], json: bool) -> i32 {
             return 1;
         }
     };
+    // sec-review Note A: account routing matches a hint against an account's
+    // label OR one of its vaults (first hit wins). If this account's label equals
+    // another account's vault name (or vice versa), a routing hint that string is
+    // order-dependent — surprising, though not exploitable (both are the
+    // operator's own accounts and the approval still gates). Warn at authoring so
+    // the ambiguity is visible; prefer labels that are not also vault names.
+    if !json {
+        if let Some(other) = store
+            .accounts
+            .iter()
+            .find(|a| a.vaults.iter().any(|v| v == &label))
+        {
+            println!(
+                "  {} {}",
+                s.brass("\u{2717}"),
+                s.dim(&format!(
+                    "label {label:?} also names a vault of account {:?}; routing that name is ambiguous",
+                    other.label
+                ))
+            );
+        }
+        if let Some((other, vault)) = store.accounts.iter().find_map(|a| {
+            vaults
+                .iter()
+                .find(|v| **v == a.label)
+                .map(|v| (a.label.clone(), v.clone()))
+        }) {
+            println!(
+                "  {} {}",
+                s.brass("\u{2717}"),
+                s.dim(&format!(
+                    "vault {vault:?} of this account matches the label of account {other:?}; routing that name is ambiguous"
+                ))
+            );
+        }
+    }
     if let Err(e) = store.add(&label, &dek, &token, vaults.clone()) {
         eprintln!("latch: {e}");
         return 1;
