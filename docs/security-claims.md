@@ -242,6 +242,218 @@ and `AppModel` currently passes an empty placeholder. The at-rest storage and
 delivery of the wrapped blob are the remaining integration, at which point
 residual 12's local-only assumption must be re-checked.
 
+## 15. The config rule engine + account routing (`b66404c`)
+
+The per-command `CommandStore` became a generic if-this-then-that engine: an
+ordered rule list (`Match` -> `Action`) plus named `Source`s. `parse_vault`
+argv-sniffing is deleted; account routing is now the matched source's configured
+`account` label, and `AccountStore::route` / `ThresholdAccountStore::{route,
+route_exact}` match by **label OR vault**.
+
+**Independent review verdict — CONFIRMED SOUND (two low-severity hardening
+notes).** Written by the security-reviewer, which did **not** author `config.rs`
+or the `fulfill` rewrite (rust-core, `b66404c`); per the review-integrity rule
+this is not a self-certification. The adversarial pass covered: whether a crafted
+argv/rule can route to the wrong account or the wrong threshold key; whether
+removing the `op` hardwiring opens a fail-open path; and whether the deferred
+`arg_regex` can be smuggled into an always-true match.
+
+| Claim | Enforcing code | Proving test |
+|-------|----------------|--------------|
+| Account routing is **config-derived, never caller-argv-derived**: the hint is the matched source's `account` label; the caller's argv no longer influences which account unlocks (it only selects which of Tom's own rules matches, and every match still requires a fresh approval/lease). This is *stronger* than the old `--vault` sniff | `daemon.rs::fulfill` (`vault = action.account.clone()`; `parse_vault` deleted), `config.rs::Config::resolve` | `daemon.rs::v1_and_v2_accounts_coexist_and_each_takes_its_own_path`, `config::tests::resolve_first_match_wins_and_flattens_source` |
+| The v2 threshold path selects **one** account atomically (`record.clone()`): the phone's partial `Z_F` is agreed against that record's `E` and combined with the SAME account's Mac share `m` and token ciphertext — no cross-account share splicing is reachable via label/vault confusion | `daemon.rs::fulfill` (`v2 = store.route_exact(...).map(\|a\| (label, a.record.clone()))`), `threshold.rs::route_exact` | `daemon.rs::remote_v2_threshold_approval_decrypts_via_two_party_combine`, `threshold::tests::each_account_gets_a_unique_ephemeral_and_routes`, `full_two_of_two_round_trip_{raw_x,x963}` |
+| `route_exact` stays **exact** when v1 accounts coexist (v2 claims only a label/vault match, never the single-account fallback), so a migration store never lets v2 over-capture a v1 request | `daemon.rs::fulfill` (`route_exact(...).or_else(\|\| if v1_empty { route(...) } else { None })`) | `daemon.rs::v1_and_v2_accounts_coexist_and_each_takes_its_own_path` |
+| An invocation that **no rule matches** is refused, never run ungated; removing `default_op`/`parse_vault` leaves **no** built-in rule for any command (a zero-config daemon refuses everything until configured) | `config.rs::Config::resolve` (`None`), `daemon.rs::fulfill` (`fail_closed`) | `daemon.rs::unconfigured_command_is_refused_with_a_config_hint`, `config::tests::empty_match_never_matches` |
+| An **empty match** never matches (a malformed/partial rule fails closed, never gates every command) | `config.rs::Match::matches` (`is_empty() -> false`) | `config::tests::empty_match_never_matches`, `add_rule_rejects_unknown_source_and_empty_match` |
+| The deferred **`arg_regex` cannot be smuggled into an always-true match**: `Match::matches` returns `false` whenever `arg_regex.is_some()`, independent of how the config was authored — so even a hand-edited/imported regex rule is a dead rule (fails closed), only ever *more* restrictive, never always-true | `config.rs::Match::matches` (`if self.arg_regex.is_some() { return false }`) | `config::tests::regex_condition_is_deferred_and_fails_closed` |
+| Invariants #1/#2/#7 unchanged: the config only chooses provider/source/risk; token-ciphertext-at-rest, op-child-stdout->client-fd, and the fail-closed branches are the same code paths | `daemon.rs::fulfill` (unchanged token/provider handling), `config.rs` (routing only) | the full `daemon::tests` suite (inert-at-rest, denial-fails-closed) passes unchanged |
+
+**Low-severity hardening note A (config-authoring ambiguity, not caller-exploitable).**
+`route`/`route_exact` match `label == v OR vault.contains(v)` with `.find()`
+returning the first hit. If one account's `label` collides with another
+account's `vault` name, routing is order-dependent. The hint is config-derived
+(Tom's own source label), so this is a misconfiguration foot-gun, not an attacker
+primitive, and the mis-routed account still requires a fresh phone approval.
+Recommend documenting that a source `account` label must be unambiguous across
+the account/threshold stores.
+
+**Low-severity hardening note B (fall-through on a dangling source).**
+`Config::resolve` `continue`s past a rule whose `Match` holds but whose
+`action.source` is unknown, trying the next rule rather than hard-refusing.
+`add_rule`, `remove_source`, and `config import` all validate referential
+integrity (`cli.rs::config_import` rejects an unknown source / empty match), so a
+dangling source cannot arrive via the CLI or import; only a direct hand-edit of
+the 0600 `config.json` (a same-UID write, already outside Latch's boundary) can
+reach it, and the worst effect is a *downgrade* to a later broader rule — still
+gated, never ungated. Recommend a matched-rule-with-unknown-source hard
+fail-closed (refuse the invocation) rather than fall through, so a misconfigured
+specific rule can never silently resolve to a broader one. Informational.
+
+## 16. The zero-knowledge phone reduction (`cdeebb7`, `ec59737`, `6e3d485`)
+
+The phone dropped the R5 `consentConsistent` account<->secret cross-check, all
+provider/account display surfaces, and all Mac-outcome reasoning, becoming a
+pure provider-blind approve/deny approver that renders only the opaque
+Mac-provided display fields.
+
+**Independent review verdict — CONFIRMED SOUND.** Written by the
+security-reviewer, which did **not** author the phone reduction (phone-approver);
+not a self-certification. The adversarial pass covered: whether removing R5
+creates a new display-spoof materially worse than the accepted residual #7;
+whether the phone still learns only TRANSPORT status (never OUTCOME); and whether
+the crypto is byte-identical.
+
+| Claim | Enforcing code | Proving test |
+|-------|----------------|--------------|
+| Removing R5 creates **no** new attack worse than residual #7. A hostile relay gains nothing (the request rides the Ed25519-signed `Envelope` + replay guard; any tamper breaks the signature). A compromised Mac controls BOTH the displayed `secret_refs` AND the challenge `label`/`accountId`, so R5's fuzzy token-overlap was trivially self-satisfiable and never stopped the residual-#7 spoof; the "inconsistent request" R5 caught maps to no capable-adversary primitive | `envelope.rs::open`, `replay.rs::ReplayGuard`; phone `controller.ts::liveApproveThreshold` (no consent check, SE gate is the key release) | `proto/tests/hostile_relay.rs` (26 attacks) + `pairing_mitm.rs` pass unchanged; the phone gates the KEY not the display truth |
+| The honest residual is correctly a **Mac-trust boundary, not a phone one**: a compromised Mac can spoof the display; the phone gates the SE key-agreement / DEK read behind Face ID, and the human declining an unexpected request is the backstop | `controller.ts::liveApprove{,Threshold}` (Face ID gate), residual #7 | reviewed by inspection; consistent with residual #7 |
+| The phone learns only **TRANSPORT** status, never **OUTCOME**: `ApproveOutcome = sent \| refused \| no-session \| error`; "sent" means only that the response left the phone. All Mac-outcome copy ("Secret delivered" / "No secret was delivered" / "Could not reach your Mac") is removed for phone-local facts ("Approved. Sent." / "Denied." / "Request expired." / cause-neutral "That didn't go through.") | `controller.ts::liveApprove` (doc: "does not learn, and must not infer, whether the Mac then unlocked or delivered anything"), `approval-sheet.tsx::{DecisionSent,TerminalStatus}` | `bun run proto:selftest` green; grep confirms no approval-time outcome inference remains (only zero-knowledge doc-comments + legitimate pairing-msg-1 transport facts) |
+| **Crypto byte-identical.** The only crypto-path edit is the Face ID `reason` string (`Approve ${label}` -> `"Approve request"`), which is a display-only `LAContext` prompt — the ECDH is `sharedSecretFromKeyAgreement(f, E)`, independent of `reason`. `requests.ts` is doc-comment only; wire fields unchanged; `ephemeralPub` is the sole crypto input, authenticated by the enclosing signed envelope; `accountId`/`seKeyId` travel in one signed challenge | phone `LatchSeModule.swift::computePartial` (reason feeds only the prompt), `controller.ts` (loadDek/computePartial/shapeEcdh/session.respond unchanged), `requests.ts` (doc only) | phone protocol **vectors 15/15**, `proto:selftest` all green (envelope, replay, forged-sender, wrong-recipient, tamper, fingerprint/mailbox, pairing tag/rendezvous vs rust); Rust `latch-proto` 26 pass |
+
+**Minor doc-drift (non-security, both changes).** A stale comment at
+`apps/phone/modules/latch-se/ios/LatchSeModule.swift:138` still reads "Bind the
+Face-ID prompt to the account being unlocked (R5): the reason is the account
+label" — the reason is now the generic "Approve request". Flagged to the
+phone-approver to clean; not a vulnerability.
+
+**R5 mapping in this doc:** no §/row mapped R5 to phone code (the sweep found
+none), so no stale claim to retract here; the R5 protocol doc comment on
+`requests.ts` was already rewritten in `ec59737`.
+
+## 17. Caller-stdin splice to the tool child (`538fd70`)
+
+The `Run` frame now carries three descriptors (stdin, stdout, stderr) over
+SCM_RIGHTS instead of two; the daemon splices the caller's stdin straight to the
+spawned tool child so interactive tools (`op inject`, prompts) read the caller's
+terminal. The claim is that the daemon only *passes* the fd (never reads it), so
+invariant #2 (no caller/secret bytes in daemon memory) holds for the input
+direction too.
+
+**Independent review verdict — CONFIRMED SOUND on the happy path (two
+low-severity hardening notes).** Written by the security-reviewer, which did
+**not** author the splice (config-cli, `538fd70`); not a self-certification. The
+adversarial pass covered: whether the daemon ever reads/buffers/inspects stdin;
+fd ownership/lifetime (leak, retained readable dup, cross-request confusion);
+whether stdin perturbs the stdout/stderr splice; fail-closed on a missing fd; and
+new hostile surface (weird fd, blocking-stdin stall).
+
+| Claim | Enforcing code | Proving test |
+|-------|----------------|--------------|
+| The daemon **only passes** the stdin fd, never `read()`s / buffers / inspects it: its sole consumer is `cmd.stdin(Stdio::from(fd))`. No caller/secret byte enters daemon memory for the input direction (invariant #2 holds for input) | `provider.rs::{OpProvider,EnvFileProvider}::run` (`Stdio::from(run.stdin)`), `daemon.rs::{handle_conn,fulfill}` (threads the fd through, never reads it) | `daemon.rs::caller_stdin_is_spliced_to_the_tool_child` (bytes written to the caller-side pipe reach the child; the daemon reads nothing) |
+| **fd ownership/lifetime is correct**: every received fd is wrapped in `OwnedFd` (closed exactly once on drop); the daemon never `dup`s, so it retains no readable copy; on every fail-closed early return the unused stdin/stdout `OwnedFd`s drop (close) rather than splice | `local.rs::recv_with_fds` (`OwnedFd::from_raw_fd`), `daemon.rs::fulfill` (owned params dropped on early return), `provider.rs::run` (`Stdio::from` moves ownership to the child spawn) | `local.rs::op_fd_passing_and_reply_roundtrip_over_a_socketpair`, `daemon.rs::full_loop_over_the_socket_with_local_control_approval` |
+| **No cross-request / cross-client fd confusion**; ordering preserved: each connection is a separate `spawn_blocking` task with its own `recv_frame` -> its own `OwnedFd` set on its own stack; the shim sends `[stdin, stdout, stderr]` and the daemon reads `next()/next()/next()` in the same order (SCM_RIGHTS preserves array order) | `daemon.rs::serve` (per-conn `spawn_blocking`), `handle_conn` (positional `fds.next()`), `shim.rs::forward` (`[inp, out, err]`) | `daemon.rs::caller_stdin_is_spliced_to_the_tool_child`, `dev_autoapprove_full_loop_delivers_secret_to_caller` |
+| **Fails closed on the input path**: there is no daemon-buffered-stdin fallback anywhere — the daemon never reads stdin, so a missing/failed fd cannot fall through to daemon-read input; the child simply gets `None` for that slot | `daemon.rs::fulfill`, `provider.rs::run` (no daemon read of stdin exists) | reviewed by inspection (grep: `run.stdin`'s only use is `Stdio::from`) |
+| A **malicious client passing a weird fd** as stdin gains nothing: the daemon splices it to the child (same UID as the attacker) and never acts on the fd's identity, so it is no more than what the attacker could feed a tool it ran itself | `provider.rs::run` (passthrough only) | reviewed by inspection; same trust model as the pre-existing stdout/stderr passing |
+
+**Low-severity hardening note A (missing-fd inherit — invariant-#2-adjacent,
+defense-in-depth).** The daemon does not validate that a `Run` frame carries
+exactly three descriptors, and a missing fd makes the child **inherit the
+daemon's** corresponding stdio (`provider.rs::run`: `if let Some(fd) = run.stdout
+{ cmd.stdout(Stdio::from(fd)) }` with no `else` -> std default is *inherit*). So a
+non-conforming same-UID client that sends fewer than three fds (e.g. zero) makes
+an approved `op` child write its **secret to the daemon's inherited stdout**
+(under launchd, a same-UID-readable log) instead of to the caller — secret bytes
+leaving the intended splice path. The `None`->inherit pattern pre-dates this
+change for stdout/stderr, but the stdin splice makes the three-fd positional
+contract load-bearing with still no validation, and a *short* count now also
+**misassigns** slots (a two-fd `[stdout, stderr]` sender is read as `[stdin,
+stdout]`, leaving `stderr = None` -> inherit and shifting stdout). Bounded:
+requires a crafted non-standard frame from a same-UID client **and** a granted
+approval or active lease, and a same-UID attacker can read the secret more
+directly — no real escalation. Cheap to close and recommended for an airtight
+invariant #2: (a) reject a `Run` frame whose fd count != 3 (fail closed), and
+(b) default an absent child stdio to `Stdio::null()` rather than inherit, so the
+daemon's own stdio can never become a sink for tool output.
+
+**RESOLVED (`91aab46`).** Both closes landed and are verified sound: `handle_conn`
+now refuses any `Run` frame whose descriptor count != 3 (`fds.len() != 3 -> Exit
+{ code: 1 }`) **before** anything spawns, so a short/long count can never
+misassign slots; and both providers default an absent stdio to `Stdio::null()`
+(`run.stdin.map_or_else(Stdio::null, Stdio::from)`), so the daemon's own
+same-UID-readable stdio can never sink a tool's secret output. Proven by
+`daemon.rs::run_frame_with_wrong_fd_count_is_refused` (a 2-fd frame -> exit 1, no
+output) with the happy-path splice unchanged (`caller_stdin_is_spliced_to_the_tool_child`).
+
+**Low-severity hardening note B (caller-stdin stall — DoS, post-approval +
+same-UID).** Splicing the caller's stdin lets a compromised caller pin a daemon
+blocking-thread: pre-change the child inherited the daemon's stdin (effectively
+`/dev/null` under launchd, so a stdin read hit EOF); post-change the child reads
+the caller's fd, which the attacker can hold open without sending data, so a
+stdin-reading tool (`op inject`) blocks and holds its `spawn_blocking` thread for
+as long as the caller keeps the fd open. With an active lease (approval
+short-circuited) an attacker could fire many such requests and exhaust the
+bounded blocking pool. Bounded (post-approval, same-UID, DoS-only, no disclosure,
+fails closed) and the same class as any long-running approved child, but now
+caller-triggerable via input. Optional hardening: a spawn watchdog/timeout, or
+record it as an accepted same-UID residual.
+
+**Note:** commit `538fd70`'s `shim.rs` hunk references a `crate::proxy` module
+(the recursion fuse) that is part of the concurrent proxy work and was untracked
+at review time, so the crate did not build standalone at that commit; the stdin
+tests above were exercised by supplying the `proxy` module into a detached
+worktree. Flagged to the team so the proxy module lands committed and the tree
+builds clean (not a defect in the splice itself). **Update:** the proxy module is
+now committed (`f5448cf`) and the tree builds (`91aab46` also landed Finding A's
+fix — the `Run` fd path is now airtight); see §18.
+
+## 18. The auto-aliasing proxy (`f5448cf`, `65d75d2`)
+
+`~/.latch/bin` goes first on `PATH`; each intercepted command is a symlink there
+at the `latch` runtime binary. Running `op` resolves the symlink -> `latch`
+re-enters as `latch op ...` -> gates on the phone -> execs the **real** `op`
+(resolved with the proxy excluded). Management is `latch-config proxy
+add|remove|list|status|doctor|env`. Design: `docs/design/proxy-aliasing.md`.
+
+**Independent review verdict — CONFIRMED SOUND (two low-severity notes, neither a
+distinct exploit).** Written by the security-reviewer, which did **not** author
+the proxy (proxy-shim / rust-core); not a self-certification. The proxy is a
+PATH/resolution convenience layer that **correctly disclaims being a containment
+boundary**; the adversarial pass confirmed it fails closed on every
+resolution/recursion fault, never lets the caller-controlled depth counter touch
+a security decision, and does not weaken caller identity (#6) or secret handling
+(#2).
+
+| Claim | Enforcing code | Proving test |
+|-------|----------------|--------------|
+| `find_real` cannot be steered to an **attacker binary** via symlinks: `canonicalize` resolves a symlink / symlink-chain / real-looking symlink-into-the-proxy-dir to the running `latch` binary, and rule 1 (canonical == `own_binary`) excludes it **in any directory** | `paths.rs::find_real` (skip `canon == own`), `proxy.rs::alias_target` | `proxy::a_stray_alias_symlink_outside_the_proxy_dir_is_not_the_real_tool`, `drift_when_a_real_binary_precedes_the_alias_is_a_bypass`, `healthy_when_alias_is_first_and_points_at_current` |
+| The **daemon-up** path is immune to **caller PATH poisoning**: the `Run` frame carries only `argv`/`cwd`/`proxy_depth`/fds — never the caller's `PATH`/env — so the daemon resolves the real binary in its **own** trusted (launchd-pinned) `PATH`; a caller cannot redirect what the daemon spawns or steer the injected SA token to an attacker binary. The daemon-**down** path uses the caller's `PATH` but injects **no** secret (transparent exec), so a poisoned `PATH` there just runs the caller's own binary with no token — identical to no-Latch | `local.rs::Frame::Run` (no env field), `provider.rs::OpProvider::resolve` -> `paths::find_real` (daemon env), `shim.rs::exec_real` (no env injected) | reviewed by inspection; `daemon.rs` provider tests spawn from the daemon's own resolution |
+| A **hard copy** of the `latch` binary planted as `<cmd>` (not caught by canonical equality) **fails closed**: `find_real` returns it -> re-enter -> loop, bounded by the depth fuse to exit 70 (shim) / daemon refuse at `MAX_DEPTH`. No ungated run, no secret leak — a bounded self-DoS requiring same-UID to plant a copy of the binary | `shim.rs::dispatch` (`depth_exceeded` -> exit 70), `daemon.rs::fulfill` (`proxy_depth >= MAX_DEPTH` -> `fail_closed`) | `daemon.rs::proxy_depth_is_incremented_on_the_child_and_fuses_at_the_limit`, `proxy::depth_fuse_reads_and_increments` |
+| **PATH-order bypass is documented as a residual, never claimed prevented.** A real `<cmd>` before the proxy routes an *unmodified* caller ungated; `doctor` reports it as an operator convenience, and a caller that *wants* to skip the gate always can (real binary is never moved). No code treats PATH order as a control | `proxy.rs::ProxyStatus::issue` ("a real {cmd} precedes the proxy on PATH (requests would be ungated)"), `docs/design/proxy-aliasing.md` §"not a containment boundary" | `proxy::drift_when_a_real_binary_precedes_the_alias_is_a_bypass` |
+| The **recursion guard cannot be cleared to escape gating.** `proxy_depth` is used in exactly one decision — `fulfill`'s `>= MAX_DEPTH -> fail_closed` (deny, safe direction) — and is **never** consulted by the phone gate, account routing, caller-identity derivation, or lease keys. Setting `LATCH_PROXY_DEPTH` high -> self-deny; setting it to 0 -> only prolongs a loop that exists solely if `find_real` is buggy (self-DoS), never a bypass; `saturating_add` prevents wrap | `daemon.rs::fulfill` (sole `proxy_depth` decision + `child_depth` env), `proxy.rs::{current_depth,depth_exceeded,next_depth_value}` | `daemon.rs::proxy_depth_is_incremented_on_the_child_and_fuses_at_the_limit`, `proxy::depth_fuse_reads_and_increments` |
+| Caller identity (#6) is **not weakened**: the daemon derives identity from the kernel peer pid + ancestry walk, independent of anything the proxy supplies (argv/cwd/depth are decorative for identity) | `daemon.rs::handle_conn` (`peer = lease::peer_pid`), `lease.rs::walk_ancestry` | existing `lease.rs` ancestry/grant-key suite (unchanged) |
+| Fail-closed (#7): a resolution failure execs nothing (`exit 127`); a protocol fault while the daemon is up is `exit 70`, never an ungated run; only a **down** daemon execs transparently (by design, injecting no secret) | `shim.rs::{exec_real,forward}` (127 / 70), `daemon.rs::fulfill` | reviewed by inspection; `shim.rs` module contract |
+
+**Low-severity note A (doc-vs-code + defense-in-depth): the runtime `find_real`
+implements only rule 1, not the proxy-dir exclusion (rule 2) the design claims.**
+`docs/design/proxy-aliasing.md` §"hard problem 1(a)" states two exclusion rules —
+(1) canonical == `current_exe` **and** (2) skip any candidate inside the proxy
+dir. `paths::find_real` (the resolver that actually chooses what to exec/spawn)
+implements only rule 1; rule 2 exists only in the **diagnostic** path
+(`proxy.rs::ProxyStatus::detect_with`, via `is_shim_dir`). Impact: a **non-symlink**
+executable resident in `~/.latch/bin` under a tool's name (a hard copy, a script,
+or a same-UID-planted non-latch binary) is not excluded by `find_real`, so the
+daemon-up path would treat it as "the real tool" and spawn it **with the injected
+SA token**. Every route requires same-UID write to `~/.latch/bin` — already
+game-over (such an attacker can read the approved tool's `/proc/<pid>/environ` or
+replace the real binary), so it is not a distinct escalation — but it is a real
+gap between the doc's claimed guarantee and the code, and it diverges from the
+diagnostic path. **Recommend implementing rule 2 in `find_real`** (skip any
+candidate whose parent canonicalises to `shim_bin_dir()`): trivial, restores
+doc/diagnostic parity, guarantees the daemon never injects a token into a
+proxy-dir-resident binary, and as a bonus makes the hard-copy case resolve to the
+real tool instead of fail-closed-looping.
+
+**Low-severity note B (display correctness post-split, no security impact):**
+`paths::find_real` keys its exclusion on `own_binary()` (= `current_exe`), while
+aliases point at `alias_target()` (the sibling `latch` runtime binary). In the
+runtime `latch` and the daemon these coincide, so **execution is correct**. But
+called from `latch-config` (`current_exe` != the runtime the aliases point at),
+rule 1 fails to exclude the proxy-dir alias, so `Alias.real` (used only for
+`proxy list`/`doctor` **display**) can show the alias path instead of the real
+binary, disagreeing with `ProxyStatus.real` (which uses `alias_target`, correct).
+Display-only; no execution/security impact. Recommend `find_real` exclude against
+`alias_target()` (or both) for correct post-split diagnostics.
+
 ---
 
 ## Residuals (honest limits)
