@@ -44,7 +44,7 @@ impl Factor {
             Factor::Phone => "paired phone (sealed remote approval)",
             Factor::Biometric => "hardware biometric (Secure Enclave)",
             Factor::DevInsecure => "DEV-INSECURE (same-UID self-approval)",
-            Factor::NoFactor => "none — gated requests fail closed",
+            Factor::NoFactor => "none, gated requests fail closed",
         }
     }
 
