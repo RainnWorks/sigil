@@ -6,7 +6,16 @@ import SwiftUI
 
 struct PairingView: View {
     @Environment(AppModel.self) private var model
-    @State private var relayURL = ""
+    /// The managed relay every install defaults to; the user never has to
+    /// think about it. Mirrors sigil-core's `DEFAULT_RELAY_URL`.
+    private static let sigilRelayURL = "https://relay.rainn.works"
+    private static let sigilRelayHost = "relay.rainn.works"
+
+    @State private var relayURL = PairingView.sigilRelayURL
+    /// Whether the relay field is expanded for a self-hosted or alternate
+    /// relay. Off by default: the relay is invisible plumbing, not a decision
+    /// most pairings need to make.
+    @State private var useCustomRelay = false
 
     var body: some View {
         ScrollView {
@@ -24,7 +33,17 @@ struct PairingView: View {
             .padding(20)
         }
         .navigationTitle("Pairing")
-        .onAppear { if relayURL.isEmpty { relayURL = model.paired?.relayURL ?? model.settings.relayURL } }
+        .onAppear {
+            // Only override the managed default when there is a real saved
+            // choice (an existing pairing, or a previously configured
+            // relay) that differs from it; otherwise the Sigil relay stands.
+            let saved = model.paired?.relayURL
+                ?? (model.settings.relayURL.isEmpty ? nil : model.settings.relayURL)
+            if let saved, saved != Self.sigilRelayURL {
+                relayURL = saved
+                useCustomRelay = true
+            }
+        }
     }
 
     private func pairedList(_ paired: PairedDevice) -> some View {
@@ -131,14 +150,43 @@ struct PairingView: View {
 
     private var startPanel: some View {
         Section(title: "Pair a phone",
-                subtitle: "The relay is the blind mailbox the Mac and phone meet on. Use your own relay URL.") {
-            VStack(alignment: .leading, spacing: 10) {
-                TextField("https://relay.example", text: $relayURL)
-                    .textFieldStyle(.roundedBorder).font(.mono(11))
+                subtitle: "The relay carries only sealed envelopes between this Mac and your phone; it can neither read nor forge them.") {
+            VStack(alignment: .leading, spacing: 12) {
+                if useCustomRelay { customRelayField } else { defaultRelayRow }
                 Button("Render QR") { model.beginPairing(relayURL: relayURL) }
                     .buttonStyle(.glassProminent).tint(Palette.cobalt)
                     .disabled(relayURL.isEmpty)
             }
+        }
+    }
+
+    /// The managed-default state: leads with the fact that pairing just
+    /// works, not with a hostname the user never needs to look at.
+    private var defaultRelayRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Circle().fill(Palette.seaGreen).frame(width: 6, height: 6)
+                Text("Using the Sigil relay").font(.system(size: 12, weight: .medium))
+            }
+            MonoText(Self.sigilRelayHost, size: 10, color: .secondary)
+            Button("Use your own relay") { useCustomRelay = true }
+                .buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(Palette.cobalt)
+        }
+    }
+
+    /// The self-host override, tucked behind the disclosure above.
+    private var customRelayField: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Relay").font(.system(size: 12, weight: .medium))
+            TextField("https://relay.example", text: $relayURL)
+                .textFieldStyle(.roundedBorder).font(.mono(11))
+            Text("Self-hosted, or a different shared relay. Same trust surface either way.")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            Button("Use the Sigil relay instead") {
+                relayURL = Self.sigilRelayURL
+                useCustomRelay = false
+            }
+            .buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(.secondary)
         }
     }
 
