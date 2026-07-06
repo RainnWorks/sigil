@@ -19,8 +19,12 @@
 // never part of the buffered item and never stored.
 
 /** Envelope time-to-live, ms. Short: this only has to outlive the gap between
- * a deposit and the other side's next poll, not a real offline window. */
-export const TTL_MS = 120_000;
+ * a deposit and the other side's next poll, not a real offline window.
+ * Must stay ordered relay TTL >= proto REPLAY_WINDOW_MS (150_000) > the
+ * approval timeout (120_000), so the relay never expires a queued envelope
+ * before the replay window would still accept it. 180_000 leaves 30s of
+ * headroom over the replay window itself, not just equality with it. */
+export const TTL_MS = 180_000;
 /** Bounded FIFO depth per direction. Overflow is rejected, never silently dropped. */
 export const MAX_QUEUE = 32;
 /** Envelopes are tiny (a sealed DEK or a small request). Anything larger is abuse. */
