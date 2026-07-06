@@ -63,6 +63,14 @@ test("health needs no mailbox", async () => {
   });
 });
 
+test("GET / serves the landing page as HTML, not the health JSON", async () => {
+  const r = await fetch(baseUrl);
+  expect(r.status).toBe(200);
+  expect(r.headers.get("content-type")).toBe("text/html; charset=utf-8");
+  const body = await r.text();
+  expect(body).toContain("<title>Sigil relay</title>");
+});
+
 test("rejects a malformed mailbox id", async () => {
   expect((await fetch(`${baseUrl}/mailbox/nope/to-phone`)).status).toBe(400);
 });

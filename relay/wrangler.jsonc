@@ -12,6 +12,10 @@
     "bindings": [{ "name": "MAILBOX", "class_name": "Mailbox" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Mailbox"] }],
+  // Bundles ../landing.html into src/index.ts as a raw text module (see
+  // src/html.d.ts for the matching ambient type), so GET / serves the exact
+  // same bytes as the Bun variant's readFileSync of that one source file.
+  "rules": [{ "type": "Text", "globs": ["**/*.html"] }],
   // Deliberately OFF. Request logs would record mailbox ids and timing, which is
   // exactly the metadata this relay promises never to retain. See README.
   "observability": { "enabled": false }

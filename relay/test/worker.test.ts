@@ -20,6 +20,14 @@ describe("routing and health", () => {
     expect(await r.json()).toEqual({ ok: true, service: "latch-relay" });
   });
 
+  it("GET / serves the landing page as HTML, not the health JSON", async () => {
+    const r = await SELF.fetch(base);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    const body = await r.text();
+    expect(body).toContain("<title>Sigil relay</title>");
+  });
+
   it("rejects a malformed mailbox id", async () => {
     const r = await SELF.fetch(`${base}/mailbox/not-hex/to-phone`);
     expect(r.status).toBe(400);

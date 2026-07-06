@@ -14,10 +14,15 @@
 // A DO instance stays alive for the length of an in-flight fetch() the same
 // way any Worker does; an outstanding long-poll `await` is exactly that, not
 // idle time, so this never fights the runtime's own isolate lifecycle.
+//
+// GET / serves the static landing page (../landing.html, bundled in as a text
+// module - see wrangler.jsonc's "rules" and src/html.d.ts); GET /health is
+// still the JSON liveness check any uptime probe relies on.
 
 import { DurableObject } from "cloudflare:workers";
 import * as P from "../shared/protocol";
 import { sendPush } from "../shared/push";
+import landingHtml from "../landing.html";
 
 export interface Env {
   MAILBOX: DurableObjectNamespace<Mailbox>;
@@ -102,7 +107,12 @@ export class Mailbox extends DurableObject<Env> {
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const parts = new URL(req.url).pathname.split("/").filter(Boolean);
-    if (parts.length === 0 || parts[0] === "health") return json(P.RESP.health());
+    if (parts.length === 0) {
+      return new Response(landingHtml, {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+    if (parts[0] === "health") return json(P.RESP.health());
     if (parts[0] !== "mailbox" || !P.validId(parts[1])) {
       return json(P.RESP.err("bad_mailbox"), 400);
     }

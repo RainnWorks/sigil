@@ -7,7 +7,9 @@
 // every mailbox. That's fine: envelopes are meant to be short-lived, and the
 // side that deposited one still has its own copy if a retry is needed.
 // GETs are long-poll (see ../shared/protocol's longPoll/wake): held open on an
-// empty slot until a matching POST wakes them, or ~LONG_POLL_MS elapses.
+// empty slot until a matching POST wakes them, or ~LONG_POLL_MS elapses. GET /
+// serves the static landing page (../landing.html); GET /health is still the
+// JSON liveness check the Docker HEALTHCHECK and any uptime probe rely on.
 // Run: `bun run relay/bun/server.ts` (PORT defaults to 8787).
 
 import { readFileSync } from "node:fs";
@@ -20,6 +22,10 @@ const json = (body: unknown, status = 200): Response =>
     status,
     headers: { "content-type": "application/json" },
   });
+
+// Read once at startup, same as the Worker bundles it in at build time, so
+// both variants serve the identical bytes of the one source file.
+const LANDING_HTML = readFileSync(`${import.meta.dir}/../landing.html`, "utf8");
 
 const boxes = new Map<string, P.Mailbox>();
 
@@ -55,7 +61,12 @@ const server = Bun.serve({
   port,
   async fetch(req) {
     const parts = new URL(req.url).pathname.split("/").filter(Boolean);
-    if (parts.length === 0 || parts[0] === "health") return json(P.RESP.health());
+    if (parts.length === 0) {
+      return new Response(LANDING_HTML, {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+    if (parts[0] === "health") return json(P.RESP.health());
     if (parts[0] !== "mailbox" || !P.validId(parts[1])) {
       return json(P.RESP.err("bad_mailbox"), 400);
     }

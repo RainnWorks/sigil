@@ -22,6 +22,7 @@ RUN bun install --production --frozen-lockfile
 
 COPY bun ./bun
 COPY shared ./shared
+COPY landing.html ./landing.html
 
 # The official Bun image ships a non-root "bun" user (uid 1000) for exactly
 # this purpose; the relay never runs as root.
