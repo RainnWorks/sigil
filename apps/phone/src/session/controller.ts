@@ -25,6 +25,7 @@ import {
   type Sodium,
   toBase64,
 } from "@/src/protocol";
+
 import { computePartial, isSecureEnclaveAvailable } from "@/modules/latch-se";
 import { store } from "@/src/state/store";
 import { PhoneRelay } from "@/src/transport/phone-relay";
@@ -109,14 +110,20 @@ export async function unpair(): Promise<void> {
   store.clearPairingState();
 }
 
-export type ApproveOutcome = "sent" | "refused" | "mismatch" | "no-session" | "error";
+export type ApproveOutcome = "sent" | "refused" | "no-session" | "error";
 
 /**
  * Approve `request` over the live transport. Reads the DEK behind Face ID and,
  * only if the gate passes, seals an `ApprovalResponse` carrying `wrappedDek`
  * (standard-base64 of the raw 32-byte DEK, confidential inside the envelope seal)
- * and sends it toward the daemon. Returns "refused" if the biometric did not
- * pass (nothing is sent), "no-session" when unarmed, "error" on transport failure.
+ * and dispatches it toward the daemon. Returns "sent" once the decision has left
+ * this device, "refused" if the biometric did not pass (nothing is sent),
+ * "no-session" when unarmed, "error" if the dispatch itself threw.
+ *
+ * "sent" means exactly that the response left the phone. This function does not
+ * learn, and must not infer, whether the Mac then unlocked or delivered anything:
+ * the phone is a zero-knowledge approver, so the outcome on the far side is not
+ * its concern and is never reported back through this result.
  */
 export async function liveApprove(request: ApprovalRequest): Promise<ApproveOutcome> {
   if (!live) return "no-session";
@@ -141,11 +148,13 @@ export async function liveApprove(request: ApprovalRequest): Promise<ApproveOutc
  * The v2 approve: derive the phone's partial `Z_F = x(f·E)` in the Secure Enclave
  * and seal it as a `ThresholdPartial` (never a DEK). The enclave key-agreement is
  * itself the Face ID gate, so there is no separate biometric and no unguarded
- * path. R5: the biometric prompt's reason names the account being unlocked
- * (`threshold.label`), binding the human's consent to the account the challenge
- * claims. Fails closed to "refused" on a denied/failed biometric or an off-curve
+ * path. Fails closed to "refused" on a denied/failed biometric or an off-curve
  * `E`, and "error" if this device has no Secure Enclave (a v2 account cannot be
  * approved without it).
+ *
+ * The phone does not reason about what `threshold.accountId` is: it is an opaque
+ * routing tag the crypto needs (which pinned key `f` to agree, echoed back for
+ * correlation), never a provider/account concept the phone interprets or shows.
  */
 async function liveApproveThreshold(request: ApprovalRequest): Promise<ApproveOutcome> {
   if (!live) return "no-session";
@@ -153,22 +162,15 @@ async function liveApproveThreshold(request: ApprovalRequest): Promise<ApproveOu
   if (!ch) return "error";
   if (!isSecureEnclaveAvailable()) return "error";
 
-  // R5: bind consent to the account shown. The sheet displays `ch.label` as the
-  // account being unlocked; refuse (fail closed, before the SE op) if that
-  // account shares nothing with the secret refs in the readout, so a mis-issued
-  // challenge cannot show the human account A while cryptographically unlocking
-  // account B.
-  if (!consentConsistent(ch.label, ch.accountId, request.secrets)) return "mismatch";
-
   let zfB64: string;
   try {
     const sodium = await loadSodium();
-    // The enclave key-agreement is the Face ID gate; the reason names the account
-    // (R5). It returns the RAW 32-byte X-coordinate; the ECDH-output shaping
-    // (raw-x identity vs x963-sha256) is applied here in the vector-locked TS
-    // combiner core, byte-exact with the Mac's threshold.rs, so the phone never
-    // depends on CryptoKit's KDF parameters (NV-7).
-    const rawXB64 = await computePartial(ch.seKeyId, ch.ephemeralPub, `Approve ${ch.label}`);
+    // The enclave key-agreement is the Face ID gate. It returns the RAW 32-byte
+    // X-coordinate; the ECDH-output shaping (raw-x identity vs x963-sha256) is
+    // applied here in the vector-locked TS combiner core, byte-exact with the
+    // Mac's threshold.rs, so the phone never depends on CryptoKit's KDF
+    // parameters (NV-7).
+    const rawXB64 = await computePartial(ch.seKeyId, ch.ephemeralPub, "Approve request");
     const zf = shapeEcdh(sodium, fromBase64(rawXB64), ch.ecdhAlgo, fromBase64(ch.ephemeralPub));
     zfB64 = toBase64(zf);
   } catch {
@@ -183,38 +185,6 @@ async function liveApproveThreshold(request: ApprovalRequest): Promise<ApproveOu
   } catch {
     return "error";
   }
-}
-
-/**
- * R5 consent cross-check: does the account named in the challenge agree with the
- * secret refs shown in the readout? A residual-#7 Mac attacker can only decouple
- * "what the human sees" from "what gets unlocked" if the account label and the
- * displayed secrets can drift apart, so we refuse when the challenge's account
- * shares no meaningful token with any secret ref. Consistent (or nothing to
- * cross-check, i.e. no secrets) => true.
- */
-function consentConsistent(
-  label: string,
-  accountId: string,
-  secrets: ApprovalRequest["secrets"],
-): boolean {
-  if (secrets.length === 0) return true;
-  const account = new Set([...tokens(label), ...tokens(accountId)]);
-  if (account.size === 0) return false;
-  for (const ref of secrets) {
-    for (const t of [ref.label, ref.provider, ...ref.segments].flatMap(tokens)) {
-      if (account.has(t)) return true;
-    }
-  }
-  return false;
-}
-
-/** Lowercase word tokens (>=3 chars) for the fuzzy consent cross-check. */
-function tokens(s: string): string[] {
-  return s
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((t) => t.length >= 3);
 }
 
 export type DenyOutcome = "sent" | "no-session" | "error";

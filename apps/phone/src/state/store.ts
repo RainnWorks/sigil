@@ -7,7 +7,7 @@
 import { useSyncExternalStore } from "react";
 
 import { type ApprovalRequest, type Decision } from "@/src/protocol";
-import { requestSource, secretRefLabel } from "@/src/lib/format";
+import { secretRefLabel } from "@/src/lib/format";
 import {
   type AppState,
   type HistoryEntry,
@@ -89,30 +89,30 @@ class Store {
   markExpired(requestId: string): void {
     const p = this.find(requestId);
     if (!p || p.state === "approved" || p.state === "denied") return;
-    this.transition(requestId, "expired");
+    // A terminal request is recorded to history and drops out of the active
+    // queue, rather than lingering as a dead row.
     this.record(p, "expired");
+    this.remove(requestId);
   }
 
   decide(requestId: string, decision: Decision, note?: string): void {
     const p = this.find(requestId);
     if (!p || p.state === "approved" || p.state === "denied" || p.state === "expired") return;
-    this.transition(requestId, decision === "approved" ? "approved" : "denied");
+    // Record the outcome, then drop the request from the active queue: once a
+    // decision is made the phone is done with it, and it lives on only in history.
     this.record(p, decision, note);
+    this.remove(requestId);
   }
 
   lockdown(): void {
-    // Deny everything pending, refuse everything new.
+    // Deny everything pending, refuse everything new. Denied requests are recorded
+    // and cleared from the queue, so lockdown leaves nothing dangling.
     for (const p of this.state.pending) {
       if (p.state !== "approved" && p.state !== "denied" && p.state !== "expired") {
         this.record(p, "denied", "locked down");
       }
     }
-    this.patch({
-      arm: "lockedDown",
-      pending: this.state.pending.map((p) =>
-        p.state === "fresh" || p.state === "expiring" ? { ...p, state: "denied" } : p,
-      ),
-    });
+    this.patch({ arm: "lockedDown", pending: [] });
   }
 
   clearLockdown(): void {
@@ -154,6 +154,13 @@ class Store {
     return this.state.pending.find((p) => p.request.requestId === requestId);
   }
 
+  /** Drop a request from the active queue (it has reached a terminal state). */
+  private remove(requestId: string): void {
+    this.patch({
+      pending: this.state.pending.filter((p) => p.request.requestId !== requestId),
+    });
+  }
+
   private record(p: PendingRequest, decision: Decision | "expired", note?: string): void {
     const r = p.request;
     const label =
@@ -161,12 +168,12 @@ class Store {
         ? r.secrets.map(secretRefLabel).join(", ")
         : r.ssh
           ? `${r.ssh.keyLabel} → ${r.ssh.host}`
-          : requestSource(r);
+          : (r.command.join(" ") || r.provenance.machine);
     const entry: HistoryEntry = {
       id: r.requestId,
       kind: r.kind,
       label,
-      account: requestSource(r),
+      origin: r.provenance.machine,
       process: r.provenance.processChain[r.provenance.processChain.length - 1] ?? "",
       cwd: r.provenance.cwd,
       decision,

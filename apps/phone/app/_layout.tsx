@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useColorScheme } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
@@ -27,6 +27,13 @@ export default function RootLayout() {
   const router = useRouter();
   const paired = useSelector((s) => s.paired);
   const [hydrated, setHydrated] = useState(false);
+  // Auto-present: the count of requests still awaiting a decision. When the first
+  // one arrives we pop the approval sheet straight away (no tapping in); we reset
+  // the latch once the queue drains so the next arrival re-presents.
+  const liveCount = useSelector(
+    (s) => s.pending.filter((r) => r.state === "fresh" || r.state === "expiring").length,
+  );
+  const presentedRef = useRef(false);
 
   useEffect(() => {
     // Boot from the REAL state: if this phone has a stored pairing, arm the relay
@@ -54,6 +61,19 @@ export default function RootLayout() {
       router.replace("/pairing");
     }
   }, [hydrated, paired, router]);
+
+  useEffect(() => {
+    // Auto-present the approval sheet the instant a request lands, so the human
+    // never has to hunt for it. Latch on presentRef so we present once per burst
+    // (not on every state tick), and re-arm when the queue empties.
+    if (!hydrated || !paired) return;
+    if (liveCount > 0 && !presentedRef.current) {
+      presentedRef.current = true;
+      router.push("/approval");
+    } else if (liveCount === 0) {
+      presentedRef.current = false;
+    }
+  }, [hydrated, paired, liveCount, router]);
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>

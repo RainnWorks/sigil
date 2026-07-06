@@ -29,9 +29,9 @@ export default function TabsLayout() {
         <NativeTabs.Trigger.Icon sf="list.bullet.rectangle" md="history" />
         <NativeTabs.Trigger.Label>History</NativeTabs.Trigger.Label>
       </NativeTabs.Trigger>
-      <NativeTabs.Trigger name="(accounts)">
-        <NativeTabs.Trigger.Icon sf="key.fill" md="key" />
-        <NativeTabs.Trigger.Label>Accounts</NativeTabs.Trigger.Label>
+      <NativeTabs.Trigger name="(devices)">
+        <NativeTabs.Trigger.Icon sf="laptopcomputer" md="devices" />
+        <NativeTabs.Trigger.Label>Devices</NativeTabs.Trigger.Label>
       </NativeTabs.Trigger>
       <NativeTabs.Trigger name="(settings)">
         <NativeTabs.Trigger.Icon sf="gearshape" md="settings" />

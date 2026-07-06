@@ -4,7 +4,7 @@
  * SecretRef's display-only `segments` / `label`; it never parses the opaque
  * `reference`, which only the owning provider understands.
  */
-import { type ApprovalRequest, type SecretRef } from "@/src/protocol";
+import { type SecretRef } from "@/src/protocol";
 
 /** "just now", "12s ago", "4m ago", "2d ago" — the brief's terse register. */
 export function relativeTime(fromMs: number, nowMs: number = Date.now()): string {
@@ -62,18 +62,6 @@ export function secretRefLabel(ref: SecretRef): string {
   if (leaf === undefined) return ref.label;
   const head = ref.segments.slice(0, -1).join("/");
   return head ? `${head} › ${leaf}` : leaf;
-}
-
-/**
- * The provider-agnostic "source" line for a request header: the first secret's
- * provider (e.g. "1password"), or the command name for kinds that read no
- * secret (ssh_signature, resume, lockdown_clear).
- */
-export function requestSource(r: ApprovalRequest): string {
-  const first = r.secrets[0];
-  if (first) return first.provider;
-  if (r.ssh) return r.ssh.keyLabel;
-  return r.command[0] ?? "";
 }
 
 /** Render a resolved process chain as "zsh -> claude -> op read". */

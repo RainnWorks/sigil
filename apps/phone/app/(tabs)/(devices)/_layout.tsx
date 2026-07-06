@@ -2,7 +2,7 @@ import { Stack } from "expo-router/stack";
 
 import { useTheme } from "@/theme/colors";
 
-export default function AccountsStack() {
+export default function DevicesStack() {
   const p = useTheme();
   return (
     <Stack
@@ -16,7 +16,7 @@ export default function AccountsStack() {
         headerTitleStyle: { color: p.label },
       }}
     >
-      <Stack.Screen name="index" options={{ title: "Accounts" }} />
+      <Stack.Screen name="index" options={{ title: "Devices" }} />
     </Stack>
   );
 }

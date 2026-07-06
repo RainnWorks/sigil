@@ -5,12 +5,7 @@
  * directly for pure-UI iteration.
  */
 import { type ApprovalRequest } from "@/src/protocol";
-import {
-  type Account,
-  type AppState,
-  type HistoryEntry,
-  type Lease,
-} from "@/src/domain/types";
+import { type AppState, type HistoryEntry, type Lease } from "@/src/domain/types";
 
 const now = Date.now();
 
@@ -127,18 +122,6 @@ export function demoSshRequest(): ApprovalRequest {
   };
 }
 
-export const demoAccounts: Account[] = [
-  { id: "a1", label: "Rowm work", vaults: 2, health: "healthy", lastUsedAt: now - 4 * 60_000 },
-  {
-    id: "a2",
-    label: "Personal",
-    vaults: 1,
-    health: "rotate",
-    detail: "rotate in 6d",
-    lastUsedAt: now - 2 * 24 * 3600_000,
-  },
-];
-
 export const demoLeases: Lease[] = [
   {
     id: "l1",
@@ -154,7 +137,7 @@ export const demoHistory: HistoryEntry[] = [
     id: "h1",
     kind: "secret_read",
     label: "Engineering/.env › graphql-api",
-    account: "Rowm work",
+    origin: "studio.local",
     process: "claude",
     cwd: "~/Projects/rowm",
     decision: "approved",
@@ -165,7 +148,7 @@ export const demoHistory: HistoryEntry[] = [
     id: "h2",
     kind: "ssh_signature",
     label: "github-deploy → git@github.com",
-    account: "Rowm work",
+    origin: "studio.local",
     process: "ssh",
     cwd: "~/Projects/rowm",
     decision: "approved",
@@ -176,7 +159,7 @@ export const demoHistory: HistoryEntry[] = [
     id: "h3",
     kind: "secret_read",
     label: "AWS-prod › access-key",
-    account: "Rowm work",
+    origin: "studio.local",
     process: "zsh",
     cwd: "~/Projects/infra",
     decision: "denied",
@@ -188,7 +171,7 @@ export const demoHistory: HistoryEntry[] = [
     id: "h4",
     kind: "secret_read",
     label: "Personal/router › password",
-    account: "Personal",
+    origin: "studio.local",
     process: "zsh",
     cwd: "~/Projects/home",
     decision: "expired",
@@ -220,7 +203,6 @@ export function emptyInitialState(): AppState {
     connection: { rung: "none", machine: "", lastSeenAt: 0 },
     pending: [],
     history: [],
-    accounts: [],
     leases: [],
     settings: defaultSettings(),
     pairingWords: null,
@@ -235,7 +217,6 @@ export function demoInitialState(): AppState {
     connection: { rung: "lan", machine: "studio.local", lastSeenAt: now - 12_000 },
     pending: [],
     history: demoHistory,
-    accounts: demoAccounts,
     leases: demoLeases,
     settings: defaultSettings(),
     pairingWords: null,

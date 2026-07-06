@@ -29,7 +29,8 @@ export interface HistoryEntry {
   kind: ApprovalRequest["kind"];
   /** Display label: "Engineering/.env > graphql-api" or "github-deploy -> git@github.com". */
   label: string;
-  account: string;
+  /** The Mac this request came from (provenance.machine); searchable, provider-free. */
+  origin: string;
   process: string;
   cwd: string;
   decision: Decision | "expired";
@@ -38,18 +39,6 @@ export interface HistoryEntry {
   at: number;
   /** How it was decided: "phone", "rule", "local". */
   via: string;
-}
-
-export type TokenHealth = "healthy" | "rotate" | "expiring";
-
-export interface Account {
-  id: string;
-  label: string;
-  vaults: number;
-  health: TokenHealth;
-  /** e.g. "expires in 6d" for the rotate/expiring states. */
-  detail?: string;
-  lastUsedAt: number;
 }
 
 export interface Lease {
@@ -85,7 +74,6 @@ export interface AppState {
   connection: Connection;
   pending: PendingRequest[];
   history: HistoryEntry[];
-  accounts: Account[];
   leases: Lease[];
   settings: Settings;
   /** The six pairing words, held only during the ceremony. */

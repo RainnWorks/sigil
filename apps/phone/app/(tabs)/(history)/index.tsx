@@ -36,7 +36,7 @@ export default function HistoryScreen() {
       (h) =>
         h.label.toLowerCase().includes(q) ||
         h.process.toLowerCase().includes(q) ||
-        h.account.toLowerCase().includes(q) ||
+        h.origin.toLowerCase().includes(q) ||
         h.cwd.toLowerCase().includes(q),
     );
   }, [query, s.history]);

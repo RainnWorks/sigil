@@ -6,7 +6,7 @@ import { Mono, Sans } from "@/components/ui/text";
 import { Card, Hairline, SectionHeader, StatePill } from "@/components/ui/primitives";
 import { stateLabel, useTheme } from "@/theme/colors";
 import { radius, space } from "@/theme/tokens";
-import { relativeTime, requestSource, secretRefLabel } from "@/src/lib/format";
+import { relativeTime, secretRefLabel } from "@/src/lib/format";
 import { type PendingRequest } from "@/src/domain/types";
 import { useAppState } from "@/src/state/store";
 
@@ -40,8 +40,9 @@ export default function HomeScreen() {
           )}
         </View>
         <Mono size={13} tone="faint">
-          {s.accounts.length} account{s.accounts.length === 1 ? "" : "s"} ·{" "}
-          {s.connection.rung === "none" ? "no link" : `${s.connection.rung} · seen ${relativeTime(s.connection.lastSeenAt)}`}
+          {s.connection.rung === "none"
+            ? "no link"
+            : `${s.connection.rung} · seen ${relativeTime(s.connection.lastSeenAt)}`}
         </Mono>
       </View>
 
@@ -124,7 +125,7 @@ function PendingRow({ pending, onPress }: { pending: PendingRequest; onPress: ()
       ? r.secrets.map(secretRefLabel).join(", ")
       : r.ssh
         ? `${r.ssh.keyLabel} → ${r.ssh.host}`
-        : requestSource(r);
+        : r.command.join(" ") || r.provenance.machine;
   return (
     <Pressable
       onPress={onPress}
@@ -136,7 +137,7 @@ function PendingRow({ pending, onPress }: { pending: PendingRequest; onPress: ()
           {label}
         </Mono>
         <Mono size={12} tone="muted">
-          {requestSource(r)} · {r.provenance.processChain[r.provenance.processChain.length - 1]}
+          {r.provenance.machine} · {r.provenance.processChain[r.provenance.processChain.length - 1]}
         </Mono>
       </View>
       <Sf name="chevron.right" color={p.faint} size={14} />
