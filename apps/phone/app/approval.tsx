@@ -8,8 +8,9 @@ import { useAppState } from "@/src/state/store";
 
 /**
  * The approval sheet route, presented as a native form sheet with detents. Shows
- * the first live request; falls back to the most recent one so its terminal
- * state (approved / denied / expired / superseded) is still viewable.
+ * the first live (fresh / expiring) request. Decided requests leave the queue and
+ * live on only in history, so once the queue drains the sheet auto-dismisses;
+ * this route shows "Nothing to approve" only in the brief window before it closes.
  */
 export default function ApprovalRoute() {
   const router = useRouter();

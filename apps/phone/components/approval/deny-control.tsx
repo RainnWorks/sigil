@@ -5,11 +5,12 @@
  * than allowing.
  */
 import { useState } from "react";
-import { Pressable, View } from "react-native";
+import { Pressable, StyleSheet, View } from "react-native";
 import Animated, { FadeIn, FadeOut } from "react-native-reanimated";
 
 import { Sf } from "@/components/ui/sf";
 import { Sans } from "@/components/ui/text";
+import { GlassSurface } from "@/components/ui/glass";
 import { useTheme } from "@/theme/colors";
 import { radius, space } from "@/theme/tokens";
 import { hapticTick } from "@/src/lib/haptics";
@@ -46,11 +47,19 @@ export function DenyControl({
           borderRadius: radius.capsule,
           borderWidth: 1,
           borderColor: p.deny + "a6",
+          overflow: "hidden",
           alignItems: "center",
           justifyContent: "center",
           opacity: disabled ? 0.5 : 1,
         }}
       >
+        {/* Subtle Liquid Glass behind the outline; falls back to today's transparent capsule. */}
+        <GlassSurface
+          style={StyleSheet.absoluteFill}
+          fallbackColor="transparent"
+          tintColor={p.deny + "1f"}
+          glassStyle="clear"
+        />
         <Sans size={16} weight="medium" style={{ color: p.deny }}>
           Deny
         </Sans>

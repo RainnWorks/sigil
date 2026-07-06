@@ -64,20 +64,19 @@ export type EcdhAlgo = "raw-x" | "x963-sha256";
  * The per-request v2 threshold challenge (docs/design/threshold-v2.md §7),
  * mirroring proto `ThresholdChallenge`. Absent on v1 requests and on kinds that
  * read no secret. It carries the base point the phone key-agrees its
- * Secure-Enclave key `f` against, plus the account binding the phone shows and
- * consents to.
+ * Secure-Enclave key `f` against, plus an opaque routing tag the crypto needs.
  *
- * R5 (bind consent to the account shown): `accountId`/`label` name the account
- * being unlocked. The phone MUST display `label`, bind its Face ID consent to
- * it, and cross-check it against the request's `secrets`, so a mis-issued
- * challenge cannot decouple what the human sees from what gets unlocked.
- * `ephemeralPub` is the only cryptographic input and is authenticated by the
- * enclosing signed envelope.
+ * The phone is a zero-knowledge approver: `accountId` is treated purely as an
+ * opaque tag telling the enclave which pinned key `f` to agree with (and is
+ * echoed back for correlation), never as an account concept the phone displays
+ * or reasons about. `label` is retained for wire-compatibility with the daemon /
+ * proto but is NOT shown or interpreted here. `ephemeralPub` is the only
+ * cryptographic input and is authenticated by the enclosing signed envelope.
  */
 export interface ThresholdChallenge {
-  /** Account whose token this unlocks; echoed in the response for correlation. */
+  /** Opaque routing tag: selects the pinned SE key to agree with; echoed for correlation. */
   accountId: string;
-  /** Human label of that account, shown to and consented to by the approver (R5). */
+  /** Retained for wire-compatibility with proto; the provider-blind phone ignores it. */
   label: string;
   /**
    * The account's fixed ECDH base point `E = e·G`, ANSI X9.63 (65 bytes),

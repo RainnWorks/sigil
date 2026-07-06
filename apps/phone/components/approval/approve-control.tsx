@@ -10,7 +10,7 @@
  * gate fails the parent flips `busy` off and the control resets itself.
  */
 import { useEffect } from "react";
-import { LayoutChangeEvent, Pressable, View } from "react-native";
+import { LayoutChangeEvent, Pressable, StyleSheet, View } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, {
   Easing,
@@ -23,6 +23,7 @@ import Animated, {
 
 import { Sf } from "@/components/ui/sf";
 import { Sans } from "@/components/ui/text";
+import { GlassSurface } from "@/components/ui/glass";
 import { useTheme } from "@/theme/colors";
 import { radius } from "@/theme/tokens";
 import { hapticThreshold, hapticTick } from "@/src/lib/haptics";
@@ -57,12 +58,19 @@ function TapApprove({ busy, onApprove }: { busy: boolean; onApprove: () => void 
       style={{
         height: H,
         borderRadius: radius.capsule,
-        backgroundColor: p.cobalt,
+        overflow: "hidden",
         alignItems: "center",
         justifyContent: "center",
         opacity: busy ? 0.6 : 1,
       }}
     >
+      {/* iOS 26 Liquid Glass, tinted cobalt; falls back to a solid cobalt capsule. */}
+      <GlassSurface
+        style={StyleSheet.absoluteFill}
+        fallbackColor={p.cobalt}
+        tintColor={p.cobalt}
+        isInteractive
+      />
       <Sans size={17} weight="semibold" style={{ color: p.cobaltInk }}>
         {busy ? "Approving…" : "Approve"}
       </Sans>
