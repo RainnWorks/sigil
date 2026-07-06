@@ -207,7 +207,48 @@ always-on daemon must not be able to rewrite which commands are gated. Re-run
   existing zero-config `op` keeps working after upgrade. The legacy file is left
   in place (non-destructive); `latch wipe` removes both.
 
+## Migration: verb moves (lean `latch` vs `latch-config`)
+
+The split is a HARD CUT — no back-compat aliases in the lean binary (aliases
+would re-reserve the very verbs we moved off it, defeating gateability). The
+exact moves, so retargeting the Mac app (#42) is mechanical:
+
+| old invocation                    | new invocation                         |
+|-----------------------------------|----------------------------------------|
+| `latch config <verb>`             | `latch-config <verb>` (no `config` word)|
+| `latch config source …`           | `latch-config source …`                |
+| `latch config rule …`             | `latch-config rule …`                  |
+| `latch config list` / `export` / `import` | `latch-config list` / `export` / `import` |
+| `latch config add <cmd> …`        | `latch-config add <cmd> …`             |
+| `latch account <verb>`            | `latch-config account <verb>`          |
+| `latch settings <verb>`           | `latch-config settings <verb>`         |
+| `latch mac-approvals …`           | `latch-config mac-approvals …`         |
+| `latch wipe [--force]`            | `latch-config wipe [--force]`          |
+| `latch <anything-else>`           | unchanged (lean `latch`)               |
+
+Everything else (`status`, `daemon`, `doctor`, `pair`, `unpair`, `qr`,
+`start`/`stop`/`restart`, `lease`, `lockdown`, `approve`, `deny`, `history`,
+`pending`, `ssh`, `sshagent`, `setup`, `shim`, `run`) stays on the lean `latch`
+binary. Proxy management (`proxy add|remove|list|status|doctor|env`) lives on
+`latch-config`, NOT reserved in the lean binary, so a program named `proxy` is
+gateable as `latch proxy …`.
+
 ## Security notes (for the security-reviewer, not self-certified)
+
+- **Matched-but-broken rule fails closed (sec-review Note B):** if the first rule
+  whose match holds names a source that no longer exists, `resolve` returns
+  `None` (refuse) — it does NOT fall through to a later, broader rule. Falling
+  through would be a fail-open downgrade of a hand-edited config to an unintended
+  broader route. Invariant #5 over convenience.
+- **Label/vault routing collision (sec-review Note A):** account routing matches
+  an account by its **label OR one of its vault names** (`.find`, first hit
+  wins). If one account's label equals another account's vault name, a routing
+  hint that string is order-dependent (the account earlier in the store wins).
+  This is a Tom-authored-config misconfiguration, not an exploit (both accounts
+  are the operator's own, and the approval is still gated), but it is surprising.
+  `latch-config account add` warns when a new account's label collides with an
+  existing account's vault (or vice versa) so the ambiguity is visible at
+  authoring time. Prefer account labels that are not also vault names.
 
 - Inert-at-rest (#1), secrets-bypass-daemon (#2), fail-closed (#7) are untouched:
   the config only chooses *which* provider/source/risk; the token and env

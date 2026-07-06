@@ -369,16 +369,25 @@ impl Config {
     }
 
     /// Resolve the first rule that matches `argv`, flattened with its source into
-    /// a [`ResolvedAction`]. `None` means "unmatched" — the daemon refuses and
-    /// points at `latch-config`. A rule whose action names an unknown source is
-    /// skipped (fails closed rather than dispatching to a non-existent provider).
+    /// a [`ResolvedAction`]. `None` means "refuse" — the daemon fails closed and
+    /// points at `latch-config`.
+    ///
+    /// A rule whose action names an **unknown source** makes the whole resolution
+    /// fail closed (`None`), it does NOT fall through to a later, broader rule.
+    /// Falling through would be a fail-OPEN downgrade: a malformed or hand-edited
+    /// high-priority rule could silently route the command to a broader rule the
+    /// author did not intend for it. Invariant #5 ("everything fails closed") wins
+    /// over convenience here; `latch-config` and `import` validate referential
+    /// integrity up front, so a dangling source only arises from a hand-edit, and
+    /// the safe answer to a hand-edited-broken rule is to refuse.
     pub fn resolve(&self, argv: &[String]) -> Option<ResolvedAction> {
         for rule in &self.rules {
             if !rule.match_.matches(argv) {
                 continue;
             }
             let Some(src) = self.source(&rule.action.source) else {
-                continue;
+                // Matched, but its source is gone: refuse, never downgrade.
+                return None;
             };
             return Some(ResolvedAction {
                 rule: rule.name.clone(),
@@ -657,6 +666,63 @@ mod tests {
         assert!(cfg.gates_command("op"));
         assert!(!cfg.gates_command("read"));
         assert!(!cfg.gates_command("gcloud"));
+    }
+
+    #[test]
+    fn matched_rule_with_unknown_source_fails_closed_not_downgrade() {
+        // sec-review Note B: a matched rule whose source is gone (hand-edited
+        // config) must REFUSE, never fall through to a later broader rule. Build a
+        // config by hand (bypassing add_rule's referential check, as a bad edit
+        // would) where the first matching rule points at a missing source and a
+        // later catch-all-ish rule would otherwise capture the same command.
+        let cfg = Config {
+            version: VERSION,
+            sources: vec![Source {
+                name: "real".into(),
+                provider: "env-file".into(),
+                account: None,
+                path: Some("/x/.env".into()),
+            }],
+            rules: vec![
+                Rule {
+                    name: "specific".into(),
+                    match_: Match {
+                        command: Some("op".into()),
+                        argv_contains: vec!["read".into()],
+                        ..Match::default()
+                    },
+                    action: Action {
+                        source: "GONE".into(), // dangling on purpose
+                        risk: RiskLevel::Routine,
+                        timeout_sec: None,
+                    },
+                },
+                Rule {
+                    name: "broad".into(),
+                    match_: Match {
+                        command: Some("op".into()),
+                        ..Match::default()
+                    },
+                    action: Action {
+                        source: "real".into(),
+                        risk: RiskLevel::Routine,
+                        timeout_sec: None,
+                    },
+                },
+            ],
+        };
+        // `op read …` matches the specific (broken) rule first -> refuse, do NOT
+        // downgrade to the broad rule.
+        assert!(
+            cfg.resolve(&argv(&["op", "read", "x"])).is_none(),
+            "a matched rule with a dangling source must fail closed, not downgrade"
+        );
+        // A command the broken rule does NOT match still resolves via the broad
+        // rule (the fail-closed is scoped to the matched-but-broken rule).
+        assert_eq!(
+            cfg.resolve(&argv(&["op", "item", "get"])).unwrap().rule,
+            "broad"
+        );
     }
 
     #[test]
