@@ -65,12 +65,20 @@ export function ApprovalSheet({
 
   useEffect(() => {
     if (!committed) return;
-    // Record the decision and auto-dismiss. Approve lingers a touch longer so the
-    // acknowledgement reads; deny is quicker (it must never feel heavier).
+    // Record the decision, then either advance or dismiss. Approve lingers a
+    // touch longer so the acknowledgement reads; deny is quicker (it must never
+    // feel heavier).
     const delay = committed.decision === "approved" ? 950 : 650;
     const t = setTimeout(() => {
       store.decide(request.requestId, committed.decision, committed.note);
-      onDone();
+      // If another request is still waiting, leave the sheet open: the route
+      // re-selects the next pending one and remounts this component (keyed by
+      // request id), so "decide one, the next is right there". Only dismiss when
+      // the queue is empty.
+      const more = store
+        .getState()
+        .pending.some((pp) => pp.state === "fresh" || pp.state === "expiring");
+      if (!more) onDone();
     }, delay);
     return () => clearTimeout(t);
   }, [committed, request.requestId, onDone]);

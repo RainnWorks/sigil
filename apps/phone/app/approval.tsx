@@ -29,7 +29,14 @@ export default function ApprovalRoute() {
 
   return (
     <View style={{ flex: 1, paddingTop: space.lg }}>
-      <ApprovalSheet pending={pending} onDone={() => router.back()} />
+      {/* Keyed by request id: when a decision advances the sheet to the next
+          pending request, this remounts fresh (local busy/committed/gate state
+          reset) instead of carrying the previous request's state over. */}
+      <ApprovalSheet
+        key={pending.request.requestId}
+        pending={pending}
+        onDone={() => router.back()}
+      />
     </View>
   );
 }
