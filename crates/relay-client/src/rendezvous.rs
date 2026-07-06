@@ -1,121 +1,67 @@
-//! A raw, opaque-string client for the blind relay, used only by the pairing
-//! rendezvous.
+//! A raw, opaque-string client for the pairing rendezvous on the v4 relay.
 //!
 //! The steady-state [`DaemonRelay`](crate::DaemonRelay) /
 //! [`PhoneRelay`](crate::PhoneRelay) transports (de)serialize
 //! [`Envelope`](latch_proto::Envelope)s, but the first pairing message (the
-//! phone's `PairingResponse`) is authenticated by its own MAC, not by an
-//! envelope seal, so it cannot ride those typed transports. This client speaks
-//! the same two relay endpoints (`POST /mailbox/{id}/submit`,
-//! `GET /mailbox/{id}/pending`) with an entirely opaque UTF-8 payload, exactly
-//! as the relay itself treats it. It carries pairing traffic on the
-//! [`rendezvous_mailbox`](latch_proto::rendezvous_mailbox), which is distinct
-//! from any steady-state mailbox.
+//! phone's `PairingResponse`) is authenticated by its own MAC, not by an envelope
+//! seal, so it cannot ride those typed transports. This client speaks the same
+//! two relay slots (`POST`/`GET /mailbox/{id}/to-phone` and `.../to-daemon`) with
+//! an entirely opaque payload, on the
+//! [`rendezvous_mailbox`](latch_proto::rendezvous_mailbox), distinct from any
+//! steady-state mailbox.
 //!
-//! Blocking, like the phone side: pairing is a short, human-paced ceremony done
-//! one round trip at a time, so a synchronous client needs no runtime.
+//! Direction is role-fixed, mirroring the steady state: the daemon side sends
+//! toward the phone (`to-phone`) and receives from the phone (`to-daemon`); the
+//! phone side is the mirror. Blocking, like the rest of the ceremony.
 
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
-
 use latch_proto::TransportError;
 
-use crate::mailbox_hex;
+use crate::http::{HttpMailbox, Slot};
 
-/// Per-request HTTP timeout. `/pending` returns immediately with whatever is
-/// queued, so this only bounds a stalled connection.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Delay between empty rendezvous polls.
+const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-/// The `/pending` response body (`RESP.pending` in `shared/protocol.ts`).
-#[derive(Deserialize)]
-struct Pending {
-    envelopes: Vec<String>,
-    #[allow(dead_code)]
-    depth: i64,
-}
-
-/// A blocking client for one rendezvous mailbox on the blind relay.
+/// A blocking client for one rendezvous mailbox, fixed to one party's direction
+/// pair (send toward the peer, receive from the peer).
 pub struct Rendezvous {
-    base: String,
-    mailbox_hex: String,
-    client: reqwest::blocking::Client,
+    http: HttpMailbox,
+    send_slot: Slot,
+    recv_slot: Slot,
 }
 
 impl Rendezvous {
-    /// Build a client against the `http(s)://host` relay `base` for `mailbox`.
-    pub fn new(base: &str, mailbox: [u8; 32]) -> Result<Self, TransportError> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .map_err(|e| TransportError::Backend(format!("building http client: {e}")))?;
+    /// The daemon side of the ceremony: send `to-phone`, receive `to-daemon`.
+    pub fn daemon(base: &str, mailbox: [u8; 32]) -> Result<Self, TransportError> {
         Ok(Self {
-            base: base.trim_end_matches('/').to_string(),
-            mailbox_hex: mailbox_hex(&mailbox),
-            client,
+            http: HttpMailbox::new(base, mailbox)?,
+            send_slot: Slot::ToPhone,
+            recv_slot: Slot::ToDaemon,
         })
     }
 
-    fn pending_url(&self) -> String {
-        format!("{}/mailbox/{}/pending", self.base, self.mailbox_hex)
+    /// The phone side of the ceremony: send `to-daemon`, receive `to-phone`.
+    pub fn phone(base: &str, mailbox: [u8; 32]) -> Result<Self, TransportError> {
+        Ok(Self {
+            http: HttpMailbox::new(base, mailbox)?,
+            send_slot: Slot::ToDaemon,
+            recv_slot: Slot::ToPhone,
+        })
     }
 
-    fn submit_url(&self) -> String {
-        format!("{}/mailbox/{}/submit", self.base, self.mailbox_hex)
+    /// POST one opaque payload toward the peer.
+    pub fn send(&self, payload: &str) -> Result<(), TransportError> {
+        self.http.deposit(self.send_slot, payload, None)
     }
 
-    /// POST one opaque payload to the mailbox.
-    pub fn submit(&self, payload: &str) -> Result<(), TransportError> {
-        let resp = self
-            .client
-            .post(self.submit_url())
-            .header(reqwest::header::CONTENT_TYPE, "text/plain")
-            .body(payload.to_string())
-            .send()
-            .map_err(|e| TransportError::Backend(format!("POST submit: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(TransportError::Backend(format!(
-                "POST submit: status {}",
-                resp.status()
-            )));
-        }
-        Ok(())
-    }
-
-    /// GET and drain everything currently queued for the mailbox (drain-on-read:
-    /// the relay removes what it returns).
-    pub fn poll(&self) -> Result<Vec<String>, TransportError> {
-        let resp = self
-            .client
-            .get(self.pending_url())
-            .send()
-            .map_err(|e| TransportError::Backend(format!("GET pending: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(TransportError::Backend(format!(
-                "GET pending: status {}",
-                resp.status()
-            )));
-        }
-        let body = resp
-            .text()
-            .map_err(|e| TransportError::Backend(format!("reading pending body: {e}")))?;
-        let parsed: Pending = serde_json::from_str(&body)
-            .map_err(|e| TransportError::Backend(format!("parsing pending body: {e}")))?;
-        Ok(parsed.envelopes)
-    }
-
-    /// Poll until one payload arrives or `timeout` elapses, sleeping `interval`
-    /// between empty polls. Returns the first payload, or `None` on timeout. If
-    /// a single poll returns several, the extras are dropped: the pairing
-    /// ceremony is strictly one message per direction.
-    pub fn wait(
-        &self,
-        timeout: Duration,
-        interval: Duration,
-    ) -> Result<Option<String>, TransportError> {
+    /// Poll until one payload arrives or `timeout` elapses. Returns the first
+    /// payload, or `None` on timeout. If a single drain returns several the extras
+    /// are dropped: the ceremony is strictly one message per direction.
+    pub fn recv(&self, timeout: Duration) -> Result<Option<String>, TransportError> {
         let deadline = Instant::now() + timeout;
         loop {
-            let mut batch = self.poll()?;
+            let mut batch = self.http.drain(self.recv_slot)?;
             if !batch.is_empty() {
                 return Ok(Some(batch.remove(0)));
             }
@@ -123,7 +69,7 @@ impl Rendezvous {
             if remaining.is_zero() {
                 return Ok(None);
             }
-            std::thread::sleep(interval.min(remaining));
+            std::thread::sleep(POLL_INTERVAL.min(remaining));
         }
     }
 }

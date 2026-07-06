@@ -147,24 +147,17 @@ fn build_gate(
     let approver: Box<dyn Approver> = match factor {
         Factor::Phone => {
             let cfg = remote.expect("phone factor implies a pairing config");
-            let relay = DaemonRelay::connect(&cfg.relay_url, cfg.mailbox())
-                .map_err(|e| anyhow::anyhow!("attaching to relay {}: {e}", cfg.relay_url))?;
-            // The push doorbell: a disk-backed registration store (survives
-            // restarts) plus an APNs sender when a signing key resolves. Both are
-            // best-effort; a daemon that cannot build the sender still approves,
-            // and the phone falls back to polling. The daemon is the ONLY push
-            // origin; the relay never sees the token.
+            let relay = DaemonRelay::new(&cfg.relay_url, cfg.mailbox())
+                .map_err(|e| anyhow::anyhow!("reaching relay {}: {e}", cfg.relay_url))?;
+            // The disk-backed push registration store (survives restarts). The
+            // phone's token, when registered, is forwarded to the relay on each
+            // deposit so the RELAY rings a content-free doorbell; the daemon holds
+            // no Apple secret and signs no push. Best-effort: with no token the
+            // phone simply polls.
             let push_store = Arc::new(crate::push_store::PushStore::load());
-            let doorbell = match crate::apns::ApnsDoorbell::new() {
-                Ok(d) => Some(Arc::new(d)),
-                Err(e) => {
-                    eprintln!("latch daemon: apns doorbell disabled ({e}); the phone will poll");
-                    None
-                }
-            };
             Box::new(
                 RemoteApprover::new(Arc::new(relay), cfg.daemon_identity, cfg.phone)
-                    .with_push(push_store, doorbell),
+                    .with_push(push_store),
             )
         }
         // The biometric unwrap is the only gate; an unresolved decision fails
@@ -2670,9 +2663,9 @@ mod tests {
     // --- the FULL cross-process loop over the REAL relay -------------------
     //
     // Same milestone as `remote_softphone_approval_delivers_secret_over_the_socket`,
-    // but the envelopes traverse the real blind relay (the Bun server) over real
-    // HTTP + WebSocket instead of the in-process LocalRelay: the daemon attaches
-    // outbound over a WebSocket (`DaemonRelay`) and the softphone polls over HTTPS
+    // but the envelopes traverse the real blind relay (the Bun server) over plain
+    // HTTP instead of the in-process LocalRelay: the daemon deposits/drains its
+    // mailbox slots (`DaemonRelay`) and the softphone deposits/drains the mirror
     // (`PhoneRelay`). Pairing is done in-process (out-of-band by design); only
     // the post-pairing approval round trip is carried by the relay.
 
@@ -2780,9 +2773,9 @@ mod tests {
         };
         assert_eq!(cfg.mailbox(), mailbox);
 
-        // Daemon side: RemoteApprover over a real outbound WebSocket. No dev flag,
+        // Daemon side: RemoteApprover over the real HTTP relay. No dev flag,
         // no biometric: the paired phone is the real approving factor.
-        let daemon_relay = DaemonRelay::connect(&base, mailbox).expect("daemon ws attach");
+        let daemon_relay = DaemonRelay::new(&base, mailbox).expect("daemon http client");
         let core = remote_core(
             &dir,
             daemon_id,
@@ -2796,7 +2789,7 @@ mod tests {
         // The inert-daemon invariant: no DEK at rest; it arrives per-approval.
         assert!(!core.keystore.has_dek(), "daemon holds no DEK at rest");
 
-        // Phone side: the softphone serves over the real HTTPS transport.
+        // Phone side: the softphone serves over the real HTTP transport.
         let phone_relay = PhoneRelay::new(&base, mailbox)
             .expect("phone transport")
             .with_poll_interval(Duration::from_millis(50));
@@ -2883,8 +2876,8 @@ mod tests {
         let phone_pub = softphone.phone_identity();
         let mailbox = softphone.mailbox();
 
-        // Attach the daemon and let the WebSocket establish.
-        let daemon_relay = DaemonRelay::connect(&base, mailbox).expect("daemon ws attach");
+        // Point the daemon at the relay and let the first deposit through.
+        let daemon_relay = DaemonRelay::new(&base, mailbox).expect("daemon http client");
         std::thread::sleep(Duration::from_millis(400));
 
         // Bounce the relay: drop the old process, start a fresh one on the port.
@@ -3149,7 +3142,7 @@ mod tests {
         // identity. The account token is sealed under the phone-held DEK; the
         // daemon holds none.
         let dir = tmpdir("reload-relay");
-        let daemon_relay = DaemonRelay::connect(&base, mailbox).expect("daemon ws attach");
+        let daemon_relay = DaemonRelay::new(&base, mailbox).expect("daemon http client");
         let core = remote_core(
             &dir,
             cfg.daemon_identity,
@@ -3162,7 +3155,7 @@ mod tests {
         );
         assert!(!core.keystore.has_dek(), "daemon holds no DEK at rest");
 
-        // Phone side over the real HTTPS transport.
+        // Phone side over the real HTTP transport.
         let phone_relay = PhoneRelay::new(&base, mailbox)
             .expect("phone transport")
             .with_poll_interval(Duration::from_millis(50));
@@ -3218,11 +3211,10 @@ mod tests {
     )]
     fn latch_pair_completes_the_ceremony_over_the_real_relay() {
         // Drive the real `latch pair` ceremony end to end over the blind relay:
-        // the daemon side uses the raw WebSocket rendezvous (`RendezvousWs` via
-        // `pair::relay_channel`), the phone side uses the HTTP `Rendezvous`
-        // client, and they meet on the rendezvous mailbox. Proves the pairing
-        // transport, the message framing, and the QR round-trip against a real
-        // relay process.
+        // the daemon side uses the HTTP rendezvous (`Rendezvous::daemon` via
+        // `pair::relay_channel`), the phone side the mirror (`Rendezvous::phone`),
+        // and they meet on the rendezvous mailbox. Proves the pairing transport,
+        // the message framing, and the QR round-trip against a real relay process.
         let Some((base, _server)) = obtain_relay() else {
             eprintln!(
                 "SKIPPED latch_pair_completes_the_ceremony_over_the_real_relay: no relay. \
@@ -3244,15 +3236,15 @@ mod tests {
             let qr = qr_rx.recv().expect("daemon rendered a QR");
             let payload = PairingPayload::from_qr_string(&qr).unwrap();
             let mailbox = rendezvous_mailbox(&payload.daemon, &payload.secret);
-            let rv = Rendezvous::new(&base_phone, mailbox).unwrap();
+            let rv = Rendezvous::phone(&base_phone, mailbox).unwrap();
             let phone_id = DeviceIdentity::generate();
             let (mut pairing, resp) =
                 Pairing::scan(phone_id, &qr, now_ms(), Policy::Approve).unwrap();
-            rv.submit(&URL_SAFE_NO_PAD.encode(serde_json::to_vec(&resp).unwrap()))
+            rv.send(&URL_SAFE_NO_PAD.encode(serde_json::to_vec(&resp).unwrap()))
                 .unwrap();
             pairing.confirm().unwrap();
             let env_wire = rv
-                .wait(Duration::from_secs(10), Duration::from_millis(50))
+                .recv(Duration::from_secs(10))
                 .unwrap()
                 .expect("the daemon sealed the DEK back");
             let env: Envelope = serde_json::from_str(&env_wire).unwrap();

@@ -46,6 +46,19 @@ pub enum TransportError {
     Backend(String),
 }
 
+/// A best-effort push "doorbell" hint the daemon hands the relay alongside a
+/// deposited request. The daemon does NOT ring the doorbell itself: it forwards
+/// the phone's device token so the publisher-operated relay (which holds the
+/// APNs/FCM signing key) can ring a content-free push and then forget the token.
+/// Carrying it here, not in the sealed payload, keeps the push request-free.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushHint {
+    /// The platform device token (APNs: lowercase hex). Opaque to the relay.
+    pub token: String,
+    /// The push service the token addresses: `"apns"` or `"fcm"`.
+    pub platform: String,
+}
+
 /// Carries sealed envelopes between a daemon and a phone, by mailbox id.
 ///
 /// [`recv`](Transport::recv) blocks up to `timeout` and returns `Ok(None)` on
@@ -54,6 +67,20 @@ pub trait Transport: Send + Sync {
     /// Enqueue `env` for the given mailbox and direction.
     fn send(&self, mailbox: [u8; 32], dir: Direction, env: &Envelope)
         -> Result<(), TransportError>;
+
+    /// Deposit a request toward the phone, optionally with a push doorbell
+    /// [`PushHint`] the *relay* rings. The default ignores the hint and is a plain
+    /// [`Direction::ToPhone`] [`send`](Transport::send) — correct for the
+    /// in-process [`LocalRelay`], which has no relay to ring. A network relay
+    /// overrides this to carry the token so the relay can wake the phone.
+    fn deposit_to_phone(
+        &self,
+        mailbox: [u8; 32],
+        env: &Envelope,
+        _hint: Option<PushHint>,
+    ) -> Result<(), TransportError> {
+        self.send(mailbox, Direction::ToPhone, env)
+    }
 
     /// Dequeue the next envelope for the given mailbox and direction, waiting up
     /// to `timeout`. `Ok(None)` means nothing arrived in time.

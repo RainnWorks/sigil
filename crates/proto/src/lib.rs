@@ -37,7 +37,7 @@ pub use threshold::{
     P256Point, ThresholdError, ThresholdRecord, KDF_ALGO_ID, THRESHOLD_DOMAIN,
     THRESHOLD_RECORD_VERSION,
 };
-pub use transport::{Direction, LocalRelay, Transport, TransportError};
+pub use transport::{Direction, LocalRelay, PushHint, Transport, TransportError};
 
 /// Maximum allowed clock skew between sender and receiver, in milliseconds.
 pub const REPLAY_WINDOW_MS: u64 = 90_000;

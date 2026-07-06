@@ -1,48 +1,34 @@
-//! [`PhoneRelay`]: the approver's HTTPS [`Transport`].
+//! [`PhoneRelay`]: the approver's HTTP [`Transport`] to the v4 stateless relay.
 //!
-//! The phone has no inbound connection; it polls. `recv(ToPhone)` drains
-//! `GET /mailbox/{id}/pending` (drain-on-read: the relay removes what it hands
-//! back) and buffers the batch, returning one envelope at a time so the
-//! [`Transport`] contract (one per `recv`) is preserved. `send(ToDaemon)` posts
-//! the opaque envelope to `POST /mailbox/{id}/submit`.
+//! The phone has no inbound connection; it deposits and drains. `send(ToDaemon)`
+//! POSTs `/mailbox/{id}/to-daemon`; `recv(ToPhone)` short-polls
+//! `GET /mailbox/{id}/to-phone` (drain-on-read), buffering the batch and
+//! returning one envelope per call so the [`Transport`] contract is preserved.
 //!
-//! Blocking is deliberate: the approver's serve loop is one thread doing one
-//! round trip at a time, so a synchronous client is the right shape and needs no
-//! async runtime. Any transport error fails closed — the approver drops that one
-//! turn and keeps serving; the daemon's request simply times out and is retried.
+//! Used by the reference softphone in the end-to-end tests; the real iOS approver
+//! speaks the same wire from TypeScript. Blocking is deliberate: the approver's
+//! serve loop is one thread doing one round trip at a time. Any transport error
+//! fails closed: the approver drops that turn and the daemon's request times out
+//! and is retried.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
-
 use latch_proto::envelope::Envelope;
 use latch_proto::{Direction, Transport, TransportError};
 
-use crate::{mailbox_hex, wire};
+use crate::http::{HttpMailbox, Slot};
+use crate::wire;
 
-/// Per-poll HTTP timeout. `/pending` returns immediately with whatever is
-/// queued (it is not a long-poll), so this only bounds a stalled connection.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-/// Delay between empty `/pending` polls, trading latency for request volume.
+/// Delay between empty `to-phone` polls, trading latency for request volume.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-/// The `/pending` response body (`RESP.pending` in `shared/protocol.ts`).
-#[derive(Deserialize)]
-struct Pending {
-    envelopes: Vec<String>,
-    #[allow(dead_code)]
-    depth: i64,
-}
-
-/// A phone-side [`Transport`] that polls the blind relay over HTTPS.
+/// A phone-side [`Transport`] over plain HTTP to the blind relay.
 pub struct PhoneRelay {
-    base: String,
-    mailbox_hex: String,
-    /// Envelopes drained from `/pending` but not yet returned by `recv`.
+    http: HttpMailbox,
+    /// Envelopes drained from `to-phone` but not yet returned by `recv`.
     buffer: Mutex<VecDeque<Envelope>>,
-    client: reqwest::blocking::Client,
     poll_interval: Duration,
 }
 
@@ -50,15 +36,9 @@ impl PhoneRelay {
     /// Build a phone transport against the `http(s)://host` relay `base` for
     /// `mailbox`.
     pub fn new(base: &str, mailbox: [u8; 32]) -> Result<Self, TransportError> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .map_err(|e| TransportError::Backend(format!("building http client: {e}")))?;
         Ok(Self {
-            base: base.trim_end_matches('/').to_string(),
-            mailbox_hex: mailbox_hex(&mailbox),
+            http: HttpMailbox::new(base, mailbox)?,
             buffer: Mutex::new(VecDeque::new()),
-            client,
             poll_interval: POLL_INTERVAL,
         })
     }
@@ -69,37 +49,14 @@ impl PhoneRelay {
         self
     }
 
-    fn pending_url(&self) -> String {
-        format!("{}/mailbox/{}/pending", self.base, self.mailbox_hex)
-    }
-
-    fn submit_url(&self) -> String {
-        format!("{}/mailbox/{}/submit", self.base, self.mailbox_hex)
-    }
-
-    /// GET `/pending` once and append any envelopes to the buffer.
-    fn poll_pending(&self) -> Result<(), TransportError> {
-        let resp = self
-            .client
-            .get(self.pending_url())
-            .send()
-            .map_err(|e| TransportError::Backend(format!("GET pending: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(TransportError::Backend(format!(
-                "GET pending: status {}",
-                resp.status()
-            )));
-        }
-        let body = resp
-            .text()
-            .map_err(|e| TransportError::Backend(format!("reading pending body: {e}")))?;
-        let parsed: Pending = serde_json::from_str(&body)
-            .map_err(|e| TransportError::Backend(format!("parsing pending body: {e}")))?;
+    /// GET `to-phone` once and append any envelopes to the buffer.
+    fn poll_to_phone(&self) -> Result<(), TransportError> {
+        let drained = self.http.drain(Slot::ToPhone)?;
         let mut buf = self.buffer.lock().map_err(|_| TransportError::Closed)?;
-        for s in parsed.envelopes {
+        for s in drained {
             match wire::wire_to_envelope(&s) {
                 Ok(env) => buf.push_back(env),
-                Err(e) => eprintln!("latch relay: dropped an undecodable pending envelope: {e}"),
+                Err(e) => eprintln!("latch relay: dropped an undecodable to-phone envelope: {e}"),
             }
         }
         Ok(())
@@ -128,20 +85,7 @@ impl Transport for PhoneRelay {
         }
         let wire = wire::envelope_to_wire(env)
             .map_err(|e| TransportError::Backend(format!("serializing envelope: {e}")))?;
-        let resp = self
-            .client
-            .post(self.submit_url())
-            .header(reqwest::header::CONTENT_TYPE, "text/plain")
-            .body(wire)
-            .send()
-            .map_err(|e| TransportError::Backend(format!("POST submit: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(TransportError::Backend(format!(
-                "POST submit: status {}",
-                resp.status()
-            )));
-        }
-        Ok(())
+        self.http.deposit(Slot::ToDaemon, &wire, None)
     }
 
     fn recv(
@@ -160,7 +104,7 @@ impl Transport for PhoneRelay {
             if let Some(env) = self.pop_buffered()? {
                 return Ok(Some(env));
             }
-            self.poll_pending()?;
+            self.poll_to_phone()?;
             if let Some(env) = self.pop_buffered()? {
                 return Ok(Some(env));
             }

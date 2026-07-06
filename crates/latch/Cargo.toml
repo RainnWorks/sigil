@@ -88,17 +88,9 @@ signature = "2"
 # approval screen (matches `ssh-keygen -l`). Already in-tree transitively via
 # ssh-key; taken as a direct dep so the agent can hash arbitrary sign-data.
 sha2 = "0.10"
-# reqwest (blocking, rustls, http2): the daemon is the SOLE origin of the APNs
-# push doorbell (the relay never sends a push). APNs is HTTP/2-only, so the
-# http2 feature is required; blocking fits the doorbell's one-shot best-effort
-# send from the approval worker (already a blocking thread). rustls-tls shares
-# the rustls 0.23 stack the relay-client already pulls (one TLS stack in-tree).
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "http2"] }
-# p256 (ecdsa + pkcs8 + pem): sign the ES256 APNs provider JWT with the `.p8`
-# auth key. Reuses the p256 0.13 already vendored for the SE ECIES wrap; the
-# ecdsa/pkcs8/pem features add JWT signing and `.p8` (PKCS#8 PEM) parsing without
-# a JOSE crate (a hand-rolled compact JWS is a dozen lines and avoids ring).
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std"] }
+# NOTE: the daemon no longer signs/sends APNs (the v4 relay does), so the reqwest
+# + p256 deps that `src/apns.rs` used are gone. The daemon reaches the relay only
+# through `latch-relay-client` (plain HTTP), and carries zero Apple secret.
 
 # latch-softphone: the reference approver, used by the remote e2e integration
 # test to stand in for a paired phone. Dev-only; never linked into the daemon.

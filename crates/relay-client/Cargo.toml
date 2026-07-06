@@ -3,7 +3,7 @@ name = "latch-relay-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Network Transport impls for the Latch blind relay: daemon-side WebSocket, phone-side HTTPS"
+description = "HTTP Transport impls for the Latch blind relay (v4): daemon + phone slots, pairing rendezvous"
 
 [lib]
 name = "latch_relay_client"
@@ -11,26 +11,14 @@ path = "src/lib.rs"
 
 [dependencies]
 latch-proto = { path = "../proto" }
-# serde_json: (de)serialize the opaque proto::Envelope to/from the JSON string
-# the relay carries, and build/parse the WS control frames in shared/protocol.ts.
+# serde_json: (de)serialize the opaque proto::Envelope and build the small slot
+# request/response JSON bodies the relay carries.
 serde_json.workspace = true
-# serde: derive for the small `/pending` response body the phone GETs.
+# serde: derive for the small slot-drain response body ({"envelopes":[...]}).
 serde.workspace = true
 # thiserror: typed relay-client errors mapped onto the Transport seam.
 thiserror.workspace = true
-# tokio: the daemon side owns a single background runtime thread driving one
-# long-lived outbound WebSocket; the sync Transport methods bridge to it over
-# channels. Phone side is blocking and needs no runtime.
-tokio = { workspace = true, features = ["rt", "net", "time", "sync", "io-util", "macros"] }
-# tokio-tungstenite: async WebSocket client for the daemon's outbound attach.
-# rustls-tls-webpki-roots bundles Mozilla roots (wss:// to the shared relay)
-# with no system dependency, keeping the single-binary story; ws:// (self-hosted
-# / loopback) needs no roots. Shares rustls 0.23 with reqwest below (one TLS
-# stack in the tree).
-tokio-tungstenite = { version = "0.24", features = ["connect", "rustls-tls-webpki-roots"] }
-# futures-util: SinkExt/StreamExt to drive the split WebSocket read/write halves.
-futures-util = { version = "0.3", default-features = false }
-# reqwest (blocking, rustls): the phone side is pure request/response
-# (GET /pending, POST /submit), so a blocking HTTP client is the right fit and
-# avoids a second async runtime. rustls-tls shares rustls 0.23 with the WS side.
+# reqwest (blocking, rustls): every relay face is pure request/response (POST a
+# slot, GET-drain a slot), so a blocking HTTP client is the right fit and needs
+# no async runtime. rustls-tls keeps the single-binary story (no system TLS).
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

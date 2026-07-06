@@ -12,9 +12,10 @@
 //!
 //! The ceremony is written against a [`PairChannel`] so it is exercised
 //! end-to-end headlessly (in-process, with the softphone) as well as over the
-//! real relay via [`RendezvousWs`]. The transport is never the security layer:
-//! message 1 (the response) is authenticated by its pairing MAC, and message 3
-//! (the DEK) is a standard sealed [`Envelope`](latch_proto::Envelope).
+//! real relay via the HTTP [`Rendezvous`](latch_relay_client::Rendezvous). The
+//! transport is never the security layer: message 1 (the response) is
+//! authenticated by its pairing MAC, and message 3 (the DEK) is a standard sealed
+//! [`Envelope`](latch_proto::Envelope).
 
 use std::time::{Duration, Instant};
 
@@ -29,19 +30,20 @@ use latch_proto::{rendezvous_mailbox, PairingResponse, TransportError};
 use crate::pairing_store::{NewPairing, NewPhoneShare};
 
 /// The opaque-string channel the pairing ceremony runs over: send toward the
-/// phone, receive from the phone. Implemented by [`RendezvousWs`] for the real
-/// relay and by an in-memory pair in tests.
+/// phone, receive from the phone. Implemented by the HTTP
+/// [`Rendezvous`](latch_relay_client::Rendezvous) for the real relay and by an
+/// in-memory pair in tests.
 pub trait PairChannel {
     fn send(&self, payload: String) -> Result<(), TransportError>;
     fn recv(&self, timeout: Duration) -> Result<Option<String>, TransportError>;
 }
 
-impl PairChannel for latch_relay_client::RendezvousWs {
+impl PairChannel for latch_relay_client::Rendezvous {
     fn send(&self, payload: String) -> Result<(), TransportError> {
-        latch_relay_client::RendezvousWs::send(self, payload)
+        latch_relay_client::Rendezvous::send(self, &payload)
     }
     fn recv(&self, timeout: Duration) -> Result<Option<String>, TransportError> {
-        latch_relay_client::RendezvousWs::recv(self, timeout)
+        latch_relay_client::Rendezvous::recv(self, timeout)
     }
 }
 
@@ -190,12 +192,13 @@ pub fn run_ceremony(daemon_identity: DeviceIdentity, opts: CeremonyOpts<'_>) -> 
     })
 }
 
-/// Build the real relay channel: an outbound WebSocket attach to `relay_url` for
-/// the rendezvous `mailbox`.
+/// Build the real relay channel: the daemon side of the HTTP rendezvous on
+/// `relay_url` for the rendezvous `mailbox` (send `to-phone`, receive
+/// `to-daemon`).
 pub fn relay_channel(relay_url: &str, mailbox: [u8; 32]) -> Result<Box<dyn PairChannel>> {
-    let ws = latch_relay_client::RendezvousWs::connect(relay_url, mailbox)
-        .map_err(|e| anyhow::anyhow!("attaching to relay {relay_url}: {e}"))?;
-    Ok(Box::new(ws))
+    let rv = latch_relay_client::Rendezvous::daemon(relay_url, mailbox)
+        .map_err(|e| anyhow::anyhow!("reaching relay {relay_url}: {e}"))?;
+    Ok(Box::new(rv))
 }
 
 #[cfg(test)]

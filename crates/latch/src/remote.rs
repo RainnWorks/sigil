@@ -30,10 +30,9 @@ use latch_proto::identity::DeviceIdentity;
 use latch_proto::ReplayGuard;
 use latch_proto::{
     mailbox_id, now_ms, ApprovalRequest, ApprovalResponse, Decision as ProtoDecision, Direction,
-    PeerIdentity, Provenance, PushRegister, ToDaemonMessage, Transport,
+    PeerIdentity, Provenance, PushHint, PushRegister, ToDaemonMessage, Transport,
 };
 
-use crate::apns::ApnsDoorbell;
 use crate::approve::{ApprovalContext, ApprovalOutcome, Approver, Decision};
 use crate::push_store::PushStore;
 
@@ -58,11 +57,9 @@ pub struct RemoteApprover {
     timeout: Duration,
     machine: String,
     /// Phone push registrations, keyed by mailbox. A registration arrives inline
-    /// on the ToDaemon channel and is recorded here; the doorbell reads it.
+    /// on the ToDaemon channel and is recorded here; the token is forwarded to the
+    /// relay per deposit so the relay (not the daemon) rings the doorbell.
     push_store: Arc<PushStore>,
-    /// The APNs doorbell sender, when one could be built. `None` disables the
-    /// doorbell entirely (approvals still work; the phone polls). Best-effort.
-    doorbell: Option<Arc<ApnsDoorbell>>,
 }
 
 impl RemoteApprover {
@@ -84,26 +81,19 @@ impl RemoteApprover {
             guard: Mutex::new(ReplayGuard::new()),
             timeout: DEFAULT_REMOTE_TIMEOUT,
             machine: hostname(),
-            // Default to an inert doorbell: an in-memory registration store and no
-            // sender. The production daemon replaces both via `with_push`; the
-            // softphone/local test loop runs with these no-ops and never touches
-            // the filesystem or the network.
+            // Default to an in-memory registration store. The production daemon
+            // replaces it via `with_push` with the disk-backed one; the
+            // softphone/local test loop runs with this no-op and never touches the
+            // filesystem.
             push_store: Arc::new(PushStore::ephemeral()),
-            doorbell: None,
         }
     }
 
-    /// Attach the persistent push registration store and the APNs doorbell sender.
-    /// The production `build_gate` wires the real, disk-backed store and a sender
-    /// (when a signing key is available); a `None` doorbell leaves registrations
-    /// recorded but never rung.
-    pub fn with_push(
-        mut self,
-        push_store: Arc<PushStore>,
-        doorbell: Option<Arc<ApnsDoorbell>>,
-    ) -> Self {
+    /// Attach the persistent push registration store. The production `build_gate`
+    /// wires the disk-backed one so a registered token survives a restart and is
+    /// forwarded to the relay on each deposit.
+    pub fn with_push(mut self, push_store: Arc<PushStore>) -> Self {
         self.push_store = push_store;
-        self.doorbell = doorbell;
         self
     }
 
@@ -163,11 +153,11 @@ impl RemoteApprover {
     fn round_trip(&self, ctx: &ApprovalContext) -> Option<ApprovalOutcome> {
         let req = self.build_request(ctx);
 
-        // Drain any registration the phone sent while we were idle, so the
-        // doorbell below rings the freshest token. Non-blocking.
+        // Drain any registration the phone sent while we were idle, so the deposit
+        // below carries the freshest token. Non-blocking.
         self.drain_pending();
 
-        // Seal and send the request to the phone.
+        // Seal the request for the phone.
         let counter = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         let env = Envelope::seal(
             &req,
@@ -177,13 +167,14 @@ impl RemoteApprover {
             &self.phone,
         )
         .ok()?;
-        self.transport
-            .send(self.pairing_id, Direction::ToPhone, &env)
-            .ok()?;
 
-        // Best-effort doorbell: wake the phone so it fetches this request without
-        // waiting for its poll interval. Fails open (never gates correctness).
-        self.ring_doorbell();
+        // Deposit it to the relay, forwarding the phone's push token (if any) so
+        // the RELAY rings a content-free doorbell. The token wakes the phone to
+        // fetch the request; it is best-effort and never gates correctness (the
+        // phone's poll backstop delivers regardless). The daemon signs no push.
+        self.transport
+            .deposit_to_phone(self.pairing_id, &env, self.push_hint())
+            .ok()?;
 
         // Await the correlating response, handling any interleaved registration.
         let deadline = Instant::now() + self.timeout;
@@ -287,31 +278,16 @@ impl RemoteApprover {
             .register(self.pairing_id, &pr.token, &pr.platform, now_ms());
     }
 
-    /// Ring the phone's push doorbell, if a token is registered and a sender was
-    /// built. Best-effort and fully swallowed: any failure logs and returns, since
-    /// the request already reached the relay and the phone's poll delivers it.
-    fn ring_doorbell(&self) {
-        let Some(reg) = self.push_store.get(self.pairing_id) else {
-            return; // no token yet: the phone polls
-        };
-        match reg.platform.as_str() {
-            "apns" => {
-                let Some(doorbell) = &self.doorbell else {
-                    return; // no sender configured
-                };
-                let now_secs = now_ms() / 1000;
-                if let Err(e) = doorbell.ring(&reg.token, now_secs) {
-                    eprintln!("latch daemon: apns doorbell not delivered ({e}); relying on the phone poll backstop");
-                }
-            }
-            // Android is a follow-up; the phone's poll backstop covers it today.
-            "fcm" => {
-                eprintln!("latch daemon: fcm push unsupported; relying on the phone poll backstop");
-            }
-            other => {
-                eprintln!("latch daemon: unknown push platform '{other}'; relying on the phone poll backstop");
-            }
-        }
+    /// The push doorbell hint to forward to the relay for this pairing: the phone's
+    /// registered token and platform, if any. `None` means no token is on file, so
+    /// the deposit carries no hint and the phone relies on its poll backstop. The
+    /// daemon does not interpret the platform (the relay owns push): it forwards
+    /// whatever the phone registered verbatim.
+    fn push_hint(&self) -> Option<PushHint> {
+        self.push_store.get(self.pairing_id).map(|reg| PushHint {
+            token: reg.token,
+            platform: reg.platform,
+        })
     }
 }
 
@@ -425,7 +401,7 @@ mod tests {
 
         let store = Arc::new(PushStore::ephemeral());
         let approver = RemoteApprover::new(Arc::new(relay.clone()), clone_id(&daemon), phone_pub)
-            .with_push(store.clone(), None)
+            .with_push(store.clone())
             .with_timeout(Duration::from_secs(2));
 
         // The phone registers its push token first (counter 1, ToDaemon).
@@ -479,7 +455,7 @@ mod tests {
             clone_id(&daemon),
             phone.peer_identity(),
         )
-        .with_push(store.clone(), None)
+        .with_push(store.clone())
         // A short timeout: no response ever comes, so the approval denies, but
         // the pre-drain still records the buffered registration.
         .with_timeout(Duration::from_millis(80));
