@@ -14,7 +14,7 @@ baked `op` into the core gating path:
 1. `CommandConfig::default_op()` / `CommandStore::resolve("op")` returned a
    built-in 1Password config, so the core *knew* about `op`.
 2. `fulfill` sniffed `--vault` out of the argv (`parse_vault`) to route a
-   1Password account — argv semantics only `op` has.
+   1Password account: argv semantics only `op` has.
 
 Both are removed. `op`-ness now lives entirely in **user-authored rules** plus
 the `op` provider plugin (`provider::OpProvider`). The core evaluates generic
@@ -24,17 +24,17 @@ source. Nothing in the rule vocabulary or the engine names `op`.
 ## Package & binary layout (landed)
 
 One workspace package (`crates/sigil`). Its `[lib]` is the shared core
-`sigil_core` — the rule engine, providers, gating/daemon, keystore, transport,
+`sigil_core`: the rule engine, providers, gating/daemon, keystore, transport,
 and the proxy module all live here, so both binaries call one implementation
 with zero duplication. Two thin `[[bin]]` targets in `src/bin/`:
 
-- **`sigil`** — the lean hot-path + runtime binary agents and launchd invoke:
+- **`sigil`**: the lean hot-path + runtime binary agents and launchd invoke:
   the `sigil <cmd>` gating primitive, the transparent shim multicall, `sigil
   proxy …` (the auto-aliasing proxy), `sigil run`, and the runtime verbs
   (daemon, status, pair, lease, ssh, …). Reserved verbs in this binary: the
   runtime set + `run` + `proxy` + `config` (hint-only, points at `sigil-config`);
   everything else is the `sigil <cmd>` primitive.
-- **`sigil-config`** — the configuration-management CLI the desktop shells out
+- **`sigil-config`**: the configuration-management CLI the desktop shells out
   to under the hood: `source`/`rule`/`list`/`export`/`import`, plus the
   config-ish mutations (`account`, `settings`, `mac-approvals`, `wipe`).
 
@@ -51,12 +51,12 @@ runtime verb is `sigil run -- <cmd>`.
 
 The multicall `sigil` binary keeps its two faces; this change sharpens the split:
 
-- **Gating CLI** — `sigil <cmd> [args]`, the transparent shim alias, and
+- **Gating CLI**: `sigil <cmd> [args]`, the transparent shim alias, and
   `sigil run -- <cmd>`. On an invocation the daemon evaluates the configured
   rules; the first matching rule gates the command on the phone, injects its
   source's env, and execs+streams. No rule matches -> refuse and point at
   `sigil config` (never run ungated: a silent pass-through is false security).
-- **Configuration CLI** — `sigil config …`. A provider-agnostic config layer
+- **Configuration CLI**: `sigil config …`. A provider-agnostic config layer
   that authors rules and sources. It is the owned primitive; the **desktop app
   is a client** that shells out to it (or, later, speaks the same JSON). JSON
   in/out mirrors the daemon-control-protocol philosophy: one machine interface,
@@ -64,7 +64,7 @@ The multicall `sigil` binary keeps its two faces; this change sharpens the split
 
 ## Data model
 
-Persisted at `~/.sigil/config.json` (plaintext by design — it holds routing,
+Persisted at `~/.sigil/config.json` (plaintext by design: it holds routing,
 never a secret; it must be readable while the daemon is inert). Two collections:
 
 ```jsonc
@@ -104,7 +104,7 @@ source to the provider. Nothing here is op-only in the *engine's* eyes.
 The inline `env` provider stores only KEY **names** here (public, for the
 zero-knowledge readout); the VALUES are AES-256-GCM sealed under the DEK in the
 account store (`sigil.db`), keyed by the source `name`, exactly like a
-service-account token — so `config.json` never holds a secret value. Set/change
+service-account token, so `config.json` never holds a secret value. Set/change
 them with `sigil-config source env set <name> --key <KEY>` (VALUE read from
 stdin, never argv) or `--stdin` (KEY=VALUE lines); `source env unset` removes
 one, and removing the source removes its sealed blob.
@@ -120,7 +120,7 @@ Rules are an **ordered list; first match wins**. Ordering is authorship order
 | `match`  | the conditions (below)                              |
 | `action` | what to do on a match                               |
 
-**Match** — composable conditions on the invoked command + argv. All present
+**Match**: composable conditions on the invoked command + argv. All present
 conditions must hold (AND). A match with **no** conditions never matches (fails
 closed rather than gating everything).
 
@@ -133,7 +133,7 @@ closed rather than gating everything).
 | `flag_equals`   | every `{flag,value}` appears (`--flag=value` or `--flag value`)  |
 | `arg_regex`     | (deferred, see below) a regex matches the joined args            |
 
-**Action** — for a **gate** rule: require phone approval, then inject the named
+**Action**: for a **gate** rule, require phone approval, then inject the named
 source's env, then exec. For an **allow** rule: run the matched command directly
 (passthrough), no approval, no injection.
 
@@ -145,7 +145,7 @@ source's env, then exec. For an **allow** rule: run the matched command directly
 | `timeout_sec` | gate only: optional per-rule approval timeout; falls back to settings |
 
 `mode` defaults to `gate` and a missing/unknown mode gates: a hand-edit can never
-silently open a passthrough. An **allow** rule is a pure passthrough — it names no
+silently open a passthrough. An **allow** rule is a pure passthrough: it names no
 source, carries no lease, and needs no approval. It is the inverse of a gate: an
 explicit allowlist entry, scoped strictly to its match (an empty match never
 matches, in either mode, so allow can never become allow-everything). An
@@ -216,7 +216,7 @@ The core never parses `op://`, never reads `--vault`, never special-cases `op`.
    child stdout splices to the client fd, every failure fails closed.
 
 `parse_vault` is deleted from the core. Account selection is configuration, not
-argv archaeology — which is exactly the generalization.
+argv archaeology, which is exactly the generalization.
 
 ## Configuration CLI surface
 
@@ -257,13 +257,13 @@ always-on daemon must not be able to rewrite which commands are gated. Re-run
   (named after the command) + a `Rule` matching `command == <cmd>`. The retired
   `risk` tier on legacy entries is dropped: every migrated rule is run-once. To preserve
   the historical implicit behavior, if no legacy entry named `op` exists, a
-  default `op` rule + `1password` source (no account) is synthesized — so Tom's
+  default `op` rule + `1password` source (no account) is synthesized, so Tom's
   existing zero-config `op` keeps working after upgrade. The legacy file is left
   in place (non-destructive); `sigil wipe` removes both.
 
 ## Migration: verb moves (lean `sigil` vs `sigil-config`)
 
-The split is a HARD CUT — no back-compat aliases in the lean binary (aliases
+The split is a HARD CUT: no back-compat aliases in the lean binary (aliases
 would re-reserve the very verbs we moved off it, defeating gateability). The
 exact moves, so retargeting the Mac app (#42) is mechanical:
 
@@ -291,7 +291,7 @@ gateable as `sigil proxy …`.
 
 - **Matched-but-broken rule fails closed (sec-review Note B):** if the first rule
   whose match holds names a source that no longer exists, `resolve` returns
-  `None` (refuse) — it does NOT fall through to a later, broader rule. Falling
+  `None` (refuse): it does NOT fall through to a later, broader rule. Falling
   through would be a fail-open downgrade of a hand-edited config to an unintended
   broader route. Invariant #5 over convenience.
 - **Label/vault routing collision (sec-review Note A):** account routing matches

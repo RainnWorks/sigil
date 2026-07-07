@@ -1,4 +1,4 @@
-# latch
+# Sigil
 
 Personal remote-approval instrument for 1Password secrets. Single user (Tom),
 never a team product. The design brief at `docs/design/sigil-design-brief.html`

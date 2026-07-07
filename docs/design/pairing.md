@@ -28,7 +28,7 @@ assume that transport is fully malicious: it can read, drop, reorder, duplicate,
 mutate, and manufacture messages, and it knows both parties' *public* keys.
 Nothing physical protects this leg. If it were unauthenticated, a network
 attacker could substitute its own public key for the phone's, and the daemon
-would pin the attacker as "the phone" — the attacker would then approve its own
+would pin the attacker as "the phone": the attacker would then approve its own
 requests forever. This is the one substitution the ceremony must stop.
 
 The QR is what makes stopping it possible. Besides the daemon's public keys and
@@ -102,13 +102,13 @@ sequenceDiagram
     participant D as Mac daemon
     participant H as Human
     participant P as Phone
-    Note over D: mint(): generate 256-bit secret,<br/>build QR payload — state Init
+    Note over D: mint(): generate 256-bit secret,<br/>build QR payload, state Init
     D-->>H: render QR on screen
     H-->>P: point camera (OPTICAL, MITM-proof)
-    Note over P: scan(): pin daemon keys,<br/>mint phone identity — state Scanned
+    Note over P: scan(): pin daemon keys,<br/>mint phone identity, state Scanned
     Note over P: respond(): tag = MAC over<br/>transcript(QR ∥ phone id ∥ nonce)<br/>secret consumed + zeroized
     P->>D: PairingResponse {phone id, nonce, tag}  (NETWORK, hostile)
-    Note over D: receive_response():<br/>not-consumed → not-expired →<br/>verify tag (constant-time)<br/>pin phone — state ResponseReceived
+    Note over D: receive_response():<br/>not-consumed → not-expired →<br/>verify tag (constant-time)<br/>pin phone, state ResponseReceived
     D-->>H: show 6 words
     P-->>H: show 6 words
     H->>H: compare (SAS backstop)
@@ -117,7 +117,7 @@ sequenceDiagram
     Note over D,P: state Confirmed
     Note over D: deliver_dek(): seal DEK to phone's<br/>pinned X25519 key in an Envelope
     D->>P: Envelope(DEK)  (NETWORK, hostile)
-    Note over P: receive_dek(): open, recover DEK<br/>— state DekDelivered
+    Note over P: receive_dek(): open, recover DEK,<br/>state DekDelivered
     Note over D: erase plaintext DEK
 ```
 
@@ -141,17 +141,17 @@ H( domain
 
 Each binding earns its place:
 
-- **daemon identity** — a response tagged for pairing A cannot be replayed
+- **daemon identity**: a response tagged for pairing A cannot be replayed
   against a freshly minted pairing B; B's daemon identity differs, so the
   transcript (and B's independent secret) reject it.
-- **phone identity** — the tag covers exactly the key in the message. A network
+- **phone identity**: the tag covers exactly the key in the message. A network
   attacker who swaps `resp.phone` for its own key invalidates the tag and cannot
   recompute it without the secret. This is the core MITM defense.
-- **nonce** — makes each response unique and one-shot.
+- **nonce**: makes each response unique and one-shot.
 
 The secret is deliberately **not** in the transcript; it is the MAC key, not
 part of the signed message. So the transcript is a public value that leaks
-nothing about the secret — a clean seam to hand a reviewer.
+nothing about the secret, a clean seam to hand a reviewer.
 
 **Subkey then MAC.**
 
@@ -186,15 +186,15 @@ produces. The Mac app exports its SE public key in ANSI X9.63 uncompressed form
 the daemon wraps the DEK to it as follows, for a P-256 recipient:
 
 1. Generate an ephemeral P-256 key pair `(d_E, Q_E)`.
-2. `Z = ECDH_cofactor(d_E, Q_recipient)` — the 32-byte big-endian X coordinate of
+2. `Z = ECDH_cofactor(d_E, Q_recipient)`: the 32-byte big-endian X coordinate of
    the shared point. P-256's cofactor is 1, so cofactor ECDH equals plain ECDH.
 3. ANSI-X9.63 KDF with SHA-256, deriving 32 bytes:
    `K = SHA256(Z ∥ 0x00000001 ∥ SharedInfo)`, where `SharedInfo = Q_E` in ANSI
    X9.63 uncompressed form (`0x04 ∥ X ∥ Y`, 65 bytes). 32 bytes fit one SHA-256
    block, so the KDF counter never advances past 1.
-   - `aes_key = K[0..16]` — **AES-128** (Apple uses a 128-bit AES key for EC keys
+   - `aes_key = K[0..16]`: **AES-128** (Apple uses a 128-bit AES key for EC keys
      up to 256 bits, despite the `SHA256` in the algorithm name).
-   - `iv = K[16..32]` — the **variable** 16-byte GCM IV. (The non-`VariableIV`
+   - `iv = K[16..32]`: the **variable** 16-byte GCM IV. (The non-`VariableIV`
      algorithm would instead use a fixed all-zero 16-byte IV; we must match the
      `VariableIV` variant, which is what `se-selftest.swift` uses.)
 4. AES-128-GCM over the 32-byte DEK with that key and 16-byte IV, empty AAD,
@@ -252,8 +252,8 @@ Touch ID, and its printed blob length must be 113.
 
 ## Why no PAKE
 
-A PAKE (SPAKE2, OPAQUE, etc.) exists to turn a **low-entropy** shared secret — a
-human-chosen password an attacker could guess offline — into a mutually
+A PAKE (SPAKE2, OPAQUE, etc.) exists to turn a **low-entropy** shared secret (a
+human-chosen password an attacker could guess offline) into a mutually
 authenticated key without exposing it to a dictionary attack. That is not our
 situation. Our shared secret is a full **256-bit CSPRNG value** transferred over
 an optical channel; there is no low-entropy human input to protect and nothing
@@ -290,8 +290,8 @@ Reading six words aloud is cheap and the failure mode is loud.
   checking expiry *before* the tag. A short window bounds how long a
   photographed QR is useful.
 - **One-time (daemon side).** The first cryptographically valid response sets
-  `consumed`; any later response — even a perfectly valid one from a second
-  device that scanned the same QR — is refused with `SecretConsumed`. A failed
+  `consumed`; any later response (even a perfectly valid one from a second
+  device that scanned the same QR) is refused with `SecretConsumed`. A failed
   attempt does not consume the secret, so a transient network error is
   recoverable but a second success is not possible.
 - **One-time (phone side).** `respond()` `take`s the secret out and zeroizes it,
@@ -316,7 +316,7 @@ The handshake is built to be attacked at clean, public boundaries. Each of these
 is a documented place to mount an attack and assert it fails closed:
 
 - **`PairingResponse` fields are public and mutable in a test.** Swap `phone`
-  for an attacker key, flip a bit in `tag`, replace `nonce` — then assert
+  for an attacker key, flip a bit in `tag`, replace `nonce`, then assert
   `receive_response` returns `BadTag`. (`tag_rejected_when_phone_key_substituted`
   is the seed; the suite should fuzz every field.)
 - **`PairingResponse::build` / `verify` are exposed.** Construct a response under
@@ -340,7 +340,7 @@ is a documented place to mount an attack and assert it fails closed:
   no `==` on tags/keys exists and that `Dek`/`PairingResponse` never gain
   `PartialEq`.
 
-## Device-side unknowns — NEEDS VERIFICATION
+## Device-side unknowns: NEEDS VERIFICATION
 
 This crate defines the protocol and its in-memory operations. The following
 depend on platform behavior outside `crates/sigil-proto` and must be verified when the
