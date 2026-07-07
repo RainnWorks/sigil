@@ -1,0 +1,20 @@
+[package]
+name = "sigil-direct"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Direct Transport impls for Sigil rungs 1-2 (LAN/Bonjour, owned endpoint): sealed envelopes over a duplex TCP link, plus the relay-fallback selector and the discovery/verification seam"
+
+[lib]
+name = "sigil_direct"
+path = "src/lib.rs"
+
+[dependencies]
+sigil-proto = { path = "../sigil-proto" }
+# serde_json: (de)serialize the SAME opaque proto::Envelope wire the relay
+# carries, so a direct link changes only the pipe, never the crypto.
+serde_json.workspace = true
+# serde: derive for the tiny, non-secret mDNS/discovery record shape.
+serde.workspace = true
+# thiserror: typed errors mapped onto the Transport seam and the discovery gate.
+thiserror.workspace = true

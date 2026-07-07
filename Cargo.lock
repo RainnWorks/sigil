@@ -1326,6 +1326,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sigil-direct"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sigil-proto",
+ "thiserror",
+]
+
+[[package]]
 name = "sigil-proto"
 version = "0.1.0"
 dependencies = [
