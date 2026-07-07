@@ -93,6 +93,26 @@ pub trait Keystore: Send + Sync {
     /// biometric prompt. The returned key is `Zeroizing`; the caller must drop
     /// it as soon as the token is decrypted.
     fn unwrap_dek(&self, reason: &str) -> Result<Dek, KeystoreError>;
+
+    /// Prove a live hardware user-presence (Touch ID / Secure Enclave), as a gate
+    /// **independent of unwrapping the DEK for delivery** (#48). Authorizing a new
+    /// pairing calls this so accepting a device is gated on the human's biometric
+    /// even on a path that never delivers a DEK, and so the gate does not rely on
+    /// the pairing ceremony's incidental DEK unwrap staying in place.
+    ///
+    /// The default fails **closed**: any keystore that reports
+    /// [`is_biometric`](Self::is_biometric) `== true` MUST override this with a
+    /// real hardware check, or the pairing gate refuses. Non-biometric dev
+    /// keystores keep this default and are simply never asked: the pairing gate
+    /// calls this only when `is_biometric()` is true, so `SIGIL_DEV_KEYSTORE`
+    /// (which makes `is_biometric()` false, behind its own loud warning) is the
+    /// single switch that lets headless dev and tests through without a biometric.
+    fn verify_presence(&self, reason: &str) -> Result<(), KeystoreError> {
+        let _ = reason;
+        Err(KeystoreError::Backend(
+            "this keystore has no hardware user-presence check".into(),
+        ))
+    }
 }
 
 /// In-memory keystore. Holds blobs and a DEK in RAM, wiped on drop. It is the

@@ -57,6 +57,48 @@ use sigil_relay_client::DaemonRelay;
 /// Default session-lease TTL granted by an "approve for this session" decision.
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 
+/// How often the config watcher stat-polls `~/.sigil/config.json` for a change.
+/// Modest on purpose: rule edits are human-paced, and a stat every couple of
+/// seconds is free next to a gating round trip.
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// A hot-swappable holder for the resolved rule/source [`Config`], so a
+/// `sigil-config` edit takes effect without a daemon restart (#59).
+///
+/// It is an `RwLock<Arc<Config>>`. A gating decision takes a *snapshot*
+/// ([`Self::snapshot`]): it read-locks, clones the (cheap) `Arc`, and unlocks
+/// immediately, then evaluates the whole `resolve` against that one `Arc`. A
+/// reload takes a *store* ([`Self::store`]): it write-locks and swaps in a new
+/// `Arc`. Because a decision holds its own `Arc` for its full duration, a reload
+/// that lands mid-decision is invisible to it (no torn read): the decision sees
+/// either the entire old config or, next time, the entire new one, never a blend.
+struct ConfigCell(std::sync::RwLock<Arc<Config>>);
+
+impl ConfigCell {
+    fn new(cfg: Config) -> Self {
+        Self(std::sync::RwLock::new(Arc::new(cfg)))
+    }
+
+    /// A consistent snapshot for one gating decision. Clone-and-release, so a
+    /// concurrent [`store`](Self::store) can never change the config under a
+    /// `resolve` in progress.
+    fn snapshot(&self) -> Arc<Config> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Atomically replace the live config. The brief write lock means every
+    /// reader observes either the whole old `Arc` or the whole new one.
+    fn store(&self, cfg: Config) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(cfg);
+    }
+}
+
+impl From<Config> for ConfigCell {
+    fn from(cfg: Config) -> Self {
+        Self::new(cfg)
+    }
+}
+
 /// Shared daemon state, cloned (via `Arc`) into every connection worker.
 pub struct Core {
     keystore: Arc<dyn Keystore>,
@@ -75,9 +117,11 @@ pub struct Core {
     /// the seam is generic and each provider owns its own tool discovery.
     providers: ProviderRegistry,
     /// The generic rule/source config: an ordered rule list matched against each
-    /// invocation, resolving to a provider + source + lease policy. Loaded at arm time.
-    /// The core holds no concept of `op`; op-ness lives in user-authored rules.
-    config: Config,
+    /// invocation, resolving to a provider + source + lease policy. Loaded at arm
+    /// time and hot-swappable (#59): the config watcher re-reads it when
+    /// `config.json` changes so edits apply without a restart. The core holds no
+    /// concept of `op`; op-ness lives in user-authored rules.
+    config: ConfigCell,
     lease_ttl: Duration,
     /// The approving factor resolved at arm time (residual #1 mitigation).
     factor: Factor,
@@ -251,7 +295,7 @@ impl Core {
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(SysProcessTable),
             providers: ProviderRegistry::with_defaults(),
-            config,
+            config: config.into(),
             lease_ttl: DEFAULT_LEASE_TTL,
             factor,
             ssh_signers,
@@ -275,6 +319,24 @@ impl Core {
                 leases: self.leases.active(),
             },
         )
+    }
+
+    /// Reload the rule/source config from disk into the hot cell (#59).
+    ///
+    /// **Fail-closed by construction:** the swap ([`ConfigCell::store`]) is
+    /// reached ONLY on the `Ok` arm, i.e. only after [`Config::load`] has fully
+    /// parsed and validated the file. A malformed, truncated (a
+    /// half-written save), or unreadable file returns `Err` here WITHOUT touching
+    /// the cell, so the last-good rules stay in force and gating is never
+    /// downgraded by a bad reload. The caller logs the `Err` and keeps serving.
+    fn reload_config(&self) -> Result<(), String> {
+        match Config::load() {
+            Ok(cfg) => {
+                self.config.store(cfg);
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     /// The audit `via` label for a fresh grant under the resolved factor.
@@ -607,6 +669,10 @@ async fn serve(
             .expect("spawning the ToDaemon owner")
     });
 
+    // The config hot-reloader (#59): picks up `sigil-config` edits without a
+    // restart. Shares the shutdown flag so it stops with the daemon.
+    let config_watcher = spawn_config_watcher(core.clone(), listener_shutdown.clone());
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -672,10 +738,70 @@ async fn serve(
     if let Some(handle) = listener_handle {
         let _ = handle.join();
     }
+    // The watcher wakes at most one poll interval after the flag is set.
+    if let Some(handle) = config_watcher {
+        let _ = handle.join();
+    }
 
     let _ = fs::remove_file(&sock);
     let _ = fs::remove_file(&ssh_sock);
     Ok(())
+}
+
+/// The config file's modification time, or `None` if it is absent/unreadable.
+/// The watcher compares this across polls; a change (including create/remove)
+/// triggers a reload attempt.
+fn config_mtime(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Watch `~/.sigil/config.json` and hot-swap the daemon's in-memory rule set when
+/// it changes, so `sigil-config` edits (and the Mac app's Rules editor) apply
+/// without a restart (#59).
+///
+/// It stat-polls the mtime on a modest interval rather than wiring an OS file
+/// watcher: rule edits are human-paced, the daemon is single-user, and a `stat`
+/// every couple of seconds costs nothing. On a detected change it calls
+/// [`Core::reload_config`], which is fail-closed: it swaps only on a clean parse,
+/// so a malformed or half-written file leaves the last-good rules in force and we
+/// log a warning here rather than downgrade gating.
+///
+/// Runs on its own thread and exits when `shutdown` is set. Returns `None` (no
+/// thread) when there is no resolvable config path (no HOME), which only happens
+/// in degenerate environments.
+fn spawn_config_watcher(
+    core: Arc<Core>,
+    shutdown: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let path = Config::path()?;
+    let handle = std::thread::Builder::new()
+        .name("sigil-config-watcher".into())
+        .spawn(move || {
+            let mut last = config_mtime(&path);
+            while !shutdown.load(Ordering::SeqCst) {
+                std::thread::sleep(CONFIG_POLL_INTERVAL);
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let current = config_mtime(&path);
+                if current == last {
+                    continue;
+                }
+                last = current;
+                match core.reload_config() {
+                    Ok(()) => {
+                        eprintln!("sigil daemon: reloaded config from {}", path.display());
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "sigil daemon: config reload failed, keeping last-good rules: {e}"
+                        );
+                    }
+                }
+            }
+        })
+        .expect("spawning the config watcher");
+    Some(handle)
 }
 
 /// Create the socket directory 0700 and clear any stale socket file.
@@ -943,7 +1069,10 @@ fn fulfill(
     // Evaluate the rules against this whole invocation. An invocation that no
     // rule matches is refused (never run ungated) with a pointer to `sigil
     // config`; the core holds no built-in rule for any command, `op` included.
-    let action = match core.config.resolve(argv) {
+    // `snapshot()` pins one consistent config `Arc` for this whole decision, so a
+    // hot-reload landing mid-`resolve` cannot tear it (#59).
+    let config = core.config.snapshot();
+    let action = match config.resolve(argv) {
         None => {
             return fail_closed(
                 stderr,
@@ -1553,7 +1682,7 @@ mod tests {
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
             ))]),
-            config,
+            config: config.into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: Vec::new(),
@@ -1682,7 +1811,7 @@ mod tests {
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(&dir, "tok", "secret-1"),
             ))]),
-            config: op_config(),
+            config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: Vec::new(),
@@ -2131,7 +2260,7 @@ mod tests {
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
-            config,
+            config: config.into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: Vec::new(),
@@ -2249,7 +2378,7 @@ mod tests {
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
-            config: env_inline_config("faketool", &["TOKEN", "REGION"]),
+            config: env_inline_config("faketool", &["TOKEN", "REGION"]).into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: Vec::new(),
@@ -2305,7 +2434,7 @@ mod tests {
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
-            config: env_inline_config("faketool", &["TOKEN"]),
+            config: env_inline_config("faketool", &["TOKEN"]).into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: Vec::new(),
@@ -2376,7 +2505,7 @@ mod tests {
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
-            config: env_inline_config("faketool", &["TOKEN"]), // readout: TOKEN only
+            config: env_inline_config("faketool", &["TOKEN"]).into(), // readout: TOKEN only
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: Vec::new(),
@@ -2448,7 +2577,7 @@ mod tests {
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
-            config,
+            config: config.into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: Vec::new(),
@@ -2529,7 +2658,7 @@ mod tests {
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
-            config: env_file_config("faketool", env_path.to_str().unwrap()),
+            config: env_file_config("faketool", env_path.to_str().unwrap()).into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: Vec::new(),
@@ -2617,7 +2746,7 @@ mod tests {
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
-            config: op_config(),
+            config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: vec![Box::new(sshagent::FileSshSigner::new(vec![(
@@ -2824,7 +2953,7 @@ mod tests {
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
             ))]),
-            config: op_config(),
+            config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::Phone,
             ssh_signers: Vec::new(),
@@ -3067,7 +3196,7 @@ mod tests {
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
             ))]),
-            config: op_config(),
+            config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::Phone,
             ssh_signers: Vec::new(),
@@ -3278,7 +3407,7 @@ mod tests {
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_echo_op(&dir),
             ))]),
-            config: coexist_config(),
+            config: coexist_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::Phone,
             ssh_signers: Vec::new(),
@@ -3642,7 +3771,7 @@ mod tests {
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
             ))]),
-            config: op_config(),
+            config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor,
             ssh_signers: Vec::new(),
@@ -3727,6 +3856,109 @@ mod tests {
     ) -> [String; 6] {
         let w = sigil_proto::fingerprint_words(daemon, phone);
         std::array::from_fn(|i| w[i].to_string())
+    }
+
+    /// Small argv builder for the reload tests.
+    fn av(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn config_hot_reload_swaps_in_the_on_disk_rules() {
+        // #59: a `sigil-config` edit (here, a rewritten config.json) is picked up
+        // by reload_config and atomically swapped in, no restart. The daemon
+        // starts on the in-memory op_config; after reload it serves the on-disk
+        // rules instead.
+        let _home = HomeGuard::new("hot-reload");
+        let dir = tmpdir("hot-reload");
+        let (core, _) = test_core(
+            &dir,
+            "tok",
+            "secret",
+            DevMode::Off,
+            Duration::from_millis(10),
+        );
+
+        // Before: the in-memory op rule gates `op read`.
+        assert!(
+            matches!(
+                core.config
+                    .snapshot()
+                    .resolve(&av(&["op", "read", "op://V/i/f"])),
+                Some(crate::config::Resolution::Gate(_))
+            ),
+            "op gates before the reload"
+        );
+
+        // Author a different config on disk: gate `deploy` via env-file, no op rule.
+        env_file_config("deploy", "/x/.env")
+            .save()
+            .expect("writing the on-disk config");
+        core.reload_config()
+            .expect("a clean reload swaps in the on-disk rules");
+
+        // After: the old op rule is gone (refuse), the new deploy rule gates.
+        assert!(
+            core.config
+                .snapshot()
+                .resolve(&av(&["op", "read", "x"]))
+                .is_none(),
+            "the retired op rule refuses after the reload"
+        );
+        assert!(
+            matches!(
+                core.config.snapshot().resolve(&av(&["deploy"])),
+                Some(crate::config::Resolution::Gate(_))
+            ),
+            "the freshly loaded deploy rule gates"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_reload_is_fail_closed_on_a_malformed_file() {
+        // #59 fail-closed proof: a malformed / half-written config.json must NOT
+        // downgrade gating. reload_config errors and the last-good rules stay in
+        // force; the swap is never reached on the error path.
+        let _home = HomeGuard::new("hot-reload-bad");
+        let dir = tmpdir("hot-reload-bad");
+        let (core, _) = test_core(
+            &dir,
+            "tok",
+            "secret",
+            DevMode::Off,
+            Duration::from_millis(10),
+        );
+
+        // Adopt a good on-disk config that gates op.
+        op_config().save().expect("writing a good config");
+        core.reload_config().expect("clean reload");
+        assert!(
+            core.config
+                .snapshot()
+                .resolve(&av(&["op", "read", "x"]))
+                .is_some(),
+            "op gates after the good reload"
+        );
+
+        // Corrupt config.json (a truncated save is exactly this shape).
+        let path = Config::path().expect("a config path under SIGIL_HOME");
+        std::fs::write(&path, b"{ this is not valid json").expect("corrupting the config");
+        let err = core
+            .reload_config()
+            .expect_err("a malformed reload must return an error");
+        assert!(!err.is_empty(), "the error is surfaced for logging");
+
+        // The last-good config is untouched: op still gates. A bad reload never
+        // falls open (nor to refuse-all): it keeps what worked.
+        assert!(
+            core.config
+                .snapshot()
+                .resolve(&av(&["op", "read", "x"]))
+                .is_some(),
+            "a malformed reload must not downgrade the last-good gating"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -4042,7 +4274,7 @@ mod tests {
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
-            config,
+            config: config.into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: Vec::new(),
@@ -4119,7 +4351,7 @@ mod tests {
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
-            config: op_config(),
+            config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: vec![Box::new(sshagent::FileSshSigner::new(vec![(

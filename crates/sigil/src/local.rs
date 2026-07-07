@@ -23,16 +23,82 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Where the daemon listens. `SIGIL_SOCK` overrides; otherwise it is
-/// `$TMPDIR/sigil/daemon.sock` (falling back to `/tmp`).
+/// The one runtime directory every Sigil socket lives under, resolved with **zero
+/// environment** so the daemon, the `op` shim, the `sigil` CLI, and a bare shell
+/// all agree on it. This is the fix for the "manual `SIGIL_SOCK` juggling" that a
+/// per-context `$TMPDIR` used to force: the GUI (launched by launchd), a login
+/// shell, and a subprocess can each see a *different* `$TMPDIR` (or none at all,
+/// falling back to `/tmp`), so deriving the socket from `$TMPDIR` made them bind
+/// and connect to different names. We instead anchor on the stable per-user temp
+/// dir (`confstr(_CS_DARWIN_USER_TEMP_DIR)` on macOS), which is identical across
+/// all of those contexts for one user, then append `sigil/`.
+///
+/// Callers that want to override (tests, or a bespoke deployment) do so at the
+/// socket level via `SIGIL_SOCK` / `SIGIL_SSH_SOCK`, not here, so a single
+/// authoritative default stands unless a full path is deliberately supplied.
+pub fn runtime_dir() -> PathBuf {
+    stable_temp_base().join("sigil")
+}
+
+/// The stable per-user temporary directory the [`runtime_dir`] anchors on.
+///
+/// On macOS this is `confstr(_CS_DARWIN_USER_TEMP_DIR)` (e.g.
+/// `/var/folders/xx/…/T/`), which the OS guarantees is the same for a given user
+/// whether the process was started by launchd, a GUI app, or a login shell, and
+/// which is short enough to keep the socket well under `sun_path`'s limit. It is
+/// deliberately NOT the `$TMPDIR` env var, which any of those contexts may strip
+/// or override. If the lookup ever fails we fall back to `/tmp` (shared, but at
+/// least consistent). On other platforms we keep the historical `$TMPDIR` (then
+/// `/tmp`) behavior.
+#[cfg(target_os = "macos")]
+fn stable_temp_base() -> PathBuf {
+    darwin_user_temp_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stable_temp_base() -> PathBuf {
+    std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+/// Query `confstr(_CS_DARWIN_USER_TEMP_DIR)` for the stable per-user temp dir.
+/// Returns `None` if the lookup reports no value (so the caller can fall back).
+#[cfg(target_os = "macos")]
+fn darwin_user_temp_dir() -> Option<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let name = libc::_CS_DARWIN_USER_TEMP_DIR;
+    // First call sizes the buffer (including the trailing NUL).
+    // SAFETY: a null buffer with length 0 is the documented sizing call.
+    let needed = unsafe { libc::confstr(name, std::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; needed];
+    // SAFETY: `buf` is `needed` bytes; confstr writes at most that many.
+    let got = unsafe { libc::confstr(name, buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if got == 0 || got > buf.len() {
+        return None;
+    }
+    // `got` counts the trailing NUL; drop it and anything past the string.
+    buf.truncate(got.saturating_sub(1));
+    if buf.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_vec(buf)))
+}
+
+/// Where the daemon listens. `SIGIL_SOCK` overrides with a full path (tests, a
+/// bespoke deployment); otherwise it is `<runtime_dir>/daemon.sock`, the one
+/// authoritative default the GUI, shim, and a bare shell all resolve with zero
+/// environment (see [`runtime_dir`]).
 pub fn socket_path() -> PathBuf {
     if let Some(p) = std::env::var_os("SIGIL_SOCK") {
         return PathBuf::from(p);
     }
-    let base = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("sigil").join("daemon.sock")
+    runtime_dir().join("daemon.sock")
 }
 
 /// A request frame from a client. Tagged so op traffic and the control protocol
@@ -340,6 +406,59 @@ mod tests {
                 body: "{\"k\":1}".into()
             }
         );
+    }
+
+    #[test]
+    fn socket_path_honors_the_sigil_sock_override() {
+        // Tests and bespoke deployments override with a full path; that must win
+        // over the computed default.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("SIGIL_SOCK");
+        std::env::set_var("SIGIL_SOCK", "/tmp/custom-sigil/x.sock");
+        assert_eq!(socket_path(), PathBuf::from("/tmp/custom-sigil/x.sock"));
+        match prev {
+            Some(v) => std::env::set_var("SIGIL_SOCK", v),
+            None => std::env::remove_var("SIGIL_SOCK"),
+        }
+    }
+
+    #[test]
+    fn daemon_and_ssh_sockets_share_one_authoritative_runtime_dir() {
+        // #59: with zero environment, the daemon socket and the ssh-agent socket
+        // both resolve under the SAME runtime dir, so the GUI, shim, and a bare
+        // shell all meet at one place without SIGIL_SOCK juggling.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_sock = std::env::var_os("SIGIL_SOCK");
+        let prev_ssh = std::env::var_os("SIGIL_SSH_SOCK");
+        std::env::remove_var("SIGIL_SOCK");
+        std::env::remove_var("SIGIL_SSH_SOCK");
+
+        let dir = runtime_dir();
+        let daemon = socket_path();
+        let ssh = crate::sshagent::socket_path();
+        assert_eq!(daemon.parent(), Some(dir.as_path()));
+        assert_eq!(ssh.parent(), Some(dir.as_path()));
+        assert_eq!(daemon.file_name().unwrap(), "daemon.sock");
+        assert_eq!(ssh.file_name().unwrap(), "ssh-agent.sock");
+        // The default must fit sun_path with margin (the whole point of anchoring
+        // on the short, stable per-user temp dir rather than a long $TMPDIR).
+        assert!(
+            crate::service::socket_path_fits().is_ok(),
+            "the default socket path must fit sun_path"
+        );
+
+        match prev_sock {
+            Some(v) => std::env::set_var("SIGIL_SOCK", v),
+            None => std::env::remove_var("SIGIL_SOCK"),
+        }
+        match prev_ssh {
+            Some(v) => std::env::set_var("SIGIL_SSH_SOCK", v),
+            None => std::env::remove_var("SIGIL_SSH_SOCK"),
+        }
     }
 
     #[test]

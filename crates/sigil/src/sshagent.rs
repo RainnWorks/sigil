@@ -852,17 +852,17 @@ pub fn resolve_file_identity(e: &SshFileEntry) -> Option<ServedIdentity> {
 
 // --- socket path ------------------------------------------------------------
 
-/// Where the agent listens. `SIGIL_SSH_SOCK` overrides; otherwise it sits beside
-/// the daemon socket at `$TMPDIR/sigil/ssh-agent.sock` (falling back to `/tmp`).
-/// This is the value a user points `SSH_AUTH_SOCK` at.
+/// Where the agent listens. `SIGIL_SSH_SOCK` overrides with a full path;
+/// otherwise it sits beside the daemon socket at `<runtime_dir>/ssh-agent.sock`,
+/// resolved from the SAME authoritative [`crate::local::runtime_dir`] the daemon
+/// socket uses (zero environment, stable across the GUI/shell/launchd), so the
+/// two sockets can never land in different directories. This is the value a user
+/// points `SSH_AUTH_SOCK` at.
 pub fn socket_path() -> PathBuf {
     if let Some(p) = std::env::var_os("SIGIL_SSH_SOCK") {
         return PathBuf::from(p);
     }
-    let base = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("sigil").join("ssh-agent.sock")
+    crate::local::runtime_dir().join("ssh-agent.sock")
 }
 
 #[cfg(test)]

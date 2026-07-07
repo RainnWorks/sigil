@@ -286,6 +286,24 @@ impl Keystore for MacKeystore {
         dek.copy_from_slice(plaintext.bytes());
         Ok(dek)
     }
+
+    fn verify_presence(&self, reason: &str) -> Result<(), KeystoreError> {
+        // #48: prove a live Touch ID before authorizing a new pairing, using the
+        // exact SE plumbing the approval path uses. The only biometric primitive
+        // on this keystore is exercising the enclave's `.biometryCurrentSet`
+        // private key, so we perform that private-key op (the same
+        // `SecKeyCreateDecryptedData` the approval unwrap uses) purely as a
+        // presence probe and immediately drop the recovered key -- it is a
+        // `Zeroizing` buffer, so it is wiped here and nothing is delivered
+        // anywhere. This is what makes the gate independent of DEK *delivery*: no
+        // DEK crosses a boundary, we only require the human to be present. A
+        // declined/cancelled prompt surfaces as `Declined`, which the pairing
+        // gate treats as a refusal (deny-closed). Requires the DEK envelope to
+        // exist; `sigil pair` provisions it via `ensure_dek` before authorizing.
+        let dek = self.unwrap_dek(reason)?;
+        drop(dek);
+        Ok(())
+    }
 }
 
 /// Re-find the Secure Enclave private key [`MacKeystore::ensure_dek`] minted,
