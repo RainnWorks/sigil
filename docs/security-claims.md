@@ -1544,3 +1544,159 @@ references/labels/provenance, never a secret value), relay
 powerless/anonymous (no key-distribution role added; the receipt is opaque
 ciphertext to the relay), and zero em-dash/zero emoji in user-facing strings all
 hold across these diffs.
+
+## Independent review verdict: #36 resolution broadcast + #51 direct transport (merged `feat/config-rule-engine` @ `f842e0d`)
+
+*Written by the independent security-reviewer (did NOT implement any of this
+code), per the review-integrity rule. Adversarial pass over commits `ea473fc`
+(#36 resolution-broadcast wire + phone dismissal) and `db2f9e7` (#51 direct
+transport rungs 1-2, new crate `crates/sigil-direct`). Both features are
+ADDITIVE and DORMANT: neither is wired into the shipping approval/serve path, so
+the review's first job was to confirm that, then to confirm no latent flaw can
+bite once deliberately enabled.*
+
+**Gate run (this reviewer, on HEAD `f842e0d`):** `cargo test` = **401 passed, 0
+failed, 7 ignored** across all crates (233 sigil-core, 90 sigil-proto, 18
+sigil-direct, plus proto/relay-client/softphone integration + doctests);
+`cargo clippy --all-targets -- -D warnings` = **clean**; `cargo fmt --check` =
+**clean**. Em-dash (U+2014) / en-dash (U+2013) / emoji scan of every added line
+in both commits: **none**.
+
+**Overall verdict: GREEN. No P0/P1/P2 findings. Ship-clear, and — more to the
+point — dormant, so nothing here can affect the shipping path until an operator
+deliberately wires it.** Every scope item verified sound against the code, not
+the implementer notes.
+
+### Dormancy — CONFIRMED for both features
+
+- **#36 `broadcast_resolution` is dormant: CONFIRMED.** `grep` across `crates`
+  and `apps` finds exactly one definition (`remote.rs:466`) and callers ONLY in
+  its own unit test (`remote.rs:890`). The production `serve` path and the
+  ToDaemon owner loop never call it; `build_gate` (`daemon.rs:197-246`, the sole
+  production approver wiring) constructs a `RemoteApprover` and never invokes any
+  resolution broadcast. No `RingApprover` / ring coordinator exists yet (deferred
+  with design in `docs/design/multi-device.md`). The wire type, the daemon seal
+  method, and the phone `dismissResolved` handler are all present and tested but
+  reachable only when a future ring coordinator calls them.
+- **#51 direct transport is dormant/OFF by default: CONFIRMED.** `grep` for
+  `sigil-direct` / `sigil_direct` / `DirectLink` / `FallbackTransport` /
+  `verify_link` finds ZERO references outside `crates/sigil-direct/` itself. The
+  crate is a workspace member (so it compiles and is tested) but is a dependency
+  of no other crate — not `sigil`, not the phone. Production `build_gate`
+  (`daemon.rs:219`) wires `RemoteApprover::new(Arc::new(relay), …)` on a raw
+  `DaemonRelay`, never a `FallbackTransport`; no primary is ever installed and
+  the relay remains the sole transport. The phone `LadderTransport` is likewise
+  imported nowhere in the shipping session wiring.
+
+### #36 resolution broadcast — GREEN (per scope item)
+
+- **(a) Sealed + signed + replay-protected; a hostile relay can neither forge
+  nor replay a dismissal: GREEN.** `ResolutionBroadcast` rides the identical
+  `Envelope::seal`/`open` path as every other message (crypto_box to the phone's
+  pinned agreement key, Ed25519 signature over all fields, single-use request id,
+  per-pairing monotonic counter, timestamp window). Proven by
+  `hostile_relay.rs::resolution_broadcast_rides_the_sealed_signed_replay_protected_envelope`:
+  a stranger's agreement secret fails `Decrypt`; a ciphertext bit-flip fails
+  `BadSignature`; a forge from an unpinned key fails `BadSignature` (the phone
+  still pins the daemon); the exact bytes replayed fail
+  `Replay(DuplicateRequest)`. The daemon-side seal is re-proven end-to-end in
+  `remote.rs::broadcast_resolution_deposits_a_sealed_dismissal_the_phone_can_open`,
+  including the replay rejection on the phone's guard.
+- **(b) Worst a hostile relay can do is withhold/delay; never a release, never
+  an approval: GREEN.** The type carries only `{request_id, status}` — no DEK, no
+  Z_F, no decision detail (`ResolutionStatus` deliberately does not say approve
+  vs deny). A dropped/delayed broadcast degrades to single-device behavior: the
+  loser device's own request timeout still expires the sheet
+  (`broadcast_resolution` doc + `deposit_and_wait` fail-closed timeout). A
+  (cryptographically impossible) forged-but-valid one at most hides a prompt,
+  which withholds a release — it can never cause one, because the phone's
+  `dismissResolved` records a neutral outcome and touches no key.
+- **(c) Touches no waiter channel, no ReplayGuard, no DEK/Z_F: GREEN.**
+  `broadcast_resolution` (`remote.rs:466-484`) shares only the daemon->phone
+  `counter` and `Envelope::seal`, exactly like a request deposit. It registers no
+  waiter (no `waiters` map mutation), locks no `guard` (that guards the inbound
+  ToDaemon direction; this is an outbound ToPhone deposit), and never constructs
+  or reads a DEK or partial. A seal/transport error is swallowed (best-effort),
+  which is safe precisely because it gates nothing.
+- **(d) Phone `dismissResolved` records a zero-knowledge neutral entry and
+  cannot release anything: GREEN.** `store.ts::dismissResolved` no-ops on an
+  unknown or already-terminal request (`approved`/`denied`/`expired`), then
+  records `"superseded"` (or `"expired"` for an expiry) — never `approved`/
+  `denied`. `HistoryEntry.decision` is widened to `Decision | "expired" |
+  "superseded"`; `RequestState` gains a terminal `"superseded"`. It carries no
+  DEK path and cannot transition a request into an approve. `classifyToPhone`
+  fails closed: a `"resolution"` tag with a missing/blank `requestId` or an
+  out-of-set `status` returns `null` and the caller drops it. `handleInbound`
+  opens the envelope ONCE to a raw payload (crypto verified regardless of shape),
+  then demuxes — so a resolution rides the same signature/replay/decrypt gate as
+  a request, and is never acknowledged with a delivery receipt.
+- **Wire-shape stability: GREEN.** `ToPhoneMessage::from_value` uses a
+  hand-rolled `type`-tag peek (not `#[serde(untagged)]`), so the untagged
+  `ApprovalRequest` wire shape is byte-for-byte unchanged and the pinned vectors
+  / pairing transcript do not shift. Mirrors the audited ToDaemon demux.
+
+### #51 direct transport — GREEN (per scope item)
+
+- **(a) Carries only opaque sealed envelopes; a rogue LAN/TCP peer's frames fail
+  `Envelope::open` and are dropped: GREEN.** `DirectLink` frames the exact
+  `serde_json` envelope wire the relay uses (`wire::{envelope_to_wire,
+  wire_to_envelope}`), authenticates nothing, decrypts nothing, grants nothing
+  (module doc + `tcp.rs`). Every frame is still opened by `Envelope::open` at the
+  unchanged `RemoteApprover`/phone call site. A frame that does not even decode to
+  an `Envelope` is dropped while framing stays synchronised (`read_loop` consumes
+  exactly `len` bytes); one that decodes but is not sealed to the pinned peer
+  fails `open` downstream. No plaintext and no new network trust.
+- **(b) `FallbackTransport` with no primary is byte-identical to the relay:
+  GREEN.** With `primary == None` (the default and the post-failure state),
+  `send`/`deposit_to_phone`/`recv` delegate straight to the relay with no added
+  behavior (`fallback.rs` + `with_no_primary_it_is_exactly_the_relay`). Spoofing
+  or withholding mDNS cannot affect a daemon with no installed primary, because
+  discovery is never consulted on the transport path.
+- **(c) A primary is installed only after `verify_link` opens an envelope as the
+  pinned peer; a TCP-only imposter fails closed: GREEN.** `verify_link`
+  (`discovery.rs:127`) reads exactly one envelope off the dialled link and demands
+  the caller-supplied predicate (wired to the same `Envelope::open` against the
+  pinned peer key) accept it; otherwise `NotPinnedPeer` / `Timeout`, and the link
+  is never installed. `install_primary` doc-contracts that the caller MUST have
+  verified first. Proven by `verify_link_rejects_an_envelope_the_predicate_denies`
+  and `verify_link_times_out_when_nothing_arrives`. The mDNS `ServiceRecord.hint`
+  is explicitly a non-secret dial discriminator, never the mailbox id, never
+  trusted.
+- **(d) Downgrade safety — active LAN MITM is at worst a one-timeout
+  fail-closed denial, never a forge/leak: GREEN (with a named residual).** A MITM
+  can complete a TCP handshake and relay the phone's genuine verification envelope
+  to get promoted, then black-hole traffic. The consequence is a `recv`/`send`
+  error that retires the primary (`retire_if_current`, guarded by `Arc::ptr_eq`
+  so a concurrent fresh install is not clobbered) and spends the remaining budget
+  on the relay; if it black-holes silently within a single window the approval
+  times out and fails closed. It cannot forge a request/response (envelope) or
+  read a secret. The residual (a `PreferDirect` deposit black-holed by an active
+  MITM costs one timeout before the demote-on-silence retry, which lives in the
+  not-yet-landed owner-loop change) is the reason the crate ships OFF; it is
+  documented in `docs/design/direct-transport.md` and inherits the fail-closed
+  floor. `Mirror` policy removes even the one-timeout delay at the cost of always
+  touching the relay.
+- **(e) Fail-closed on drop/truncation/over-cap; rung-2 listener at-rest
+  inertness: GREEN.** `MAX_FRAME_BYTES` (64 KiB) caps a declared frame length
+  before allocation; an over-cap length, an unknown direction byte, EOF, or a
+  truncated read all break `read_loop` and `shared.close()` (latched, never
+  cleared), which `shutdown(Both)` propagates so both ends fail over together.
+  `recv` drains buffered frames first, then surfaces `Closed`
+  (`buffered_frames_survive_a_close_and_are_delivered_before_the_error`). A
+  non-UTF8 or undecodable-but-length-valid frame is dropped while the link stays
+  synchronised. `DirectListener::accept` hands back an explicitly UNVERIFIED link;
+  at rest it holds no keys and grants nothing until `verify_link` promotes it.
+- **(f) OFF by default, relay remains default: GREEN.** Covered under Dormancy
+  above — no crate depends on `sigil-direct`, and `build_gate` wires the raw
+  relay.
+
+### Cross-cutting invariants — GREEN
+
+Daemon-at-rest inert (neither feature holds a token/DEK; the resolution broadcast
+and the direct link carry only opaque ciphertext), secret-bytes-never-in-daemon-
+memory (a `ResolutionBroadcast` is `{request_id, status}`; a `DirectLink` frame is
+an opaque `Envelope` never parsed for secret material), relay powerless/anonymous
+(no key-distribution role added — the mDNS record is untrusted and the envelope
+layer is the sole trust boundary), fail-closed everywhere (verify gate, drop/
+truncation, timeout, unknown tag), and zero em-dash / zero emoji in user-facing
+strings all hold across these diffs.
