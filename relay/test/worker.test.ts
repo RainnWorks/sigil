@@ -87,6 +87,59 @@ describe("deposit and drain", () => {
     expect(elapsed).toBeLessThan(150); // woken, not timed out (matches the test LONG_POLL_MS)
   });
 
+  it("a lone long-poll on an empty slot HOLDS for ~the full window, not an instant empty", async () => {
+    // The anti-hammer property end to end: an empty-slot GET must sit for its
+    // window (150ms test binding), not return a fast empty a client re-fires
+    // on. It resolves empty, but only after holding, not instantly.
+    const id = mailboxId();
+    const started = Date.now();
+    const body = await (await SELF.fetch(mbox(id, "to-phone"))).json();
+    const elapsed = Date.now() - started;
+    expect(body).toEqual({ envelopes: [] });
+    expect(elapsed).toBeGreaterThanOrEqual(100); // held ~the full 150ms, not a fast return
+  });
+
+  it("a second concurrent GET does not ping-pong the first empty: it holds, deposit goes to the newest", async () => {
+    // Two overlapping GETs on one slot. The newcomer must NOT flush the first
+    // to an instant empty (the reported hammer). Both hold; a single deposit
+    // reaches the newest; the other keeps holding and only then times out empty.
+    const id = mailboxId();
+    const started = Date.now();
+    const first = SELF.fetch(mbox(id, "to-phone"));
+    const second = SELF.fetch(mbox(id, "to-phone"));
+    await new Promise((r) => setTimeout(r, 20)); // let both register and hold
+    await toPhone(id, { env: "for-the-newest" });
+
+    const [b1, b2] = await Promise.all([
+      (async () => ({ body: await (await first).json(), t: Date.now() - started }))(),
+      (async () => ({ body: await (await second).json(), t: Date.now() - started }))(),
+    ]);
+    const bodies = [b1.body, b2.body];
+    // Exactly one got the deposit; the other is an empty that HELD (timed out
+    // near the full window), never an instant empty from being superseded.
+    expect(bodies).toContainEqual({ envelopes: ["for-the-newest"] });
+    expect(bodies).toContainEqual({ envelopes: [] });
+    const empty = b1.body && (b1.body as { envelopes: string[] }).envelopes.length === 0 ? b1 : b2;
+    expect(empty.t).toBeGreaterThanOrEqual(100); // the empty one held, it was not fast-flushed
+  });
+
+  it("no deposit is lost across a disconnect/reconnect: the reconnect receives it", async () => {
+    // A held GET disconnects without its signal firing server-side (an orphan
+    // waiter may linger). A reconnecting GET then holds, and a subsequent
+    // deposit must reach that live reconnect, not vanish into the orphan.
+    const id = mailboxId();
+    const ctrl = new AbortController();
+    const disconnected = SELF.fetch(mbox(id, "to-phone"), { signal: ctrl.signal });
+    await new Promise((r) => setTimeout(r, 15));
+    ctrl.abort(); // client goes away mid-poll
+    await expect(disconnected).rejects.toThrow();
+
+    const reconnect = SELF.fetch(mbox(id, "to-phone")); // client comes back, holds
+    await new Promise((r) => setTimeout(r, 15));
+    await toPhone(id, { env: "survives-reconnect" });
+    expect(await (await reconnect).json()).toEqual({ envelopes: ["survives-reconnect"] });
+  });
+
   it("a disconnected long-poll GET does not leak: a later deposit still lands normally", async () => {
     const id = mailboxId();
     const ctrl = new AbortController();

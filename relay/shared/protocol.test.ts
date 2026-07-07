@@ -45,41 +45,106 @@ test("wake() on a slot with no waiters is a no-op, item stays queued", () => {
   expect(list.map((i) => i.blob)).toEqual(["unread"]); // still there
 });
 
-test("a second long-poll on the same slot evicts the first, which resolves empty", async () => {
+test("a lone long-poll on an empty slot HOLDS: it does not resolve early", async () => {
+  // The core anti-hammer property. An empty-slot poll must sit for its full
+  // window, not return a fast empty a client would instantly re-fire on. We
+  // give it a comfortably long timeout and confirm it is still pending a beat
+  // later (nothing resolved it), then let a deposit wake it so nothing leaks.
   const list: P.Item[] = [];
   const waiters: P.Waiter[] = [];
-  const first = P.longPoll(list, waiters, Date.now(), 5_000);
+  let resolved = false;
+  const pending = P.longPoll(list, waiters, Date.now(), 5_000).then((v) => {
+    resolved = true;
+    return v;
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  expect(resolved).toBe(false); // still holding, not a fast empty
   expect(waiters.length).toBe(1);
 
-  const second = P.longPoll(list, waiters, Date.now(), 5_000);
-  expect(await first).toEqual([]); // evicted, not left dangling forever
-  expect(waiters.length).toBe(1); // only the second remains registered
-
-  list.push({ blob: "for-the-survivor", exp: Date.now() + 10_000 });
+  list.push({ blob: "eventually", exp: Date.now() + 10_000 });
   P.wake(list, waiters, Date.now());
-  expect(await second).toEqual(["for-the-survivor"]);
+  expect(await pending).toEqual(["eventually"]);
+});
+
+test("a second concurrent GET does NOT resolve the first empty (no ping-pong)", async () => {
+  // The regression guard for the reported hammer: superseding a live waiter the
+  // instant a second GET arrived turned one quiet wait into an instant-empty
+  // cascade. Now both waiters coexist and hold; neither is resolved early.
+  const list: P.Item[] = [];
+  const waiters: P.Waiter[] = [];
+  let firstResolved = false;
+  const first = P.longPoll(list, waiters, Date.now(), 5_000).then((v) => {
+    firstResolved = true;
+    return v;
+  });
+  expect(waiters.length).toBe(1);
+
+  const second = P.longPoll(list, waiters, Date.now(), 5_000); // concurrent, same slot
+  await new Promise((r) => setTimeout(r, 10));
+  expect(firstResolved).toBe(false); // the newcomer did NOT flush the first empty
+  expect(waiters.length).toBe(2); // both coexist, both holding
+
+  // A deposit goes to the NEWEST (second); the first keeps holding, unflushed.
+  list.push({ blob: "for-the-newest", exp: Date.now() + 10_000 });
+  P.wake(list, waiters, Date.now());
+  expect(await second).toEqual(["for-the-newest"]);
+  expect(firstResolved).toBe(false); // still holding after the newest was served
+  expect(waiters.length).toBe(1); // only the first remains
+
+  // A second deposit then reaches the first; nothing was lost or fast-emptied.
+  list.push({ blob: "for-the-first", exp: Date.now() + 10_000 });
+  P.wake(list, waiters, Date.now());
+  expect(await first).toEqual(["for-the-first"]);
   expect(waiters).toEqual([]);
 });
 
-test("eviction on reconnect prevents a deposit from being lost to an orphaned waiter", async () => {
+test("no deposit is lost across a disconnect/reconnect: it reaches the reconnect, not the orphan", async () => {
   // Models the real gap this exists for: a client's long-poll GET disconnects
   // without its AbortSignal ever firing (confirmed not to fire reliably when
-  // forwarded through a Durable Object), leaving an orphaned waiter. The
-  // client reconnects with a fresh long-poll *before* the next deposit — that
-  // reconnect must evict the orphan so the deposit reaches the live waiter,
-  // not the one nobody can hear from any more.
+  // forwarded through a Durable Object), leaving an orphaned waiter. The client
+  // reconnects with a fresh long-poll *before* the next deposit. The deposit
+  // must reach the live reconnect, not the orphan nobody can hear from — and
+  // (unlike the old design) without the orphan being resolved empty early.
   const list: P.Item[] = [];
   const waiters: P.Waiter[] = [];
-  const orphaned = P.longPoll(list, waiters, Date.now(), 5_000); // signal never fires; simulates a real disconnect
+  let orphanResolved = false;
+  const orphaned = P.longPoll(list, waiters, Date.now(), 5_000).then((v) => {
+    orphanResolved = true;
+    return v;
+  }); // signal never fires; simulates a real disconnect
   expect(waiters.length).toBe(1);
 
   const reconnected = P.longPoll(list, waiters, Date.now(), 5_000); // the client's fresh attach
-  expect(await orphaned).toEqual([]); // evicted, not stealing the next deposit
-  expect(waiters.length).toBe(1);
+  expect(waiters.length).toBe(2); // orphan not evicted; both registered
 
+  // The deposit reaches the newest (the live reconnect), never the orphan.
   list.push({ blob: "the-actual-message", exp: Date.now() + 10_000 });
   P.wake(list, waiters, Date.now());
   expect(await reconnected).toEqual(["the-actual-message"]); // delivered to the live client
+  expect(orphanResolved).toBe(false); // orphan never received (nor stole) the deposit
+  expect(list).toEqual([]); // nothing lost, nothing left queued
+});
+
+test("the coexisting-waiter count is bounded: past MAX_WAITERS the oldest is dropped", async () => {
+  // Overlapping GETs can't grow the waiter list without limit. At the cap a new
+  // GET drops the OLDEST waiter (resolved empty, the slot is provably empty) to
+  // admit the newcomer, keeping the bound while never touching the newer ones.
+  const list: P.Item[] = [];
+  const waiters: P.Waiter[] = [];
+  const polls: Promise<string[]>[] = [];
+  for (let i = 0; i < P.MAX_WAITERS; i++) {
+    polls.push(P.longPoll(list, waiters, Date.now(), 5_000));
+  }
+  expect(waiters.length).toBe(P.MAX_WAITERS); // full, none dropped yet
+
+  const overflow = P.longPoll(list, waiters, Date.now(), 5_000); // one past the cap
+  expect(waiters.length).toBe(P.MAX_WAITERS); // still bounded, not grown
+  expect(await polls[0]).toEqual([]); // the oldest was the one dropped, resolved empty
+
+  // The newcomer holds normally and a deposit still reaches the newest.
+  list.push({ blob: "still-delivered", exp: Date.now() + 10_000 });
+  P.wake(list, waiters, Date.now());
+  expect(await overflow).toEqual(["still-delivered"]);
 });
 
 test("an aborted signal resolves empty and cleans up its waiter, before any timeout", async () => {

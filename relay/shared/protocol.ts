@@ -26,21 +26,44 @@
 // operation (a pending approval, a pairing in progress), for seconds, not for
 // as long as the app is open. Idle daemon/phone hold nothing open at all.
 //
-// Known residual, confirmed against a real local Workers runtime (not just a
-// simulated test double): an incoming Request's `signal` does not reliably
-// fire when a long-poll GET is forwarded through a Durable Object, so a
-// client that disconnects mid-poll can leave an orphaned waiter behind that
-// nobody will ever hear from. `longPoll` evicts any such stale waiter the
-// moment the same slot's next long-poll re-attaches, so wake() can never hand
-// a deposit to a waiter that's already been superseded. The gap this does
-// NOT close: a deposit landing in the narrow window after the disconnect but
-// before the reconnect's long-poll re-attaches is still handed to the
-// (already-abandoned) orphan and is genuinely lost, not merely delayed, for
-// that one delivery. Bounded, rare (requires unlucky timing on top of an
-// actual disconnect), and something client-side retry/resend should account
-// for regardless of this relay's behavior; flagged here rather than silently
-// assumed away. Confirm on a real Cloudflare deploy whether the edge network
-// behaves differently from local wrangler dev before treating it as closed.
+// v5.1: a long-poll on an empty slot HOLDS for the full ~LONG_POLL_MS unless a
+// deposit wakes it. It no longer resolves an already-registered waiter early
+// when a second GET arrives on the same slot. That early-empty was the source
+// of an instant-return -> instant-refire hammer: superseding a live waiter the
+// instant a second GET landed turned one quiet wait into a burst of fast
+// empties that a client re-fired on at network speed (and two such GETs could
+// ping-pong empties off each other). The relay exists precisely so a waiting
+// side sits in ONE held request; manufacturing a fast empty defeats that.
+// Multiple waiters on one slot now coexist, each held for its full duration; a
+// deposit is handed to the NEWEST of them (see {@link wake}), and the
+// coexisting count is bounded by {@link MAX_WAITERS}.
+//
+// Why "newest": the only reason two GETs legitimately overlap on one slot is a
+// single client whose earlier poll's connection died without its `signal`
+// firing (confirmed unreliable when a long-poll GET is forwarded through a
+// Durable Object; verified against a real local Workers runtime, not just a
+// simulated test double) and then reconnected. The reconnect is the newest
+// waiter and the live one; handing the deposit to the newest delivers it to
+// the client that can still hear it, and does so WITHOUT resolving the older
+// (possibly still-live) waiter empty first, so no fast empty is manufactured.
+// The stale/orphaned older waiter simply times out into the void after
+// ~LONG_POLL_MS with nobody listening.
+//
+// Known residual (this partly closes #53). Now CLOSED: the manufactured
+// early-empty (a normal single poll holds the full window; a second concurrent
+// GET can no longer ping-pong it empty), and the disconnect-then-reconnect
+// delivery (the reconnect, being newest, receives the deposit rather than the
+// orphan). Still OPEN: a deposit that lands in the gap after a disconnect but
+// before ANY reconnecting long-poll re-attaches is handed to the orphaned
+// waiter (it is the only, hence newest, waiter) and is genuinely lost, not
+// merely delayed, for that one delivery. A second, narrower residual: if a
+// client holds two overlapping polls and the NEWER connection dies while the
+// older stays live, that deposit is handed to the dead-newer waiter and lost.
+// Both are bounded, require an actual disconnect on top of unlucky timing, and
+// are what client-side retry/resend must cover regardless of this relay.
+// Confirm on a real Cloudflare deploy whether the edge network delivers a
+// GET's abort signal more reliably than local wrangler dev before treating the
+// disconnect-gap residual as fully closed.
 
 /** Envelope time-to-live, ms. Short: this only has to outlive the gap between
  * a deposit and the other side's next poll, not a real offline window.
@@ -61,6 +84,18 @@ export const MAX_BODY_BYTES = MAX_ENVELOPE_BYTES + 4_096;
 /** How long a long-poll GET holds an empty slot open before returning an
  * empty result. Clients read with a comfortably longer timeout than this. */
 export const LONG_POLL_MS = 25_000;
+/** Upper bound on how many long-poll waiters may coexist on one slot. In normal
+ * use this is 1 (a client keeps a single poll in flight and re-issues only after
+ * it resolves); it climbs above 1 only when a client's polls genuinely overlap
+ * (a reconnect after a disconnect whose signal never fired, or a client firing
+ * a second GET before the first returns). This caps that: rather than resolving
+ * an existing waiter early to make room (the fast-empty this design exists to
+ * avoid), a new GET past the cap drops the OLDEST waiter (the stalest, hence
+ * likeliest orphaned) and takes its place. Small: a single client should never
+ * legitimately hold this many at once, and each waiter self-expires after
+ * {@link LONG_POLL_MS} regardless. This is the explicit memory bound; the rate
+ * limiter is only a coarse backstop, not the mechanism. */
+export const MAX_WAITERS = 8;
 /** Per-mailbox operations allowed per {@link RATE_WINDOW_MS}. Held only in the
  * mailbox's in-memory record; never persisted. Non-load-bearing anti-abuse.
  * Long-poll GETs are event-driven now, not a 2s/400ms hammer: each side holds
@@ -195,6 +230,12 @@ export function drain(list: Item[], now: number): string[] {
  * resolves with one last drain (ordinarily `[]`, but never presumed to be:
  * see the comment on the timeout branch below).
  *
+ * A newcomer never resolves an existing waiter early: multiple waiters coexist
+ * on a slot, each held for its full duration, and {@link wake} hands a deposit
+ * to the newest. This is what keeps a normal poll holding the full window and
+ * stops two concurrent GETs from ping-ponging empties. Only crossing
+ * {@link MAX_WAITERS} drops a waiter (the oldest) before its natural end.
+ *
  * `timeoutMs` defaults to {@link LONG_POLL_MS} and exists as a parameter
  * purely so tests can shrink it; production callers should not pass it.
  */
@@ -208,19 +249,28 @@ export function longPoll(
   const immediate = drain(list, now);
   if (immediate.length > 0) return Promise.resolve(immediate);
 
-  // At most one live long-poll per slot: a new GET supersedes whatever was
-  // already registered here, resolving it empty. This is the fix for a real,
-  // confirmed gap: an incoming Request's `signal` does not reliably fire when
-  // this fetch is forwarded through a Durable Object (verified against a real
-  // local Workers runtime, not just a simulated one) — a client that
-  // disconnects mid-poll can leave its waiter registered with nobody left to
-  // hear from it. Without eviction, `wake` could hand a deposit to that
-  // orphaned waiter and the data would be gone, not merely delayed, by the
-  // time the reconnect's long-poll registers behind it. This closes that gap
-  // for the disconnect-then-reconnect ordering. It does not close the
-  // narrower one where a deposit lands in the gap before the reconnect's
-  // long-poll re-attaches at all: see the residual note in the module header.
-  for (const evicted of waiters.splice(0)) evicted([]);
+  // The slot is empty (the drain above returned nothing). Register this GET as
+  // a waiter and hold it open for its full duration. A second concurrent GET on
+  // the same empty slot does NOT resolve an existing waiter early: doing so is
+  // exactly what manufactured the instant-return -> instant-refire hammer this
+  // relay exists to prevent. Waiters coexist; each holds until a deposit wakes
+  // it (handed to the NEWEST waiter — the client's current live connection, see
+  // {@link wake}), its own timeout fires, or its `signal` aborts. A stale or
+  // orphaned older waiter is never resolved early by a newcomer; it just times
+  // out into the void. See the module header for the disconnect residual this
+  // does and does not close, and why newest-wins delivers a reconnect correctly.
+  //
+  // Bound the coexisting count so overlapping GETs can't grow it without limit.
+  // At the cap, drop the OLDEST waiter (the stalest, hence likeliest orphaned)
+  // to admit the newcomer. The slot is provably empty here, so the dropped
+  // waiter is resolved with [] and no queued deposit can be lost to it. This is
+  // the only place a waiter resolves without either a deposit or its own
+  // timeout, and it is reachable only under genuinely overlapping polls past
+  // {@link MAX_WAITERS}, never in the normal single-poller case.
+  while (waiters.length >= MAX_WAITERS) {
+    const oldest = waiters.shift();
+    oldest?.([]);
+  }
 
   return new Promise<string[]>((resolve) => {
     let settled = false;
@@ -258,14 +308,23 @@ export function longPoll(
 }
 
 /**
- * Wake the oldest pending long-poll waiter for a slot, if any, handing it
+ * Wake the NEWEST pending long-poll waiter for a slot, if any, handing it
  * everything now queued (drained). Call this right after a successful
  * {@link enqueue} on the same list. A no-op if nothing is waiting: the item
  * just sits in the queue for the next GET, long-poll or not, to pick up.
+ *
+ * Newest, not oldest: the only reason a slot holds more than one waiter is a
+ * single client whose earlier poll's connection died without its `signal`
+ * firing (see the module header) and then reconnected. The reconnect is the
+ * newest waiter and the live one; the stale older waiter can no longer be
+ * heard from. Delivering to the newest hands the deposit to the connection
+ * that can still receive it, and — because {@link longPoll} never resolves the
+ * older waiter early — does so without manufacturing a fast empty. The stale
+ * older waiter is left to time out on its own into the void.
  */
 export function wake(list: Item[], waiters: Waiter[], now: number): void {
   if (waiters.length === 0) return;
-  const waiter = waiters.shift()!;
+  const waiter = waiters.pop()!;
   waiter(drain(list, now));
 }
 

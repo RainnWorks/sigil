@@ -52,9 +52,10 @@ away, so a caller finds out about a new deposit the moment it happens instead
 of on its next poll tick. This is not a return to v3's mistake: nothing is
 held for an *idle* party. A long-poll is held only by whichever side is
 actively waiting on a live operation (a pending approval, a pairing in
-progress), for at most `LONG_POLL_MS` (~25s), and only one at a time per
-slot. See "Long-poll" below for the wire and a real, bounded residual found
-and only partly closed while building this.
+progress), for at most `LONG_POLL_MS` (~25s). A lone poll holds the full
+window and is never resolved early; the **v5.1** revision (see "Long-poll"
+below) fixed a concurrent-GET rule that used to manufacture fast empties, and
+records the real, bounded disconnect residual that remains only partly closed.
 
 ## Trust-model note (relaxation, not a verdict)
 
@@ -128,34 +129,57 @@ large, `429` rate limited, `507` queue full, `404` unknown route.
 A GET with nothing queued holds the request open (see `longPoll`/`wake` in
 `shared/protocol.ts`) instead of returning empty immediately. A matching
 `POST` wakes it right away; failing that, it resolves to `{"envelopes":[]}`
-after `LONG_POLL_MS`. At most one live long-poll is tracked per slot: a new
-GET on the same slot evicts (resolves empty) any waiter already registered
-there before registering itself.
+after `LONG_POLL_MS`. A lone poll on an empty slot **holds for the full
+window** — it is never resolved early.
 
-That eviction rule exists because of a real gap found and confirmed against
-a real local Workers runtime (`wrangler dev`, not just the simulated test
-pool): an incoming request's `AbortSignal` does **not** reliably fire when a
-long-poll GET is forwarded through a Durable Object. A client whose
-connection drops mid-poll can leave an orphaned waiter behind with nobody
-left to hear from it. Without eviction, `wake` could hand the next deposit to
-that orphan and the data would be gone, not merely delayed. Eviction closes
-this for the common case — disconnect, then reconnect with a fresh long-poll,
-*then* the next deposit arrives — since the reconnect supersedes the orphan
-before anything is deposited.
+**v5.1 changed how a second concurrent GET on the same slot is handled.** The
+previous build resolved (empty) any waiter already registered there the instant
+a new GET arrived. That early-empty was the root cause of an *instant-return →
+instant-refire* hammer: superseding a live waiter turned one quiet held request
+into a burst of fast empties a client re-fired on at network speed, and two such
+GETs could ping-pong empties off each other. A caller pinned at the rate limit
+during pairing was exactly this. Now waiters **coexist**: a newcomer never
+resolves an existing waiter early, each waiter holds for its full duration, and
+`wake` hands a deposit to the **newest** waiter. The coexisting count is bounded
+by `MAX_WAITERS` (8); only crossing that bound drops a waiter — the oldest, the
+stalest and likeliest-orphaned — and only then, never in the normal case.
 
-**It does not close every case.** If a deposit lands in the narrow window
-after a disconnect but *before* the reconnect's long-poll re-attaches, that
-deposit is still handed to the (already-abandoned) orphan and is genuinely
-lost for that one delivery, not merely delayed — confirmed by direct testing
-against `wrangler dev` (see the module comment above `longPoll` in
-`shared/protocol.ts` for the exact mechanism).
+Delivering to the newest is what preserves the correctness the old eviction was
+protecting. The gap it guarded against is real and confirmed against a real
+local Workers runtime (`wrangler dev`, not just the simulated test pool): an
+incoming request's `AbortSignal` does **not** reliably fire when a long-poll GET
+is forwarded through a Durable Object, so a client whose connection drops
+mid-poll can leave an orphaned waiter behind with nobody left to hear from it.
+The only reason two GETs legitimately overlap on one slot is a single client
+whose earlier poll disconnected that way and then reconnected — so the newest
+waiter is the live reconnect, and handing the deposit to it (rather than to the
+orphan, and without flushing the orphan empty first) delivers to the connection
+that can still receive it. This closes the disconnect-then-reconnect ordering
+that eviction used to close, plus the fast-empty hammer eviction itself created.
+
+**It does not close every case.** If a deposit lands in the narrow window after
+a disconnect but *before* any reconnecting long-poll re-attaches at all, that
+deposit is still handed to the (already-abandoned) orphan — the only, hence
+newest, waiter — and is genuinely lost for that one delivery, not merely
+delayed. A second, narrower residual arrives with coexisting waiters: if a
+client holds two overlapping polls and the *newer* connection dies while the
+older stays live, `wake` serves the dead-newer one and that deposit is lost.
+Both require a real disconnect on top of unlucky timing (see the module comment
+above `longPoll` in `shared/protocol.ts` for the exact mechanism).
 
 #### KNOWN ISSUE: Worker/DO disconnect-orphan race (bounded, fail-closed, needs real-edge verification)
 
-- **What**: an incoming request's `AbortSignal` does not reliably fire when
-  a long-poll GET is forwarded through a Durable Object. A disconnect landing
-  in the gap before the client's reconnect re-attaches loses that one
-  delivery to the orphaned waiter.
+- **What v5.1 closed**: the fast-empty hammer (a normal single poll now holds
+  the full window; a second concurrent GET can no longer flush an existing
+  waiter empty, so two GETs cannot ping-pong), and the disconnect-*then*-
+  reconnect delivery (the reconnect, being the newest waiter, receives the
+  deposit rather than the orphan). This is the part of #53 now addressed.
+- **What remains (the residual below)**: an incoming request's `AbortSignal`
+  does not reliably fire when a long-poll GET is forwarded through a Durable
+  Object. A disconnect landing in the gap before *any* reconnect re-attaches
+  loses that one delivery to the orphaned waiter; and, more narrowly, if a
+  client holds two overlapping polls and the newer connection dies while the
+  older lives, `wake` (newest-first) serves the dead one and loses the deposit.
 - **Blast radius, why this is an acceptable documented interim rather than a
   blocker**: the daemon and phone each deposit/respond once per exchange,
   with no higher-level resend today, so a lost delivery here is genuinely
@@ -347,16 +371,24 @@ Covered and passing locally:
 - **Deposit and drain**, both directions, drain-on-read, independent queues.
 - **Long-poll** — a GET on an empty slot holds and resolves the moment a
   matching deposit lands, well before its timeout; with nothing deposited, it
-  times out to `[]`.
+  times out to `[]`. A lone poll is measured to **hold ~the full window**, not
+  return a fast empty (both suites).
+- **Concurrent GET / anti-ping-pong** (both suites) — two overlapping GETs on
+  one slot both hold; the newcomer does **not** flush the first empty; a single
+  deposit goes to the newest and the other keeps holding (measured to time out
+  near the full window, not instantly). A **disconnect/reconnect** then lands a
+  deposit on the live reconnect, never the orphan.
 - **Disconnect cleanup** — an aborted GET's waiter is removed immediately
   (both suites); a later deposit against the same mailbox still lands
   normally afterward, proving the mailbox isn't corrupted by an abandoned
   long-poll.
 - **Long-poll unit tests** (`shared/protocol.test.ts`, pure logic, no server):
-  immediate/wake/timeout paths, `wake()` on an empty waiter list is a no-op,
-  a second long-poll on the same slot evicts the first (resolving it empty),
-  and the eviction specifically closes the disconnect-then-reconnect
-  ordering so a deposit reaches the live waiter instead of an orphan.
+  immediate/wake/timeout paths, `wake()` on an empty waiter list is a no-op, a
+  lone poll holds (does not resolve early), a second concurrent poll does **not**
+  resolve the first empty (both coexist; a deposit goes to the newest), a
+  disconnect/reconnect delivers the deposit to the live reconnect not the
+  orphan, and the coexisting-waiter count is bounded by `MAX_WAITERS` (past the
+  cap the oldest is dropped).
 - **Opacity** — adversarial non-JSON bytes round-trip byte-identically inside
   `env`.
 - **Bounds** — an oversized envelope is `413`; the 33rd deposit past
@@ -389,8 +421,12 @@ residual above was found: a held GET, killed client-side with a real
 a fresh reconnect, delivers correctly (confirmed woken in ~500ms, not the
 full 25s) — and the same sequence with the deposit landing *before* the
 reconnect reproduces the known residual (confirmed still pending after 5s of
-a 25s window). Both outcomes match what the eviction logic in `longPoll`
-predicts; see the comment above it in `shared/protocol.ts`.
+a 25s window). Both outcomes match what the `longPoll`/`wake` newest-waiter
+logic predicts; see the comment above it in `shared/protocol.ts`. (This
+hand-check predates the v5.1 revision, which removed the early-empty eviction
+in favour of coexisting waiters with newest-first delivery; the
+disconnect-then-reconnect outcome it confirmed is unchanged, and re-running it
+on a real Cloudflare deploy is still the open verification step.)
 
 **NEEDS VERIFICATION** (needs a live Cloudflare account, a real APNs key,
 on-device clients, or a working local Docker engine):
