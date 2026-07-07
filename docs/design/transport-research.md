@@ -54,7 +54,7 @@ the option.
 | **ntfy** (self-host Go binary) | N on iOS | N on iOS | Y | **N for our app** (official iOS app is bound to ntfy.sh's Apple account; self-host iOS MUST relay through ntfy.sh, which then sees topic + message) | Y | ~ (self-host, but iOS still needs ntfy.sh upstream) | Fork ntfy-iOS to `works.rainn.sigil` + run own upstream w/ own APNs = MORE code than the relay | $0 | Mature (Android); iOS custom-app unsupported |
 | **NATS / JetStream** (single binary / Synadia) | Y (opaque subjects/payloads) | ~ (subject can be a hash, but auth wants creds) | Y | **N** (no mobile push; add APNs/FCM yourself) | ~ (phone would hold a NATS conn or request/reply on wake) | Y (single binary self-host; Synadia cloud) | Doorbell (still) + NATS client on 3 platforms + run/operate a NATS server | $0 self-host / Synadia paid | Very mature |
 | **MQTT managed** (HiveMQ / EMQX Cloud) | ~ (opaque payloads; broker sees them) | N (accounts / client IDs) | Y (retained msgs, QoS) | **N** (no push; add APNs/FCM) | ~ (persistent broker conn) | Y (self-host EMQX; managed cloud) | Doorbell + MQTT client on 3 platforms + broker | Managed paid | Very mature |
-| **Ably / Pusher Beams / PubNub** | N (not blind by design; opaque payload possible) | N (API keys / accounts) | Y | ~ (Beams/PubNub push to custom app **via YOUR APNs/FCM** — so they hold your push token; violates "APNs token never touches the relay") | Y | **N** (no self-host) | Doorbell config + SDK on 3 platforms | Paid tiers | Mature |
+| **Ably / Pusher Beams / PubNub** | N (not blind by design; opaque payload possible) | N (API keys / accounts) | Y | ~ (Beams/PubNub push to custom app **via YOUR APNs/FCM**, so they hold your push token; violates "APNs token never touches the relay") | Y | **N** (no self-host) | Doorbell config + SDK on 3 platforms | Paid tiers | Mature |
 | **Expo Push Service** (+ expo-server-sdk) | ~ (Expo relays your push) | N | n/a (doorbell only) | ~ (works, but adds Expo as a push middleman holding tokens; can bypass to raw APNs/FCM) | Y | N/A | Thin (expo-server-sdk) but adds a middleman for the nudge | $0 | Mature |
 | **Web Push / VAPID** | Y | ~ | n/a | **N** (native iOS/Android apps cannot use Web Push; PWA-only on iOS 16.4+) | N/A | N/A | N/A | $0 | N/A for native |
 | **CF Durable Objects / Queues** | Y | Y | Y | N (separate doorbell) | Y | ~ (CF only for the hosted form; Bun for self-host) | This IS the current relay substrate | $0 free tier | Shipped |
@@ -71,7 +71,7 @@ two-part split is not incidental but forced:
 - **Directionality.** FCM (and APNs) are cloud->device only. The phone's sealed
   approval + partial has to get **back** to the daemon. FCM offers no
   device->daemon path. So even in the best case you still need a second channel
-  for phone->daemon — and a blind, anonymous, outbound-daemon channel for a
+  for phone->daemon, and a blind, anonymous, outbound-daemon channel for a
   few-KB sealed blob is precisely a mailbox. FCM cannot remove the mailbox; it
   can only ever be the doorbell.
 - **iOS background-data reliability.** Silent/background data pushes on iOS are
@@ -80,7 +80,7 @@ two-part split is not incidental but forced:
   exactly why the brief already chose a *visible, content-free* doorbell + a
   phone-initiated fetch rather than shipping the request inside the push. Trying
   to make FCM the transport would mean shipping the sealed envelope inside a
-  background data message — the least reliable iOS path — and it caps at 4 KB
+  background data message (the least reliable iOS path), and it caps at 4 KB
   (2 KB for topic sends), which our envelopes bump against.
 - **Anonymity.** An FCM/APNs token *is* a device identity, and a hosted relay
   that routed by it would hold that identity. The design deliberately keeps the
@@ -148,7 +148,7 @@ Concretely:
 3. **Reject FCM-as-entire-transport, ntfy-for-iOS, and the managed realtime
    services**, for the reasons in the table and the tension section: FCM can't
    carry phone->daemon; ntfy's iOS custom-app push is unsupported (self-host
-   iOS must relay through ntfy.sh, which then sees topic + message — not blind,
+   iOS must relay through ntfy.sh, which then sees topic + message: not blind,
    not anonymous); Ably/Pusher/PubNub aren't self-hostable and would hold the
    push token; NATS/MQTT add a broker + client stack and still need our own
    doorbell.
@@ -160,7 +160,7 @@ Concretely:
   to Apple/Google carries no request content. Unchanged from today's posture.
 - **Anonymous:** mailbox = hash of two pinned keys, no accounts; push token stays
   off the relay. Unchanged.
-- **Custom code:** already near the floor — the mailbox is ~100 lines you keep,
+- **Custom code:** already near the floor: the mailbox is ~100 lines you keep,
   the doorbell is ~1 file you must write regardless of any service. The exercise's
   honest conclusion is that the relay is *not* the fat to trim; the irreducible
   doorbell is the only new code, and it is small.
