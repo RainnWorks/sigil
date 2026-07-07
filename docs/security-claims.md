@@ -676,6 +676,67 @@ docs): it unlocks nothing and the doorbell payload is a static string.
   `PushHint` on a deposit, the daemon signs no push, and `push.json` stays 0600
   under `~/.sigil`. None of that changed.
 
+**Independent review verdict — CONFIRMED SOUND (no findings; three accepted
+residuals).** Written by the security-reviewer, which did **not** author the
+demux-owner refactor (`7cbb24b`) or the allow-mode / lease-policy engine
+(`e51b4ef`); per the review-integrity rule this is not a self-certification. The
+adversarial pass covered both commits on `feat/config-rule-engine`: the
+push-doorbell demux (race, stale-drop vs the replay counter, owner liveness,
+token opacity) and the consent-surface changes (allow-mode fail-closed, lease
+authority, passthrough splice discipline). The gate is green: `cargo test` 365
+passed / 0 failed, `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt
+--check` clean.
+
+**Demux owner (`7cbb24b`).**
+
+| Claim | Enforcing code | Proving test | Verdict |
+|-------|----------------|--------------|---------|
+| Register-before-deposit closes the only response-loss window: the waiter is inserted under `request_id` before the request is deposited, and the phone answers only after it receives the deposit, so no response can arrive before its waiter exists | `remote.rs::round_trip` (register then `deposit_and_wait`), `remote.rs::register_waiter` | `remote::tests::an_approval_receives_its_own_response_via_the_owner` | SOUND |
+| No cross-delivery: responses route by sealed, phone-signed `request_id` (uuidv7, unique); a relay cannot forge/redirect a response (fails `Envelope::open` signature) and a response for approval A can never resolve B (distinct ids) | `remote.rs::route_response` (`waiters.get(&resp.request_id)`), `envelope.rs::open` | `remote::tests::two_concurrent_approvals_each_receive_their_own_response` (distinct DEKs asserted) | SOUND |
+| Stale/late/duplicate response cannot resurrect a grant: no waiter -> dropped; a replay is rejected by the `ReplayGuard` monotonic counter (no state change on reject, so it cannot desync a later legitimate response) | `remote.rs::route_response`, `replay.rs::check_and_record` | `hostile_relay::reordering_queued_envelopes_is_caught`, `replay` unit tests | SOUND |
+| Single reader: exactly one production `recv(ToDaemon)` exists (the owner); no second reader can steal a deposit | `remote.rs::run_todaemon_owner` (only `Direction::ToDaemon` `recv` in the crate) | grep-confirmed sole reader | SOUND |
+| Fail-closed on owner death: a panicked/exited owner routes no responses; every `round_trip` `recv_timeout`s to `None` -> deny. No path opens fail-open | `remote.rs::deposit_and_wait` (`Err(_) => None`), `RemoteApprover::decide` (`unwrap_or_else -> Deny`) | `daemon::tests::denied_request_fails_closed_and_delivers_no_secret` | SOUND |
+| The token path cannot influence a decision: a `PushRegister` only writes `{token, platform}` to the 0600 store; it never touches `waiters`, a DEK, or `Z_F`. The daemon signs no push; the token rides only as an opaque `PushHint` | `remote.rs::dispatch` / `record_registration`, `push_store.rs` (0600) | `remote::tests::the_owner_captures_an_arm_time_registration`, `push_store` 0600 test | SOUND |
+
+**Allow-mode + lease engine (`e51b4ef`).**
+
+| Claim | Enforcing code | Proving test | Verdict |
+|-------|----------------|--------------|---------|
+| Allow can never become allow-everything: an empty `Match` matches nothing in **both** modes, and an unmatched invocation resolves to `None` (refuse), never a silent passthrough | `config.rs::Match::matches` (`is_empty() -> false`), `config.rs::resolve` (`None` on no match) | `config::tests::empty_match_never_matches`, `allow_rule_resolves_to_passthrough_and_layers_above_a_gate` (unmatched refuses) | SOUND |
+| Absent `mode` defaults to Gate, never Allow: `#[serde(default)]` + `#[derive(Default)] #[default] Gate`, so an older/hand-edited config that omits `mode` fails safe to gating. An **unknown** mode string fails the whole parse; the daemon then falls back to an empty config that refuses everything (stronger than gate) | `config.rs::RuleMode` (`#[default] Gate`), `Action.mode` (`#[serde(default)]`), `daemon.rs::serve` (parse error -> `Config::default()`) | `config::tests::allow_rule_..._layers_above_a_gate` (round-trips `Gate` by default) | SOUND |
+| A matched **gate** rule with a missing source REFUSES (`None`), it does not fall through to a broader rule (this implements section-15 note B's recommendation: no fail-open downgrade) | `config.rs::resolve` (`let Some(src) = ... else { return None }`) | `config::tests::matched_rule_with_unknown_source_fails_closed_not_downgrade` | SOUND |
+| `run_passthrough` injects no env and preserves invariant #2: it is `spawn_with_env(run, &[])`, reusing the one reviewed splice/exec path (caller fds to the child, absent fd -> `Stdio::null` never inherit, proxy-depth fuse). Allow never mints a lease, never creates a pending approval, never reaches the phone | `provider.rs::run_passthrough` -> `spawn_with_env`, `daemon.rs::fulfill` allow arm (`credential: None`, `env: None`, `source: ""`) | `daemon::tests::allow_rule_runs_the_command_directly_without_gating` (0 leases, 0 pending, exit 0) | SOUND |
+| Lease authority is the daemon alone: a run-once rule yields no lease even when the approver returns one; a leasable rule clamps to `max_secs`. Every grant site consults the single clamped `lease_ttl` | `request.rs::LeasePolicy::clamp_secs`, `daemon.rs::fulfill` (`lease_secs = decision.lease_ttl().and_then(clamp)`; both `leases.grant` sites gated on `lease_ttl`) | `daemon::tests::run_once_rule_never_leases_even_when_a_lease_is_returned`, `leasable_rule_clamps_an_over_cap_lease_to_the_rule_max`, `request::tests::lease_policy_defaults_to_run_once_and_clamps` | SOUND |
+| First-match-in-config-order is the only precedence; no second ordering path | `config.rs::resolve` (single `for rule in &self.rules` returning on first match) | `config::tests::resolve_first_match_wins_and_flattens_source`, `allow_rule_..._layers_above_a_gate` | SOUND |
+| `lease_policy` rides inside the sealed+signed envelope (part of what the approver consents to); a relay cannot read or alter it without breaking the AEAD/signature | `remote.rs::build_request` (`lease_policy` in `ApprovalRequest`), `envelope.rs::seal/open` | `hostile_relay` tamper/forge suite (any bit flip breaks `open`), `request::tests::lease_policy_round_trips_through_json_camel_case` | SOUND |
+
+**Accepted residuals (not defects, called out per the honesty rule):**
+
+- *Hostile-relay reordering is a denial vector, never a wrong approval.* If the
+  relay reorders `ToDaemon` envelopes so a higher counter is opened first, the
+  earlier legitimate response is rejected by the monotonic `ReplayGuard`
+  (counter regression) and dropped; its `round_trip` then times out and denies.
+  This is the intended fail-closed property (invariant #4/#7): the relay can
+  induce a denial (it can already do that by dropping), but cannot induce a grant
+  or a replay. Documented, not fixable without weakening the counter.
+- *Owner liveness is a single point of failure for the doorbell, but fail-closed.*
+  A poisoned `waiters`/`guard` mutex (only reachable if a `round_trip` panics
+  while holding it) or an owner panic stops response routing; all in-flight and
+  future approvals then deny at timeout. It never fails open. A restart respawns
+  the owner. Accepted.
+- *An unknown `mode` (or any parse error) in the hand-edited 0600 `config.json`
+  disables the entire rule set*, not just the malformed rule, because the daemon
+  falls back to `Config::default()` (empty -> refuse all). This is fail-closed
+  (safe) but an availability foot-gun: one typo bricks all gating until fixed. A
+  same-UID hand-edit is already outside Sigil's trust boundary. Informational.
+
+**Test-coverage note (informational, not a finding).** The "absent `mode`
+defaults to Gate" property is guaranteed by construction (`#[serde(default)]` +
+`#[default] Gate`) and exercised indirectly, but there is no focused test that
+deserializes a rule JSON with the `mode` key omitted and asserts `Gate`. A
+one-line test would harden the invariant against a future refactor that drops the
+`#[serde(default)]`.
+
 ---
 
 ## Residuals (honest limits)
