@@ -57,6 +57,22 @@ struct Drained {
     envelopes: Vec<String>,
 }
 
+/// The outcome of a single slot GET the caller must pace against. A drain that
+/// returns envelopes (possibly none: an empty long-poll) is distinct from the
+/// relay rate-limiting us (HTTP 429), because the two want opposite responses:
+/// an empty hold that actually elapsed re-issues promptly, whereas a 429 (like
+/// any *fast* return) must back off before the next GET. Surfacing the 429 as a
+/// value rather than folding it into the generic error lets the caller read the
+/// `Retry-After` the relay asked for instead of guessing.
+pub(crate) enum DrainOutcome {
+    /// The slot drained cleanly; the vec is empty when the long-poll hold
+    /// elapsed with nothing buffered.
+    Envelopes(Vec<String>),
+    /// The relay answered 429. `retry_after` is the parsed `Retry-After`
+    /// header (delta-seconds form) when the relay sent one, else `None`.
+    RateLimited { retry_after: Option<Duration> },
+}
+
 /// A blocking client for one mailbox on the v4 relay.
 pub(crate) struct HttpMailbox {
     base: String,
@@ -116,22 +132,35 @@ impl HttpMailbox {
         Ok(())
     }
 
-    /// GET and drain every opaque payload currently buffered for a slot
-    /// (drain-on-read: the relay removes what it returns). The body is read
-    /// through a hard cap ([`MAX_DRAIN_BYTES`]) rather than via `resp.text()`,
-    /// so a relay that ignores its own queue/size limits (buggy, or hostile)
-    /// cannot force this client to buffer an unbounded response.
-    pub(crate) fn drain(&self, slot: Slot) -> Result<Vec<String>, TransportError> {
+    /// GET a slot once, classifying the response into a [`DrainOutcome`] the
+    /// caller can pace against (drain-on-read: the relay removes what it
+    /// returns). A 429 is reported as [`DrainOutcome::RateLimited`] rather than
+    /// an error so the caller can honor `Retry-After` and back off; every other
+    /// non-success status is still a transient error. The body is read through a
+    /// hard cap ([`MAX_DRAIN_BYTES`]) rather than via `resp.text()`, so a relay
+    /// that ignores its own queue/size limits (buggy, or hostile) cannot force
+    /// this client to buffer an unbounded response.
+    pub(crate) fn poll_slot(&self, slot: Slot) -> Result<DrainOutcome, TransportError> {
         let resp = self
             .client
             .get(self.slot_url(slot))
             .send()
             .map_err(|e| TransportError::Backend(format!("GET {}: {e}", slot.path())))?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(Duration::from_secs);
+            return Ok(DrainOutcome::RateLimited { retry_after });
+        }
+        if !status.is_success() {
             return Err(TransportError::Backend(format!(
                 "GET {}: status {}",
                 slot.path(),
-                resp.status()
+                status
             )));
         }
         let mut body = Vec::new();
@@ -146,7 +175,22 @@ impl HttpMailbox {
         }
         let parsed: Drained = serde_json::from_slice(&body)
             .map_err(|e| TransportError::Backend(format!("parsing {} body: {e}", slot.path())))?;
-        Ok(parsed.envelopes)
+        Ok(DrainOutcome::Envelopes(parsed.envelopes))
+    }
+
+    /// GET and drain every opaque payload currently buffered for a slot. Thin
+    /// wrapper over [`poll_slot`] for callers (the phone slot, the pairing
+    /// rendezvous) whose own loops already back off on any error: a 429 folds
+    /// back into a transient error for them.
+    pub(crate) fn drain(&self, slot: Slot) -> Result<Vec<String>, TransportError> {
+        match self.poll_slot(slot)? {
+            DrainOutcome::Envelopes(envs) => Ok(envs),
+            DrainOutcome::RateLimited { .. } => Err(TransportError::Backend(format!(
+                "GET {}: status {}",
+                slot.path(),
+                reqwest::StatusCode::TOO_MANY_REQUESTS
+            ))),
+        }
     }
 }
 
