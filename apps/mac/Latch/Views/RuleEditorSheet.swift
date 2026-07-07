@@ -37,6 +37,9 @@ struct RuleEditorSheet: View {
     /// id, so stacking rules (even an identical one) always succeeds.
     private var blocker: String? {
         if draft.match.isEmpty { return "Add at least one match condition." }
+        // An allow rule injects nothing, so its environment is hidden and never
+        // authored; only a gate rule's environment can be malformed.
+        if draft.mode == .allow { return nil }
         return envError
     }
 
@@ -82,7 +85,12 @@ struct RuleEditorSheet: View {
                 VStack(alignment: .leading, spacing: 18) {
                     if let error = model.lastError { ErrorStrip(message: error) }
                     matchSection
-                    environmentSection
+                    approvalSection
+                    // An allow rule is a pure passthrough: it names no source and
+                    // injects nothing, so the environment editor is hidden entirely.
+                    if draft.mode == .gate {
+                        environmentSection
+                    }
                 }
                 .padding(20)
             }
@@ -105,12 +113,15 @@ struct RuleEditorSheet: View {
         VStack(spacing: 8) {
             // The reinforcing cue at the commit point: a sealed value cannot be
             // recovered from here or anywhere else, so keep a copy if you need one.
-            HStack(spacing: 6) {
-                Image(systemName: "lock.fill").font(.system(size: 9)).foregroundStyle(.tertiary)
-                Text("Values are sealed on save and cannot be read back afterward. Keep your own copy if you need one.")
-                    .font(.system(size: 10)).foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 0)
+            // Only a gate rule seals an environment; an allow rule injects nothing.
+            if draft.mode == .gate {
+                HStack(spacing: 6) {
+                    Image(systemName: "lock.fill").font(.system(size: 9)).foregroundStyle(.tertiary)
+                    Text("Values are sealed on save and cannot be read back afterward. Keep your own copy if you need one.")
+                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
             }
             HStack {
                 Text(blocker ?? " ")
@@ -154,6 +165,81 @@ struct RuleEditorSheet: View {
                 }
             }
         }
+    }
+
+    // MARK: approval (gate vs allow, and the lease policy)
+
+    private var approvalSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            sectionTitle("Approval",
+                         "Whether this command waits for your phone, or runs straight through.")
+
+            Picker("Approval", selection: $draft.mode) {
+                Text("Require approval").tag(RuleMode.gate)
+                Text("Allow without asking").tag(RuleMode.allow)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            // The plain consequence of the choice, stated once.
+            Text(draft.mode == .allow
+                 ? "Runs without asking. No phone approval, and no environment is injected."
+                 : "Held until you approve on your phone, then its environment is injected.")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if draft.mode == .gate { leaseControls }
+        }
+    }
+
+    /// The lease policy for a gate rule: run-once (a fresh approval every time) or
+    /// leasable (one approval may open a session window up to a cap). Everything is
+    /// a tap; there is no hold-to-confirm.
+    private var leaseControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Lease").font(.system(size: 11)).foregroundStyle(.secondary)
+
+            Picker("Lease", selection: $draft.leasable) {
+                Text("Run once").tag(false)
+                Text("Leasable").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            Text(draft.leasable
+                 ? "One approval may open a session window; later runs auto-approve until it lapses."
+                 : "Every run needs a fresh approval.")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if draft.leasable {
+                HStack(spacing: 8) {
+                    Text("Up to").font(.system(size: 11)).foregroundStyle(.secondary)
+                    Picker("Lease cap", selection: $draft.leaseMaxSecs) {
+                        ForEach(leaseCapOptions, id: \.self) { secs in
+                            Text(LeaseDuration.label(secs)).tag(secs)
+                        }
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                    Text("before it must be approved again.")
+                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+    }
+
+    /// The lease-cap presets, plus the rule's current cap if it is a non-preset
+    /// value (an older config or a CLI-authored one), so editing never silently
+    /// snaps it to a preset.
+    private var leaseCapOptions: [Int] {
+        var opts = LeaseDuration.presets
+        if !opts.contains(draft.leaseMaxSecs) {
+            opts.append(draft.leaseMaxSecs)
+            opts.sort()
+        }
+        return opts
     }
 
     // MARK: environment

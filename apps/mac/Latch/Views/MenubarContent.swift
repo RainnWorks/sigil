@@ -136,14 +136,6 @@ private struct PendingCard: View {
     let onApprove: (_ lease: Bool) -> Void
     let onDeny: () -> Void
 
-    private var riskTone: StateTone {
-        switch request.risk {
-        case .routine: return .neutral
-        case .elevated: return .warn
-        case .critical: return .denied
-        }
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top) {
@@ -171,11 +163,9 @@ private struct PendingCard: View {
                     Text("+\(request.coalesced) coalesced").font(.system(size: 10)).foregroundStyle(.tertiary)
                 }
             }
-            if request.risk != .routine, let reason = request.reason {
-                HStack(spacing: 5) {
-                    StatePill(tone: riskTone, text: request.risk.rawValue)
-                    Text(reason).font(.system(size: 10)).foregroundStyle(.secondary)
-                }
+            if let reason = request.reason {
+                Text(reason).font(.system(size: 10)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             if canApproveLocally {
@@ -185,10 +175,15 @@ private struct PendingCard: View {
                         .buttonStyle(.glass)
                         .tint(Palette.rust)
                 }
-                Button("Approve as session lease") { onApprove(true) }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 10))
-                    .foregroundStyle(Palette.seaGreen)
+                // The lease affordance appears only when the matched rule permits
+                // one; a run-once rule never offers it (the daemon would refuse it).
+                if request.leasable {
+                    Button(request.maxLeaseSecs.map { "Approve as session lease (up to \(LeaseDuration.short($0)))" }
+                           ?? "Approve as session lease") { onApprove(true) }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Palette.seaGreen)
+                }
             } else {
                 // Hardened / phone-only: degrade, never error.
                 HStack(spacing: 6) {

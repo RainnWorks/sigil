@@ -289,7 +289,8 @@ enum Fixtures {
             ssh: nil,
             provenance: Provenance(processChain: ["zsh", "claude", "op"], cwd: "~/Projects/rowm",
                                    machine: "studio.local", requestedAt: Date().addingTimeInterval(-6)),
-            risk: .routine, reason: nil, expiresAt: Date().addingTimeInterval(96), timeoutSec: 120, coalesced: 3),
+            leasable: false, maxLeaseSecs: nil, reason: nil,
+            expiresAt: Date().addingTimeInterval(96), timeoutSec: 120, coalesced: 3),
         PendingRequest(
             id: "req-2", kind: .sshSignature, command: ["ssh", "git@github.com"],
             secrets: [],
@@ -297,7 +298,8 @@ enum Fixtures {
                               fingerprint: "SHA256:9m8x1c0Vd2pKtqE7bQ4wZ+f3nR6uJ0aLyH5sT8oW1c"),
             provenance: Provenance(processChain: ["zsh", "git", "ssh"], cwd: "~/Projects/op-remote",
                                    machine: "studio.local", requestedAt: Date().addingTimeInterval(-2)),
-            risk: .elevated, reason: "Production deploy key.", expiresAt: Date().addingTimeInterval(58), timeoutSec: 120),
+            leasable: true, maxLeaseSecs: 900, reason: "Production deploy key.",
+            expiresAt: Date().addingTimeInterval(58), timeoutSec: 120),
     ]
 
     static let paired = PairedDevice(id: "dev-phone", name: "iPhone",
@@ -318,11 +320,12 @@ enum Fixtures {
         rules: [
             RuleConfig(name: "op",
                        match: MatchConfig(command: "op"),
-                       action: ActionConfig(source: "op", risk: "routine", timeoutSec: nil)),
+                       action: ActionConfig(mode: .gate, source: "op")),
             RuleConfig(name: "gcloud",
                        match: MatchConfig(command: "gcloud", argvContains: ["auth"],
                                           flagEquals: [FlagEqConfig(flag: "--project", value: "prod")]),
-                       action: ActionConfig(source: "gcloud", risk: "routine", timeoutSec: nil)),
+                       action: ActionConfig(mode: .gate, source: "gcloud",
+                                            lease: .leasable(maxSecs: 900))),
         ])
 
     static let settings = AppSettings(approvalTimeoutSec: 120, notificationsEnabled: true,

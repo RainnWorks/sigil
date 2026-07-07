@@ -52,7 +52,8 @@ protocol DaemonClient: Sendable {
     /// `sigil-config source remove <name>`. Also purges the source's sealed env
     /// blob. Refuses while a rule references it.
     func removeSource(name: String) async throws
-    /// `sigil-config rule add <name> --source … [match flags…] [--risk …] [--timeout …]`.
+    /// `sigil-config rule add <name> [--source … | --allow] [match flags…]
+    /// [--leasable [--lease-max …]] [--timeout …]`.
     func addRule(_ rule: RuleConfig) async throws
     /// `sigil-config rule remove <name>`.
     func removeRule(name: String) async throws

@@ -139,8 +139,6 @@ struct HistoryEntry: Identifiable, Equatable, Sendable {
 
 // MARK: - Pending requests (the approval sheet / menubar)
 
-enum RiskLevel: String, Sendable, Equatable { case routine, elevated, critical }
-
 struct SecretRef: Equatable, Sendable {
     var provider: String
     /// Display-only path segments, most-general first.
@@ -171,7 +169,12 @@ struct PendingRequest: Identifiable, Equatable, Sendable {
     var secrets: [SecretRef]
     var ssh: SshChallenge?
     var provenance: Provenance
-    var risk: RiskLevel
+    /// Whether this request's matched rule permits a session lease. When false
+    /// (run-once), a local approver must not offer "approve for N minutes"; the
+    /// daemon refuses a lease even if one is asked for.
+    var leasable: Bool = false
+    /// The per-rule lease cap in seconds when `leasable`; nil for run-once.
+    var maxLeaseSecs: Int?
     var reason: String?
     var expiresAt: Date
     var timeoutSec: TimeInterval

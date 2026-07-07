@@ -197,29 +197,32 @@ final class AppModel {
         do {
             let cfg = try await daemon.config()
             // Identity: reuse an edit's stable id; else mint a unique one from the
-            // match. A rule and its hidden source share the string.
+            // match. A gate rule and its hidden source share the string.
             let name: String = oldName ?? draft.sourceName ?? uniqueName(from: draft.match, in: cfg)
-            let sourceName = draft.sourceName ?? name
-            let priorKeys = cfg.source(named: sourceName)?.keys ?? []
-            // Create the hidden env source on first save (an edit reuses it, so
-            // its sealed values survive).
-            if cfg.source(named: sourceName) == nil {
-                try await daemon.addSource(SourceConfig(name: sourceName, provider: envProviderID))
-            }
-            let rule = RuleConfig(
-                name: name,
-                match: draft.match,
-                action: ActionConfig(source: sourceName, risk: draft.risk.rawValue,
-                                     timeoutSec: draft.timeoutSec))
-            if oldName != nil {
-                var updated = try await daemon.config()
-                updated.rules.removeAll { $0.name == name }
-                updated.rules.append(rule)
-                try await daemon.importConfig(updated)
+
+            if draft.mode == .allow {
+                // A passthrough: no source, no lease, no environment. Any hidden
+                // env source a former gate rule left behind (an edit gate->allow)
+                // is swept by pruneOrphanSources below, purging its sealed values.
+                let rule = RuleConfig(name: name, match: draft.match,
+                                      action: ActionConfig(mode: .allow))
+                try await writeRule(rule, replacing: oldName)
             } else {
-                try await daemon.addRule(rule)
+                let sourceName = draft.sourceName ?? name
+                let priorKeys = cfg.source(named: sourceName)?.keys ?? []
+                // Create the hidden env source on first save (an edit reuses it, so
+                // its sealed values survive).
+                if cfg.source(named: sourceName) == nil {
+                    try await daemon.addSource(SourceConfig(name: sourceName, provider: envProviderID))
+                }
+                let rule = RuleConfig(
+                    name: name,
+                    match: draft.match,
+                    action: ActionConfig(mode: .gate, source: sourceName,
+                                         lease: draft.leasePolicy, timeoutSec: draft.timeoutSec))
+                try await writeRule(rule, replacing: oldName)
+                try await applyEnv(draft, source: sourceName, priorKeys: priorKeys)
             }
-            try await applyEnv(draft, source: sourceName, priorKeys: priorKeys)
             lastError = nil
             ok = true
         } catch {
@@ -230,6 +233,23 @@ final class AppModel {
         await pruneOrphanSources()
         await loadSecondaryScreens()
         return ok
+    }
+
+    /// Persist one authored rule: a brand-new rule goes through `rule add`; an
+    /// edit round-trips the whole config through `import` (atomic, revalidated),
+    /// replacing the rule in place so its precedence in the list is preserved.
+    private func writeRule(_ rule: RuleConfig, replacing oldName: String?) async throws {
+        guard oldName != nil else {
+            try await daemon.addRule(rule)
+            return
+        }
+        var updated = try await daemon.config()
+        if let idx = updated.rules.firstIndex(where: { $0.name == rule.name }) {
+            updated.rules[idx] = rule
+        } else {
+            updated.rules.append(rule)
+        }
+        try await daemon.importConfig(updated)
     }
 
     /// Reorder the rules by drag. The rules array order IS the precedence: the
