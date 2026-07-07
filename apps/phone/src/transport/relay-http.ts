@@ -9,9 +9,18 @@
  * `to-phone` (and the daemon's mirror `to-daemon` GET) LONG-POLLS: an empty
  * mailbox holds the request open server-side until a deposit lands or the
  * relay's own ~25s timeout, then returns (with or without envelopes) either
- * way. The doorbell is the whole point of this transport, so the phone never
- * sleep-polls; it just issues sequential GETs and lets the relay do the
- * waiting (see `FETCH_TIMEOUT_MS` below and {@link RelayMailbox.waitOne}).
+ * way. The doorbell is the whole point of this transport.
+ *
+ * A subtlety the poll loop MUST respect: the relay's long-poll is a single
+ * holder per slot. When a second GET hits an already-held slot the server
+ * resolves BOTH early and empty (mutual eviction), and any other fast-empty
+ * path (a 429, an abort, a relay blip) likewise returns in well under the
+ * ~25s hold. If the client re-fired immediately on such a fast return it would
+ * become a network-speed hammer, so {@link RelayMailbox.waitOne} times each
+ * GET: a return that did NOT actually hold triggers exponential backoff, and
+ * only one poll loop per mailbox slot is ever allowed to run (see the
+ * `activeWaits` registry). Steady state is otherwise an APNs doorbell, not a
+ * poll; see PhoneRelay.
  *
  * The relay never parses the payload; it is a UTF-8 string in one side and out
  * the other. The steady-state {@link PhoneRelay} and the pairing rendezvous
@@ -23,7 +32,7 @@
  * the daemon over `to-daemon` (`src/lib/push.ts`'s PushRegisterMessage) -
  * unaffected by this module.
  */
-import { toHex } from "@/src/protocol";
+import { toHex } from "@/src/protocol/bytes";
 
 /**
  * Client-side ceiling on one `to-phone` GET, comfortably above the relay's
@@ -32,9 +41,85 @@ import { toHex } from "@/src/protocol";
  */
 const FETCH_TIMEOUT_MS = 30_000;
 
+/**
+ * The relay's server-side long-poll hold. A healthy empty GET returns at about
+ * this age; anything materially shorter means the hold did NOT happen (fast
+ * return) and must be backed off, not re-fired.
+ */
+const HELD_MIN_MS = 20_000;
+
+/** Small floor after a genuine ~full hold returned empty: re-poll promptly. */
+const HELD_FLOOR_MS = 250;
+
+/** First backoff step after a fast return; doubles each consecutive fast return. */
+const BACKOFF_BASE_MS = 1_000;
+
+/** Backoff ceiling: a pathological fast-empty/429 storm settles to ~one GET / this. */
+const BACKOFF_CAP_MS = 20_000;
+
+/** Additive jitter ceiling, to desynchronize retries and never poll below a floor. */
+const JITTER_MS = 1_000;
+
 /** The `/to-phone` GET response body. */
 interface ToPhoneBody {
   envelopes: string[];
+}
+
+/** The structured outcome of one `to-phone` GET, so the loop can reason without throwing. */
+interface PollResult {
+  /** Drained payloads (empty when the hold expired with nothing waiting). */
+  envelopes: string[];
+  /** HTTP status, or 0 for a network error / abort (no response). */
+  status: number;
+  /** `Retry-After` in ms if the server sent one (429/503), else null. */
+  retryAfterMs: number | null;
+  /** Wall-clock age of the GET, ms: how the loop tells a real hold from a fast return. */
+  elapsedMs: number;
+}
+
+/** Injectable seams so {@link RelayMailbox.waitOne}'s timing/backoff is testable without real waits. */
+export interface RelayMailboxDeps {
+  fetch?: typeof fetch;
+  now?: () => number;
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  random?: () => number;
+}
+
+/**
+ * At most ONE `waitOne` poll loop per mailbox slot, process-wide, keyed by the
+ * `to-phone` URL. A second `waitOne` on the same slot (a React re-mount, a
+ * duplicate subscription, even from a different {@link RelayMailbox} instance)
+ * aborts the first before starting - two concurrent pollers on one slot are
+ * exactly what triggers the relay's mutual-eviction ping-pong.
+ */
+const activeWaits = new Map<string, AbortController>();
+
+/** Resolve after `ms`, or early if `signal` aborts. Never rejects. */
+function realSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(done, ms);
+    const onAbort = () => done();
+    function done(): void {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }
+    signal.addEventListener("abort", onAbort);
+  });
+}
+
+/** Parse a `Retry-After` header (delta-seconds or HTTP-date) to ms, or null. */
+function parseRetryAfter(headerValue: string | null, now: number): number | null {
+  if (!headerValue) return null;
+  const secs = Number(headerValue);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const when = Date.parse(headerValue);
+  if (!Number.isNaN(when)) return Math.max(0, when - now);
+  return null;
 }
 
 /**
@@ -66,10 +151,18 @@ export function relayBaseFromEndpoints(endpoints: string[]): string {
 export class RelayMailbox {
   private readonly base: string;
   private readonly mailboxHex: string;
+  private readonly fetchImpl: typeof fetch;
+  private readonly now: () => number;
+  private readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
+  private readonly random: () => number;
 
-  constructor(base: string, mailbox: Uint8Array) {
+  constructor(base: string, mailbox: Uint8Array, deps: RelayMailboxDeps = {}) {
     this.base = normalizeRelayBase(base);
     this.mailboxHex = toHex(mailbox);
+    this.fetchImpl = deps.fetch ?? fetch;
+    this.now = deps.now ?? Date.now;
+    this.sleep = deps.sleep ?? realSleep;
+    this.random = deps.random ?? Math.random;
   }
 
   private toDaemonUrl(): string {
@@ -82,7 +175,7 @@ export class RelayMailbox {
 
   /** POST one opaque payload toward the daemon. Rejects on any non-2xx (fail closed). */
   async send(env: string): Promise<void> {
-    const resp = await fetch(this.toDaemonUrl(), {
+    const resp = await this.fetchImpl(this.toDaemonUrl(), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ env }),
@@ -93,42 +186,118 @@ export class RelayMailbox {
   }
 
   /**
-   * GET and drain every queued payload for the mailbox (drain-on-read). This
-   * is the long-poll call: the relay itself holds it open server-side (up to
-   * ~25s) when the mailbox is empty, so one call already waits - callers
-   * never need their own sleep on top of it. `FETCH_TIMEOUT_MS` only guards
-   * against the relay hanging past its own timeout.
+   * One `to-phone` GET, reported structurally instead of thrown, so the poll
+   * loop can distinguish a genuine hold from a fast return / 429 / blip and
+   * time it. Guards the GET with its own {@link FETCH_TIMEOUT_MS} abort and
+   * with the caller's `signal` (so aborting the loop cancels an in-flight GET).
    */
-  async drain(): Promise<string[]> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  private async pollToPhone(signal: AbortSignal): Promise<PollResult> {
+    const inner = new AbortController();
+    const onOuterAbort = () => inner.abort();
+    if (signal.aborted) inner.abort();
+    else signal.addEventListener("abort", onOuterAbort);
+    const timer = setTimeout(() => inner.abort(), FETCH_TIMEOUT_MS);
+    const started = this.now();
     try {
-      const resp = await fetch(this.toPhoneUrl(), { method: "GET", signal: controller.signal });
+      const resp = await this.fetchImpl(this.toPhoneUrl(), { method: "GET", signal: inner.signal });
+      const elapsedMs = this.now() - started;
       if (!resp.ok) {
-        throw new Error(`relay to-phone: HTTP ${resp.status}`);
+        const retryAfterMs = parseRetryAfter(resp.headers.get("retry-after"), this.now());
+        return { envelopes: [], status: resp.status, retryAfterMs, elapsedMs };
       }
       const body = (await resp.json()) as ToPhoneBody;
-      return Array.isArray(body.envelopes) ? body.envelopes : [];
+      const envelopes = Array.isArray(body.envelopes) ? body.envelopes : [];
+      return { envelopes, status: resp.status, retryAfterMs: null, elapsedMs };
+    } catch {
+      // Network error, or an abort (loop cancel / fetch timeout): a fast,
+      // payload-less return. The loop decides whether to back off or bail.
+      return { envelopes: [], status: 0, retryAfterMs: null, elapsedMs: this.now() - started };
     } finally {
       clearTimeout(timer);
+      signal.removeEventListener("abort", onOuterAbort);
     }
   }
 
   /**
-   * Long-poll `to-phone` until one payload arrives or `timeoutMs` elapses.
-   * Each `drain()` call already blocks server-side while the mailbox is
-   * empty, so this just re-issues sequential GETs with no client sleep
-   * between them - the relay does the waiting. Returns the first payload, or
-   * `null` once `timeoutMs` has elapsed with nothing delivered. Extra
-   * payloads in a single drain are returned on later calls only, for the
-   * ceremony's strictly-one-per-direction use; the caller decides.
+   * GET and drain every queued payload for the mailbox (drain-on-read). This
+   * is the single-shot long-poll call: the relay itself holds it open
+   * server-side (up to ~25s) when the mailbox is empty. Throws on any non-2xx
+   * or transport failure (fail closed), keeping the `relay to-phone:` prefix
+   * its callers key error copy on. For a bounded, backing-off *wait*, use
+   * {@link waitOne}; `drain` never loops or backs off on its own.
+   */
+  async drain(): Promise<string[]> {
+    const controller = new AbortController();
+    const r = await this.pollToPhone(controller.signal);
+    if (r.status === 0) throw new Error("relay to-phone: request failed");
+    if (r.status < 200 || r.status >= 300) throw new Error(`relay to-phone: HTTP ${r.status}`);
+    return r.envelopes;
+  }
+
+  /**
+   * Long-poll `to-phone` until one payload arrives or `timeoutMs` elapses, with
+   * a MANDATORY floor between GETs so a fast return can never cause an instant
+   * re-poll:
+   *
+   *   - A GET that actually held (empty, but >= {@link HELD_MIN_MS} old) is the
+   *     healthy idle case: re-poll after only {@link HELD_FLOOR_MS} + jitter,
+   *     and reset the backoff. Steady idle cost is ~one GET per hold (~25s).
+   *   - A fast return - empty-but-quick (server eviction), a 429/5xx, or a
+   *     network blip - did NOT hold: back off exponentially (base
+   *     {@link BACKOFF_BASE_MS}, x2 per consecutive fast return, cap
+   *     {@link BACKOFF_CAP_MS}) with additive jitter, honoring a `Retry-After`
+   *     when the server sent one. A pathological storm settles to ~one GET per
+   *     {@link BACKOFF_CAP_MS}; it is NEVER a >1/sec hammer.
+   *
+   * A 429/5xx is treated as such a fast return, not thrown - throwing would let
+   * a retrying caller re-hammer. A hard relay outage therefore just backs off
+   * quietly until `timeoutMs`, then returns `null` (fail closed, bounded).
+   *
+   * At most one loop per mailbox slot runs at a time (`activeWaits`): a second
+   * `waitOne` on the same slot aborts the first, which then resolves `null`.
+   *
+   * Returns the first payload, or `null` once `timeoutMs` elapsed / the loop was
+   * superseded. Extra payloads in a single drain are dropped here; the ceremony
+   * this backs is strictly one-message-per-direction.
    */
   async waitOne(timeoutMs: number): Promise<string | null> {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      const batch = await this.drain();
-      if (batch.length > 0) return batch[0] ?? null;
-      if (Date.now() >= deadline) return null;
+    const key = this.toPhoneUrl();
+    // Dedupe: supersede any prior loop on this exact slot before starting.
+    activeWaits.get(key)?.abort();
+    const controller = new AbortController();
+    activeWaits.set(key, controller);
+
+    const deadline = this.now() + timeoutMs;
+    let consecutiveFast = 0;
+    try {
+      for (;;) {
+        if (controller.signal.aborted) return null;
+        const r = await this.pollToPhone(controller.signal);
+        if (controller.signal.aborted) return null;
+        if (r.envelopes.length > 0) return r.envelopes[0] ?? null;
+        if (this.now() >= deadline) return null;
+
+        const held = r.status >= 200 && r.status < 300 && r.elapsedMs >= HELD_MIN_MS;
+        let delay: number;
+        if (held) {
+          // The hold worked; nothing waiting. Re-poll promptly, backoff reset.
+          consecutiveFast = 0;
+          delay = HELD_FLOOR_MS + this.random() * HELD_FLOOR_MS;
+        } else {
+          // A fast return: escalate so consecutive ones can never hammer.
+          consecutiveFast += 1;
+          const exp = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** (consecutiveFast - 1));
+          const floor = r.retryAfterMs ?? exp;
+          delay = floor + this.random() * JITTER_MS;
+        }
+
+        // Never sleep past the ceremony deadline.
+        const remaining = deadline - this.now();
+        if (remaining <= 0) return null;
+        await this.sleep(Math.min(delay, remaining), controller.signal);
+      }
+    } finally {
+      if (activeWaits.get(key) === controller) activeWaits.delete(key);
     }
   }
 }

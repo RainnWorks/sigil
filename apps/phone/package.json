@@ -9,7 +9,8 @@
     "android": "expo run:android",
     "typecheck": "tsc --noEmit",
     "proto:selftest": "bun run src/protocol/self-test.ts",
-    "proto:vectors": "bun run src/protocol/verify-vectors.ts"
+    "proto:vectors": "bun run src/protocol/verify-vectors.ts",
+    "relay:selftest": "bun run src/transport/relay-http.selftest.ts"
   },
   "dependencies": {
     "@expo/ui": "~57.0.3",
