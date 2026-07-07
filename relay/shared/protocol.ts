@@ -53,21 +53,32 @@
 // early-empty (a normal single poll holds the full window; a second concurrent
 // GET can no longer ping-pong it empty), and the disconnect-then-reconnect
 // delivery (the reconnect, being newest, receives the deposit rather than the
-// orphan). Still OPEN: a deposit that lands in the gap after a disconnect but
-// before ANY reconnecting long-poll re-attaches is handed to the orphaned
-// waiter (it is the only, hence newest, waiter) and is genuinely lost, not
-// merely delayed, for that one delivery. A second, narrower residual is NOT
-// reachable by any client shipped today: it would need a client holding two
-// overlapping polls where the NEWER connection dies while the older stays live
-// (the deposit then goes to the dead-newer waiter). Both shipped clients are
-// strictly single-flight per slot (the daemon blocks one GET at a time; the
-// phone aborts its prior poll before a new one), so only a hypothetical future
-// concurrent-poll client could reach it. The disconnect-gap residual above is
-// bounded, requires an actual disconnect on top of unlucky timing, and is what
-// client-side retry/resend must cover regardless of this relay.
+// orphan). Also hardened (v5.2): {@link wake} no longer drains the buffer
+// BEFORE handing to a waiter; it OFFERS the still-queued items and drains only
+// once the waiter reports it accepted (see {@link Waiter}). So a waiter whose
+// disconnect we can OBSERVE (its abort/timeout fired, marking it settled) can
+// no longer swallow a drained-but-undelivered item: it rejects the offer and
+// the item stays queued for the next GET. Still OPEN: the case the relay cannot
+// observe. If a connection dies WITHOUT its abort signal firing (the confirmed
+// Durable-Object behaviour) the waiter is not settled, so it still accepts the
+// offer and the item still drains into the void. Concretely: a deposit that
+// lands in the gap after such a silent disconnect but before ANY reconnecting
+// long-poll re-attaches is handed to the orphaned waiter (it is the only, hence
+// newest, waiter), accepted, and genuinely lost, not merely delayed, for that
+// one delivery. A second, narrower residual is NOT reachable by any client
+// shipped today: it would need a client holding two overlapping polls where the
+// NEWER connection dies silently while the older stays live (the deposit then
+// goes to the dead-newer waiter, which is not settled and accepts). Both
+// shipped clients are strictly single-flight per slot (the daemon blocks one
+// GET at a time; the phone aborts its prior poll before a new one), so only a
+// hypothetical future concurrent-poll client could reach it. The disconnect-gap
+// residual above is bounded, requires an actual SILENT disconnect on top of
+// unlucky timing, and is what client-side retry/resend (leaning on the sender's
+// poll backstop and the item TTL) must cover regardless of this relay.
 // Confirm on a real Cloudflare deploy whether the edge network delivers a
 // GET's abort signal more reliably than local wrangler dev before treating the
-// disconnect-gap residual as fully closed.
+// disconnect-gap residual as fully closed; if it does fire reliably there, the
+// offer-then-drain hardening above closes it entirely on that edge.
 
 /** Envelope time-to-live, ms. Short: this only has to outlive the gap between
  * a deposit and the other side's next poll, not a real offline window.
@@ -126,9 +137,18 @@ export const MAILBOX_ID = /^[0-9a-f]{64}$/;
 export type Item = { blob: string; exp: number };
 
 /** A pending long-poll GET's resolver, called at most once with whatever was
- * just drained for it. Held on the {@link Mailbox} itself so both variants
- * share one shape; nothing here is I/O, it's a plain callback. */
-export type Waiter = (blobs: string[]) => void;
+ * offered to it. Held on the {@link Mailbox} itself so both variants share one
+ * shape; nothing here is I/O, it's a plain callback.
+ *
+ * Returns whether it ACCEPTED the offer: `true` if this call is the one that
+ * settles the waiter (the promise resolves with `blobs`), `false` if the waiter
+ * was already settled (timed out, aborted, or resolved) and therefore dropped
+ * the offer on the floor. {@link wake} relies on this: it only drains the buffer
+ * once a waiter reports it accepted, so an offer a stale waiter rejects is never
+ * removed from the queue. This is the closest thing to a delivery ack the relay
+ * has without adding a wire-level receipt, and it's what keeps a drained item
+ * from vanishing into a waiter that can no longer take it. */
+export type Waiter = (blobs: string[]) => boolean;
 
 export type Mailbox = {
   /** daemon -> phone; drained by GET .../to-phone. */
@@ -284,10 +304,11 @@ export function longPoll(
       signal?.removeEventListener("abort", onAbort);
     };
     const waiter: Waiter = (blobs) => {
-      if (settled) return;
+      if (settled) return false; // already gone; {@link wake} must not drain into us
       settled = true;
       cleanup();
       resolve(blobs);
+      return true;
     };
     const onAbort = () => {
       if (settled) return;
@@ -299,10 +320,12 @@ export function longPoll(
       if (settled) return;
       settled = true;
       cleanup();
-      // {@link wake} always drains before calling a waiter, so in the normal
-      // case nothing is left here; this final drain only matters for the
-      // vanishingly unlikely case of a deposit landing in the same tick the
-      // timer fires, after this waiter already left the array.
+      // A live waiter that {@link wake} offered to would have accepted and been
+      // removed before its timer fired, so in the normal case nothing is left
+      // here. This final drain only matters for the vanishingly unlikely case of
+      // a deposit landing in the same tick the timer fires (after this waiter
+      // already settled/left the array): rather than resolve empty and strand
+      // that item until the next GET, hand it back on the way out.
       resolve(drain(list, Date.now()));
     }, timeoutMs);
     waiters.push(waiter);
@@ -312,23 +335,49 @@ export function longPoll(
 
 /**
  * Wake the NEWEST pending long-poll waiter for a slot, if any, handing it
- * everything now queued (drained). Call this right after a successful
- * {@link enqueue} on the same list. A no-op if nothing is waiting: the item
- * just sits in the queue for the next GET, long-poll or not, to pick up.
+ * everything now queued. Call this right after a successful {@link enqueue} on
+ * the same list. A no-op if nothing is waiting: the item just sits in the queue
+ * for the next GET, long-poll or not, to pick up.
+ *
+ * Offer-then-drain, not drain-then-offer. The previous version drained the
+ * buffer first and only then called the waiter, so if the popped waiter had
+ * already settled (its abort or timeout raced in) the drained blobs were dropped
+ * on the floor and genuinely lost. Now we OFFER the still-queued blobs to a
+ * waiter and only empty the buffer once that waiter reports it ACCEPTED the
+ * offer (was live, resolved its promise). A waiter that rejects (already
+ * settled) leaves every item exactly where it was — same array, same `exp`, no
+ * TTL reset — and we try the next-newest, then leave the items queued for the
+ * next GET if none accept. This closes the "drain-on-read then never delivered"
+ * window for a waiter we can observe to be dead (one whose signal fired). It
+ * does NOT close the case of an orphaned waiter whose connection died WITHOUT
+ * its signal firing: such a waiter is not `settled`, so it still reports accept
+ * and the offer still drains into the void. That undetectable orphan-gap is the
+ * documented #53 residual (see the module header); relay-side it can only be
+ * covered by the sender's poll backstop and the item TTL, not eliminated here.
  *
  * Newest, not oldest: the only reason a slot holds more than one waiter is a
  * single client whose earlier poll's connection died without its `signal`
  * firing (see the module header) and then reconnected. The reconnect is the
  * newest waiter and the live one; the stale older waiter can no longer be
- * heard from. Delivering to the newest hands the deposit to the connection
- * that can still receive it, and — because {@link longPoll} never resolves the
- * older waiter early — does so without manufacturing a fast empty. The stale
- * older waiter is left to time out on its own into the void.
+ * heard from. Offering to the newest hands the deposit to the connection that
+ * can still receive it, and — because {@link longPoll} never resolves the older
+ * waiter early — does so without manufacturing a fast empty. Any stale older
+ * waiter is left to time out on its own into the void.
  */
 export function wake(list: Item[], waiters: Waiter[], now: number): void {
-  if (waiters.length === 0) return;
-  const waiter = waiters.pop()!;
-  waiter(drain(list, now));
+  retainLive(list, now);
+  if (list.length === 0) return; // nothing to hand off (defensive; enqueue precedes wake)
+  // Offer to the newest waiter; if it rejects (already settled), keep the items
+  // and try the next-newest. Only a positive accept empties the buffer.
+  while (waiters.length > 0) {
+    const waiter = waiters.pop()!;
+    if (waiter(list.map((i) => i.blob))) {
+      list.length = 0; // accepted by a live waiter: now, and only now, drain
+      return;
+    }
+    // rejected: items untouched (still in `list`), fall through to the next waiter
+  }
+  // No waiter accepted: leave everything queued for the next GET to drain.
 }
 
 /** JSON response bodies, shared so both variants emit identical bytes. */

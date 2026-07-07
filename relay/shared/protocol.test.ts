@@ -159,6 +159,37 @@ test("an aborted signal resolves empty and cleans up its waiter, before any time
   expect(waiters).toEqual([]); // no leaked waiter after disconnect
 });
 
+test("disconnect mid-delivery: wake offers before draining, so a settled waiter never swallows the item", async () => {
+  // The core #53 hardening. wake() must not remove an item from the buffer and
+  // THEN discover the waiter it handed it to is dead. It offers the still-queued
+  // item and drains only once a waiter reports it accepted (was live). Here the
+  // newest waiter has settled (its abort fired mid-delivery) and rejects; wake
+  // falls through to the live older waiter and drains only then. Nothing lost.
+  const list: P.Item[] = [{ blob: "in-flight", exp: Date.now() + 10_000 }];
+  const waiters: P.Waiter[] = [];
+  const liveGot: string[][] = [];
+  waiters.push((blobs) => {   // older, still live: accepts
+    liveGot.push(blobs);
+    return true;
+  });
+  waiters.push(() => false);  // newer, settled mid-delivery: rejects the offer
+
+  P.wake(list, waiters, Date.now());
+
+  expect(liveGot).toEqual([["in-flight"]]); // reached the live waiter, not the void
+  expect(list).toEqual([]); // drained only after the positive accept
+  expect(waiters).toEqual([]); // both offered-to and removed
+
+  // And the fully abandoned case: a lone settled waiter must leave the item
+  // queued for the next real GET rather than eating it.
+  const list2: P.Item[] = [{ blob: "next-poll-gets-it", exp: Date.now() + 10_000 }];
+  const waiters2: P.Waiter[] = [() => false];
+  P.wake(list2, waiters2, Date.now());
+  expect(list2.map((i) => i.blob)).toEqual(["next-poll-gets-it"]); // preserved
+  const out = await P.longPoll(list2, waiters2, Date.now(), 20);
+  expect(out).toEqual(["next-poll-gets-it"]); // a later poll drains it
+});
+
 test("a wake after abort is harmless: the waiter is already gone", async () => {
   const list: P.Item[] = [];
   const waiters: P.Waiter[] = [];

@@ -3,16 +3,31 @@
 import { test, expect } from "bun:test";
 import * as P from "./shared/protocol";
 
-// A "dead" waiter models a connection that is gone but whose server-side abort
-// never fired (the confirmed DO behaviour): it stays registered but whatever it
-// is handed goes into the void. We record what it received to prove loss.
-function deadWaiter(sink: string[][]): P.Waiter {
-  return (blobs) => sink.push(blobs);
+// A SILENT-ORPHAN waiter models a connection that is gone but whose server-side
+// abort never fired (the confirmed DO behaviour): it stays registered, is NOT
+// settled, so it still reports it ACCEPTED (returns true), and whatever it is
+// handed goes into the void. This is the case the relay cannot observe and so
+// cannot save. We record what it received to prove loss.
+function silentOrphan(sink: string[][]): P.Waiter {
+  return (blobs) => {
+    sink.push(blobs);
+    return true; // not settled => accepts; the loss the relay cannot detect
+  };
 }
 
-test("RESIDUAL IS REAL: newest waiter dead + older waiter live => deposit lost to the void", () => {
-  // Precondition for this loss: two coexisting waiters where the NEWER is dead
-  // and the OLDER is live. wake() pops the newest (dead) and drains into it.
+// A SETTLED-DEAD waiter models a connection whose abort/timeout DID fire: the
+// real longPoll waiter would have spliced itself out of the array on settling,
+// but if wake ever reaches one it must REJECT the offer (return false) so the
+// item is preserved. Offer-then-drain relies on exactly this.
+function settledDead(): P.Waiter {
+  return () => false;
+}
+
+test("RESIDUAL IS REAL: newest waiter SILENTLY dead (accepts) + older live => deposit lost to the void", () => {
+  // Precondition for this loss: two coexisting waiters where the NEWER is a
+  // silent orphan (abort never fired, still accepts) and the OLDER is live.
+  // wake() offers to the newest; it accepts (it is not settled) and drains.
+  // This is the undetectable orphan-gap residual, NOT fixed by offer-then-drain.
   const list: P.Item[] = [];
   const waiters: P.Waiter[] = [];
   const voided: string[][] = [];
@@ -20,18 +35,62 @@ test("RESIDUAL IS REAL: newest waiter dead + older waiter live => deposit lost t
 
   // Older, LIVE waiter (real reconnect that can still receive).
   P.longPoll(list, waiters, Date.now(), 60_000).then((v) => (liveGot = v));
-  // Newer, DEAD waiter registered after it (a second overlapping poll whose
-  // connection died without its signal firing).
-  waiters.push(deadWaiter(voided));
+  // Newer, SILENTLY DEAD waiter (a second overlapping poll whose connection
+  // died without its signal firing, so it is not settled and still accepts).
+  waiters.push(silentOrphan(voided));
   expect(waiters.length).toBe(2);
 
   list.push({ blob: "approval-response", exp: Date.now() + 10_000 });
   P.wake(list, waiters, Date.now());
 
-  // The deposit went to the dead newest and is gone; the live older got nothing.
+  // The deposit went to the silent-dead newest and is gone; the live older got
+  // nothing. This remains the documented residual: the sender's poll backstop
+  // and the item TTL are what cover it, not the relay.
   expect(voided).toEqual([["approval-response"]]);
   expect(liveGot).toBeNull();
   expect(list).toEqual([]); // drained, not requeued: genuinely lost
+});
+
+test("HARDENED (offer-then-drain): newest waiter SETTLED-dead (rejects) + older live => item reaches the live one, not lost", () => {
+  // The disconnect-mid-delivery case the relay CAN observe: the newest waiter's
+  // abort/timeout fired, so it rejects the offer. Under the old drain-then-offer
+  // wake this drained into the dead newest and was lost. Now wake offers first,
+  // the settled newest rejects, and wake falls through to the live older waiter,
+  // draining only after that positive accept. Nothing is lost.
+  const list: P.Item[] = [];
+  const waiters: P.Waiter[] = [];
+  let liveGot: string[] | null = null;
+
+  waiters.push((blobs) => {          // older, LIVE
+    liveGot = blobs;
+    return true;
+  });
+  waiters.push(settledDead());       // newer, SETTLED-dead (rejects)
+  expect(waiters.length).toBe(2);
+
+  list.push({ blob: "approval-response", exp: Date.now() + 10_000 });
+  P.wake(list, waiters, Date.now());
+
+  expect(liveGot).toEqual(["approval-response"]); // fell through to the live one
+  expect(list).toEqual([]);                       // drained only on the accept
+  expect(waiters).toEqual([]);                    // both waiters consumed
+});
+
+test("HARDENED (offer-then-drain): a lone SETTLED-dead waiter never swallows the item; it stays queued for the next GET", async () => {
+  // The single-orphan gap, but with a waiter whose disconnect the relay CAN see
+  // (settled => rejects). Old wake drained-then-offered and lost it; new wake
+  // offers, the rejection preserves the item, and a later real poll drains it.
+  const list: P.Item[] = [{ blob: "to-daemon-response", exp: Date.now() + 10_000 }];
+  const waiters: P.Waiter[] = [settledDead()];
+
+  P.wake(list, waiters, Date.now());
+
+  expect(list.map((i) => i.blob)).toEqual(["to-daemon-response"]); // preserved
+  expect(waiters).toEqual([]); // the rejecting waiter was consumed off the list
+
+  // A real reconnecting poll now drains the still-queued item: delivered, not lost.
+  const out = await P.longPoll(list, waiters, Date.now(), 50);
+  expect(out).toEqual(["to-daemon-response"]);
 });
 
 test("NOT reachable by a single-flight client: coexisting waiters always have the live one newest", async () => {
@@ -44,7 +103,7 @@ test("NOT reachable by a single-flight client: coexisting waiters always have th
   const orphanVoid: string[][] = [];
   let reconnectGot: string[] | null = null;
 
-  waiters.push(deadWaiter(orphanVoid)); // older = dead orphan
+  waiters.push(silentOrphan(orphanVoid)); // older = dead orphan
   P.longPoll(list, waiters, Date.now(), 60_000).then((v) => (reconnectGot = v)); // newer = live
 
   list.push({ blob: "approval-response", exp: Date.now() + 10_000 });
@@ -87,7 +146,7 @@ test("MAX_WAITERS drop-oldest never loses a queued deposit: slot is provably emp
   const list: P.Item[] = [];
   const waiters: P.Waiter[] = [];
   const drops: string[][] = [];
-  for (let i = 0; i < P.MAX_WAITERS; i++) waiters.push(deadWaiter(drops));
+  for (let i = 0; i < P.MAX_WAITERS; i++) waiters.push(silentOrphan(drops));
   // A real item is queued, but the drop path is unreachable while list is
   // non-empty: longPoll would drain-and-return immediately instead of evicting.
   const immediate = P.longPoll(
