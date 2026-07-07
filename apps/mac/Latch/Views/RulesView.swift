@@ -15,6 +15,9 @@ import SwiftUI
 struct RulesView: View {
     @Environment(AppModel.self) private var model
     @State private var editor: EditorContext?
+    /// The rule awaiting a remove confirmation. Removing a rule also purges its
+    /// sealed values, which cannot be recovered, so it is a deliberate two-step.
+    @State private var confirmingRemove: RuleConfig?
 
     var body: some View {
         ScrollView {
@@ -37,6 +40,20 @@ struct RulesView: View {
         }
         .sheet(item: $editor) { ctx in
             RuleEditorSheet(draft: ctx.draft, editingName: ctx.editingName)
+        }
+        .confirmationDialog(
+            confirmingRemove.map { "Remove rule \($0.name)?" } ?? "Remove rule?",
+            isPresented: Binding(get: { confirmingRemove != nil },
+                                 set: { if !$0 { confirmingRemove = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Remove", role: .destructive) {
+                if let rule = confirmingRemove { Task { await model.removeRule(rule) } }
+                confirmingRemove = nil
+            }
+            Button("Cancel", role: .cancel) { confirmingRemove = nil }
+        } message: {
+            Text("Its sealed values cannot be recovered.")
         }
         .task { await model.loadSecondaryScreens() }
     }
@@ -79,7 +96,7 @@ struct RulesView: View {
                                      draft: RuleDraft(editing: rule, in: model.config),
                                      editingName: rule.name)
                              },
-                             onRemove: { Task { await model.removeRule(rule) } })
+                             onRemove: { confirmingRemove = rule })
                 }
             }
         }

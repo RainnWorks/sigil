@@ -7,8 +7,11 @@
 //
 //  The environment is the whole point: each row is a KEY (always shown) and a
 //  VALUE (write-only). A value you type is sealed on save and never shown again;
-//  re-opening the rule shows the KEY with a masked, "unchanged" value you can
-//  replace or remove but never read back. Sealing a value asks for Touch ID.
+//  re-opening the rule shows the KEY with a masked, "sealed" value you can
+//  replace or remove but never read back. Sealing encrypts the value under the
+//  local device key (the host DEK). On a Secure Enclave keystore that unwrap is
+//  gated by Touch ID; the app currently runs the dev file keystore (SE wrap is
+//  task #24/#49), which seals without a prompt, so the copy never promises one.
 
 import SwiftUI
 
@@ -37,7 +40,10 @@ struct RuleEditorSheet: View {
     }
 
     /// What is wrong with the environment rows, or nil. Keys must be valid and
-    /// unique, and any typed value needs a KEY to hold it.
+    /// unique; any typed value needs a KEY to hold it; and a fresh KEY must be
+    /// given a value, so a blank one can never silently seal an empty-string
+    /// secret that then masquerades as "sealed" forever. An existing row left
+    /// blank is the deliberate keep-unchanged case, so it is not a gap.
     private var envError: String? {
         var seen = Set<String>()
         for row in draft.env {
@@ -47,6 +53,9 @@ struct RuleEditorSheet: View {
                 continue
             }
             if !EnvKey.isValid(key) { return "\(key) is not a valid variable name." }
+            if !row.existing && row.value.isEmpty {
+                return "Give \(key) a value, or remove the row."
+            }
             if !seen.insert(key).inserted { return "Each KEY must be set once (\(key) repeats)." }
         }
         return nil
@@ -83,14 +92,25 @@ struct RuleEditorSheet: View {
     }
 
     private var footer: some View {
-        HStack {
-            Text(blocker ?? " ")
-                .font(.system(size: 10)).foregroundStyle(.tertiary)
-            Spacer()
-            Button("Cancel") { dismiss() }.buttonStyle(.glass)
-            Button(isEdit ? "Save" : "Add rule") { Task { await save() } }
-                .buttonStyle(.glassProminent).tint(Palette.cobalt)
-                .disabled(!canSave)
+        VStack(spacing: 8) {
+            // The reinforcing cue at the commit point: a sealed value cannot be
+            // recovered from here or anywhere else, so keep a copy if you need one.
+            HStack(spacing: 6) {
+                Image(systemName: "lock.fill").font(.system(size: 9)).foregroundStyle(.tertiary)
+                Text("Values are sealed on save and cannot be read back afterward. Keep your own copy if you need one.")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            HStack {
+                Text(blocker ?? " ")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+                Spacer()
+                Button("Cancel") { dismiss() }.buttonStyle(.glass)
+                Button(isEdit ? "Save" : "Add rule") { Task { await save() } }
+                    .buttonStyle(.glassProminent).tint(Palette.cobalt)
+                    .disabled(!canSave)
+            }
         }
         .padding(.horizontal, 20).padding(.vertical, 14)
     }
@@ -118,7 +138,7 @@ struct RuleEditorSheet: View {
                 }
             )
 
-            TokenListEditor(title: "Argv contains", placeholder: "a substring of some argument",
+            TokenListEditor(title: "Argument contains", placeholder: "a substring of some argument",
                             tokens: $draft.argvContains)
             TokenListEditor(title: "Flags present", placeholder: "--vault",
                             tokens: $draft.flagPresent)
@@ -191,6 +211,10 @@ struct RuleEditorSheet: View {
 /// A fresh row is a KEY you name and a VALUE you set now.
 private struct EnvEditor: View {
     @Binding var rows: [EnvRow]
+    /// The sealed row awaiting a remove confirmation. Removing a sealed value
+    /// unseals it permanently, so it must not look like discarding a blank new
+    /// row; a fresh row is removed outright (nothing is lost).
+    @State private var confirmingRemoval: EnvRow?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -200,7 +224,9 @@ private struct EnvEditor: View {
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 ForEach($rows) { $row in
-                    EnvRowView(row: $row) { remove(row) }
+                    EnvRowView(row: $row) {
+                        if row.existing { confirmingRemoval = row } else { remove(row) }
+                    }
                 }
             }
             Button {
@@ -209,6 +235,20 @@ private struct EnvEditor: View {
                 Label("Add variable", systemImage: "plus").font(.system(size: 11))
             }
             .buttonStyle(.plain).foregroundStyle(Palette.cobalt)
+        }
+        .confirmationDialog(
+            confirmingRemoval.map { "Remove \($0.key)?" } ?? "Remove sealed value?",
+            isPresented: Binding(get: { confirmingRemoval != nil },
+                                 set: { if !$0 { confirmingRemoval = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Remove", role: .destructive) {
+                if let row = confirmingRemoval { remove(row) }
+                confirmingRemoval = nil
+            }
+            Button("Cancel", role: .cancel) { confirmingRemoval = nil }
+        } message: {
+            Text("Its sealed value cannot be recovered. The key is dropped on save.")
         }
     }
 
@@ -223,18 +263,29 @@ private struct EnvRowView: View {
 
     var body: some View {
         HStack(spacing: 8) {
+            // A sealed row carries a lock so keep-vs-replace is obvious at a glance;
+            // a fresh row has none.
+            Image(systemName: "lock.fill")
+                .font(.system(size: 10))
+                .foregroundStyle(row.existing ? Palette.brass : .clear)
+                .accessibilityHidden(!row.existing)
             TextField("KEY", text: $row.key)
                 .textFieldStyle(.roundedBorder).font(.mono(11))
-                .frame(maxWidth: 200)
+                .frame(maxWidth: 190)
                 .disabled(row.existing)   // a sealed KEY cannot be renamed in place
             Text("=").foregroundStyle(.tertiary)
-            SecureField(row.existing ? "unchanged" : "value", text: $row.value)
+            SecureField(row.existing ? "sealed, leave blank to keep" : "value", text: $row.value)
                 .textFieldStyle(.roundedBorder).font(.mono(11))
+            // Distinct destructive affordance on a sealed row (trash, rust) so
+            // unsealing never looks like discarding a blank new row (minus).
             Button(action: onRemove) {
-                Image(systemName: "minus.circle").font(.system(size: 12))
+                Image(systemName: row.existing ? "trash" : "minus.circle").font(.system(size: 12))
             }
-            .buttonStyle(.plain).foregroundStyle(.secondary)
-            .accessibilityLabel(row.key.isEmpty ? "Remove variable" : "Remove \(row.key)")
+            .buttonStyle(.plain)
+            .foregroundStyle(row.existing ? Palette.rust : .secondary)
+            .accessibilityLabel(
+                row.existing ? "Remove sealed value \(row.key)"
+                             : (row.key.isEmpty ? "Remove variable" : "Remove \(row.key)"))
         }
     }
 }
@@ -341,7 +392,11 @@ private struct FlagEqEditor: View {
     }
 }
 
-#Preview("New rule from quick start") {
+// The op quick start lays down OP_SERVICE_ACCOUNT_TOKEN with an empty value, so
+// this preview also pins the P0 guard: Add rule is disabled and the footer reads
+// "Give OP_SERVICE_ACCOUNT_TOKEN a value, or remove the row." until the token is
+// typed, so a blank value can never silently seal an empty secret.
+#Preview("Quick start (empty value blocks save)") {
     RuleEditorSheet(draft: QuickStart.catalog[0].draft(), editingName: nil)
         .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
 }
