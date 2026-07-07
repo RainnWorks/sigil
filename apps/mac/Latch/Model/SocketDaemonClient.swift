@@ -140,21 +140,18 @@ struct SocketDaemonClient: DaemonClient {
 
     // MARK: - Shelled out to `sigil … --json` (keystore / config mutations)
 
-    func accounts() async throws -> [Account] { try await cli.accounts() }
-    func addAccount(_ draft: AccountDraft) async throws -> Account {
-        try await cli.addAccount(draft)
-    }
-    func rotateAccount(id: String, token: String) async throws -> Account {
-        try await cli.rotateAccount(id: id, token: token)
-    }
-    func removeAccount(_ account: Account) async throws { try await cli.removeAccount(account) }
-
     func config() async throws -> SigilConfig { try await cli.config() }
     func addSource(_ source: SourceConfig) async throws { try await cli.addSource(source) }
     func removeSource(name: String) async throws { try await cli.removeSource(name: name) }
     func addRule(_ rule: RuleConfig) async throws { try await cli.addRule(rule) }
     func removeRule(name: String) async throws { try await cli.removeRule(name: name) }
     func importConfig(_ config: SigilConfig) async throws { try await cli.importConfig(config) }
+    func sealEnv(source: String, secrets: [EnvSecret]) async throws {
+        try await cli.sealEnv(source: source, secrets: secrets)
+    }
+    func unsealEnv(source: String, key: String) async throws {
+        try await cli.unsealEnv(source: source, key: key)
+    }
 
     func settings() async throws -> AppSettings { try await cli.settings() }
     func saveSettings(_ settings: AppSettings) async throws { try await cli.saveSettings(settings) }
@@ -290,7 +287,7 @@ struct SocketDaemonClient: DaemonClient {
             daemonUp: false,
             socketPath: socketPath,
             shim: ShimState(kind: .unknown, path: nil, issue: "daemon not running"),
-            opFound: false, opPath: nil, accountCount: 0,
+            opFound: false, opPath: nil,
             factor: .failClosed, relayReachable: nil, relayURL: nil, lockedDown: false)
     }
 }

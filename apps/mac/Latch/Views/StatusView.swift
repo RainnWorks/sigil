@@ -56,9 +56,6 @@ struct StatusView: View {
                     Divider()
                     StatusRow(ok: s.opFound, label: "op", value: s.opPath ?? "no op on PATH", mono: true)
                     Divider()
-                    StatusRow(ok: s.accountCount > 0, warn: s.accountCount == 0, label: "accounts",
-                              value: "\(s.accountCount) configured")
-                    Divider()
                     StatusRow(ok: s.factor.tone != .warn, warn: s.factor.tone == .warn,
                               label: "factor", value: "\(s.factor.label) · \(s.factor.detail)")
                     if let reachable = s.relayReachable {

@@ -1,14 +1,14 @@
 //  RuleEditorSheet.swift
-//  Author or edit one rule: what command to watch (match), which source to inject
-//  from, and how much friction the approval takes (risk + timeout). Opened blank
-//  from the toolbar, pre-filled from a recipe, or seeded from an existing rule for
-//  an in-place edit. It never authors config in Swift; Save hands the draft to the
-//  model, which drives the `sigil-config` verbs.
+//  Author or edit one rule: the command to watch (match) and the write-once
+//  environment to inject into it. Opened blank from the toolbar, pre-filled from
+//  a quick start, or seeded from an existing rule for an in-place edit. It never
+//  authors config in Swift; Save hands the draft to the model, which drives the
+//  `sigil-config` verbs and seals the values under the DEK.
 //
-//  A rule references a Source. Rather than make the source its own first step, the
-//  picker lists the sources you already have (from the Sources screen) and, if you
-//  need a new one, lets you add it inline. A 1Password credential is wired to its
-//  routing source automatically on save, so you pick an ingredient, not plumbing.
+//  The environment is the whole point: each row is a KEY (always shown) and a
+//  VALUE (write-only). A value you type is sealed on save and never shown again;
+//  re-opening the rule shows the KEY with a masked, "unchanged" value you can
+//  replace or remove but never read back. Sealing a value asks for Touch ID.
 
 import SwiftUI
 
@@ -17,43 +17,42 @@ struct RuleEditorSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     let editingName: String?
-    /// The provider the source picker is pinned to (a recipe's choice), or nil to
-    /// let the picker span every provider (the custom path).
-    private let pinnedProvider: SourceProvider?
 
     @State private var draft: RuleDraft
-    /// The chosen ingredient, by `Account.id`. An env-file ingredient is a config
-    /// source already; a 1Password ingredient is a credential the model wires to a
-    /// routing source on save.
-    @State private var ingredientID: String?
-    @State private var addingSource = false
     @State private var saving = false
-    @State private var usesTimeout: Bool
 
-    init(draft: RuleDraft, editingName: String?, ingredients: [Account]) {
+    init(draft: RuleDraft, editingName: String?) {
         self.editingName = editingName
-        self.pinnedProvider = draft.custom ? nil : draft.provider
         _draft = State(initialValue: draft)
-        _usesTimeout = State(initialValue: draft.timeoutSec != nil)
-        _ingredientID = State(initialValue: Self.initialIngredient(draft, ingredients))
     }
 
     private var isEdit: Bool { editingName != nil }
 
-    /// Ingredients the picker offers: filtered to the pinned provider, or all when
-    /// the provider is free (custom).
-    private var candidates: [Account] {
-        guard let pinnedProvider else { return model.accounts }
-        return model.accounts.filter { $0.provider == pinnedProvider }
+    /// The reason Save is blocked, or nil when the draft is authorable. Ordered so
+    /// the most fundamental gap surfaces first.
+    private var blocker: String? {
+        if draft.name.trimmed.isEmpty { return "Give the rule a name." }
+        if draft.match.isEmpty { return "Add at least one match condition." }
+        return envError
     }
 
-    private var selectedIngredient: Account? {
-        model.accounts.first { $0.id == ingredientID }
+    /// What is wrong with the environment rows, or nil. Keys must be valid and
+    /// unique, and any typed value needs a KEY to hold it.
+    private var envError: String? {
+        var seen = Set<String>()
+        for row in draft.env {
+            let key = row.key.trimmed
+            if key.isEmpty {
+                if !row.value.isEmpty { return "Give every value a KEY name." }
+                continue
+            }
+            if !EnvKey.isValid(key) { return "\(key) is not a valid variable name." }
+            if !seen.insert(key).inserted { return "Each KEY must be set once (\(key) repeats)." }
+        }
+        return nil
     }
 
-    private var canSave: Bool {
-        !draft.name.trimmed.isEmpty && !draft.match.isEmpty && selectedIngredient != nil && !saving
-    }
+    private var canSave: Bool { blocker == nil && !saving }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -64,8 +63,7 @@ struct RuleEditorSheet: View {
                     if let error = model.lastError { ErrorStrip(message: error) }
                     nameSection
                     matchSection
-                    sourceSection
-                    riskSection
+                    environmentSection
                 }
                 .padding(20)
             }
@@ -73,11 +71,6 @@ struct RuleEditorSheet: View {
             footer
         }
         .frame(width: 540, height: 640)
-        .sheet(isPresented: $addingSource) {
-            // A recipe pins the provider; the neutral custom path defaults to an
-            // env file rather than 1Password, so op is not the premise.
-            AddAccountSheet(initialProvider: pinnedProvider ?? .envFile)
-        }
     }
 
     private var header: some View {
@@ -91,7 +84,7 @@ struct RuleEditorSheet: View {
 
     private var footer: some View {
         HStack {
-            Text(draft.match.isEmpty ? "Add at least one match condition." : " ")
+            Text(blocker ?? " ")
                 .font(.system(size: 10)).foregroundStyle(.tertiary)
             Spacer()
             Button("Cancel") { dismiss() }.buttonStyle(.glass)
@@ -133,134 +126,26 @@ struct RuleEditorSheet: View {
         }
     }
 
-    // MARK: source
+    // MARK: environment
 
-    private var sourceSection: some View {
+    private var environmentSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            sectionTitle("Source", "Where this rule injects its secret from after your phone approves.")
-            if candidates.isEmpty {
-                noSourceCallout
-            } else {
-                Picker("Source", selection: $ingredientID) {
-                    ForEach(candidates) { account in
-                        Text(sourceLabel(account)).tag(Optional(account.id))
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                Button {
-                    addingSource = true
-                } label: {
-                    Label("Add a source", systemImage: "plus").font(.system(size: 11))
-                }
-                .buttonStyle(.plain).foregroundStyle(Palette.cobalt)
-            }
-        }
-        .onChange(of: model.accounts) { _, accounts in
-            // A source just added inline: select it so the rule can save.
-            if ingredientID == nil || !accounts.contains(where: { $0.id == ingredientID }) {
-                ingredientID = Self.firstMatch(pinnedProvider, accounts)
-            }
-        }
-    }
-
-    private var noSourceCallout: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(pinnedProvider.map { "No \($0.displayName) source yet." } ?? "No sources yet.")
-                .font(.system(size: 11)).foregroundStyle(.secondary)
-            Button("Add a source") { addingSource = true }
-                .buttonStyle(.glass).controlSize(.small)
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Palette.brass.opacity(0.08), in: .rect(cornerRadius: 10))
-    }
-
-    // MARK: risk + timeout
-
-    private var riskSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            sectionTitle("Risk", "Scales the approve control on your phone. Deny is always one tap.")
-            Picker("Risk", selection: $draft.risk) {
-                ForEach(RiskLevel.allCases) { risk in Text(risk.displayName).tag(risk) }
-            }
-            .pickerStyle(.segmented).labelsHidden()
-            Text(riskGloss).font(.system(size: 10)).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Toggle(isOn: $usesTimeout.animation()) {
-                Text("Custom approval timeout").font(.system(size: 12))
-            }
-            .toggleStyle(.switch).controlSize(.small)
-            if usesTimeout {
-                Stepper(value: Binding(
-                    get: { draft.timeoutSec ?? model.settings.approvalTimeoutSec },
-                    set: { draft.timeoutSec = $0 }
-                ), in: 15...600, step: 15) {
-                    LabeledContent("Timeout") {
-                        MonoText("\(draft.timeoutSec ?? model.settings.approvalTimeoutSec)s", size: 11, color: .secondary)
-                    }
-                }
-            }
-            Text("If no decision arrives before the timeout, the request fails closed and is denied.")
-                .font(.system(size: 10)).foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .onChange(of: usesTimeout) { _, on in
-            if !on { draft.timeoutSec = nil }
-            else if draft.timeoutSec == nil { draft.timeoutSec = model.settings.approvalTimeoutSec }
+            sectionTitle("Environment",
+                         "The KEY=VALUE secrets to inject after your phone approves. Each value is sealed on your device the moment you save and is never shown again.")
+            EnvEditor(rows: $draft.env)
         }
     }
 
     // MARK: save
 
     private func save() async {
-        guard let ingredient = selectedIngredient else { return }
         saving = true
         defer { saving = false }
         // Dismiss only when the save actually took. On a refusal the model leaves
-        // lastError set and returns false, so the sheet stays open with the reason
-        // showing rather than pretending it worked.
-        if await model.saveRule(draft, source: ingredient, replacing: editingName) {
+        // lastError set and returns false, so the sheet stays open with the reason.
+        if await model.saveRule(draft, replacing: editingName) {
             dismiss()
         }
-    }
-
-    // MARK: helpers
-
-    /// A one-line gloss of what the selected risk changes on the phone. Deny is
-    /// always one tap; risk only scales the approve side.
-    private var riskGloss: String {
-        switch draft.risk {
-        case .routine: return "Routine: approve with a single tap on your phone."
-        case .elevated: return "Elevated: approve takes a deliberate confirm, so it is not a reflex tap."
-        case .critical: return "Critical: approve takes the firmest confirmation the phone offers."
-        }
-    }
-
-    private func sourceLabel(_ account: Account) -> String {
-        let where_ = account.provider == .envFile ? (account.path ?? account.label) : account.label
-        return "\(account.provider.displayName) · \(where_)"
-    }
-
-    private static func initialIngredient(_ draft: RuleDraft, _ ingredients: [Account]) -> String? {
-        // Editing: land on the ingredient the rule's source resolves to.
-        if !draft.sourceKey.isEmpty {
-            switch draft.provider {
-            case .onePassword:
-                if let hit = ingredients.first(where: { $0.provider == .onePassword && $0.label == draft.sourceKey }) {
-                    return hit.id
-                }
-            case .envFile:
-                if let hit = ingredients.first(where: { $0.id == draft.sourceKey }) { return hit.id }
-            }
-        }
-        return firstMatch(draft.custom ? nil : draft.provider, ingredients)
-    }
-
-    private static func firstMatch(_ provider: SourceProvider?, _ ingredients: [Account]) -> String? {
-        if let provider { return ingredients.first { $0.provider == provider }?.id }
-        return ingredients.first?.id
     }
 
     // MARK: small view builders
@@ -295,6 +180,75 @@ struct RuleEditorSheet: View {
 
     private func twoUp<A: View, B: View>(_ a: A, _ b: B) -> some View {
         HStack(alignment: .top, spacing: 12) { a; b }
+    }
+}
+
+// MARK: - Environment editor
+
+/// A rows-of-KEY-plus-VALUE editor. KEY is always visible; VALUE is a SecureField
+/// that writes only. An existing KEY (loaded from a saved rule) has a read-only
+/// name and a masked "unchanged" value: typing replaces it, the minus removes it.
+/// A fresh row is a KEY you name and a VALUE you set now.
+private struct EnvEditor: View {
+    @Binding var rows: [EnvRow]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if rows.isEmpty {
+                Text("No environment. This rule will gate the command without injecting anything.")
+                    .font(.system(size: 11)).foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach($rows) { $row in
+                    EnvRowView(row: $row) { remove(row) }
+                }
+            }
+            Button {
+                rows.append(EnvRow())
+            } label: {
+                Label("Add variable", systemImage: "plus").font(.system(size: 11))
+            }
+            .buttonStyle(.plain).foregroundStyle(Palette.cobalt)
+        }
+    }
+
+    private func remove(_ row: EnvRow) {
+        rows.removeAll { $0.id == row.id }
+    }
+}
+
+private struct EnvRowView: View {
+    @Binding var row: EnvRow
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            TextField("KEY", text: $row.key)
+                .textFieldStyle(.roundedBorder).font(.mono(11))
+                .frame(maxWidth: 200)
+                .disabled(row.existing)   // a sealed KEY cannot be renamed in place
+            Text("=").foregroundStyle(.tertiary)
+            SecureField(row.existing ? "unchanged" : "value", text: $row.value)
+                .textFieldStyle(.roundedBorder).font(.mono(11))
+            Button(action: onRemove) {
+                Image(systemName: "minus.circle").font(.system(size: 12))
+            }
+            .buttonStyle(.plain).foregroundStyle(.secondary)
+            .accessibilityLabel(row.key.isEmpty ? "Remove variable" : "Remove \(row.key)")
+        }
+    }
+}
+
+/// Environment-variable-name validation, mirroring core's `valid_env_key`
+/// (crates/sigil/src/cli.rs): non-empty and free of `=`, whitespace, and control
+/// characters, so it can never corrupt the child's environment or the sealed wire.
+enum EnvKey {
+    static func isValid(_ key: String) -> Bool {
+        guard !key.isEmpty else { return false }
+        return !key.unicodeScalars.contains { s in
+            s == "=" || s.value == 0 || s.properties.isWhitespace
+                || (s.value < 0x20) || s.value == 0x7f
+        }
     }
 }
 
@@ -387,13 +341,19 @@ private struct FlagEqEditor: View {
     }
 }
 
-#Preview("New rule") {
-    RuleEditorSheet(draft: Recipe.catalog[0].draft(), editingName: nil,
-                    ingredients: Fixtures.accounts)
+#Preview("New rule from quick start") {
+    RuleEditorSheet(draft: QuickStart.catalog[0].draft(), editingName: nil)
         .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
 }
 
-#Preview("Custom rule") {
-    RuleEditorSheet(draft: RuleDraft(), editingName: nil, ingredients: Fixtures.accounts)
+#Preview("Blank rule") {
+    RuleEditorSheet(draft: RuleDraft(), editingName: nil)
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+}
+
+#Preview("Editing (masked values)") {
+    RuleEditorSheet(
+        draft: RuleDraft(editing: Fixtures.config.rules[0], in: Fixtures.config),
+        editingName: "op")
         .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
 }

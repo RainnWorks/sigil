@@ -1,14 +1,14 @@
 //  RulesView.swift
-//  The if-this-then-that surface, the spine of the configurator. A rule watches
-//  for a command you run (match on command, subcommand, argv, flags), gates it on
-//  your phone, and injects the environment from a source you name. The screen
-//  leads with one-click recipes so the first rule is never a blank form, then
-//  lists the rules you have, each editable in full.
+//  The if-this-then-that surface, the whole spine of the configurator. A rule
+//  watches for a command you run (match on command, subcommand, argv, flags),
+//  gates it on your phone, and injects the write-once environment you gave it.
+//  The screen leads with one-tap quick starts so the first rule is never a blank
+//  form, then lists the rules you have, each editable in full.
 //
-//  Provider-blind by construction: a rule names a source, never a vendor. The
-//  1Password recipe is one tile among peers. Everything here drives the
-//  `sigil-config` seam (rule/source verbs, or a whole-config import for an edit);
-//  no gating logic lives in Swift.
+//  There is no source or provider surface: 1Password is just a command you gate,
+//  and its token is one of the environment values you inject. Everything here
+//  drives the `sigil-config` seam (rule verbs, a whole-config import for an edit,
+//  and the sealed `source env` values); no gating logic lives in Swift.
 
 import SwiftUI
 
@@ -20,7 +20,7 @@ struct RulesView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 if let error = model.lastError { ErrorStrip(message: error) }
-                recipes
+                quickStarts
                 rules
             }
             .padding(20)
@@ -28,39 +28,33 @@ struct RulesView: View {
         .navigationTitle("Rules")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                // The toolbar add is the from-scratch path: a custom draft whose
-                // source picker spans every provider, not one pinned kind.
                 Button {
-                    var draft = RuleDraft()
-                    draft.custom = true
-                    editor = EditorContext(draft: draft, editingName: nil)
+                    editor = EditorContext(draft: RuleDraft(), editingName: nil)
                 } label: {
                     Label("Add", systemImage: "plus")
                 }
             }
         }
         .sheet(item: $editor) { ctx in
-            RuleEditorSheet(draft: ctx.draft, editingName: ctx.editingName,
-                            ingredients: model.accounts)
+            RuleEditorSheet(draft: ctx.draft, editingName: ctx.editingName)
         }
         .task { await model.loadSecondaryScreens() }
     }
 
-    // MARK: recipes
+    // MARK: quick starts
 
-    private var recipes: some View {
+    private var quickStarts: some View {
         VStack(alignment: .leading, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("Start from a recipe").font(.system(size: 13, weight: .semibold))
-                Text("Lay down a working rule for a common tool, then confirm the source and risk. You can always author one from scratch.")
+                Text("Start from a command").font(.system(size: 13, weight: .semibold))
+                Text("Pre-fill the command to gate and the environment it wants, then fill in the values. You can always author one from scratch.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 10)], spacing: 10) {
-                ForEach(Recipe.catalog) { recipe in
-                    RecipeCard(recipe: recipe) {
-                        editor = EditorContext(draft: recipe.draft(),
-                                               editingName: nil)
+                ForEach(QuickStart.catalog) { start in
+                    QuickStartCard(start: start) {
+                        editor = EditorContext(draft: start.draft(), editingName: nil)
                     }
                 }
             }
@@ -82,8 +76,7 @@ struct RulesView: View {
                              source: model.config.source(named: rule.action.source),
                              onEdit: {
                                  editor = EditorContext(
-                                     draft: RuleDraft(editing: rule, in: model.config,
-                                                      ingredients: model.accounts),
+                                     draft: RuleDraft(editing: rule, in: model.config),
                                      editingName: rule.name)
                              },
                              onRemove: { Task { await model.removeRule(rule) } })
@@ -95,16 +88,15 @@ struct RulesView: View {
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("No rules yet").font(.system(size: 13, weight: .semibold))
-            Text("A rule watches for a command you run and holds it for approval on your phone before any secret is read. It has three parts:")
+            Text("A rule watches for a command you run and holds it for approval on your phone. It has two parts:")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             VStack(alignment: .leading, spacing: 6) {
                 modelRow(number: "1", title: "Match", detail: "the command to watch, e.g. op read")
-                modelRow(number: "2", title: "Source", detail: "where its secret comes from")
-                modelRow(number: "3", title: "Risk", detail: "how much friction the approval takes")
+                modelRow(number: "2", title: "Environment", detail: "the KEY=VALUE secrets to hand it, sealed on save")
             }
             .padding(.vertical, 2)
-            Text("Pick a recipe above to lay one down, or add a custom rule.")
+            Text("Pick a command above to start, or add one from scratch.")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
         }
         .padding(16)
@@ -126,30 +118,30 @@ struct RulesView: View {
 }
 
 /// Identifies the editor sheet and carries its starting draft. Its `id` changes
-/// per invocation so a recipe tap always re-presents with fresh defaults.
+/// per invocation so a quick-start tap always re-presents with fresh defaults.
 private struct EditorContext: Identifiable {
     let id = UUID()
     let draft: RuleDraft
     let editingName: String?
 }
 
-// MARK: - Recipe card
+// MARK: - Quick-start card
 
-private struct RecipeCard: View {
-    let recipe: Recipe
+private struct QuickStartCard: View {
+    let start: QuickStart
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             HStack(alignment: .top, spacing: 10) {
-                Image(systemName: recipe.symbol)
+                Image(systemName: start.symbol)
                     .font(.system(size: 15))
                     .foregroundStyle(Palette.cobalt)
                     .frame(width: 22)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(recipe.title).font(.system(size: 12, weight: .semibold))
+                    Text(start.title).font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.primary)
-                    Text(recipe.subtitle).font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text(start.subtitle).font(.system(size: 10)).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                         .multilineTextAlignment(.leading)
                 }
@@ -171,15 +163,13 @@ private struct RuleCard: View {
     let onEdit: () -> Void
     let onRemove: () -> Void
 
+    private var keys: [String] { source?.keys ?? [] }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Text(rule.name).font(.system(size: 13, weight: .semibold))
-                RiskPill(risk: rule.action.riskLevel)
                 Spacer()
-                if let timeout = rule.action.timeoutSec {
-                    MonoText("\(timeout)s", size: 10, color: .secondary)
-                }
             }
 
             // What it watches for.
@@ -188,19 +178,13 @@ private struct RuleCard: View {
                 MonoText(rule.match.summary, size: 11, color: .secondary)
             }
 
-            // Where it injects from.
-            HStack(spacing: 6) {
-                Text("into").font(.system(size: 10)).foregroundStyle(.tertiary)
-                if let source {
-                    StatePill(tone: .neutral, text: source.knownProvider?.displayName ?? source.provider)
-                    MonoText(source.origin, size: 11, color: .secondary)
+            // What it injects (KEY names only; values are sealed and unreadable).
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("sets").font(.system(size: 10)).foregroundStyle(.tertiary)
+                if keys.isEmpty {
+                    Text("no environment").font(.system(size: 11)).foregroundStyle(.tertiary)
                 } else {
-                    HStack(spacing: 4) {
-                        Image(systemName: "exclamationmark.triangle")
-                            .foregroundStyle(Palette.brass).font(.system(size: 10))
-                        Text("source \(rule.action.source) is missing; this rule fails closed")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                    }
+                    FlowKeys(keys: keys)
                 }
             }
 
@@ -217,28 +201,22 @@ private struct RuleCard: View {
     }
 }
 
-/// The risk policy as a tinted pill. Routine is calm; elevated and critical carry
-/// the brief's brass and rust so the friction reads at a glance.
-struct RiskPill: View {
-    let risk: RiskLevel
-    private var tone: StateTone {
-        switch risk {
-        case .routine: return .neutral
-        case .elevated: return .warn
-        case .critical: return .denied
+/// The KEY names as small mono capsules, wrapping across lines.
+private struct FlowKeys: View {
+    let keys: [String]
+    var body: some View {
+        // A rule rarely injects more than a handful of keys, so a simple wrapping
+        // HStack via a LazyVGrid of adaptive chips reads cleanly without a custom
+        // flow layout.
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 90), spacing: 6, alignment: .leading)],
+                  alignment: .leading, spacing: 6) {
+            ForEach(keys, id: \.self) { key in
+                MonoText(key, size: 11, color: .secondary)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Palette.cobalt.opacity(0.10), in: .capsule)
+            }
         }
     }
-    var body: some View {
-        StatePill(tone: tone, text: risk.displayName)
-    }
-}
-
-// RiskLevel gains the small surface the pickers and pills need. Kept here (not in
-// the wire-facing Domain type) since it is display-only.
-extension RiskLevel: CaseIterable, Identifiable {
-    static var allCases: [RiskLevel] { [.routine, .elevated, .critical] }
-    var id: String { rawValue }
-    var displayName: String { rawValue.capitalized }
 }
 
 #Preview("Rules") {

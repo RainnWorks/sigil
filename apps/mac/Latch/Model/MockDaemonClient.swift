@@ -21,7 +21,6 @@ enum MockScenario: Sendable {
 
 actor MockDaemonClient: DaemonClient {
     private var scenario: MockScenario
-    private var accountsStore: [Account]
     private var leasesStore: [Lease]
     private var historyStore: [HistoryEntry]
     private var pendingStore: [PendingRequest]
@@ -30,10 +29,13 @@ actor MockDaemonClient: DaemonClient {
     private var locked: Bool
     private var appSettings: AppSettings
     private var configStore: SigilConfig
+    /// Sealed inline env values, by source name: the mock's stand-in for the
+    /// DEK-sealed blob. Never read back to the UI (the readout is keys-only via
+    /// the source's `keys`); kept only so set/unset and edits behave faithfully.
+    private var envValues: [String: [(String, String)]] = [:]
 
     init(scenario: MockScenario = .armedIdle) {
         self.scenario = scenario
-        self.accountsStore = Fixtures.accounts
         self.leasesStore = Fixtures.leases
         self.historyStore = Fixtures.history
         self.pendingStore = (scenario == .pendingRequests) ? Fixtures.pending : []
@@ -42,6 +44,9 @@ actor MockDaemonClient: DaemonClient {
         self.locked = (scenario == .lockedDown)
         self.appSettings = Fixtures.settings
         self.configStore = Fixtures.config
+        for src in configStore.sources where src.provider == envProviderID {
+            envValues[src.name] = src.keys.map { ($0, "sealed") }
+        }
     }
 
     private var factor: Factor {
@@ -61,7 +66,6 @@ actor MockDaemonClient: DaemonClient {
                 : ShimState(kind: .healthy, path: "~/.sigil/bin/op", issue: nil),
             opFound: true,
             opPath: "/opt/homebrew/bin/op",
-            accountCount: accountsStore.count,
             factor: factor,
             relayReachable: paired != nil ? true : nil,
             relayURL: paired?.relayURL,
@@ -89,37 +93,7 @@ actor MockDaemonClient: DaemonClient {
         return checks
     }
 
-    func accounts() -> [Account] { accountsStore }
-
-    func addAccount(_ draft: AccountDraft) -> Account {
-        let a: Account
-        switch draft {
-        case .onePassword(let label, let token):
-            // Probe is faked: a token with "empty" in it sees no vaults (the warn case).
-            let vaults = token.lowercased().contains("empty") ? [] : ["Engineering", "Rowm work"]
-            a = Account(id: UUID().uuidString, label: label, provider: .onePassword, vaults: vaults,
-                        health: vaults.isEmpty ? .rotate : .healthy,
-                        detail: vaults.isEmpty ? "no usable vault visible" : nil,
-                        lastUsedAt: nil)
-        case .envFile(let name, let path):
-            a = Account(id: name, label: name, provider: .envFile, path: path)
-        }
-        accountsStore.append(a)
-        return a
-    }
-
-    func rotateAccount(id: String, token: String) throws -> Account {
-        guard let i = accountsStore.firstIndex(where: { $0.id == id }) else {
-            throw DaemonError.cli("no such account")
-        }
-        accountsStore[i].health = .healthy
-        accountsStore[i].detail = nil
-        return accountsStore[i]
-    }
-
-    func removeAccount(_ account: Account) { accountsStore.removeAll { $0.id == account.id } }
-
-    // MARK: config (rules + sources)
+    // MARK: config (rules + their hidden env sources)
     // The mock mirrors core's referential rules loosely enough that the editor's
     // happy path and refusals both demo: a duplicate name or a dangling/held
     // source throws, everything else mutates the in-memory config.
@@ -138,6 +112,41 @@ actor MockDaemonClient: DaemonClient {
             throw DaemonError.cli("source \(name) is still used by rule \(rule.name); remove the rule first")
         }
         configStore.sources.removeAll { $0.name == name }
+        envValues[name] = nil   // purge the sealed blob with the source
+    }
+
+    // MARK: inline env values (write-once; the mock never reveals them)
+
+    func sealEnv(source: String, secrets: [EnvSecret]) throws {
+        guard configStore.source(named: source)?.provider == envProviderID else {
+            throw DaemonError.cli("no inline env source named \(source)")
+        }
+        var pairs = envValues[source] ?? []
+        for s in secrets {
+            if let i = pairs.firstIndex(where: { $0.0 == s.key }) { pairs[i].1 = s.value }
+            else { pairs.append((s.key, s.value)) }
+        }
+        envValues[source] = pairs
+        syncEnvKeys(source)
+    }
+
+    func unsealEnv(source: String, key: String) throws {
+        guard configStore.source(named: source)?.provider == envProviderID else {
+            throw DaemonError.cli("no inline env source named \(source)")
+        }
+        var pairs = envValues[source] ?? []
+        let before = pairs.count
+        pairs.removeAll { $0.0 == key }
+        guard pairs.count < before else { throw DaemonError.cli("no key \(key) on \(source)") }
+        envValues[source] = pairs
+        syncEnvKeys(source)
+    }
+
+    /// Mirror core: keep the source's public KEY names (sorted) in lockstep with
+    /// the sealed pairs, never the values.
+    private func syncEnvKeys(_ source: String) {
+        guard let i = configStore.sources.firstIndex(where: { $0.name == source }) else { return }
+        configStore.sources[i].keys = (envValues[source] ?? []).map(\.0).sorted()
     }
 
     func addRule(_ rule: RuleConfig) throws {
@@ -248,18 +257,6 @@ actor MockDaemonClient: DaemonClient {
 // MARK: - Fixtures
 
 enum Fixtures {
-    static let accounts: [Account] = [
-        Account(id: "acc-rowm", label: "Rowm work", provider: .onePassword,
-                vaults: ["Engineering", "Rowm work", "Shared"],
-                health: .healthy, detail: nil, lastUsedAt: Date().addingTimeInterval(-420)),
-        Account(id: "acc-perso", label: "personal", provider: .onePassword, vaults: ["Private"],
-                health: .expiring, detail: "expires in 6d", lastUsedAt: Date().addingTimeInterval(-86_400 * 2)),
-        // Provider #2, so the fixtures do not read as 1Password-only: a
-        // source has no token to rotate or vault to probe, just a path.
-        Account(id: "ci-secrets", label: "ci-secrets", provider: .envFile,
-                path: "/Users/tom/.config/sigil/ci-secrets.env"),
-    ]
-
     static let leases: [Lease] = [
         Lease(grantHex: "9f3c1a77be20", caller: "claude", account: "Rowm work",
               scope: "Engineering/.env", grantedAt: Date().addingTimeInterval(-300),
@@ -307,24 +304,25 @@ enum Fixtures {
                                      sasWords: ["tide", "brass", "anchor", "harbor", "dusk", "iron"],
                                      relayURL: "https://relay.rainn.works", pairedAt: Date().addingTimeInterval(-86_400 * 9))
 
-    /// A representative config: a 1Password source gating `op` and an env-file
-    /// source gating `gcloud`, so the Rules screen renders both providers and the
-    /// source picker has ingredients. Names mirror the credential/source fixtures.
+    /// A representative config: two rules, each gating a command and injecting a
+    /// write-once environment from its own hidden `env` source (named after the
+    /// rule; never shown). The source `keys` are the KEY names the editor and the
+    /// rule card read back; the VALUES live only in the sealed blob.
     static let config = SigilConfig(
         version: 1,
         sources: [
-            SourceConfig(name: "rowm-work", provider: "1password", account: "Rowm work"),
-            SourceConfig(name: "ci-secrets", provider: "env-file", account: nil,
-                         path: "/Users/tom/.config/sigil/ci-secrets.env"),
+            SourceConfig(name: "op", provider: "env", keys: ["OP_SERVICE_ACCOUNT_TOKEN"]),
+            SourceConfig(name: "gcloud", provider: "env",
+                         keys: ["GOOGLE_APPLICATION_CREDENTIALS"]),
         ],
         rules: [
             RuleConfig(name: "op",
                        match: MatchConfig(command: "op"),
-                       action: ActionConfig(source: "rowm-work", risk: "routine", timeoutSec: nil)),
+                       action: ActionConfig(source: "op", risk: "routine", timeoutSec: nil)),
             RuleConfig(name: "gcloud",
                        match: MatchConfig(command: "gcloud", argvContains: ["auth"],
                                           flagEquals: [FlagEqConfig(flag: "--project", value: "prod")]),
-                       action: ActionConfig(source: "ci-secrets", risk: "elevated", timeoutSec: 90)),
+                       action: ActionConfig(source: "gcloud", risk: "routine", timeoutSec: nil)),
         ])
 
     static let settings = AppSettings(approvalTimeoutSec: 120, notificationsEnabled: true,

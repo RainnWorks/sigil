@@ -25,12 +25,14 @@
 //        "accounts": int, "factor": {"kind":"phone|biometric|fail_closed","relay":str?},
 //        "relay_reachable": bool?, "relay_url": str?, "locked_down": bool }
 //    sigil doctor --json   -> [ {"label": str, "ok": bool, "hint": str}, ... ]
-//    sigil-config account list --json -> [ {"id":str,"label":str,"vaults":[str],
-//        "health":"healthy|rotate|expiring","detail":str?,"last_used_ms":int?}, ... ]
-//    sigil-config account add --token-stdin --label <l> --json
-//        -> {"id":str,"label":str,"vaults":[str],"health":str,"detail":str?}
-//    sigil-config account rotate --id <id> --token-stdin --json -> (same account shape)
-//    sigil-config account remove --id <id> --json -> {"ok":bool,"lines":[str]}
+//    sigil-config export -> {version, sources:[{name,provider,account?,path?,
+//        keys?:[str]}], rules:[...]}   (the whole config; env sources carry KEY
+//        names only, never values)
+//    sigil-config source add <name> --provider env --json -> {"ok":bool,"lines":[str]}
+//    sigil-config source remove <name> --json -> {"ok":bool,"lines":[str]}
+//    sigil-config source env set <name> --stdin --json   (KEY=VALUE lines on
+//        stdin, sealed under the DEK) -> {"ok":bool,"lines":[str]}
+//    sigil-config source env unset <name> --key <KEY> --json -> {"ok":bool,"lines":[str]}
 //    sigil lease list --json -> [ {"grant_hex":str,"caller":str,"account":str,
 //        "scope":str,"granted_ms":int,"expires_ms":int}, ... ]
 //    sigil lease revoke <prefix> --json -> {"ok":bool,"lines":[str]}
@@ -197,55 +199,7 @@ struct CLIDaemonClient: DaemonClient {
         return dto.map { DoctorCheck(label: $0.label, ok: $0.ok, hint: $0.hint) }
     }
 
-    /// The 1Password accounts (a distinct on-disk store sigil-config owns)
-    /// plus every configured env-file source (one entry in the generic
-    /// source list), merged into the one provider-blind list the UI shows.
-    func accounts() async throws -> [Account] {
-        async let opAccounts = decode([AccountDTO].self, await runConfig(["account", "list", "--json"]))
-            .map { $0.model() }
-        async let envSources = decode([SourceDTO].self, await runConfig(["source", "list", "--json"]))
-            .compactMap { $0.envFileAccount() }
-        return try await opAccounts + envSources
-    }
-
-    func addAccount(_ draft: AccountDraft) async throws -> Account {
-        switch draft {
-        case .onePassword(let label, let token):
-            let data = try await runConfig(["account", "add", "--token-stdin", "--label", label, "--json"],
-                                           stdin: Data(token.utf8))
-            return try decode(AccountDTO.self, data).model()
-        case .envFile(let name, let path):
-            // No probe: there is no credential to test, only a file path -
-            // the provider's own `probe()` returns Unsupported for exactly
-            // this reason. A failure (e.g. the name is already taken) throws
-            // from `runConfig` itself (non-zero exit); on success the result
-            // is just what was configured, so there is nothing to decode.
-            _ = try await runConfig(["source", "add", name, "--provider", "env-file",
-                                     "--path", path, "--json"])
-            return Account(id: name, label: name, provider: .envFile, path: path)
-        }
-    }
-
-    func rotateAccount(id: String, token: String) async throws -> Account {
-        let data = try await runConfig(["account", "rotate", "--id", id, "--token-stdin", "--json"],
-                                       stdin: Data(token.utf8))
-        return try decode(AccountDTO.self, data).model()
-    }
-
-    func removeAccount(_ account: Account) async throws {
-        switch account.provider {
-        case .onePassword:
-            _ = try await runConfig(["account", "remove", "--id", account.id, "--json"])
-        case .envFile:
-            // A refusal here (e.g. "a rule still references it") comes back
-            // as an ok:false control body on stdout with a non-zero exit;
-            // execute() now surfaces that reason directly (see execute()'s
-            // terminationHandler) rather than a generic exit-code message.
-            _ = try await runConfig(["source", "remove", account.id, "--json"])
-        }
-    }
-
-    // MARK: config (rules + sources)
+    // MARK: config (rules + their hidden env sources)
 
     /// The whole config as `sigil-config export` emits it (the same JSON `list
     /// --json` prints): `{version, sources:[…], rules:[…]}`.
@@ -286,6 +240,20 @@ struct CLIDaemonClient: DaemonClient {
     func importConfig(_ config: SigilConfig) async throws {
         let body = try JSONEncoder().encode(config)
         _ = try await runConfig(["import", "--json"], stdin: body)
+    }
+
+    /// Seal every pair in one `source env set --stdin` call: the VALUES ride on
+    /// stdin as KEY=VALUE lines (never argv, which `ps` would leak), so one DEK
+    /// unwrap covers the whole batch. Core takes the VALUE verbatim after the
+    /// first `=`, so a value may itself contain `=`.
+    func sealEnv(source: String, secrets: [EnvSecret]) async throws {
+        let body = secrets.map { "\($0.key)=\($0.value)" }.joined(separator: "\n")
+        _ = try await runConfig(["source", "env", "set", source, "--stdin", "--json"],
+                                stdin: Data(body.utf8))
+    }
+
+    func unsealEnv(source: String, key: String) async throws {
+        _ = try await runConfig(["source", "env", "unset", source, "--key", key, "--json"])
     }
 
     func leases() async throws -> [Lease] {
@@ -455,39 +423,13 @@ struct StatusDTO: Decodable {
         }
         return StatusReport(daemonUp: daemon_up, socketPath: socket,
                             shim: ShimState(kind: shimKind, path: shim.path, issue: shim.issue),
-                            opFound: op.found, opPath: op.path, accountCount: accounts,
+                            opFound: op.found, opPath: op.path,
                             factor: f, relayReachable: relay_reachable, relayURL: relay_url,
                             lockedDown: locked_down)
     }
 }
 
 struct CheckDTO: Decodable { let label: String; let ok: Bool; let hint: String }
-
-private struct AccountDTO: Decodable {
-    let id: String; let label: String; let vaults: [String]
-    let health: String; let detail: String?; let last_used_ms: Int?
-    func model() -> Account {
-        Account(id: id, label: label, provider: .onePassword, vaults: vaults,
-                health: TokenHealth(rawValue: health) ?? .healthy, detail: detail,
-                lastUsedAt: last_used_ms.map { Date(timeIntervalSince1970: Double($0) / 1000) })
-    }
-}
-
-/// `sigil-config source list --json`: the generic source shape
-/// (crates/sigil/src/config.rs `Source`). Only the env-file entries turn into
-/// an `Account` here; 1Password sources are the separate credential store
-/// decoded by `AccountDTO` above, so a `provider: "1password"` source (if one
-/// ever exists here too) is not double-counted.
-private struct SourceDTO: Decodable {
-    let name: String
-    let provider: String
-    let account: String?
-    let path: String?
-    func envFileAccount() -> Account? {
-        guard provider == SourceProvider.envFile.rawValue, let path else { return nil }
-        return Account(id: name, label: name, provider: .envFile, path: path)
-    }
-}
 
 struct LeaseDTO: Decodable {
     let grant_hex: String; let caller: String; let account: String; let scope: String

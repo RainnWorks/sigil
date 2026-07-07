@@ -15,25 +15,60 @@
 
 import Foundation
 
-/// A named provider configuration a rule injects from. Mirrors `Source`: one
-/// struct, provider-specific fields present or absent by `provider`. `account`
-/// routes a 1Password credential (by its label); `path` names an env-file.
+/// The inline `env` provider id. Every rule the app authors owns one of these
+/// sources, named after the rule and never shown: it holds the rule's write-once
+/// KEY=VALUE environment, sealed under the DEK in the account store, and exposes
+/// only its KEY names here. Mirrors `crate::provider::EnvProvider::ID`.
+let envProviderID = "env"
+
+/// A named provider configuration a rule injects from. Mirrors `Source`
+/// (crates/sigil/src/config.rs). In this app every source is the inline `env`
+/// provider: `keys` lists the KEY names whose VALUES were sealed under the DEK
+/// (the values are never here, never on the wire the app sees). `account`/`path`
+/// are kept only so an older config authored by the CLI still round-trips.
+///
+/// Hand-written Codable because `keys` serializes with serde
+/// `skip_serializing_if = Vec::is_empty` on the Rust side, so it is simply absent
+/// when empty and must decode back to []; synthesized Decodable would reject the
+/// missing key.
 struct SourceConfig: Codable, Sendable, Equatable, Identifiable {
     var name: String
     var provider: String
     var account: String?
     var path: String?
+    /// The inline `env` provider's KEY names (never values). Empty for other
+    /// providers, and for an env source with nothing sealed yet.
+    var keys: [String] = []
 
     var id: String { name }
 
-    /// The provider as the app's enum, when it is one the app knows how to show.
-    var knownProvider: SourceProvider? { SourceProvider(rawValue: provider) }
+    enum CodingKeys: String, CodingKey { case name, provider, account, path, keys }
 
-    /// A one-line human description of where this source's secrets come from.
-    var origin: String {
-        if let path { return path }
-        if let account { return account }
-        return provider
+    init(name: String, provider: String, account: String? = nil,
+         path: String? = nil, keys: [String] = []) {
+        self.name = name
+        self.provider = provider
+        self.account = account
+        self.path = path
+        self.keys = keys
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        provider = try c.decode(String.self, forKey: .provider)
+        account = try c.decodeIfPresent(String.self, forKey: .account)
+        path = try c.decodeIfPresent(String.self, forKey: .path)
+        keys = try c.decodeIfPresent([String].self, forKey: .keys) ?? []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(name, forKey: .name)
+        try c.encode(provider, forKey: .provider)
+        try c.encodeIfPresent(account, forKey: .account)
+        try c.encodeIfPresent(path, forKey: .path)
+        if !keys.isEmpty { try c.encode(keys, forKey: .keys) }
     }
 }
 
@@ -155,97 +190,104 @@ struct SigilConfig: Codable, Sendable, Equatable {
     }
 }
 
-// MARK: - Recipes
+// MARK: - Quick starts
 
-/// A one-click starting point that lays down a sane source + rule for a common
-/// tool, so the first rule is never hand-authored from a blank form. Data-driven
-/// on purpose: adding a recipe is a new entry in `catalog`, not a new screen.
-/// Clicking a recipe opens the rule editor pre-filled with these defaults, where
-/// the user confirms or tweaks which source, risk, and match before saving.
-struct Recipe: Identifiable, Sendable {
+/// A one-tap starting point that pre-fills the command match and suggests the
+/// environment KEY names a common tool wants, so the first rule is not a blank
+/// form. It creates nothing on its own and names no provider or source: tapping
+/// one just opens the editor seeded with a command and some empty VALUE rows the
+/// user fills in. Adding one is a new entry in `catalog`, not a new screen.
+struct QuickStart: Identifiable, Sendable {
     let id: String
     let title: String
     let subtitle: String
     let symbol: String
-    /// The kind of source this recipe injects from. The editor pins the source
-    /// picker to this provider (or, for `.custom`, offers the full picker).
-    let provider: SourceProvider
-    /// Default argv[0] to match. Empty means "you name the command" (the editor
-    /// leaves the field blank and required).
+    /// argv[0] to match. Empty opens the editor fully blank (the "Any command"
+    /// tile) for authoring from scratch.
     let command: String
-    let subcommand: String?
-    let argvContains: [String]
-    let risk: RiskLevel
-    /// When true the recipe imposes no provider or command, opening the editor
-    /// fully blank for authoring any tool from scratch.
-    let custom: Bool
+    /// The environment KEY names to pre-lay as empty (write-only) VALUE rows.
+    let suggestedKeys: [String]
 
     init(id: String, title: String, subtitle: String, symbol: String,
-         provider: SourceProvider = .envFile, command: String = "",
-         subcommand: String? = nil, argvContains: [String] = [],
-         risk: RiskLevel = .routine, custom: Bool = false) {
+         command: String = "", suggestedKeys: [String] = []) {
         self.id = id
         self.title = title
         self.subtitle = subtitle
         self.symbol = symbol
-        self.provider = provider
         self.command = command
-        self.subcommand = subcommand
-        self.argvContains = argvContains
-        self.risk = risk
-        self.custom = custom
+        self.suggestedKeys = suggestedKeys
     }
 
-    /// The starting draft this recipe seeds the editor with.
+    /// The draft this quick start seeds the editor with.
     func draft() -> RuleDraft {
         var draft = RuleDraft()
-        draft.name = command.isEmpty ? id : command
+        draft.name = command
         draft.command = command
-        draft.subcommand = subcommand ?? ""
-        draft.argvContains = argvContains
-        draft.risk = risk
-        draft.provider = provider
-        draft.custom = custom
+        draft.env = suggestedKeys.map { EnvRow(key: $0) }
         return draft
     }
 
-    /// The shipped recipes. 1Password is the first entry, presented as one tool
-    /// among peers, never as the app's identity.
-    static let catalog: [Recipe] = [
-        Recipe(id: "1Password CLI",
-               title: "1Password CLI",
-               subtitle: "Gate op on your phone before any secret is read.",
-               symbol: "key.horizontal",
-               provider: .onePassword, command: "op", risk: .routine),
-        Recipe(id: "gcloud",
-               title: "gcloud",
-               subtitle: "Inject Google Cloud credentials from an env file when gcloud runs.",
-               symbol: "cloud",
-               provider: .envFile, command: "gcloud", risk: .elevated),
-        Recipe(id: "AWS CLI",
-               title: "AWS CLI",
-               subtitle: "Inject AWS credentials from an env file when aws runs.",
-               symbol: "cloud",
-               provider: .envFile, command: "aws", risk: .elevated),
-        // No SSH recipe yet: SSH signing is a separate first-class flow (the
-        // phone-gated ssh-agent, RequestKind.sshSignature), not an env-file
-        // injection, so there is no honest source a recipe could name here until
-        // an ssh-agent source provider exists.
-        Recipe(id: "Env file",
-               title: "Env file",
-               subtitle: "Inject a KEY=VALUE file into any command you name.",
-               symbol: "doc.text",
-               provider: .envFile, command: "", risk: .routine),
-        Recipe(id: "Any command",
-               title: "Any command",
-               subtitle: "Author a rule from scratch for any tool, any provider.",
-               symbol: "wand.and.stars",
-               provider: .envFile, command: "", risk: .routine, custom: true),
+    /// The shipped quick starts. `op` leads, presented as one command among peers
+    /// (you unlock it *with* Sigil), never as the app's identity.
+    static let catalog: [QuickStart] = [
+        QuickStart(id: "op",
+                   title: "1Password CLI",
+                   subtitle: "Gate op on your phone, then hand it its service-account token.",
+                   symbol: "key.horizontal",
+                   command: "op", suggestedKeys: ["OP_SERVICE_ACCOUNT_TOKEN"]),
+        QuickStart(id: "gcloud",
+                   title: "gcloud",
+                   subtitle: "Gate gcloud and inject its Google Cloud credentials.",
+                   symbol: "cloud",
+                   command: "gcloud", suggestedKeys: ["GOOGLE_APPLICATION_CREDENTIALS"]),
+        QuickStart(id: "aws",
+                   title: "AWS CLI",
+                   subtitle: "Gate aws and inject its access key.",
+                   symbol: "cloud",
+                   command: "aws", suggestedKeys: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]),
+        QuickStart(id: "custom",
+                   title: "Any command",
+                   subtitle: "Gate any command and inject the environment you name.",
+                   symbol: "wand.and.stars"),
     ]
 }
 
-/// The editable state behind the rule editor. Kept provider-blind: it names a
-/// command to match and a source to inject from, never anything 1Password-shaped.
+// MARK: - Environment rows
+
+/// One row of a rule's inline environment editor. The KEY is always visible; the
+/// VALUE is write-only. A row loaded from an existing rule (`existing == true`)
+/// shows a masked placeholder instead of the value the app can never read back;
+/// the user may type a replacement (`value` becomes non-empty) or drop the row.
+/// A fresh row is a KEY the user is adding now, VALUE and all.
+struct EnvRow: Identifiable {
+    let id = UUID()
+    var key: String
+    /// The VALUE the user typed. Empty on an `existing` row means "unchanged".
+    var value: String = ""
+    /// Whether this KEY is already sealed on the rule's source (loaded from
+    /// config), so its stored value is unknown to the app.
+    var existing: Bool = false
+
+    init(key: String = "", value: String = "", existing: Bool = false) {
+        self.key = key
+        self.value = value
+        self.existing = existing
+    }
+}
+
+/// A KEY=VALUE pair on its way to being sealed. The value lives here only for the
+/// moment between the editor and the `source env set` call that encrypts it under
+/// the DEK, then it is gone.
+struct EnvSecret: Sendable, Equatable {
+    var key: String
+    var value: String
+}
+
+// MARK: - Rule draft
+
+/// The editable state behind the rule editor: a command to match and the inline,
+/// write-once environment to inject. Provider-blind by construction; the backing
+/// `env` source is hidden plumbing the model manages, never named here.
 struct RuleDraft {
     var name = ""
     var command = ""
@@ -253,17 +295,17 @@ struct RuleDraft {
     var argvContains: [String] = []
     var flagPresent: [String] = []
     var flagEquals: [FlagEqConfig] = []
+    /// The inline environment rows (KEY always shown, VALUE write-only).
+    var env: [EnvRow] = []
+    /// Preserved across an edit but not surfaced: risk/lease policy is its own
+    /// screen (task #57). A brand-new rule defaults to routine.
     var risk: RiskLevel = .routine
-    /// nil means "use the global timeout".
+    /// Preserved across an edit but not surfaced. nil means "use the global timeout".
     var timeoutSec: Int?
-    /// The source picker's selection: the id of the chosen ingredient (a config
-    /// source name, or a 1Password credential label). Empty until chosen.
-    var sourceKey = ""
-    /// The provider this draft's source must be. Recipes pin it; the custom
-    /// path lets the picker span providers.
-    var provider: SourceProvider = .envFile
-    /// Whether the provider may be chosen freely (the "Any command" recipe).
-    var custom = false
+    /// The hidden `env` source backing an existing rule, carried across an edit so
+    /// its sealed values survive even a rename. nil for a brand-new rule (the
+    /// model allocates one on save).
+    var sourceName: String?
 
     /// The match this draft would author.
     var match: MatchConfig {
@@ -276,10 +318,11 @@ struct RuleDraft {
         )
     }
 
-    /// Seed a draft from an existing rule, for editing in place.
     init() {}
 
-    init(editing rule: RuleConfig, in config: SigilConfig, ingredients: [Account]) {
+    /// Seed a draft from an existing rule, for editing in place. The rule's env
+    /// source resolves to KEY-only rows (values stay sealed, unknown to the app).
+    init(editing rule: RuleConfig, in config: SigilConfig) {
         name = rule.name
         command = rule.match.command ?? ""
         subcommand = rule.match.subcommand ?? ""
@@ -288,20 +331,9 @@ struct RuleDraft {
         flagEquals = rule.match.flagEquals
         risk = rule.action.riskLevel
         timeoutSec = rule.action.timeoutSec
-        // Resolve the rule's config source back to a picker key: an env-file
-        // source keys on its own name; a 1Password source keys on the credential
-        // label it routes, so the picker lands on the same ingredient. Editing
-        // pins the provider to the rule's own (custom = false) so the source
-        // picker stays within it; silently repointing an op gate at an env file is
-        // not something a rule edit should allow. A cross-provider change is a
-        // deliberate remove-and-recreate.
+        sourceName = rule.action.source
         if let src = config.source(named: rule.action.source) {
-            provider = src.knownProvider ?? .envFile
-            custom = false
-            switch src.knownProvider {
-            case .onePassword: sourceKey = src.account ?? src.name
-            default: sourceKey = src.name
-            }
+            env = src.keys.map { EnvRow(key: $0, existing: true) }
         }
     }
 }

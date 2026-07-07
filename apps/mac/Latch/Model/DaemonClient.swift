@@ -40,31 +40,17 @@ protocol DaemonClient: Sendable {
     /// The doctor's ordered checks, each a (label, ok, hint) triple.
     func doctor() async throws -> [DoctorCheck]
 
-    // Accounts (really: configured secret sources — see `Account`, `AccountDraft`)
-    func accounts() async throws -> [Account]
-    /// Add a source for whichever provider the draft names. 1Password probes
-    /// the token's vaults live (empty is the warn case) and returns them on
-    /// the result; env-file has no equivalent probe (no credential to test),
-    /// so its result just echoes what was configured. The token, for the
-    /// 1Password case, never leaves this call.
-    func addAccount(_ draft: AccountDraft) async throws -> Account
-    /// 1Password only: replace the stored token. Env-file sources have no
-    /// token to rotate; the UI does not offer this for them.
-    func rotateAccount(id: String, token: String) async throws -> Account
-    /// Forget the source. Dispatches to the right backing store for
-    /// `account.provider` (the 1Password credential store vs. a named
-    /// config source), which is why this takes the whole `Account`.
-    func removeAccount(_ account: Account) async throws
-
-    // Config (the if-this-then-that rules + the sources they inject from).
-    // Loaded whole via `sigil-config export`; authored via the `rule`/`source`
-    // verbs; an in-place edit round-trips through `import` (export, mutate the
-    // one rule, replace). The daemon only reads this store, so all of it is
-    // sigil-config-side, never the always-on daemon.
+    // Config (the if-this-then-that rules + the hidden `env` sources they inject
+    // from). Loaded whole via `sigil-config export`; authored via the
+    // `rule`/`source` verbs; an in-place edit round-trips through `import`
+    // (export, mutate the one rule, replace). The daemon only reads this store,
+    // so all of it is sigil-config-side, never the always-on daemon.
     func config() async throws -> SigilConfig
-    /// `sigil-config source add <name> --provider … [--account …] [--path …]`.
+    /// `sigil-config source add <name> --provider env`. The app creates one
+    /// hidden `env` source per rule to hold its write-once environment.
     func addSource(_ source: SourceConfig) async throws
-    /// `sigil-config source remove <name>`. Refuses while a rule references it.
+    /// `sigil-config source remove <name>`. Also purges the source's sealed env
+    /// blob. Refuses while a rule references it.
     func removeSource(name: String) async throws
     /// `sigil-config rule add <name> --source … [match flags…] [--risk …] [--timeout …]`.
     func addRule(_ rule: RuleConfig) async throws
@@ -73,6 +59,16 @@ protocol DaemonClient: Sendable {
     /// `sigil-config import` (whole config on stdin). Validates referential
     /// integrity before persisting; used for an in-place rule edit.
     func importConfig(_ config: SigilConfig) async throws
+
+    // Inline env values (write-once, never read back). Each pair's VALUE is
+    // sealed under the DEK the moment it is set; only its KEY name survives in
+    // `config()`. Setting a value unwraps the DEK, so it presents Touch ID.
+    /// `sigil-config source env set <name> --stdin` with the KEY=VALUE pairs on
+    /// stdin (never argv), sealing every value in one DEK unwrap. An existing KEY
+    /// is replaced in place; a new KEY is appended.
+    func sealEnv(source: String, secrets: [EnvSecret]) async throws
+    /// `sigil-config source env unset <name> --key <KEY>`: drop one sealed KEY.
+    func unsealEnv(source: String, key: String) async throws
 
     // Leases
     func leases() async throws -> [Lease]

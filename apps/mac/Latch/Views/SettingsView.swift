@@ -1,6 +1,7 @@
 //  SettingsView.swift
-//  Timeouts, notifications, retention, transport (owned endpoint / relay), wipe.
-//  Also the Settings scene (Cmd+,). Voice stays calm and factual.
+//  Timeouts, notifications, retention, wipe. Also the Settings scene (Cmd+,).
+//  The relay is chosen per pairing (task #36), not here. Voice stays calm and
+//  factual.
 
 import SwiftUI
 
@@ -26,15 +27,6 @@ struct SettingsView: View {
                 }
                 Toggle("Notifications", isOn: $draft.notificationsEnabled)
                 Toggle("Reduce motion (numeric countdowns)", isOn: $draft.reduceMotion)
-            }
-
-            SwiftUI.Section("Transport") {
-                LabeledContent("Relay endpoint") {
-                    TextField("https://relay.example", text: $draft.relayURL)
-                        .textFieldStyle(.roundedBorder).font(.mono(11)).frame(minWidth: 220)
-                }
-                Text("The blind mailbox the Mac and phone meet on. Owned endpoint or a shared relay; it only ever carries sealed envelopes.")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
             }
 
             SwiftUI.Section("Retention") {

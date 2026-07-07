@@ -16,7 +16,6 @@ final class AppModel {
     // Observed state.
     private(set) var status: StatusReport?
     private(set) var doctorChecks: [DoctorCheck] = []
-    private(set) var accounts: [Account] = []
     private(set) var leases: [Lease] = []
     private(set) var history: [HistoryEntry] = []
     private(set) var pending: [PendingRequest] = []
@@ -25,9 +24,9 @@ final class AppModel {
     /// The if-this-then-that config: the rules the daemon gates on and the
     /// sources they inject from. Authored on the Rules screen.
     private(set) var config = SigilConfig()
-    /// Whether the first secondary load (accounts, config, history, settings) has
-    /// completed. The Rules and Sources screens gate their teaching empty state on
-    /// this so it never flashes before the load or on a pane re-select.
+    /// Whether the first secondary load (config, history, settings) has completed.
+    /// The Rules screen gates its teaching empty state on this so it never flashes
+    /// before the load or on a pane re-select.
     private(set) var secondaryLoaded = false
 
     /// The last daemon error, surfaced as a calm banner rather than an alert.
@@ -127,7 +126,6 @@ final class AppModel {
 
     func loadSecondaryScreens() async {
         doctorChecks = (try? await daemon.doctor()) ?? doctorChecks
-        accounts = (try? await daemon.accounts()) ?? accounts
         history = (try? await daemon.history()) ?? history
         settings = (try? await daemon.settings()) ?? settings
         config = (try? await daemon.config()) ?? config
@@ -177,85 +175,54 @@ final class AppModel {
         await performControl { try await self.daemon.revokeLease(grantPrefix: lease.grantHex) }
     }
 
-    @discardableResult
-    func addAccount(_ draft: AccountDraft) async -> Account? {
-        defer { Task { await loadSecondaryScreens() } }
-        do {
-            let account = try await daemon.addAccount(draft)
-            lastError = nil
-            return account
-        } catch {
-            lastError = describe(error)
-            return nil
-        }
-    }
+    // MARK: config (rules + their hidden env sources)
 
-    func removeAccount(_ account: Account) async {
-        do {
-            try await daemon.removeAccount(account)
-            lastError = nil
-        } catch {
-            lastError = describe(error)
-        }
-        await loadSecondaryScreens()
-    }
-
-    /// 1Password only: replace a stored token.
-    @discardableResult
-    func rotateAccount(id: String, token: String) async -> Account? {
-        defer { Task { await loadSecondaryScreens() } }
-        do {
-            let account = try await daemon.rotateAccount(id: id, token: token)
-            lastError = nil
-            return account
-        } catch {
-            lastError = describe(error)
-            return nil
-        }
-    }
-
-    // MARK: config (rules + sources)
-
-    /// Save a rule authored on the Rules screen. The chosen ingredient (a
-    /// 1Password account or an env file) is resolved to a config source first,
-    /// creating a 1Password source pointer on the fly when one does not exist yet,
-    /// so the user never hand-authors the source/rule wiring. A brand-new rule
-    /// goes through the `rule add` verb (whose targeted errors surface a duplicate
-    /// name or unknown source); an in-place edit round-trips the whole config
-    /// through `import`, which is atomic and revalidates referential integrity.
+    /// Save a rule authored on the Rules screen. Each rule owns a hidden `env`
+    /// source that holds its write-once environment; the model creates and manages
+    /// that source so the user only ever sees the rule. A brand-new rule goes
+    /// through the `rule add` verb (whose targeted errors surface a duplicate
+    /// name); an in-place edit round-trips the whole config through `import`,
+    /// which is atomic and revalidates referential integrity. Either way the
+    /// draft's environment is then sealed: new and replaced VALUES are encrypted
+    /// under the DEK in one pass (one Touch ID), and removed KEYs are dropped.
     ///
     /// Returns whether it actually took, so the editor sheet dismisses only on a
     /// real success and stays open (with the reason) on a refusal. The reload runs
     /// inline before returning: a detached refresh Task cannot be observed by the
     /// caller's synchronous check.
     @discardableResult
-    func saveRule(_ draft: RuleDraft, source ingredient: Account, replacing oldName: String?) async -> Bool {
+    func saveRule(_ draft: RuleDraft, replacing oldName: String?) async -> Bool {
         var ok = false
         do {
-            let sourceName = try await ensureSource(for: ingredient)
+            let cfg = try await daemon.config()
+            let sourceName = envSourceName(for: draft, in: cfg)
+            let priorKeys = cfg.source(named: sourceName)?.keys ?? []
+            // Create the hidden env source on first save (an edit reuses the
+            // existing one, so its sealed values survive even a rule rename).
+            if cfg.source(named: sourceName) == nil {
+                try await daemon.addSource(SourceConfig(name: sourceName, provider: envProviderID))
+            }
             let rule = RuleConfig(
                 name: draft.name.trimmed,
                 match: draft.match,
                 action: ActionConfig(source: sourceName, risk: draft.risk.rawValue,
                                      timeoutSec: draft.timeoutSec))
             if let oldName {
-                // Edit: replace the rule wholesale. `ensureSource` may have just
-                // added a source, so refetch the current config to include it,
-                // drop the old (and any same-named) rule, then import.
-                var cfg = try await daemon.config()
-                cfg.rules.removeAll { $0.name == oldName || $0.name == rule.name }
-                cfg.rules.append(rule)
-                try await daemon.importConfig(cfg)
+                var updated = try await daemon.config()
+                updated.rules.removeAll { $0.name == oldName || $0.name == rule.name }
+                updated.rules.append(rule)
+                try await daemon.importConfig(updated)
             } else {
                 try await daemon.addRule(rule)
             }
+            try await applyEnv(draft, source: sourceName, priorKeys: priorKeys)
             lastError = nil
             ok = true
         } catch {
             lastError = describe(error)
         }
-        // A repoint or a failed add can leave a 1Password routing source with no
-        // rule; sweep those up so they do not silently accumulate.
+        // A failed add can leave a hidden env source with no rule; sweep those up
+        // so they do not silently accumulate.
         await pruneOrphanSources()
         await loadSecondaryScreens()
         return ok
@@ -264,6 +231,8 @@ final class AppModel {
     func removeRule(_ rule: RuleConfig) async {
         do {
             try await daemon.removeRule(name: rule.name)
+            // Remove the hidden env source too (this purges its sealed blob).
+            try? await daemon.removeSource(name: rule.action.source)
             lastError = nil
         } catch {
             lastError = describe(error)
@@ -272,50 +241,50 @@ final class AppModel {
         await loadSecondaryScreens()
     }
 
-    /// Resolve an ingredient (an account or env file the user picked) to a config
-    /// source name a rule can reference, creating the source if it does not exist.
-    /// env-file ingredients already are config sources; a 1Password credential is
-    /// referenced through a source that routes it by label.
-    private func ensureSource(for ingredient: Account) async throws -> String {
-        let cfg = try await daemon.config()
-        switch ingredient.provider {
-        case .envFile:
-            if cfg.sources.contains(where: { $0.name == ingredient.id }) { return ingredient.id }
-            try await daemon.addSource(SourceConfig(
-                name: ingredient.id, provider: SourceProvider.envFile.rawValue,
-                account: nil, path: ingredient.path))
-            return ingredient.id
-        case .onePassword:
-            if let existing = cfg.sources.first(where: {
-                $0.provider == SourceProvider.onePassword.rawValue && $0.account == ingredient.label
-            }) {
-                return existing.name
-            }
-            var name = ingredient.label.sourceSlug
-            var n = 2
-            while cfg.sources.contains(where: { $0.name == name }) {
-                name = "\(ingredient.label.sourceSlug)-\(n)"
-                n += 1
-            }
-            try await daemon.addSource(SourceConfig(
-                name: name, provider: SourceProvider.onePassword.rawValue,
-                account: ingredient.label, path: nil))
-            return name
+    /// The hidden `env` source backing a rule: reuse the one an edit carries (so
+    /// its sealed values persist across a rename), else derive a fresh unique name
+    /// from the rule name. The name is never shown; it only wires rule to source.
+    private func envSourceName(for draft: RuleDraft, in cfg: SigilConfig) -> String {
+        if let existing = draft.sourceName { return existing }
+        var name = draft.name.trimmed.sourceSlug
+        var n = 2
+        while cfg.sources.contains(where: { $0.name == name }) {
+            name = "\(draft.name.trimmed.sourceSlug)-\(n)"
+            n += 1
+        }
+        return name
+    }
+
+    /// Seal the draft's environment into `source`. New rows (and existing rows the
+    /// user retyped) are sealed together in one `sealEnv` call so the DEK unwraps
+    /// once; KEYs that were present before the edit but are gone from the draft are
+    /// unset. Values live only for the moment of the seal, then are gone.
+    private func applyEnv(_ draft: RuleDraft, source: String, priorKeys: [String]) async throws {
+        let secrets: [EnvSecret] = draft.env.compactMap { row in
+            let key = row.key.trimmed
+            guard !key.isEmpty else { return nil }
+            // A fresh row always seals (even an empty VALUE = KEY set to ""); an
+            // existing row seals only when the user typed a replacement.
+            if row.existing && row.value.isEmpty { return nil }
+            return EnvSecret(key: key, value: row.value)
+        }
+        if !secrets.isEmpty {
+            try await daemon.sealEnv(source: source, secrets: secrets)
+        }
+        let keptKeys = Set(draft.env.map { $0.key.trimmed })
+        for removed in priorKeys where !keptKeys.contains(removed) {
+            try await daemon.unsealEnv(source: source, key: removed)
         }
     }
 
-    /// Remove 1Password routing sources no rule references any more. These are
-    /// pure plumbing the editor creates on the fly (`ensureSource`); env-file
-    /// sources are user-managed ingredients on the Sources screen and are left
-    /// alone even when unreferenced, since a user may add one before its rule.
+    /// Remove hidden `env` sources no rule references any more. These are pure
+    /// plumbing the model creates per rule; an orphan can only come from a failed
+    /// save, so sweeping them keeps the store tidy and leaks no sealed values.
     private func pruneOrphanSources() async {
         guard let cfg = try? await daemon.config() else { return }
         let referenced = Set(cfg.rules.map(\.action.source))
-        let orphans = cfg.sources.filter {
-            $0.provider == SourceProvider.onePassword.rawValue && !referenced.contains($0.name)
-        }
-        for orphan in orphans {
-            try? await daemon.removeSource(name: orphan.name)
+        for src in cfg.sources where src.provider == envProviderID && !referenced.contains(src.name) {
+            try? await daemon.removeSource(name: src.name)
         }
     }
 
