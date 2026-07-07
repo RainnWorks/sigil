@@ -596,7 +596,7 @@ inject-time key-set check; the other two are hygiene. No P0/P1.
 
 ---
 
-## 20. The persistent push-registration listener (idle ToDaemon reader)
+## 20. The single ToDaemon owner (demux to approval waiters)
 
 *Implementer note (behavior + residuals only; the verdict is the independent
 security-reviewer's).*
@@ -611,65 +611,67 @@ token expired unseen: `record_registration` never ran, `~/.sigil/push.json` was
 never written, and every later deposit carried no `PushHint`, so the relay rang
 no doorbell. The background doorbell simply never worked.
 
-**What was added.** `RemoteApprover::run_registration_listener` (spawned once by
-`daemon.rs::serve`, phone factor only) owns the idle `ToDaemon` reads: while the
-daemon is paired and no approval is running it long-polls `ToDaemon`, records any
-`PushRegister` to the disk-backed `PushStore` (0600, survives restart via
-`PushStore::load`), and drops everything else. The arm-time token is therefore
-captured the instant it lands. No phone change, no relay change, no new message
-type; the phone still deposits exactly as before.
+**Design: one reader, demultiplexing.** The relay hands each deposit to exactly
+ONE reader, so two concurrent readers of `ToDaemon` would steal each other's
+messages. The fix makes exactly one thread ever read `ToDaemon`:
+`RemoteApprover::run_todaemon_owner` (spawned once by `daemon.rs::serve`, phone
+factor only). It continuously long-polls `ToDaemon`, `classify`s each envelope
+through the one shared `ReplayGuard` (now touched by this thread alone), and
+routes by type:
 
-**Exclusion (the correctness-critical part).** The relay hands a fresh deposit to
-exactly one waiter, so if the listener and an in-flight `round_trip` both held a
-`ToDaemon` GET the approval's own `ApprovalResponse` could be delivered to the
-listener and dropped as unmatched, spuriously denying a legitimate approval. That
-is made impossible by a single `Mutex` (`RemoteApprover::channel`) that **both**
-paths acquire around every `ToDaemon` read:
+- a `PushRegister` -> `record_registration` to the disk-backed `PushStore` (0600,
+  survives restart via `PushStore::load`). This is how the arm-time token is
+  captured the instant it lands, long before any command fires;
+- an `ApprovalResponse` -> looked up in a `Mutex<HashMap<request_id,
+  std::sync::mpsc::Sender<ApprovalResponse>>>` (`RemoteApprover::waiters`) and
+  handed to the waiting `round_trip`; a response with no registered waiter is
+  stale (its approval already timed out and removed itself) and dropped, exactly
+  as the old inline demux skipped a non-correlating response;
+- anything that fails verify/replay/decode -> dropped (fail closed).
 
-- `round_trip` takes the lock **before** it deposits the request and holds it for
-  the entire deposit-and-wait. Because the deposit happens only under the lock,
-  the phone cannot answer while any listener read is outstanding, so a response
-  can only ever come back to the waiting `round_trip`.
-- The listener takes the lock only for one short poll at a time (default 2s),
-  then releases it, so an approval that wants the channel waits at most one poll
-  (on a transport that honours the recv timeout) to acquire it.
-- An `approval_active` `AtomicBool` (RAII-set for the round trip's lifetime) is a
-  pure latency/fairness hint: the listener reads it and *yields* (sleeps rather
-  than parking on the lock) while an approval runs, so it keeps observing the
-  shutdown flag instead of blocking behind a multi-minute approval. Exclusion
-  never depends on this flag; drop it and correctness is unchanged, only a
-  wasted listener beat.
+`round_trip` no longer reads `ToDaemon` at all. It **registers its waiter (the
+`Sender`) under `req.request_id` BEFORE it deposits the request**, then blocks on
+the paired receiver (`recv_timeout(self.timeout)`); on timeout, or a seal/deposit
+error, it fails closed to deny and always removes the waiter on the way out.
 
-At most one outstanding `ToDaemon` GET exists at any instant. A side effect of
-the same lock: two concurrent approvals with different grant keys now serialise
-on the channel instead of both polling `ToDaemon` (which, pre-change, could let
-one wait consume the other's response); this is a strict safety improvement for a
-single-user daemon but does mean a second distinct approval waits behind the
-first.
+**Why this is race-free (no stolen responses, no lock).** Registering before
+depositing closes the only window: the phone answers only after it *receives* the
+deposited request, so a response can never arrive before its waiter exists. There
+is exactly one `ToDaemon` reader, so no two reads ever contend for a deposit;
+there is no mutex around the channel, and thus nothing couples an approval's
+latency to the relay's long-poll. The owner is already parked in the very
+long-poll that will receive the response, so an approval piggybacks it with no
+added latency (strictly better than the pre-bug path, which issued a fresh GET per
+approval). Any number of concurrent approvals with distinct `request_id`s are
+served by the one reader via independent map entries; a test drives two at once
+and asserts each waiter receives exactly its own DEK (no cross-delivery).
 
-**Verify/replay semantics are identical on both paths.** The listener classifies
-every envelope through the same `classify` over the same single `ReplayGuard` the
-approval path uses, so the phone's one monotonic outbound counter is enforced
-across responses and registrations together exactly as before. The listener
+**Verify/replay semantics unchanged, and now single-threaded.** Every envelope
+still goes through the same `classify` over the same single `ReplayGuard`, so the
+phone's one monotonic outbound counter is enforced across responses and
+registrations together exactly as before; because only the owner reads, that guard
+is now touched by one thread (simpler, no lock-ordering question). The owner
 grants nothing and never touches a DEK or `Z_F`; a `PushRegister` only writes
 `{token, platform}`. A token is not a credential (§9 / the `push_store` module
 docs): it unlocks nothing and the doorbell payload is a static string.
 
 **Residuals for the reviewer to weigh:**
 
-- *Latency, not correctness.* On the network relay a single listener poll can
-  block for the relay's own ~25s long-poll hold regardless of the short recv
-  timeout, because a held GET is bounded server-side, not by the client timeout.
-  So an approval that fires while the listener is mid-poll can wait up to one hold
-  (~25s) to take the channel before it deposits the request. The response can
-  never be stolen (the phone cannot answer until we deposit, which is under the
-  lock), so this is added worst-case latency only. Shutdown can likewise take up
-  to one hold for the listener thread to observe the flag; the join is bounded by
-  that and the process is exiting regardless.
-- *No relay spam.* The listener holds exactly one `ToDaemon` connection and only
-  while idle; during an approval it yields entirely. This respects the standing
-  "NO SPAMMING, ONLY APNS wakeups" rule and adds no polling beyond the single
-  idle long-poll the relay already expects.
+- *Stale-response drop is intentional and fail-closed.* If a `round_trip` times
+  out and removes its waiter, a late response for that `request_id` finds no
+  waiter and is dropped. The approval has already denied; the dropped response
+  cannot resurrect a grant. A duplicate/replayed response is also stopped by the
+  `ReplayGuard` counter regardless.
+- *Owner liveness.* The doorbell depends on the owner thread running. If it exits
+  (only on the shutdown flag) or panics, arm-time registrations stop being
+  captured and, more importantly, in-flight approvals get no response and fail
+  closed to deny at their timeout. It never fails open. On the network relay a
+  single poll blocks inside the relay's ~25s hold, so shutdown/join can take up to
+  one hold; the process is exiting regardless.
+- *No relay spam.* The owner holds exactly one `ToDaemon` long-poll at a time and
+  no more; approvals reuse it rather than opening a second. This respects the
+  standing "NO SPAMMING, ONLY APNS wakeups" rule and adds no polling beyond the
+  single idle long-poll the relay already expects.
 - The relay stays powerless and anonymous: the token rides only as an opaque
   `PushHint` on a deposit, the daemon signs no push, and `push.json` stays 0600
   under `~/.sigil`. None of that changed.

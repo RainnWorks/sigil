@@ -140,9 +140,10 @@ fn load_remote_pairing(ks: &Arc<dyn Keystore>) -> Option<RemotePairingConfig> {
 /// the hardware biometric.
 ///
 /// Returns the gate plus, for the phone factor only, a live handle to the
-/// [`RemoteApprover`] so the caller can run its background registration listener
-/// (which owns the idle ToDaemon reads that capture the phone's arm-time push
-/// token). The other factors have no relay channel and hand back `None`.
+/// [`RemoteApprover`] so the caller can run its ToDaemon owner loop (the sole
+/// reader of the ToDaemon channel, which captures the phone's arm-time push token
+/// and routes approval responses to their waiters). The other factors have no
+/// relay channel and hand back `None`.
 fn build_gate(
     factor: Factor,
     remote: Option<RemotePairingConfig>,
@@ -161,9 +162,9 @@ fn build_gate(
             // phone simply polls.
             let push_store = Arc::new(crate::push_store::PushStore::load());
             // Hold the approver in an Arc: the gate takes one clone as its
-            // `Box<dyn Approver>` and `serve` keeps another to run the idle
-            // registration listener. Both share the one ToDaemon channel lock, so
-            // the listener never races an approval's response.
+            // `Box<dyn Approver>` and `serve` keeps another to run the ToDaemon
+            // owner loop. They share the waiter map, so the owner (the sole reader)
+            // routes each response to the approval waiting for it.
             let approver = Arc::new(
                 RemoteApprover::new(Arc::new(relay), cfg.daemon_identity, cfg.phone)
                     .with_push(push_store),
@@ -589,19 +590,21 @@ async fn serve(
     // one cap bounds both.
     let conns = ConnGate::new();
 
-    // The background registration listener (phone factor only). It owns the idle
-    // ToDaemon reads so the phone's arm-time push token is captured the instant it
-    // lands, instead of expiring in the relay before the next approval looks. It
-    // runs on its own thread (its recv is a blocking long-poll) and stops when the
-    // shutdown flag is set. Correctness against a concurrent approval is enforced
-    // inside the approver via a shared channel lock, not here.
+    // The single ToDaemon owner (phone factor only). It is the sole reader of the
+    // ToDaemon channel: it captures the phone's arm-time push token the instant it
+    // lands (instead of letting it expire in the relay before the next approval
+    // looks) and routes each approval response to its waiting round trip. It runs
+    // on its own thread (its recv is a blocking long-poll) and stops when the
+    // shutdown flag is set. Because it is the only reader, no two readers can steal
+    // each other's messages, and an approval piggybacks the poll it is already
+    // holding, so there is no lock and no latency coupling to the relay's hold.
     let listener_shutdown = Arc::new(AtomicBool::new(false));
     let listener_handle = remote_listener.map(|approver| {
         let stop = listener_shutdown.clone();
         std::thread::Builder::new()
-            .name("sigil-push-listener".into())
-            .spawn(move || approver.run_registration_listener(&stop))
-            .expect("spawning the push registration listener")
+            .name("sigil-todaemon-owner".into())
+            .spawn(move || approver.run_todaemon_owner(&stop))
+            .expect("spawning the ToDaemon owner")
     });
 
     loop {
@@ -663,9 +666,9 @@ async fn serve(
         }
     }
 
-    // Let the registration listener observe the shutdown flag and exit. It may be
-    // mid-poll (up to one relay long-poll hold), so this join is best-effort and
-    // bounded by that; the process is exiting regardless.
+    // Let the ToDaemon owner observe the shutdown flag and exit. It may be mid-poll
+    // (up to one relay long-poll hold), so this join is best-effort and bounded by
+    // that; the process is exiting regardless.
     if let Some(handle) = listener_handle {
         let _ = handle.join();
     }
@@ -2784,7 +2787,7 @@ mod tests {
         dek_bytes: [u8; 32],
         token: &str,
         secret: &str,
-    ) -> Arc<Core> {
+    ) -> (Arc<Core>, Arc<RemoteApprover>) {
         // The account store: token ciphertext sealed under the shared DEK. The
         // daemon holds NO DEK of its own.
         let sealing_dek: crate::secrets::Dek = Zeroizing::new(dek_bytes);
@@ -2798,14 +2801,23 @@ mod tests {
             )
             .unwrap();
 
-        let approver = RemoteApprover::new(transport, daemon_id, phone).with_timeout(timeout);
+        // Hold the approver in an Arc as production does: the gate takes one clone,
+        // the test keeps another to run the ToDaemon owner (the sole reader that
+        // routes the phone's response to the waiting round trip). Both clones point
+        // at the SAME instance, so they share the one waiter map. A short poll keeps
+        // the idle owner's join fast at test end.
+        let approver = Arc::new(
+            RemoteApprover::new(transport, daemon_id, phone)
+                .with_timeout(timeout)
+                .with_listen_poll(Duration::from_millis(20)),
+        );
         let pending = Arc::new(PendingRegistry::new());
-        Arc::new(Core {
+        let core = Arc::new(Core {
             keystore: Arc::new(MemoryKeystore::new()), // no DEK at rest
             accounts: Mutex::new(accounts),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
-            gate: ApprovalGate::new(Box::new(approver)),
+            gate: ApprovalGate::new(Box::new(approver.clone())),
             pending,
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
@@ -2817,7 +2829,21 @@ mod tests {
             factor: Factor::Phone,
             ssh_signers: Vec::new(),
             audit: None,
-        })
+        });
+        (core, approver)
+    }
+
+    /// Run a `RemoteApprover`'s ToDaemon owner loop on a background thread,
+    /// mirroring what `serve` spawns in production. The `approver` must be the same
+    /// instance the gate holds so they share the one waiter map. Returns the
+    /// shutdown flag and the join handle.
+    fn spawn_owner(
+        approver: Arc<RemoteApprover>,
+    ) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let handle = std::thread::spawn(move || approver.run_todaemon_owner(&stop));
+        (shutdown, handle)
     }
 
     /// Run the softphone's serve loop on a background thread until the returned
@@ -2842,7 +2868,7 @@ mod tests {
         let phone_pub = softphone.phone_identity();
         let mailbox = softphone.mailbox();
 
-        let core = remote_core(
+        let (core, approver) = remote_core(
             &dir,
             daemon_id,
             phone_pub,
@@ -2852,6 +2878,9 @@ mod tests {
             "remote-token-xyz",
             "remote-secret-99",
         );
+        // The daemon's ToDaemon owner: the sole reader that routes the phone's
+        // response to the waiting round trip.
+        let (owner_stop, owner) = spawn_owner(approver);
 
         let softphone = Arc::new(softphone);
         let (shutdown, approver_thread) = spawn_approver(softphone.clone(), relay.clone());
@@ -2903,6 +2932,8 @@ mod tests {
 
         shutdown.store(true, Ordering::SeqCst);
         approver_thread.join().unwrap();
+        owner_stop.store(true, Ordering::SeqCst);
+        owner.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2913,7 +2944,7 @@ mod tests {
         let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Deny);
         let phone_pub = softphone.phone_identity();
 
-        let core = remote_core(
+        let (core, approver) = remote_core(
             &dir,
             daemon_id,
             phone_pub,
@@ -2923,6 +2954,7 @@ mod tests {
             "tok",
             "should-never-appear",
         );
+        let (owner_stop, owner) = spawn_owner(approver);
 
         let softphone = Arc::new(softphone);
         let (shutdown, approver_thread) = spawn_approver(softphone.clone(), relay.clone());
@@ -2951,6 +2983,8 @@ mod tests {
 
         shutdown.store(true, Ordering::SeqCst);
         approver_thread.join().unwrap();
+        owner_stop.store(true, Ordering::SeqCst);
+        owner.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2993,7 +3027,7 @@ mod tests {
         se_key_id: &str,
         token: &str,
         secret: &str,
-    ) -> Arc<Core> {
+    ) -> (Arc<Core>, Arc<RemoteApprover>) {
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         // Mint/seal the Mac share m in the keystore, then seal the token to
         // (m, F) as a v2 record and persist it to the threshold store on disk.
@@ -3016,13 +3050,17 @@ mod tests {
         .unwrap();
         drop(m);
 
-        let approver = RemoteApprover::new(transport, daemon_id, phone).with_timeout(timeout);
-        Arc::new(Core {
+        let approver = Arc::new(
+            RemoteApprover::new(transport, daemon_id, phone)
+                .with_timeout(timeout)
+                .with_listen_poll(Duration::from_millis(20)),
+        );
+        let core = Arc::new(Core {
             keystore,                                      // holds m (sealed); NO DEK
             accounts: Mutex::new(AccountStore::default()), // no v1 accounts
             threshold: Mutex::new(store),
             leases: LeaseStore::new(),
-            gate: ApprovalGate::new(Box::new(approver)),
+            gate: ApprovalGate::new(Box::new(approver.clone())),
             pending: Arc::new(PendingRegistry::new()),
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
@@ -3034,7 +3072,8 @@ mod tests {
             factor: Factor::Phone,
             ssh_signers: Vec::new(),
             audit: None,
-        })
+        });
+        (core, approver)
     }
 
     #[test]
@@ -3050,7 +3089,7 @@ mod tests {
         let phone_pub = softphone.phone_identity();
         let mailbox = softphone.mailbox();
 
-        let core = remote_core_v2(
+        let (core, approver) = remote_core_v2(
             &dir,
             daemon_id,
             phone_pub,
@@ -3061,6 +3100,7 @@ mod tests {
             "v2-token-xyz",
             "v2-secret-99",
         );
+        let (owner_stop, owner) = spawn_owner(approver);
 
         let softphone = Arc::new(softphone);
         let (shutdown, approver_thread) = spawn_approver(softphone.clone(), relay.clone());
@@ -3109,6 +3149,8 @@ mod tests {
 
         shutdown.store(true, Ordering::SeqCst);
         approver_thread.join().unwrap();
+        owner_stop.store(true, Ordering::SeqCst);
+        owner.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3121,7 +3163,7 @@ mod tests {
         let (daemon_id, softphone, f_x963, se_key_id) = pair_softphone_v2(Policy::Deny);
         let phone_pub = softphone.phone_identity();
 
-        let core = remote_core_v2(
+        let (core, approver) = remote_core_v2(
             &dir,
             daemon_id,
             phone_pub,
@@ -3132,6 +3174,7 @@ mod tests {
             "tok",
             "should-never-appear",
         );
+        let (owner_stop, owner) = spawn_owner(approver);
 
         let softphone = Arc::new(softphone);
         let (shutdown, approver_thread) = spawn_approver(softphone.clone(), relay.clone());
@@ -3159,6 +3202,8 @@ mod tests {
 
         shutdown.store(true, Ordering::SeqCst);
         approver_thread.join().unwrap();
+        owner_stop.store(true, Ordering::SeqCst);
+        owner.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3216,14 +3261,17 @@ mod tests {
         .unwrap();
         drop(m);
 
-        let approver = RemoteApprover::new(Arc::new(relay.clone()), daemon_id, phone_pub)
-            .with_timeout(Duration::from_secs(3));
+        let approver = Arc::new(
+            RemoteApprover::new(Arc::new(relay.clone()), daemon_id, phone_pub)
+                .with_timeout(Duration::from_secs(3))
+                .with_listen_poll(Duration::from_millis(20)),
+        );
         let core = Arc::new(Core {
             keystore,
             accounts: Mutex::new(accounts),
             threshold: Mutex::new(tstore),
             leases: LeaseStore::new(),
-            gate: ApprovalGate::new(Box::new(approver)),
+            gate: ApprovalGate::new(Box::new(approver.clone())),
             pending: Arc::new(PendingRegistry::new()),
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
@@ -3236,6 +3284,7 @@ mod tests {
             ssh_signers: Vec::new(),
             audit: None,
         });
+        let (owner_stop, owner) = spawn_owner(approver);
 
         let softphone = Arc::new(softphone);
         let (shutdown, approver_thread) = spawn_approver(softphone.clone(), relay.clone());
@@ -3276,6 +3325,8 @@ mod tests {
 
         shutdown.store(true, Ordering::SeqCst);
         approver_thread.join().unwrap();
+        owner_stop.store(true, Ordering::SeqCst);
+        owner.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3410,7 +3461,7 @@ mod tests {
         // Daemon side: RemoteApprover over the real HTTP relay. No dev flag,
         // no biometric: the paired phone is the real approving factor.
         let daemon_relay = DaemonRelay::new(&base, mailbox).expect("daemon http client");
-        let core = remote_core(
+        let (core, approver) = remote_core(
             &dir,
             daemon_id,
             phone_pub,
@@ -3422,6 +3473,8 @@ mod tests {
         );
         // The inert-daemon invariant: no DEK at rest; it arrives per-approval.
         assert!(!core.keystore.has_dek(), "daemon holds no DEK at rest");
+        // The daemon's ToDaemon owner reads the real relay and routes the response.
+        let (owner_stop, owner) = spawn_owner(approver);
 
         // Phone side: the softphone serves over the real HTTP transport.
         let phone_relay = PhoneRelay::new(&base, mailbox)
@@ -3480,6 +3533,8 @@ mod tests {
 
         shutdown.store(true, Ordering::SeqCst);
         phone_thread.join().unwrap();
+        owner_stop.store(true, Ordering::SeqCst);
+        owner.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3521,7 +3576,7 @@ mod tests {
         let _server2 = bun_relay_on(port).expect("relay restart on the same port");
 
         // Generous timeout to absorb reconnect backoff.
-        let core = remote_core(
+        let (core, approver) = remote_core(
             &dir,
             daemon_id,
             phone_pub,
@@ -3531,6 +3586,7 @@ mod tests {
             "bounce-token",
             "bounce-secret-55",
         );
+        let (owner_stop, owner) = spawn_owner(approver);
 
         let phone_relay = PhoneRelay::new(&base, mailbox)
             .expect("phone transport")
@@ -3556,6 +3612,8 @@ mod tests {
 
         shutdown.store(true, Ordering::SeqCst);
         phone_thread.join().unwrap();
+        owner_stop.store(true, Ordering::SeqCst);
+        owner.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3782,7 +3840,7 @@ mod tests {
         // daemon holds none.
         let dir = tmpdir("reload-relay");
         let daemon_relay = DaemonRelay::new(&base, mailbox).expect("daemon http client");
-        let core = remote_core(
+        let (core, approver) = remote_core(
             &dir,
             cfg.daemon_identity,
             cfg.phone,
@@ -3793,6 +3851,7 @@ mod tests {
             "reload-secret-88",
         );
         assert!(!core.keystore.has_dek(), "daemon holds no DEK at rest");
+        let (owner_stop, owner) = spawn_owner(approver);
 
         // Phone side over the real HTTP transport.
         let phone_relay = PhoneRelay::new(&base, mailbox)
@@ -3840,6 +3899,8 @@ mod tests {
 
         shutdown.store(true, Ordering::SeqCst);
         phone_thread.join().unwrap();
+        owner_stop.store(true, Ordering::SeqCst);
+        owner.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 
