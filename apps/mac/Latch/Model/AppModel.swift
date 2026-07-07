@@ -232,6 +232,34 @@ final class AppModel {
         return ok
     }
 
+    /// Reorder the rules by drag. The rules array order IS the precedence: the
+    /// daemon resolves a command by first match in config order (crates/sigil
+    /// config.rs `resolve()` iterates the rules in order and returns the first
+    /// whose match hits), and the Rules screen renders that array top to bottom,
+    /// so the higher rule wins. A move is persisted through the same
+    /// export -> mutate -> import seam an edit uses: export the whole config,
+    /// reorder ONLY its rules array to match the new list order (sources are left
+    /// untouched), and import it back. `import` preserves rules order (it is a
+    /// Vec). The local array is reordered first so the drag lands instantly with
+    /// the list's native move animation; the reload then confirms it.
+    func moveRules(from offsets: IndexSet, to destination: Int) {
+        config.rules.move(fromOffsets: offsets, toOffset: destination)
+        let order = config.rules.map(\.name)
+        Task {
+            do {
+                var cfg = try await daemon.config()
+                cfg.rules.sort {
+                    (order.firstIndex(of: $0.name) ?? .max) < (order.firstIndex(of: $1.name) ?? .max)
+                }
+                try await daemon.importConfig(cfg)
+                lastError = nil
+            } catch {
+                lastError = describe(error)
+            }
+            await loadSecondaryScreens()
+        }
+    }
+
     func removeRule(_ rule: RuleConfig) async {
         do {
             try await daemon.removeRule(name: rule.name)

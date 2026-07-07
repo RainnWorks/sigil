@@ -34,7 +34,7 @@ actor MockDaemonClient: DaemonClient {
     /// the source's `keys`); kept only so set/unset and edits behave faithfully.
     private var envValues: [String: [(String, String)]] = [:]
 
-    init(scenario: MockScenario = .armedIdle) {
+    init(scenario: MockScenario = .armedIdle, config: SigilConfig = Fixtures.config) {
         self.scenario = scenario
         self.leasesStore = Fixtures.leases
         self.historyStore = Fixtures.history
@@ -43,7 +43,7 @@ actor MockDaemonClient: DaemonClient {
         self.macMode = (scenario == .hardenedPhoneOnly) ? .hardenedPhoneOnly : .enabled
         self.locked = (scenario == .lockedDown)
         self.appSettings = Fixtures.settings
-        self.configStore = Fixtures.config
+        self.configStore = config
         for src in configStore.sources where src.provider == envProviderID {
             envValues[src.name] = src.keys.map { ($0, "sealed") }
         }

@@ -9,8 +9,20 @@
 //  and its token is one of the environment values you inject. Everything here
 //  drives the `sigil-config` seam (rule verbs, a whole-config import for an edit,
 //  and the sealed `source env` values); no gating logic lives in Swift.
+//
+//  The rule LIST ORDER is precedence: the daemon resolves a command by first
+//  match in config order, so the rule higher in the list wins. The list is a
+//  native reorderable List (drag a rule up or down via `.onMove`), and each move
+//  is persisted by reordering the config's rules array through the same
+//  export -> mutate -> import seam an edit uses (AppModel.moveRules).
 
 import SwiftUI
+
+/// Horizontal inset matching the other panes' 20pt content padding. The screen
+/// is a plain `List` (so quick starts and rules scroll together and the rules can
+/// be dragged to reorder), which zeroes the default row insets, so every row
+/// restores this margin itself.
+private let contentInset: CGFloat = 20
 
 struct RulesView: View {
     @Environment(AppModel.self) private var model
@@ -20,14 +32,41 @@ struct RulesView: View {
     @State private var confirmingRemove: RuleConfig?
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                if let error = model.lastError { ErrorStrip(message: error) }
-                quickStarts
-                rules
+        List {
+            if let error = model.lastError {
+                ErrorStrip(message: error)
+                    .row(top: 20, bottom: 0)
             }
-            .padding(20)
+            quickStarts
+                .row(top: model.lastError == nil ? 20 : 16, bottom: 20)
+            rulesHeader
+                .row(top: 0, bottom: 8)
+            if model.config.rules.isEmpty {
+                // Hold the teaching block until the first load lands, so it never
+                // flashes before config arrives or on a pane re-select.
+                if model.secondaryLoaded {
+                    emptyState.row(top: 0, bottom: 20)
+                }
+            } else {
+                ForEach(model.config.rules) { rule in
+                    RuleCard(rule: rule,
+                             rank: rank(of: rule),
+                             source: model.config.source(named: rule.action.source),
+                             onEdit: {
+                                 editor = EditorContext(
+                                     draft: RuleDraft(editing: rule, in: model.config),
+                                     editingName: rule.name)
+                             },
+                             onRemove: { confirmingRemove = rule })
+                        .row(top: 0, bottom: 10)
+                }
+                // Dragging a rule up or down rewrites its precedence; the move is
+                // persisted by reordering the config's rules array (AppModel).
+                .onMove { model.moveRules(from: $0, to: $1) }
+            }
         }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
         .navigationTitle("Rules")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
@@ -80,26 +119,23 @@ struct RulesView: View {
 
     // MARK: rules
 
-    @ViewBuilder private var rules: some View {
-        VStack(alignment: .leading, spacing: 8) {
+    /// The section title and, once there are rules, the one quiet line that makes
+    /// the ordering's meaning legible: the list is precedence, top wins.
+    private var rulesHeader: some View {
+        VStack(alignment: .leading, spacing: 2) {
             Text("Your rules").font(.system(size: 13, weight: .semibold))
-            if model.config.rules.isEmpty {
-                // Hold the teaching block until the first load lands, so it never
-                // flashes before config arrives or on a pane re-select.
-                if model.secondaryLoaded { emptyState }
-            } else {
-                ForEach(model.config.rules) { rule in
-                    RuleCard(rule: rule,
-                             source: model.config.source(named: rule.action.source),
-                             onEdit: {
-                                 editor = EditorContext(
-                                     draft: RuleDraft(editing: rule, in: model.config),
-                                     editingName: rule.name)
-                             },
-                             onRemove: { confirmingRemove = rule })
-                }
+            if !model.config.rules.isEmpty {
+                Text("Checked top to bottom; the first match wins. Drag to reorder.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    /// A rule's 1-based precedence, its position in the config order. Shown on the
+    /// card so the ordering reads as ranked, not incidental.
+    private func rank(of rule: RuleConfig) -> Int {
+        (model.config.rules.firstIndex { $0.id == rule.id } ?? 0) + 1
     }
 
     private var emptyState: some View {
@@ -176,6 +212,7 @@ private struct QuickStartCard: View {
 
 private struct RuleCard: View {
     let rule: RuleConfig
+    let rank: Int
     let source: SourceConfig?
     let onEdit: () -> Void
     let onRemove: () -> Void
@@ -185,11 +222,18 @@ private struct RuleCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             // A rule is its match: the match summary is the label (it may repeat
-            // across rules; the user orders them and the higher one wins).
+            // across rules; the user drags to order them and the higher one wins).
+            // The grip signals the whole row is draggable; the rank names its
+            // precedence, so the ordering reads as deliberate.
             HStack(spacing: 8) {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 11)).foregroundStyle(.tertiary)
+                    .accessibilityHidden(true)
                 Text("when").font(.system(size: 10)).foregroundStyle(.tertiary)
                 Text(rule.match.summary).font(.mono(13, weight: .medium))
                 Spacer()
+                Text("#\(rank)").font(.mono(10)).foregroundStyle(.tertiary)
+                    .accessibilityLabel("Precedence \(rank)")
             }
 
             // What it injects (KEY names only; values are sealed and unreadable).
@@ -233,8 +277,59 @@ private struct FlowKeys: View {
     }
 }
 
+// MARK: - Row styling
+
+private extension View {
+    /// Restore the pane's content margins and card rhythm on a plain-`List` row:
+    /// no separator, no row fill (the card carries its own background), the shared
+    /// horizontal inset, and the caller's vertical gaps.
+    func row(top: CGFloat, bottom: CGFloat) -> some View {
+        self.listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
+            .listRowInsets(EdgeInsets(top: top, leading: contentInset,
+                                      bottom: bottom, trailing: contentInset))
+    }
+}
+
 #Preview("Rules") {
     NavigationStack { RulesView() }
         .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+        .frame(width: 720, height: 640)
+}
+
+// A layered list where two rules match the same base command: the specific
+// `op --account=prod` sits above the general `op`, so it wins first. This is the
+// precedence the drag-to-reorder exists to author.
+#Preview("Rules - ordering") {
+    let layered = SigilConfig(
+        version: 1,
+        sources: [
+            SourceConfig(name: "op-prod", provider: "env", keys: ["OP_SERVICE_ACCOUNT_TOKEN"]),
+            SourceConfig(name: "op", provider: "env", keys: ["OP_SERVICE_ACCOUNT_TOKEN"]),
+            SourceConfig(name: "aws", provider: "env",
+                         keys: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]),
+        ],
+        rules: [
+            RuleConfig(name: "op-prod",
+                       match: MatchConfig(command: "op",
+                                          flagEquals: [FlagEqConfig(flag: "--account", value: "prod")]),
+                       action: ActionConfig(source: "op-prod", risk: "routine", timeoutSec: nil)),
+            RuleConfig(name: "op",
+                       match: MatchConfig(command: "op"),
+                       action: ActionConfig(source: "op", risk: "routine", timeoutSec: nil)),
+            RuleConfig(name: "aws",
+                       match: MatchConfig(command: "aws"),
+                       action: ActionConfig(source: "aws", risk: "routine", timeoutSec: nil)),
+        ])
+    NavigationStack { RulesView() }
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: layered),
+                              approver: MockApprover()))
+        .frame(width: 720, height: 640)
+}
+
+#Preview("Rules - empty") {
+    NavigationStack { RulesView() }
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: SigilConfig()),
+                              approver: MockApprover()))
         .frame(width: 720, height: 640)
 }
