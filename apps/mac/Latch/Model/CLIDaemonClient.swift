@@ -220,15 +220,28 @@ struct CLIDaemonClient: DaemonClient {
     }
 
     func addRule(_ rule: RuleConfig) async throws {
-        var args = ["rule", "add", rule.name, "--source", rule.action.source]
+        let a = rule.action
+        var args = ["rule", "add", rule.name]
+        // An allow rule is a pure passthrough: `--allow`, no source, no lease, no
+        // timeout (core rejects those flags alongside --allow). A gate rule names
+        // its source and carries its lease/timeout policy.
+        if a.mode == .allow {
+            args += ["--allow"]
+        } else {
+            args += ["--source", a.source]
+        }
         let m = rule.match
         if let command = m.command { args += ["--command", command] }
         if let subcommand = m.subcommand { args += ["--subcommand", subcommand] }
         for needle in m.argvContains { args += ["--argv-contains", needle] }
         for flag in m.flagPresent { args += ["--flag", flag] }
         for fe in m.flagEquals { args += ["--flag-eq", "\(fe.flag)=\(fe.value)"] }
-        args += ["--risk", rule.action.risk]
-        if let timeout = rule.action.timeoutSec { args += ["--timeout", String(timeout)] }
+        if a.mode == .gate {
+            if case .leasable(let maxSecs) = a.lease {
+                args += ["--leasable", "--lease-max", String(maxSecs)]
+            }
+            if let timeout = a.timeoutSec { args += ["--timeout", String(timeout)] }
+        }
         args.append("--json")
         _ = try await runConfig(args)
     }
@@ -459,7 +472,10 @@ struct PendingDTO: Decodable {
     struct ProvDTO: Decodable { let process_chain: [String]; let cwd: String; let machine: String; let requested_ms: Int }
     let id: String; let kind: String; let command: [String]
     let secrets: [SecretDTO]; let ssh: SshDTO?; let provenance: ProvDTO
-    let risk: String; let reason: String?; let expires_ms: Int; let timeout_ms: Int; let coalesced: Int?
+    // The retired risk tier is gone; a request now carries its lease policy so a
+    // local approver knows whether it may offer "approve for N minutes".
+    let leasable: Bool?; let max_lease_secs: Int?
+    let reason: String?; let expires_ms: Int; let timeout_ms: Int; let coalesced: Int?
     func model() -> PendingRequest {
         PendingRequest(id: id, kind: RequestKind(rawValue: kind) ?? .secretRead, command: command,
                        secrets: secrets.map { SecretRef(provider: $0.provider, segments: $0.segments, label: $0.label) },
@@ -467,7 +483,7 @@ struct PendingDTO: Decodable {
                        provenance: Provenance(processChain: provenance.process_chain, cwd: provenance.cwd,
                                               machine: provenance.machine,
                                               requestedAt: Date(timeIntervalSince1970: Double(provenance.requested_ms) / 1000)),
-                       risk: RiskLevel(rawValue: risk) ?? .routine, reason: reason,
+                       leasable: leasable ?? false, maxLeaseSecs: max_lease_secs, reason: reason,
                        expiresAt: Date(timeIntervalSince1970: Double(expires_ms) / 1000),
                        timeoutSec: Double(timeout_ms) / 1000, coalesced: coalesced ?? 0)
     }

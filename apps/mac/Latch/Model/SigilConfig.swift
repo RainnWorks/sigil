@@ -152,20 +152,91 @@ struct MatchConfig: Codable, Sendable, Equatable {
     }
 }
 
-/// What to do on a match: gate under a risk policy, then inject the named
-/// source's environment. Mirrors `Action`. `risk` is always serialized by core;
-/// `timeout_sec` is absent when it falls back to the global setting.
+/// Whether a matched command is gated (held for phone approval, then injected)
+/// or allowed straight through (a passthrough: run directly, no approval, no
+/// injection). Mirrors `RuleMode` (crates/sigil/src/config.rs); serde spells the
+/// tags lowercase. The default is `gate`: a missing or unknown mode must gate,
+/// never silently pass a command through unapproved.
+enum RuleMode: String, Codable, Sendable, Equatable {
+    case gate
+    case allow
+}
+
+/// A gate rule's lease policy: whether one approval may also open a session
+/// window, and its cap. Mirrors `LeasePolicy` (crates/sigil-proto), an
+/// internally tagged enum: `{"kind":"runOnce"}` (the default, omitted on disk) or
+/// `{"kind":"leasable","maxSecs":900}`. Run-once is the safe default: every run
+/// needs a fresh approval.
+enum LeasePolicyConfig: Codable, Sendable, Equatable {
+    case runOnce
+    case leasable(maxSecs: Int)
+
+    enum CodingKeys: String, CodingKey { case kind, maxSecs }
+
+    var isRunOnce: Bool { if case .runOnce = self { return true } else { return false } }
+    var maxSecs: Int? { if case .leasable(let m) = self { return m } else { return nil } }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        switch try c.decode(String.self, forKey: .kind) {
+        case "leasable": self = .leasable(maxSecs: try c.decode(Int.self, forKey: .maxSecs))
+        default: self = .runOnce
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .runOnce:
+            try c.encode("runOnce", forKey: .kind)
+        case .leasable(let maxSecs):
+            try c.encode("leasable", forKey: .kind)
+            try c.encode(maxSecs, forKey: .maxSecs)
+        }
+    }
+}
+
+/// What to do on a match. For a gate rule: hold for phone approval under the
+/// lease policy, then inject the named source's environment. For an allow rule:
+/// run the command directly, naming no source and carrying no lease. Mirrors
+/// `Action`. Hand-written Codable to match core's serde exactly: `mode` is always
+/// written; `source` is omitted when empty (an allow rule); `lease` is omitted
+/// when run-once (the default); `timeout_sec` is absent when it falls back to the
+/// global setting.
 struct ActionConfig: Codable, Sendable, Equatable {
-    var source: String
-    var risk: String = RiskLevel.routine.rawValue
+    var mode: RuleMode = .gate
+    var source: String = ""
+    var lease: LeasePolicyConfig = .runOnce
     var timeoutSec: Int?
 
     enum CodingKeys: String, CodingKey {
-        case source, risk
+        case mode, source, lease
         case timeoutSec = "timeout_sec"
     }
 
-    var riskLevel: RiskLevel { RiskLevel(rawValue: risk) ?? .routine }
+    init(mode: RuleMode = .gate, source: String = "",
+         lease: LeasePolicyConfig = .runOnce, timeoutSec: Int? = nil) {
+        self.mode = mode
+        self.source = source
+        self.lease = lease
+        self.timeoutSec = timeoutSec
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        mode = try c.decodeIfPresent(RuleMode.self, forKey: .mode) ?? .gate
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? ""
+        lease = try c.decodeIfPresent(LeasePolicyConfig.self, forKey: .lease) ?? .runOnce
+        timeoutSec = try c.decodeIfPresent(Int.self, forKey: .timeoutSec)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(mode, forKey: .mode)
+        if !source.isEmpty { try c.encode(source, forKey: .source) }
+        if !lease.isRunOnce { try c.encode(lease, forKey: .lease) }
+        try c.encodeIfPresent(timeoutSec, forKey: .timeoutSec)
+    }
 }
 
 /// One rule: a match paired with the action to take when it holds. Mirrors `Rule`
@@ -295,13 +366,24 @@ struct RuleDraft {
     var argvContains: [String] = []
     var flagPresent: [String] = []
     var flagEquals: [FlagEqConfig] = []
-    /// The inline environment rows (KEY always shown, VALUE write-only).
+    /// The inline environment rows (KEY always shown, VALUE write-only). Only a
+    /// gate rule carries an environment; an allow rule injects nothing.
     var env: [EnvRow] = []
-    /// Preserved across an edit but not surfaced: risk/lease policy is its own
-    /// screen (task #57). A brand-new rule defaults to routine.
-    var risk: RiskLevel = .routine
+    /// Gate (hold for phone approval) or allow (passthrough, no approval). A
+    /// brand-new rule defaults to gate, the safe default.
+    var mode: RuleMode = .gate
+    /// Whether a gate rule may open a session lease. Off (run-once) by default.
+    var leasable: Bool = false
+    /// The lease cap in seconds when `leasable`. Preserved while toggling run-once
+    /// off and on. Defaults to 15 minutes, matching core's DEFAULT_LEASE_MAX_SECS.
+    var leaseMaxSecs: Int = 900
     /// Preserved across an edit but not surfaced. nil means "use the global timeout".
     var timeoutSec: Int?
+
+    /// The lease policy this draft would author (meaningful only for a gate rule).
+    var leasePolicy: LeasePolicyConfig {
+        leasable ? .leasable(maxSecs: leaseMaxSecs) : .runOnce
+    }
     /// The config identity of an existing rule, carried across an edit so it stays
     /// stable (never renamed). nil for a brand-new rule (the model mints one).
     var ruleName: String?
@@ -331,12 +413,41 @@ struct RuleDraft {
         argvContains = rule.match.argvContains
         flagPresent = rule.match.flagPresent
         flagEquals = rule.match.flagEquals
-        risk = rule.action.riskLevel
+        mode = rule.action.mode
+        if let cap = rule.action.lease.maxSecs {
+            leasable = true
+            leaseMaxSecs = cap
+        }
         timeoutSec = rule.action.timeoutSec
-        sourceName = rule.action.source
+        sourceName = rule.action.source.nilIfEmpty
         if let src = config.source(named: rule.action.source) {
             env = src.keys.map { EnvRow(key: $0, existing: true) }
         }
+    }
+}
+
+// MARK: - Lease duration formatting
+
+/// Human labels and preset caps for a lease window, shared by the rule editor
+/// (the cap picker) and the menubar (the "up to Nm" hint on a leasable request).
+enum LeaseDuration {
+    /// The cap presets offered in the editor, in seconds: 5m, 15m, 30m, 1h, 2h, 4h.
+    static let presets: [Int] = [300, 900, 1800, 3600, 7200, 14400]
+
+    /// A terse spelled-out label, e.g. "15 min", "1 hour", "2 hours".
+    static func label(_ secs: Int) -> String {
+        if secs >= 3600, secs % 3600 == 0 {
+            let h = secs / 3600
+            return "\(h) \(h == 1 ? "hour" : "hours")"
+        }
+        let m = max(1, secs / 60)
+        return "\(m) min"
+    }
+
+    /// A compact label for tight spots, e.g. "15m", "1h".
+    static func short(_ secs: Int) -> String {
+        if secs >= 3600, secs % 3600 == 0 { return "\(secs / 3600)h" }
+        return "\(max(1, secs / 60))m"
     }
 }
 

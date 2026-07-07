@@ -238,18 +238,23 @@ private struct RuleCard: View {
                     .accessibilityLabel("Precedence \(rank)")
             }
 
-            // Secondary line: the KEY names it injects (values are sealed, never
-            // shown). "sets" pins to the top of the chips, which wrap as whole
-            // units below.
-            HStack(alignment: .top, spacing: 6) {
-                Text("sets").font(.system(size: 10)).foregroundStyle(.tertiary)
-                    .padding(.top, 3)
-                if keys.isEmpty {
-                    Text("no environment").font(.system(size: 11)).foregroundStyle(.tertiary)
-                        .padding(.top, 1)
-                } else {
-                    FlowKeys(keys: keys)
+            // Secondary line: an allow rule reads plainly as a passthrough; a gate
+            // rule shows the KEY names it injects (values sealed, never shown) and,
+            // when leasable, its session-lease cap.
+            if rule.action.mode == .allow {
+                allowLine
+            } else {
+                HStack(alignment: .top, spacing: 6) {
+                    Text("sets").font(.system(size: 10)).foregroundStyle(.tertiary)
+                        .padding(.top, 3)
+                    if keys.isEmpty {
+                        Text("no environment").font(.system(size: 11)).foregroundStyle(.tertiary)
+                            .padding(.top, 1)
+                    } else {
+                        FlowKeys(keys: keys)
+                    }
                 }
+                if case .leasable(let cap) = rule.action.lease { leaseLine(cap) }
             }
 
             HStack {
@@ -270,6 +275,27 @@ private struct RuleCard: View {
                               lineWidth: 1)
         )
         .onHover { hovering = $0 }
+    }
+
+    /// An allow rule's passthrough readout. Brass, not cobalt: this rule runs
+    /// unapproved, so it is stated as the quiet heads-up it is.
+    private var allowLine: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "arrow.right.circle").font(.system(size: 11)).foregroundStyle(Palette.brass)
+            Text("runs without asking").font(.system(size: 11)).foregroundStyle(.primary)
+            Text("no approval, no injection").font(.system(size: 10)).foregroundStyle(.tertiary)
+            Spacer(minLength: 0)
+        }
+    }
+
+    /// A gate rule's lease cap, shown only when the rule is leasable.
+    private func leaseLine(_ cap: Int) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "clock.arrow.circlepath").font(.system(size: 10)).foregroundStyle(.tertiary)
+            Text("leasable up to \(LeaseDuration.short(cap))")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
     }
 
     /// The reorder handle. It does not itself drive the drag (the whole List row
@@ -369,10 +395,10 @@ private extension View {
     }
 }
 
-/// A layered config for previews: two rules match the same base command (the
-/// specific `op --account=prod` above the general `op`, so it wins first) plus a
-/// two-key `aws` rule. Exercises ordering, a long single key
-/// (OP_SERVICE_ACCOUNT_TOKEN), and multi-key chip wrapping in one list.
+/// A layered config for previews: the specific `op --account=prod` (leasable)
+/// above the general `op`, so it wins first; a two-key `aws` rule; and an `allow`
+/// passthrough. Exercises ordering, a long single key (OP_SERVICE_ACCOUNT_TOKEN),
+/// multi-key chip wrapping, a lease cap, and the allow-vs-gate readout in one list.
 private func previewLayeredConfig() -> SigilConfig {
     SigilConfig(
         version: 1,
@@ -386,13 +412,17 @@ private func previewLayeredConfig() -> SigilConfig {
             RuleConfig(name: "op-prod",
                        match: MatchConfig(command: "op",
                                           flagEquals: [FlagEqConfig(flag: "--account", value: "prod")]),
-                       action: ActionConfig(source: "op-prod", risk: "routine", timeoutSec: nil)),
+                       action: ActionConfig(mode: .gate, source: "op-prod",
+                                            lease: .leasable(maxSecs: 900))),
             RuleConfig(name: "op",
                        match: MatchConfig(command: "op"),
-                       action: ActionConfig(source: "op", risk: "routine", timeoutSec: nil)),
+                       action: ActionConfig(mode: .gate, source: "op")),
             RuleConfig(name: "aws",
                        match: MatchConfig(command: "aws"),
-                       action: ActionConfig(source: "aws", risk: "routine", timeoutSec: nil)),
+                       action: ActionConfig(mode: .gate, source: "aws")),
+            RuleConfig(name: "git-status",
+                       match: MatchConfig(command: "git", subcommand: "status"),
+                       action: ActionConfig(mode: .allow)),
         ])
 }
 

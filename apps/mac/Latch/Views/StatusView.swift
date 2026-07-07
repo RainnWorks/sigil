@@ -1,7 +1,7 @@
 //  StatusView.swift
 //  `sigil doctor` / status as a native panel: daemon up, shim on PATH + drift,
-//  op present, accounts, the resolved factor, relay reachability. Fix-it buttons,
-//  not error codes.
+//  the resolved factor, relay reachability. Whatever checks the daemon reports,
+//  rendered as fix-it buttons, not error codes.
 
 import SwiftUI
 
