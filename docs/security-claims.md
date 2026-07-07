@@ -1378,3 +1378,169 @@ migration (not the wire), so nothing dead needed removing daemon-side.
 `apps/phone/src/protocol/requests.ts` still carries a residual `risk: RiskLevel`
 on `ApprovalRequest` (and the `RiskLevel` type). It is now dead on the wire (the
 daemon never sends it); drop both there to match.
+
+## Independent review verdict: hot-reload + pairing biometric + delivery receipt + relay #53 (75932b0..518d28f)
+
+*Written by the independent security-reviewer (did NOT implement any of this
+code), per the review-integrity rule. Adversarial pass over commits `d916b2e`
+(#59 hot-reload + one socket, #48 pairing biometric), `88545c3` (#41 delivery
+receipt daemon side, lease-window wire alignment), and relay `a5efd0d` (#53
+offer-then-drain). This section is the verdict the implementer notes in §21
+(and the §14-16 notes) defer to.*
+
+**Gate run (this reviewer, on HEAD 518d28f):** `cargo test` = **378 passed, 0
+failed** across all crates; `cargo clippy --all-targets -- -D warnings` =
+**clean** (no warnings); `cargo fmt --check` = **clean**. Relay: worker vitest
+(`test/worker.test.ts`) = **18 passed**; bun (`bun/server.test.ts`,
+`shared/push.test.ts`, `shared/protocol.test.ts`, `longpoll-adversarial.test.ts`)
+= **40 passed across 4 files, 0 fail**. Em-dash/emoji scan of every added line in
+`crates` and `relay` (including `landing.html` and `README.md`): **none**.
+
+**Overall verdict: GREEN. No P0/P1/P2 findings. Ship-clear on these three
+changes.** Every adversarial item below verified sound against the code, not the
+implementer notes. The residuals are pre-existing, honestly documented, and
+fail-closed.
+
+### #59 config hot-reload + one authoritative socket — GREEN
+
+- **Fail-closed swap: GREEN.** `Core::reload_config` (`daemon.rs:341`) reaches
+  `ConfigCell::store` ONLY on the `Ok(cfg)` arm of `Config::load()`; the `Err`
+  arm returns the error string WITHOUT touching the cell, so a malformed,
+  truncated (half-written save), or unreadable file leaves the last-good `Arc`
+  in force. It never falls open and never downgrades to refuse-all — it keeps
+  exactly what last parsed. Proven by
+  `config_reload_is_fail_closed_on_a_malformed_file` (corrupts `config.json`,
+  asserts `op` still gates after the failed reload) and
+  `config_hot_reload_swaps_in_the_on_disk_rules`.
+- **Torn-read safety: GREEN.** `ConfigCell` is `RwLock<Arc<Config>>`. A gating
+  decision takes `snapshot()` (`daemon.rs:1144`) — read-lock, clone the `Arc`,
+  unlock — and evaluates the entire `resolve` against that one pinned `Arc`. A
+  concurrent `store()` write-swaps a *new* `Arc` and drops the caller's
+  reference to the old one only when the last snapshot holder releases it. A
+  reload landing mid-`resolve` is therefore invisible: whole-old or whole-new,
+  never a blend. The watcher thread is the sole writer.
+- **Socket: GREEN.** The default runtime dir resolves from
+  `confstr(_CS_DARWIN_USER_TEMP_DIR)` (`local.rs::darwin_user_temp_dir`), the
+  OS-provided per-user temp dir (`/var/folders/.../T/`), not the
+  attacker-strippable `$TMPDIR` env var — this is a *reduction* in attack
+  surface versus the prior `$TMPDIR` derivation, which an attacker could
+  override to redirect the bind. `prepare_socket` still forces the parent dir
+  0700 (`daemon.rs:822`) and both sockets 0600 (`daemon.rs:620,629`);
+  `service::socket_path_fits()` still guards `sun_path` length and is asserted in
+  `daemon_and_ssh_sockets_share_one_authoritative_runtime_dir`. `SIGIL_SOCK` /
+  `SIGIL_SSH_SOCK` remain full-path overrides; pointing a *client* elsewhere
+  requires already controlling the victim's environment (a pre-existing
+  compromise at which the secret is directly interceptable), and pointing the
+  *daemon* elsewhere requires controlling its launch — neither is a new lever.
+
+### #48 pairing biometric gate — GREEN
+
+- **First action in the single chokepoint, deny-closed: GREEN.**
+  `pairing_store::save` (`pairing_store.rs:169`) runs
+  `if ks.is_biometric() { ks.verify_presence(PAIRING_PRESENCE_REASON)? }` as
+  step 0, before the identity blob seal (step 1) and the config write. A decline
+  returns `Err` and NOTHING is written — proven by
+  `a_declined_biometric_refuses_the_pairing_and_writes_nothing` (asserts no
+  config file, no identity blob). `save` is the only writer of
+  `DAEMON_IDENTITY_LABEL`; both production callers (`cli.rs:1392,1503`) route
+  through it and each runs `ensure_dek()` first, so the SE DEK envelope
+  `verify_presence` exercises exists.
+- **Trait default is `Err`: GREEN.** `Keystore::verify_presence`
+  (`keystore.rs`) defaults to `Err(Backend(...))`; a keystore that reports
+  `is_biometric() == true` but omits the override fails closed at the gate.
+  Proven by `a_biometric_keystore_missing_a_verify_presence_override_fails_closed`.
+- **Real hardware check: GREEN.** `MacKeystore::verify_presence`
+  (`keystore_macos.rs`) performs the same `SecKeyCreateDecryptedData` SE
+  private-key op (`.biometryCurrentSet`) the approval unwrap uses, purely as a
+  presence probe, and drops the recovered `Zeroizing` DEK immediately — no DEK
+  crosses any boundary. The dev bypass is reachable only when
+  `is_biometric() == false`, which only `SIGIL_DEV_KEYSTORE` (behind its own
+  loud warning) produces; the gate simply never calls `verify_presence` in that
+  case. Residual: on-hardware Touch ID actually *firing* is UNPROVEN statically
+  (shares the §6 NEEDS-VERIFICATION residual; Tom's device checklist covers it).
+  Not a code finding.
+
+### #41 delivery receipt — GREEN (highest-risk new inbound; verified hardest)
+
+- **(a) Never mistaken for / never resolves a decision: GREEN.**
+  `ToDaemonMessage::from_value` classifies strictly by the `type` tag:
+  `"delivered"` -> `Delivered`, `"pushRegister"` -> `Push`, else -> `Response`.
+  An `ApprovalResponse` carries no `type`, so a receipt tag cannot shadow a
+  decision, and `DeliveryReceipt` carries no DEK/partial/lease so it cannot *be*
+  one. In the owner loop, `Delivered` dispatches ONLY to `mark_delivered`
+  (`remote.rs:508`) and never touches `route_response`/the waiter `tx`. Proven
+  by `a_delivery_receipt_marks_delivered_without_resolving_the_approval`
+  (waiter channel stays `Empty`).
+- **(b) Forge/tamper/replay rejected: GREEN.** `Delivered` rides the identical
+  seal/sign/replay path via the single `classify` -> `Envelope::open` ->
+  shared `ReplayGuard` pass. `hostile_relay.rs::
+  delivery_receipt_rides_the_sealed_signed_replay_protected_envelope` proves a
+  ciphertext bit-flip -> `BadSignature` (no forge) and an exact-bytes replay ->
+  `Replay(DuplicateRequest)` (no re-mark). A hostile relay cannot fabricate one.
+- **(c) Cannot desync the shared monotonic ReplayGuard: GREEN.** The guard is
+  consumed at envelope-open, before classification, identically for every
+  inbound kind, matching the phone's single monotonic outbound counter. A
+  `Delivered` advances `last_counter` exactly as a `Response` would. Worst case
+  under relay reordering (hold a `Response`, deliver a later `Delivered` first)
+  is a `CounterRegression` rejection of the delayed message — i.e. fail-closed
+  deny of the *display or the decision*, never a bypass. `mark_delivered` itself
+  only sets `delivered_at_ms` when unset (idempotent; duplicate/unknown/late =
+  no-op).
+- **(d) `pending` surface is display-only; no local-approval bypass: GREEN.**
+  Remote in-flight requests are enumerated onto `pending_json` from
+  `RemoteApprover::pending_snapshot` (names/provenance only — an
+  `ApprovalRequest` never carries a secret value). The control `Approve`/`Deny`
+  frames call `core.pending.resolve` (`daemon.rs:885,896`), which targets the
+  LOCAL `PendingRegistry`; a phone-gated request lives in the RemoteApprover
+  `waiters` map, not there, so `resolve` returns false ("no pending request with
+  that id"). The control socket is moreover only wired under
+  `Factor::DevInsecure`, not `Factor::Phone`. No new path lets a local
+  `approve/deny` resolve a phone-gated `request_id`.
+
+### lease-response wire (daemon sole lease authority) — GREEN
+
+- **GREEN.** `InstallLease` lost its `grant_key` field entirely (proto struct is
+  `{ ttl_ms }`); no code can trust a phone-supplied key because the field no
+  longer exists. `remote.rs::outcome_for` reads only `lease.ttl_ms` ->
+  `Decision::Lease(ttl)`. In `fulfill`, the daemon mints the grant key itself
+  from the kernel-verified caller (`lease::grant_key(&caller, cwd, &scope)`,
+  `daemon.rs:1208`) and clamps via `action.lease.clamp_secs`
+  (`daemon.rs:1354`): run-once -> `None` -> no lease; leasable ->
+  `min(requested, max_secs)`. A hostile approver cannot widen a lease past the
+  rule cap nor convert run-once to a lease — the per-rule policy is re-enforced
+  daemon-side regardless of what the phone returns. `leasable_rule_clamps_an_
+  over_cap_lease_to_the_rule_max` and the run-once tests cover it. The softphone
+  now sets only `ttl_ms`.
+
+### relay #53 offer-then-drain — GREEN (residual judged acceptable)
+
+- **GREEN.** `wake` (`protocol.ts:365`) now offers `list.map(i => i.blob)` and
+  empties the buffer (`list.length = 0`) ONLY after a waiter returns `true`
+  (was live/unsettled). A settled waiter returns `false` (`longPoll`'s waiter
+  closure guards on `settled`), leaving every `Item` in place with its ORIGINAL
+  `exp` — no TTL reset, no reorder, no drain-into-void for a waiter whose death
+  we can observe. `MAX_WAITERS` (8), coexisting-waiters, and newest-wins
+  (`waiters.pop()`) are intact; the drop-oldest-at-cap path resolves with `[]`
+  on a provably-empty slot. The `Waiter: (blobs) => boolean` contract has no
+  double-resolve (the `settled` latch) and no settled-but-registered drain
+  beyond the documented silent-orphan case.
+- **Residual (silent disconnect orphan): ACCEPTABLE, no fix required now.** A
+  connection that dies WITHOUT its abort signal firing is not `settled`, so it
+  still accepts the offer and the one queued deposit drains into the void. This
+  is **fail-closed**: the lost delivery makes the daemon time out and *deny*, it
+  never releases a secret. It is bounded by the sender's poll backstop and the
+  180s item TTL, requires an actual silent disconnect on top of unlucky timing,
+  and is unreachable by any shipped client (both are strictly single-flight per
+  slot). For a single-user personal instrument this does not warrant the
+  at-least-once/wire-receipt path yet; the module header documents it honestly
+  and flags confirming edge abort-signal behaviour on a real Cloudflare deploy.
+  Judged acceptable.
+
+### Cross-cutting invariants — GREEN
+
+Daemon-at-rest inert (config hot-reload swaps rules only; no token/DEK involved),
+secret-bytes-never-in-daemon-memory (the receipt and the `pending` snapshot carry
+references/labels/provenance, never a secret value), relay
+powerless/anonymous (no key-distribution role added; the receipt is opaque
+ciphertext to the relay), and zero em-dash/zero emoji in user-facing strings all
+hold across these diffs.
