@@ -79,6 +79,12 @@ export const PUSH_WINDOW_MS = 60_000;
 /** A mailbox id is the lowercase hex of the 32-byte proto `mailbox_id`. */
 export const MAILBOX_ID = /^[0-9a-f]{64}$/;
 
+/** The deploy date the landing page reports as "up since". A plain constant,
+ * NOT a stored timestamp: it states, honestly, when this deployment came up, and
+ * nothing about it is written anywhere. Wire it per-deploy via the RELAY_SINCE
+ * env/var; this default tracks the current deploy. */
+export const RELAY_SINCE = "2026-07-06";
+
 export type Item = { blob: string; exp: number };
 
 /** A pending long-poll GET's resolver, called at most once with whatever was
@@ -263,13 +269,48 @@ export function wake(list: Item[], waiters: Waiter[], now: number): void {
   waiter(drain(list, now));
 }
 
-/** JSON response bodies, shared so both variants emit identical bytes. */
+/** JSON response bodies, shared so both variants emit identical bytes. `health`
+ * carries the live relayed-message count (see {@link renderLanding}) so an
+ * uptime probe can read it without scraping HTML. That count is in-memory only,
+ * per running instance, and never persisted: it is a bare number, tied to no
+ * mailbox, time, or person, and it resets to zero whenever the instance
+ * restarts or is evicted. */
 export const RESP = {
-  health: () => ({ ok: true, service: "sigil-relay" }),
+  health: (count: number) => ({ ok: true, service: "sigil-relay", count }),
   deposited: () => ({ ok: true }),
   envelopes: (list: string[]) => ({ envelopes: list }),
   err: (error: string) => ({ ok: false, error }),
 };
+
+/** Group a non-negative integer with commas, deterministically. Hand-rolled
+ * rather than `toLocaleString` so the Worker and Bun variants emit byte-
+ * identical HTML regardless of the host runtime's locale data. */
+export function groupThousands(n: number): string {
+  return Math.max(0, Math.floor(n))
+    .toString()
+    .replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+/**
+ * Fill the landing page's two status placeholders at serve time: the deploy
+ * date ({@link RELAY_SINCE}) and the live relayed-message count. Rendered here
+ * so both variants produce identical bytes.
+ *
+ * The count is deliberately NOT stored anywhere: it is an in-memory tally held
+ * by whichever instance serves the page (a Worker isolate's module scope, or
+ * the Bun process), incremented once per successful deposit and forgotten the
+ * moment that instance restarts or is evicted. It records no mailbox, time, or
+ * person; it is a live "how many boxes have I passed since I woke" figure, and
+ * the page makes a joke of exactly that ("even this number isn't stored"). It
+ * is not an all-time total and cannot be, because the relay keeps nothing.
+ */
+export function renderLanding(html: string, since: string, count: number): string {
+  const n = Math.max(0, Math.floor(count));
+  return html
+    .replaceAll("{{RELAY_SINCE}}", since)
+    .replaceAll("{{MESSAGE_COUNT}}", groupThousands(n))
+    .replaceAll("{{MESSAGE_NOUN}}", n === 1 ? "message" : "messages");
+}
 
 /**
  * The body of a phone-bound deposit: the opaque envelope, plus an optional

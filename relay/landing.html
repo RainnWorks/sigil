@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sigil relay</title>
-<meta name="description" content="A blind mailbox for remote approvals. It moves sealed envelopes it cannot open, addressed by hashes it cannot reverse. Safe to run wide open, because there is nothing here to protect.">
+<meta name="description" content="A coat check for locked boxes. This relay carries the messages between your Mac and your phone that gate your command-line secrets, and it cannot read a single one. Safe to run wide open, because there is nothing here to steal.">
 <style>
   :root {
     --bg: #0b0d10;
@@ -16,6 +16,7 @@
     --accent: #7dd3c0;
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
     --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+    --hand: "Bradley Hand", "Segoe Print", "Comic Sans MS", cursive;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; }
@@ -50,71 +51,145 @@
     letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint);
     margin: 0 0 1rem;
   }
-  .cards { display: grid; gap: 0.9rem; grid-template-columns: 1fr 1fr; }
-  @media (max-width: 34rem) { .cards { grid-template-columns: 1fr; } }
-  .card {
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: 12px; padding: 1.1rem 1.15rem;
+
+  /* The ephemeral-counter gag: a live number with a hand-drawn arrow at it. */
+  .counter {
+    display: flex; align-items: center; gap: 0.5rem 1.25rem; flex-wrap: wrap;
+    margin: 2.25rem 0 0.75rem;
   }
-  .card h3 { margin: 0 0 0.35rem; font-size: 0.95rem; }
-  .card p { color: var(--muted); font-size: 0.9rem; margin: 0 0 0.75rem; }
-  .card .host { color: var(--accent); font-family: var(--mono); font-size: 0.85rem; }
-  code, pre {
-    font-family: var(--mono); font-size: 0.82rem;
-    background: #0c0f12; border: 1px solid var(--line); border-radius: 7px;
+  .counter .figure { display: flex; flex-direction: column; gap: 0.15rem; }
+  .counter .num {
+    font-family: var(--mono); font-size: 2.4rem; font-weight: 600;
+    color: var(--accent); letter-spacing: -0.02em; line-height: 1;
+    font-variant-numeric: tabular-nums;
   }
-  code { padding: 0.12rem 0.4rem; color: #cdd3d9; }
-  pre { padding: 0.7rem 0.8rem; margin: 0; overflow-x: auto; color: #cdd3d9; }
+  .counter .num-label {
+    font-size: 0.82rem; color: var(--faint);
+    text-transform: uppercase; letter-spacing: 0.07em;
+  }
+  .counter .aside { display: flex; align-items: center; gap: 0.35rem; }
+  .counter .arrow { flex: none; width: 78px; height: 52px; color: var(--accent); }
+  .counter .scrawl {
+    font-family: var(--hand); font-size: 1.15rem; color: var(--accent);
+    transform: rotate(-4deg); line-height: 1.15; max-width: 12rem;
+  }
+  .since { color: var(--faint); font-size: 0.85rem; margin: 0 0 1.15rem; }
+  .since b { color: var(--muted); font-weight: 600; font-family: var(--mono); }
+
+  /* The message-type list: each a sealed box the relay moves without opening. */
+  ul.carry { list-style: none; margin: 0.5rem 0 0; padding: 0; }
+  ul.carry li {
+    position: relative; padding: 0.55rem 0 0.55rem 1.9rem;
+    border-top: 1px solid var(--line); color: #cdd3d9; font-size: 0.98rem;
+  }
+  ul.carry li:first-child { border-top: 0; }
+  ul.carry li::before {
+    content: ""; position: absolute; left: 0; top: 0.85rem;
+    width: 12px; height: 10px; border: 1.5px solid var(--accent);
+    border-radius: 2px; opacity: 0.85;
+  }
+  ul.carry li b { color: var(--ink); font-weight: 600; }
+  ul.carry .soon {
+    font-family: var(--mono); font-size: 0.68rem; color: var(--faint);
+    border: 1px solid var(--line); border-radius: 5px; padding: 0.05rem 0.35rem;
+    margin-left: 0.4rem; text-transform: uppercase; letter-spacing: 0.06em;
+    vertical-align: 0.05rem;
+  }
+  .carry-note { color: var(--muted); font-size: 0.92rem; margin: 0.9rem 0 0; }
+
   footer {
     margin-top: 3.5rem; padding-top: 1.5rem; border-top: 1px solid var(--line);
-    color: var(--faint); font-size: 0.85rem;
-    display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap;
+    color: var(--faint); font-size: 0.9rem;
   }
-  footer a { color: var(--muted); text-decoration: none; }
-  footer a:hover { color: var(--ink); }
+  footer .trust { color: #cdd3d9; margin: 0 0 0.9rem; }
+  footer a { color: var(--accent); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  footer .row {
+    display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap;
+    color: var(--faint);
+  }
+  footer code {
+    font-family: var(--mono); font-size: 0.8rem; color: #cdd3d9;
+    background: #0c0f12; border: 1px solid var(--line); border-radius: 6px;
+    padding: 0.1rem 0.4rem;
+  }
 </style>
 </head>
 <body>
   <main class="wrap">
     <div class="mark" aria-hidden="true">&#9670;</div>
     <h1>sigil relay<span class="cursor">_</span></h1>
-    <p class="tag">A blind mailbox for remote approvals.</p>
+    <p class="tag">It carries your approvals. It cannot read one.</p>
 
-    <p class="lead">This is a relay for <strong>Sigil</strong>, the instrument that gates
-    your command-line secrets behind a tap on your phone.</p>
-
-    <p>It is deliberately powerless. It moves <strong>sealed envelopes it cannot
-    open</strong>, addressed by hashes it cannot reverse. It never sees a secret, a
-    command, an account, or who you are. It stores nothing: a message lives in
-    memory only long enough to hand it to the other side, then it is gone.</p>
+    <p class="lead">Think of it as a <strong>coat check that only takes locked
+    boxes</strong>. Your Mac and your phone share a key this relay never gets.
+    Every message is locked shut before it arrives, and only the far end can open
+    it. Even the name tags are scrambled, so the relay cannot tell whose box it is
+    holding. It hands boxes back and forth all day and holds a key to none of
+    them.</p>
 
     <p>That is why it is safe to run wide open. <strong>No accounts, no passwords,
-    nothing to configure or trust</strong> on the path your secret takes, because
-    that path holds nothing. The security is in the sealing, not the server.</p>
+    nothing to trust</strong> on the path your secret takes, because there is
+    nothing on that path worth stealing. The safety is in the lock, not the
+    server.</p>
 
-    <p class="note">The shared instance does keep one thing: a push key, so it can
-    ring your phone's doorbell. That key can buzz you; it cannot read a secret,
-    forge an approval, or learn what you decided. Self-host, and even that is yours.</p>
+    <div class="counter">
+      <div class="figure">
+        <span class="num">{{MESSAGE_COUNT}}</span>
+        <span class="num-label">{{MESSAGE_NOUN}} passed since it woke</span>
+      </div>
+      <div class="aside">
+        <svg class="arrow" viewBox="0 0 78 52" fill="none" aria-hidden="true">
+          <path d="M72 8 C 60 6, 40 10, 30 24 C 24 33, 21 38, 18 44"
+                stroke="currentColor" stroke-width="2.4"
+                stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M11 34 L 18 45 L 29 40"
+                stroke="currentColor" stroke-width="2.4"
+                stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span class="scrawl">even this number isn't stored</span>
+      </div>
+    </div>
+    <p class="since">up since <b>{{RELAY_SINCE}}</b>. that count lives in memory
+    and nowhere else; restart the relay and it forgets, back to zero. we keep
+    nothing, including this.</p>
 
     <hr class="rule">
 
-    <h2>Reach it</h2>
-    <div class="cards">
-      <div class="card">
-        <h3>Use this one</h3>
-        <p>The free default, run by Rainnworks. Nothing to set up.</p>
-        <span class="host">relay.rainn.works</span>
-      </div>
-      <div class="card">
-        <h3>Run your own</h3>
-        <p>The whole relay is one stateless worker. Point Sigil at it.</p>
-        <pre>docker run -p 8787:8787 ghcr.io/rainnworks/sigil-relay:latest</pre>
-      </div>
-    </div>
+    <h2>What it carries</h2>
+    <ul class="carry">
+      <li><b>The first hello.</b> When your Mac and phone pair, they trade sealed
+      introductions so each learns the other's key.</li>
+      <li><b>A request to approve.</b> Something on your Mac reached for a secret
+      and wants a yes before it hands one over.</li>
+      <li><b>Your answer.</b> Allow or deny, sealed on your phone with a fingerprint
+      or a face.</li>
+      <li><b>A doorbell address.</b> Your phone leaves a sealed note so it can be
+      buzzed the moment a request is waiting.</li>
+      <li><b>A "this one is settled" nudge.</b> When a request is answered or times
+      out, the other side hears it is done.<span class="soon">coming</span></li>
+    </ul>
+    <p class="carry-note">Every message it moves is one of these, and every one is
+    a locked box. The relay routes each to the right coat-check hook and passes it
+    on, still locked. It has never opened one and has no way to.</p>
+
+    <hr class="rule">
+
+    <h2>Why this exists</h2>
+    <p>It is <strong>two-factor authentication for your command line</strong>. Every
+    secret on your machine is one careless command, or one over-eager AI agent you
+    handed the keyboard, away from walking out the door.</p>
+    <p>Sigil puts a gate in front. When something reaches for a secret, your phone
+    lights up first: allow, or deny. <strong>"It can read every secret, always"</strong>
+    becomes <strong>"it can ask, and you decide, one tap at a time."</strong></p>
 
     <footer>
-      <span>Sigil, by Rainnworks</span>
-      <a href="https://github.com/rainnworks/sigil">Source and self-host guide</a>
+      <p class="trust">Do not trust us. <a href="https://github.com/RainnWorks/sigil">Read
+      the code.</a> The whole design assumes you will.</p>
+      <div class="row">
+        <span>Sigil, by Rainnworks</span>
+        <span>run your own: <code>docker run ghcr.io/rainnworks/sigil-relay</code></span>
+      </div>
     </footer>
   </main>
 </body>
