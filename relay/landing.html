@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sigil relay</title>
-<meta name="description" content="A coat check for locked boxes. This relay carries the messages between your Mac and your phone that gate your command-line secrets, and it cannot read a single one. Safe to run wide open, because there is nothing here to steal.">
+<meta name="description" content="A coat check for locked boxes. This relay carries the messages between your Mac and your phone that gate your command-line secrets, and it cannot read a single one. It holds each box only until the other side reaches for it, keeps nothing written down, and forgets every one. Safe to run wide open, because there is nothing here to steal.">
 <style>
   :root {
     --bg: #0b0d10;
@@ -102,6 +102,13 @@
     it. Even the name tags are scrambled, so the relay cannot tell whose box it is
     holding. It hands boxes back and forth all day and holds a key to none of
     them.</p>
+
+    <p>It <strong>keeps nothing</strong>. A box lands, waits in memory for the
+    other side to reach for it, and is gone the moment it is handed over. Nothing
+    is written to a disk or a database, ever. When a box is waiting, the relay can
+    <strong>buzz your phone</strong> so you know to look, without being told what
+    is inside or whose box it is. If it forgets everything, it never restarts far
+    from empty, and there is nothing in it to seize.</p>
 
     <p>That is why it is safe to run wide open. <strong>No accounts, no passwords,
     nothing to trust</strong> on the path your secret takes, because there is

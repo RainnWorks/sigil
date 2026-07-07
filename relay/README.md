@@ -156,15 +156,31 @@ orphan, and without flushing the orphan empty first) delivers to the connection
 that can still receive it. This closes the disconnect-then-reconnect ordering
 that eviction used to close, plus the fast-empty hammer eviction itself created.
 
-**It does not close every case.** If a deposit lands in the narrow window after
-a disconnect but *before* any reconnecting long-poll re-attaches at all, that
-deposit is still handed to the (already-abandoned) orphan — the only, hence
-newest, waiter — and is genuinely lost for that one delivery, not merely
-delayed. A second, narrower residual arrives with coexisting waiters: if a
-client holds two overlapping polls and the *newer* connection dies while the
-older stays live, `wake` serves the dead-newer one and that deposit is lost.
-Both require a real disconnect on top of unlucky timing (see the module comment
-above `longPoll` in `shared/protocol.ts` for the exact mechanism).
+**v5.2 hardened `wake` itself: offer-then-drain, not drain-then-offer.** The
+previous `wake` drained the buffer *first* and only then handed the blobs to the
+newest waiter, so if that waiter had already settled (its abort or timeout
+raced in mid-delivery) the drained blobs were dropped and lost. `wake` now
+*offers* the still-queued items to a waiter and empties the buffer only once the
+waiter reports it **accepted** (was live, resolved its promise); a waiter that
+rejects (already settled) leaves every item exactly where it was, same `exp`, no
+TTL reset, and `wake` falls through to the next-newest, then leaves the items
+queued for the next GET if none accept. This closes every disconnect the relay
+can *observe* — one whose `AbortSignal` fired — including the case where the
+newest waiter died mid-delivery while a live older waiter was still holding.
+
+**It still does not close the case the relay cannot observe.** The confirmed
+Durable-Object behaviour is that a long-poll GET's `AbortSignal` does *not*
+reliably fire, so a connection can die *silently*: its waiter is never marked
+settled, so it still reports it accepted and the offer still drains into the
+void. If a deposit lands in the narrow window after such a silent disconnect but
+*before* any reconnecting long-poll re-attaches at all, that deposit is handed
+to the (already-abandoned) orphan — the only, hence newest, waiter — accepted,
+and genuinely lost for that one delivery, not merely delayed. A second, narrower
+residual arrives with coexisting waiters: if a client holds two overlapping
+polls and the *newer* connection dies **silently** while the older stays live,
+`wake` serves the dead-newer one and that deposit is lost. Both require a real
+*silent* disconnect on top of unlucky timing (see the module comment above
+`longPoll` in `shared/protocol.ts` for the exact mechanism).
 
 #### KNOWN ISSUE: Worker/DO disconnect-orphan race (bounded, fail-closed, needs real-edge verification)
 
@@ -172,13 +188,22 @@ above `longPoll` in `shared/protocol.ts` for the exact mechanism).
   the full window; a second concurrent GET can no longer flush an existing
   waiter empty, so two GETs cannot ping-pong), and the disconnect-*then*-
   reconnect delivery (the reconnect, being the newest waiter, receives the
-  deposit rather than the orphan). This is the part of #53 now addressed.
-- **What remains (the residual below)**: an incoming request's `AbortSignal`
-  does not reliably fire when a long-poll GET is forwarded through a Durable
-  Object. A disconnect landing in the gap before *any* reconnect re-attaches
+  deposit rather than the orphan). This is the part of #53 addressed there.
+- **What v5.2 additionally closed**: `wake` now offers-then-drains, so it never
+  removes an item from the buffer before the waiter it hands to reports it
+  accepted. Any disconnect the relay can **observe** (its `AbortSignal` fired,
+  marking the waiter settled) can no longer swallow a drained-but-undelivered
+  item: the settled waiter rejects the offer, the item stays queued, and `wake`
+  falls through to a live older waiter if one exists.
+- **What remains (the residual below)**: the disconnect the relay **cannot**
+  observe. An incoming request's `AbortSignal` does not reliably fire when a
+  long-poll GET is forwarded through a Durable Object, so a silently-dead waiter
+  is never settled, still accepts the offer, and the offer drains into the void.
+  A silent disconnect landing in the gap before *any* reconnect re-attaches
   loses that one delivery to the orphaned waiter; and, more narrowly, if a
-  client holds two overlapping polls and the newer connection dies while the
-  older lives, `wake` (newest-first) serves the dead one and loses the deposit.
+  client holds two overlapping polls and the newer connection dies silently
+  while the older lives, `wake` (newest-first) serves the dead one and loses the
+  deposit.
 - **Blast radius, why this is an acceptable documented interim rather than a
   blocker**: the daemon and phone each deposit/respond once per exchange,
   with no higher-level resend today, so a lost delivery here is genuinely
@@ -214,7 +239,7 @@ above `longPoll` in `shared/protocol.ts` for the exact mechanism).
 
 | Constant | Value | Meaning |
 |----------|-------|---------|
-| `TTL_MS` | 120 000 (2 min) | Envelope lifetime. Short on purpose: this only has to outlive the gap to the other side's next poll or push wake-up, not a real offline window. |
+| `TTL_MS` | 180 000 (3 min) | Envelope lifetime. Short on purpose: this only has to outlive the gap to the other side's next poll or push wake-up, not a real offline window. Ordered above the proto replay window (150 000) so the relay never expires a queued envelope while the client would still accept it; the 30s of headroom over that window is what a client resend after a lost delivery leans on. |
 | `MAX_QUEUE` | 32 | Bounded FIFO depth per direction. Overflow is rejected (`507`), never silently dropped. |
 | `MAX_ENVELOPE_BYTES` | 16 384 | Size cap on `env` itself. Larger is rejected (`413`). |
 | `MAX_BODY_BYTES` | `MAX_ENVELOPE_BYTES` + 4096 | Coarse pre-read guard on the whole request body (generous slack for the JSON wrapper); the authoritative per-envelope cap is `MAX_ENVELOPE_BYTES` on `env`. |
@@ -358,7 +383,16 @@ Covered and passing locally:
   resolve the first empty (both coexist; a deposit goes to the newest), a
   disconnect/reconnect delivers the deposit to the live reconnect not the
   orphan, and the coexisting-waiter count is bounded by `MAX_WAITERS` (past the
-  cap the oldest is dropped).
+  cap the oldest is dropped). Plus the **v5.2 offer-then-drain** contract: a
+  disconnect landing mid-delivery on the newest (settled) waiter falls through
+  to a live older waiter rather than losing the item, and a lone settled waiter
+  leaves the item queued for the next GET instead of swallowing it.
+- **Disconnect-mid-delivery adversarial tests** (`longpoll-adversarial.test.ts`,
+  pure logic): the silent-orphan residual is still demonstrated as a real loss
+  (a waiter whose signal never fired still accepts into the void), while the
+  observable-disconnect case (settled waiter rejects) is proven **not** to lose;
+  plus the structural proof that one party's slot-flood cannot evict the other
+  party's delivery waiter.
 - **Opacity** — adversarial non-JSON bytes round-trip byte-identically inside
   `env`.
 - **Bounds** — an oversized envelope is `413`; the 33rd deposit past
