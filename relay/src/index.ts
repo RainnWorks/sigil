@@ -15,20 +15,10 @@
 // way any Worker does; an outstanding long-poll `await` is exactly that, not
 // idle time, so this never fights the runtime's own isolate lifecycle.
 //
-// GET / serves the landing page (../landing.html, bundled in as a text module -
-// see wrangler.jsonc's "rules" and src/html.d.ts) with two status figures
-// templated in at serve time (deploy date + a live relayed-message count); GET
-// /health is still the JSON liveness check any uptime probe relies on, now also
-// carrying that count.
-//
-// That count is EPHEMERAL by design and stored nowhere: it is the module-scope
-// `relayed` counter below, held only in this Worker isolate's own memory,
-// bumped once per successful deposit and reset to zero whenever the isolate is
-// evicted or recycled. There is no Durable Object storage, no KV, no `ctx.storage`
-// write anywhere in this file - the relay keeps literally nothing at rest, and
-// the landing page makes a joke of exactly that (an arrow at the number reading
-// "even this number isn't stored"). Because each isolate counts only what it
-// personally passed while awake, this is a live liveliness figure, not a total.
+// GET / serves the static landing page (../landing.html, bundled in as a text
+// module - see wrangler.jsonc's "rules" and src/html.d.ts); GET /health is the
+// JSON liveness check any uptime probe relies on. The relay keeps literally
+// nothing at rest: no `ctx.storage`, no KV, no counter, no persisted anything.
 
 import { DurableObject } from "cloudflare:workers";
 import * as P from "../shared/protocol";
@@ -41,21 +31,10 @@ export interface Env {
    * Absent disables the doorbell; every deposit still succeeds and relies on
    * the phone's poll backstop. */
   APNS_KEY_P8?: string;
-  /** The deploy date the landing page reports as "up since". Optional; a
-   * `var` in wrangler.jsonc, falling back to shared/protocol's RELAY_SINCE. */
-  RELAY_SINCE?: string;
   /** Overridable only so tests can shrink the long-poll window; production
    * should leave this unset and get shared/protocol's LONG_POLL_MS. */
   LONG_POLL_MS?: string;
 }
-
-// The live relayed-message count: in-memory ONLY, per isolate. Not persisted,
-// not a Durable Object, not `ctx.storage` - just a module-scope number that
-// resets to zero when this isolate is recycled. That impermanence is the point
-// (see the file header and the landing-page gag). It records nothing but its
-// own value: no mailbox id, no timestamp, nothing linkable to anyone. Bumped in
-// the top-level fetch below, once per successful deposit.
-let relayed = 0;
 
 const now = () => Date.now();
 
@@ -126,32 +105,18 @@ export class Mailbox extends DurableObject<Env> {
   }
 }
 
-/** A successful deposit is a POST to a mailbox's to-phone/to-daemon slot that
- * the Durable Object accepted (200). GETs (long-polls, drains) and rejects
- * (400/413/429/507) are not relayed messages and are not counted. */
-function isRelayedDeposit(method: string, verb: string | undefined, status: number): boolean {
-  return (
-    method === "POST" && (verb === "to-phone" || verb === "to-daemon") && status === 200
-  );
-}
-
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const parts = new URL(req.url).pathname.split("/").filter(Boolean);
     if (parts.length === 0) {
-      const since = env.RELAY_SINCE || P.RELAY_SINCE;
-      return new Response(P.renderLanding(landingHtml, since, relayed), {
+      return new Response(landingHtml, {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
     }
-    if (parts[0] === "health") return json(P.RESP.health(relayed));
+    if (parts[0] === "health") return json(P.RESP.health());
     if (parts[0] !== "mailbox" || !P.validId(parts[1])) {
       return json(P.RESP.err("bad_mailbox"), 400);
     }
-    const resp = await env.MAILBOX.getByName(parts[1]).fetch(req);
-    // Count one relayed message, in memory only (see `relayed`). Reading the
-    // status is all this needs; it records nothing about which mailbox or when.
-    if (isRelayedDeposit(req.method, parts[2], resp.status)) relayed += 1;
-    return resp;
+    return env.MAILBOX.getByName(parts[1]).fetch(req);
   },
 } satisfies ExportedHandler<Env>;

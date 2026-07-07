@@ -11,17 +11,11 @@
   // that mailbox's envelopes only in its own instance memory; it makes zero
   // storage writes (no persisted queue, no persisted counter). See
   // src/index.ts. The sqlite backing below is declared but unused: nothing in
-  // this class ever calls ctx.storage. The landing page's relayed-message count
-  // is likewise in-memory only (a module-scope counter in src/index.ts), never
-  // stored, so there is no stats Durable Object and no extra migration.
+  // this class ever calls ctx.storage. The relay keeps nothing at rest.
   "durable_objects": {
     "bindings": [{ "name": "MAILBOX", "class_name": "Mailbox" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Mailbox"] }],
-  // The deploy date the landing page reports as "up since". A plain constant,
-  // not a stored timestamp; bump it on each deploy. Falls back to
-  // shared/protocol's RELAY_SINCE if unset.
-  "vars": { "RELAY_SINCE": "2026-07-06" },
   // Bundles ../landing.html into src/index.ts as a raw text module (see
   // src/html.d.ts for the matching ambient type), so GET / serves the exact
   // same bytes as the Bun variant's readFileSync of that one source file.

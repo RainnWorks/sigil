@@ -18,10 +18,7 @@ Durable Object variant, `src/index.ts`). For self-hosting instead, see the
 
 Nothing else is required. There is no database, no KV namespace, no queue to
 provision: the relay's only state is a Durable Object's own in-memory buffer,
-declared entirely in `wrangler.jsonc`. The relayed-message count the landing
-page shows is likewise in-memory only (a module-scope counter, reset on isolate
-eviction), never stored, so there is no stats Durable Object and nothing to
-persist.
+declared entirely in `wrangler.jsonc`.
 
 ## Steps
 
@@ -92,9 +89,7 @@ doesn't arrive.
 Every `wrangler deploy` is a new version; roll back from the dashboard
 (Workers & Pages -> `sigil-relay` -> Deployments -> pick a previous version
 -> Rollback) or redeploy the previous commit. There is no data migration
-concern: the relay carries no persisted state to migrate or roll back. The
-landing page's relayed-message count is in-memory only and simply resets to zero
-on the new version, as it does on any restart.
+concern: the relay carries no persisted state to migrate or roll back.
 
 ## What still needs a human with Cloudflare access
 

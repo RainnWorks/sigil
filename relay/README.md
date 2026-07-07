@@ -90,7 +90,6 @@ a free, many-user release.
 | **Size** of each opaque blob | The pinned public keys themselves (it holds only their hash) |
 | A push token, for the instant it takes to ring one doorbell, then never again | Anything derived from ciphertext: it never parses an envelope |
 | The APNs signing key, as a platform secret | Any per-request detail in a push: the doorbell body is fixed and generic |
-| A **live in-memory count** of messages passed since the instance woke, forgotten on restart (see "The number the landing page shows") | Which mailbox, when, or by whom any counted message moved: the count is a bare number attributed to nothing, and it is stored nowhere |
 
 The relay treats every envelope as an opaque UTF-8 string. It is never parsed,
 hashed, or inspected: it flows in one deposit and out the other unchanged. The
@@ -114,8 +113,8 @@ way — the relay can't tell which, and doesn't need to.
 
 | Route | Purpose | Body / response |
 |-------|---------|------------------|
-| `GET /health` | Liveness. No mailbox needed. | `{"ok":true,"service":"sigil-relay","count":<n>}` where `count` is the live, in-memory relayed-message count for the serving instance (see "The number the landing page shows" below). |
-| `GET /` | The landing page (HTML). Templates two figures in at serve time: the deploy date and the live relayed-message `count`. | `text/html` |
+| `GET /health` | Liveness. No mailbox needed. | `{"ok":true,"service":"sigil-relay"}` |
+| `GET /` | The landing page (HTML). Static; served as-is, no templating. | `text/html` |
 | `POST /mailbox/{id}/to-phone` | Daemon deposits an envelope for the phone. | Body `{"env":"<opaque>","pushToken":"<hex>","platform":"apns"}`. `pushToken`/`platform` are optional; if `pushToken` is present the relay rings the doorbell for it and forgets it immediately. Response `{"ok":true}`. |
 | `GET /mailbox/{id}/to-phone` | Phone waits for the next envelope. Long-poll, drain-on-read. | `{"envelopes":["<opaque>",...]}` — immediately if something's already queued, otherwise held until a matching deposit or ~`LONG_POLL_MS` elapses (then `[]`). |
 | `POST /mailbox/{id}/to-daemon` | Phone deposits an envelope for the daemon. | Body `{"env":"<opaque>"}`. Response `{"ok":true}`. |
@@ -223,43 +222,14 @@ above `longPoll` in `shared/protocol.ts` for the exact mechanism).
 | `RATE_MAX` / `RATE_WINDOW_MS` | 60 / 60 000 | Per-mailbox fixed-window limiter over ordinary deposits/drains. Held only in the mailbox's in-memory record; never persisted. Sized for long-poll: each side holds at most one outstanding GET per slot and re-issues only after it resolves, so a two-sided active exchange is a couple of requests a minute per direction, with real headroom over that. Over is `429`. |
 | `PUSH_MAX` / `PUSH_WINDOW_MS` | 5 / 60 000 | A separate, tighter per-mailbox cap on push dispatches, so a leaked push token can't turn a mailbox into a doorbell-spam amplifier. **Residual**: this is per-mailbox, not per-token, so the same leaked token deposited against different mailbox ids is rate-limited independently for each; a push over this cap is silently skipped (the deposit still succeeds and 200s). |
 
-All of it — the mailbox's two queues, its rate counters, its push counter, and
-the relayed-message count the landing page shows — lives only in memory (a
-Durable Object's own instance field, a Bun process `Map`, or a Worker isolate's
-module scope). Nothing is ever written to `ctx.storage`, a database, or disk. If
-the process restarts or a Durable Object's isolate is evicted, every mailbox it
-held is simply gone, exactly the same as if a deposit had expired: the
-depositing side still has its own copy and can redeposit. The relay keeps
-literally nothing at rest.
-
-### The number the landing page shows (and forgets)
-
-The landing page shows a live count of "N messages passed since it woke", next to
-a plain deploy date it reports as "up since". That count is **ephemeral and
-stored nowhere**, and the page makes a joke of exactly that (a hand-drawn arrow
-at the number reading "even this number isn't stored"). It is behavior worth
-recording plainly:
-
-- **Definition.** Incremented **once per successful deposit** — one bump each
-  time an envelope is accepted into a mailbox queue (a `POST` `.../to-phone` or
-  `.../to-daemon` that `enqueue`s successfully), in either direction. A GET
-  (drain or long-poll) and a rejected deposit (bad body `400`, oversized `413`,
-  full queue `507`, rate-limited `429`) are not relayed messages and do not
-  count. Both variants use this one definition.
-- **Where it lives: memory only.** On the Worker it is a module-scope `let` in
-  the isolate that serves the request (bumped in the top-level `fetch` when the
-  mailbox DO returns `200` for a deposit); there is no stats Durable Object and
-  no `ctx.storage` write anywhere. On Bun it is a plain in-process variable. It
-  records nothing but its own value: no mailbox id, no timestamp, no per-message
-  row, nothing linkable to a user, a pairing, or a message.
-- **It resets, on purpose.** When the isolate is recycled or the process
-  restarts, the count is forgotten and starts again from zero. It is therefore
-  not an all-time total and cannot be one, because the relay persists nothing.
-  On the Worker it is also per-isolate: each isolate counts only what it
-  personally passed while awake. That impermanence is the point, not a bug.
-
-Because the count is stored nowhere, the "stores nothing at rest" promise stays
-literally true, and the landing page says so plainly.
+All of it — the mailbox's two queues, its rate counters, its push counter —
+lives only in the mailbox's in-memory record (a Durable Object's own instance
+field, or a value in the Bun process's `Map`). Nothing is ever written to
+`ctx.storage`, a database, or disk. If the process restarts or a Durable
+Object's isolate is evicted, every mailbox it held is simply gone, exactly the
+same as if a deposit had expired: the depositing side still has its own copy
+and can redeposit. The relay keeps literally nothing at rest, and the landing
+page (served statically, with no counter of any kind) says so plainly.
 
 ### The push doorbell (`shared/push.ts`)
 
@@ -393,17 +363,14 @@ Covered and passing locally:
   `env`.
 - **Bounds** — an oversized envelope is `413`; the 33rd deposit past
   `MAX_QUEUE` is `507`; a flood trips `429`; a body missing `env` is `400`.
-- **Relayed-message counter** (both suites) — it increments **exactly once per
-  successful deposit** in either direction, and does **not** move for a rejected
-  deposit (`400`/`507`) or a GET (drain/long-poll); `GET /` renders the copy and
-  both figures with no placeholder left unfilled (the ELI5 rewrite, the "even
-  this number isn't stored" gag, and the repo link included) and `GET /health`
-  carries the live `count`. Ephemerality (the whole point): the Worker suite
-  reaches into the mailbox `Durable Object` after a full deposit-then-drain and
-  asserts its `ctx.storage` is **completely empty** (nothing persisted, no
-  counter, no queue), proving an evicted isolate would lose the count; the Bun
-  suite deposits a known number into a fresh process, **hard-restarts** it, and
-  confirms the count is back to **zero**, because nothing was written anywhere.
+- **Zero storage at rest** (hard invariant) — the Worker suite reaches into the
+  mailbox `Durable Object` after a full deposit-then-drain and asserts its
+  `ctx.storage` is **completely empty**: no queue, no counter, nothing. There is
+  no stats Durable Object and no `ctx.storage` write anywhere in the relay.
+- **Landing page** (both suites) — `GET /` serves the static page as HTML with
+  the ELI5 copy (the coat-check framing, the message-type list, the 2FA section,
+  and the "Read the code" repo link), with no placeholder tokens left in it; the
+  landing page carries no counter. `GET /health` is a bare `{ok,service}` body.
 - **Push fail-open** — a deposit carrying a `pushToken` still 200s with no
   `APNS_KEY_P8` configured (both the Worker suite, which has no secret bound,
   and the Bun suite, which starts with the env var cleared).

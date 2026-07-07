@@ -8,18 +8,10 @@
 // side that deposited one still has its own copy if a retry is needed.
 // GETs are long-poll (see ../shared/protocol's longPoll/wake): held open on an
 // empty slot until a matching POST wakes them, or ~LONG_POLL_MS elapses. GET /
-// serves the landing page (../landing.html) with two status figures templated
-// in (deploy date + a live relayed-message count); GET /health is still the
-// JSON liveness check the Docker HEALTHCHECK and any uptime probe rely on, now
-// also carrying that count. Run: `bun run relay/bun/server.ts` (PORT defaults to
-// 8787).
-//
-// The relayed-message count is EPHEMERAL and stored nowhere: it is the
-// in-process `messageCount` below, held only in this process's memory, bumped
-// once per successful deposit and reset to zero on restart. No file, no disk, no
-// database - the relay keeps literally nothing at rest, and the landing page
-// makes a joke of exactly that. It records nothing but its own value: no mailbox
-// id, no timestamp, nothing linkable to anyone.
+// serves the static landing page (../landing.html); GET /health is the JSON
+// liveness check the Docker HEALTHCHECK and any uptime probe rely on. The relay
+// keeps literally nothing at rest: no file, no disk, no database, no counter.
+// Run: `bun run relay/bun/server.ts` (PORT defaults to 8787).
 
 import { readFileSync } from "node:fs";
 import * as P from "../shared/protocol";
@@ -64,16 +56,6 @@ const APNS_KEY_P8 = resolveApnsKey();
 // production should leave this unset and get shared/protocol's LONG_POLL_MS.
 const LONG_POLL_MS = Number(process.env.LONG_POLL_MS) || P.LONG_POLL_MS;
 
-// The deploy date the landing page reports as "up since": a plain constant, not
-// a stored timestamp. Overridable per-deploy; falls back to protocol's.
-const RELAY_SINCE = process.env.RELAY_SINCE || P.RELAY_SINCE;
-
-// The live relayed-message count: in-memory ONLY, for the life of this process.
-// Not persisted, no file, no disk - it resets to zero on restart, and that
-// impermanence is the point (see the file header and the landing-page gag). It
-// records nothing but its own value. Bumped once per successful deposit.
-let messageCount = 0;
-
 const port = Number(process.env.PORT ?? 8787);
 
 const server = Bun.serve({
@@ -81,11 +63,11 @@ const server = Bun.serve({
   async fetch(req) {
     const parts = new URL(req.url).pathname.split("/").filter(Boolean);
     if (parts.length === 0) {
-      return new Response(P.renderLanding(LANDING_HTML, RELAY_SINCE, messageCount), {
+      return new Response(LANDING_HTML, {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
     }
-    if (parts[0] === "health") return json(P.RESP.health(messageCount));
+    if (parts[0] === "health") return json(P.RESP.health());
     if (parts[0] !== "mailbox" || !P.validId(parts[1])) {
       return json(P.RESP.err("bad_mailbox"), 400);
     }
@@ -107,7 +89,6 @@ const server = Bun.serve({
       if (!body) return json(P.RESP.err("bad_body"), 400);
       const r = P.enqueue(m.toPhone, body.env, now());
       if (!r.ok) return json(P.RESP.err(r.code === 413 ? "too_large" : "queue_full"), r.code);
-      messageCount += 1; // one relayed message, in memory only (see messageCount)
       P.wake(m.toPhone, m.toPhoneWaiters, now());
       if (body.pushToken && P.pushOk(m, now())) {
         void sendPush(
@@ -131,7 +112,6 @@ const server = Bun.serve({
       if (env === null) return json(P.RESP.err("bad_body"), 400);
       const r = P.enqueue(m.toDaemon, env, now());
       if (!r.ok) return json(P.RESP.err(r.code === 413 ? "too_large" : "queue_full"), r.code);
-      messageCount += 1; // one relayed message, in memory only (see messageCount)
       P.wake(m.toDaemon, m.toDaemonWaiters, now());
       return json(P.RESP.deposited());
     }

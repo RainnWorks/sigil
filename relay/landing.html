@@ -16,7 +16,6 @@
     --accent: #7dd3c0;
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
     --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
-    --hand: "Bradley Hand", "Segoe Print", "Comic Sans MS", cursive;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; }
@@ -51,30 +50,6 @@
     letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint);
     margin: 0 0 1rem;
   }
-
-  /* The ephemeral-counter gag: a live number with a hand-drawn arrow at it. */
-  .counter {
-    display: flex; align-items: center; gap: 0.5rem 1.25rem; flex-wrap: wrap;
-    margin: 2.25rem 0 0.75rem;
-  }
-  .counter .figure { display: flex; flex-direction: column; gap: 0.15rem; }
-  .counter .num {
-    font-family: var(--mono); font-size: 2.4rem; font-weight: 600;
-    color: var(--accent); letter-spacing: -0.02em; line-height: 1;
-    font-variant-numeric: tabular-nums;
-  }
-  .counter .num-label {
-    font-size: 0.82rem; color: var(--faint);
-    text-transform: uppercase; letter-spacing: 0.07em;
-  }
-  .counter .aside { display: flex; align-items: center; gap: 0.35rem; }
-  .counter .arrow { flex: none; width: 78px; height: 52px; color: var(--accent); }
-  .counter .scrawl {
-    font-family: var(--hand); font-size: 1.15rem; color: var(--accent);
-    transform: rotate(-4deg); line-height: 1.15; max-width: 12rem;
-  }
-  .since { color: var(--faint); font-size: 0.85rem; margin: 0 0 1.15rem; }
-  .since b { color: var(--muted); font-weight: 600; font-family: var(--mono); }
 
   /* The message-type list: each a sealed box the relay moves without opening. */
   ul.carry { list-style: none; margin: 0.5rem 0 0; padding: 0; }
@@ -132,27 +107,6 @@
     nothing to trust</strong> on the path your secret takes, because there is
     nothing on that path worth stealing. The safety is in the lock, not the
     server.</p>
-
-    <div class="counter">
-      <div class="figure">
-        <span class="num">{{MESSAGE_COUNT}}</span>
-        <span class="num-label">{{MESSAGE_NOUN}} passed since it woke</span>
-      </div>
-      <div class="aside">
-        <svg class="arrow" viewBox="0 0 78 52" fill="none" aria-hidden="true">
-          <path d="M72 8 C 60 6, 40 10, 30 24 C 24 33, 21 38, 18 44"
-                stroke="currentColor" stroke-width="2.4"
-                stroke-linecap="round" stroke-linejoin="round"/>
-          <path d="M11 34 L 18 45 L 29 40"
-                stroke="currentColor" stroke-width="2.4"
-                stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-        <span class="scrawl">even this number isn't stored</span>
-      </div>
-    </div>
-    <p class="since">up since <b>{{RELAY_SINCE}}</b>. that count lives in memory
-    and nowhere else; restart the relay and it forgets, back to zero. we keep
-    nothing, including this.</p>
 
     <hr class="rule">
 
