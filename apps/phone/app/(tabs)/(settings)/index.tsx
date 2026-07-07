@@ -7,6 +7,7 @@ import { Card, Hairline, SectionHeader } from "@/components/ui/primitives";
 import { useTheme } from "@/theme/colors";
 import { radius, space } from "@/theme/tokens";
 import { useCountdown } from "@/src/lib/use-countdown";
+import { usePushDiag } from "@/src/lib/push";
 import { unpair } from "@/src/session/controller";
 import { type Lease } from "@/src/domain/types";
 import { store, useAppState } from "@/src/state/store";
@@ -18,6 +19,7 @@ import { store, useAppState } from "@/src/state/store";
 export default function SettingsScreen() {
   const p = useTheme();
   const s = useAppState();
+  const pushDiag = usePushDiag();
 
   function confirmReset(): void {
     Alert.alert(
@@ -107,6 +109,29 @@ export default function SettingsScreen() {
             value={s.settings.notificationsEnabled}
             onChange={(v) => store.setSetting("notificationsEnabled", v)}
           />
+          {pushDiag.phase !== "idle" && pushDiag.message ? (
+            <>
+              <Hairline inset={space.lg} />
+              <View style={{ flexDirection: "row", alignItems: "center", gap: space.md, padding: space.lg }}>
+                <View
+                  style={{
+                    width: 7,
+                    height: 7,
+                    borderRadius: 99,
+                    backgroundColor:
+                      pushDiag.phase === "registered"
+                        ? p.cobalt
+                        : pushDiag.phase === "failed" || pushDiag.phase === "blocked"
+                          ? p.brass
+                          : p.faint,
+                  }}
+                />
+                <Sans size={13} tone="muted" style={{ flex: 1 }}>
+                  {pushDiag.message}
+                </Sans>
+              </View>
+            </>
+          ) : null}
         </Card>
       </View>
 

@@ -11,6 +11,9 @@
       "supportsTablet": false,
       "bundleIdentifier": "works.rainn.sigil",
       "appleTeamId": "53W966FBFP",
+      "entitlements": {
+        "aps-environment": "production"
+      },
       "infoPlist": {
         "NSFaceIDUsageDescription": "Sigil uses Face ID to release the unwrap key that authorizes a secret. Denying never needs it.",
         "NSCameraUsageDescription": "Sigil uses the camera once, to scan the pairing QR shown on your Mac.",
