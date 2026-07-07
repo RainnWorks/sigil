@@ -947,6 +947,79 @@ These are real and deliberately surfaced, not defects hidden.
     plaintext).** Enforcing code: `provider.rs::{EnvProvider,spawn_with_env,
     decode_env_pairs}`, `daemon.rs::fulfill`, `cli.rs::seal_env_pairs`. See §19.
 
+14. **Pairing-authorization biometric now gates the persist step, independent of
+    DEK delivery (#48) — implementer behavior note, awaiting an independent
+    verdict.** `pairing_store::save` runs a hardware user-presence check
+    (`Keystore::verify_presence`, gated on `is_biometric()`) as its FIRST action,
+    before any state is written, and deny-closes: a declined or unavailable
+    biometric returns an error and NOTHING is persisted (no identity blob, no
+    config file). On the real macOS keystore `verify_presence` reuses the same
+    Secure Enclave `.biometryCurrentSet` private-key op the approval path uses
+    (`keystore_macos.rs::verify_presence` -> `unwrap_dek`), performed purely as a
+    presence probe and the recovered `Zeroizing` DEK dropped immediately — no DEK
+    crosses any boundary, which is what makes the gate independent of DEK
+    *delivery*. **Residual A (double biometric prompt on real hardware):** the
+    pairing ceremony still unwraps the DEK to seal it to the phone
+    (`pair.rs::run_ceremony` step 4), and this new persist-time probe is a second
+    SE op, so a real-hardware v1 pairing currently prompts Touch ID twice. The
+    codebase has no `LAContext` reuse-window plumbing yet (see the
+    `keystore_macos.rs::unwrap_dek` NEEDS-VERIFICATION note), so the two prompts
+    cannot presently be collapsed into one; a shared `LAContext` with
+    `touchIDAuthenticationAllowableReuseDuration` would reduce it to one and is the
+    natural follow-up. **Residual B (default fail-closed for a mis-declared
+    keystore):** the `Keystore::verify_presence` trait default returns `Err`, so a
+    keystore that reports `is_biometric() == true` but omits the override refuses
+    to pair rather than passing unchecked. The dev keystores keep
+    `is_biometric() == false` (only reachable under `SIGIL_DEV_KEYSTORE`, behind
+    its loud warning) and are never asked, so headless dev and tests still pair.
+    Enforcing code: `pairing_store.rs::save` (gate), `keystore.rs::verify_presence`
+    (fail-closed default), `keystore_macos.rs::verify_presence` (SE probe). Proving
+    tests: `pairing_store.rs::{a_declined_biometric_refuses_the_pairing_and_writes_nothing,
+    a_biometric_keystore_that_grants_presence_persists_the_pairing,
+    a_biometric_keystore_missing_a_verify_presence_override_fails_closed}`. The
+    on-hardware Touch ID firing is **UNPROVEN** (shares the §6 NEEDS-VERIFICATION
+    gap: the SE op is exercised only against the memory stand-in in tests).
+
+15. **Config hot-reload swaps the rule set live and stays fail-closed (#59) —
+    implementer behavior note, awaiting an independent verdict.** A watcher thread
+    stat-polls `~/.sigil/config.json` every 2s and, on an mtime change, calls
+    `Core::reload_config`, which loads and fully parses the file and only THEN
+    atomically swaps the in-memory `Arc<Config>` (`daemon.rs::{ConfigCell,
+    spawn_config_watcher,reload_config}`). **Fail-closed proof:** the swap
+    (`ConfigCell::store`) is on the `Ok` arm exclusively; a malformed, truncated
+    (half-written save), or unreadable file returns `Err` WITHOUT touching the
+    cell, so the last-good rules stay in force and gating is never downgraded by a
+    bad reload — a bad reload never falls open, nor to refuse-all. **Torn-read
+    safety:** a gating decision takes `ConfigCell::snapshot` (read-lock, clone the
+    `Arc`, unlock) and evaluates the whole `resolve` against that one `Arc`, so a
+    reload landing mid-decision is invisible to it (it sees the entire old or the
+    entire new config, never a blend). **Residuals:** (a) legacy `commands.json`
+    is not watched — only `config.json`, the current authoring surface — so a raw
+    legacy edit still needs a restart (migration is one-time); (b) removing
+    `config.json` entirely reloads to the empty default, which refuses every
+    command (fail-closed, but a surprising "everything stopped" if deleted by
+    accident); (c) the poll is mtime-based on APFS's high-resolution timestamps —
+    a same-nanosecond rewrite of identical length is theoretically missed, but
+    edits here are human-paced and single-user. Proving tests:
+    `daemon.rs::{config_hot_reload_swaps_in_the_on_disk_rules,
+    config_reload_is_fail_closed_on_a_malformed_file}`.
+
+16. **One authoritative default socket, resolved with zero environment (#59) —
+    implementer behavior note.** `local::socket_path` and `sshagent::socket_path`
+    both derive from a single `local::runtime_dir` anchored on the stable per-user
+    temp dir (`confstr(_CS_DARWIN_USER_TEMP_DIR)` on macOS), not the `$TMPDIR` env
+    var, so the daemon, the `op` shim, the `sigil` CLI, and a bare shell all
+    resolve the SAME `daemon.sock` / `ssh-agent.sock` with no `SIGIL_SOCK`.
+    `SIGIL_SOCK` / `SIGIL_SSH_SOCK` remain full-path overrides for tests and
+    bespoke deployments. The confstr path is short (~50 bytes), keeping the socket
+    well under `sun_path` (the existing `service::socket_path_fits` check still
+    guards it). **Residual:** if the confstr lookup ever returns empty we fall back
+    to `/tmp/sigil` (world-visible dir, but the socket itself is still 0600 and its
+    parent dir 0700 via `prepare_socket`); this is the same posture as the prior
+    `$TMPDIR`-absent fallback. Proving tests:
+    `local.rs::{socket_path_honors_the_sigil_sock_override,
+    daemon_and_ssh_sockets_share_one_authoritative_runtime_dir}`.
+
 ---
 
 ## Independent review verdict: pairing-security unit (f1192b6, 37035ee, 13e56c2)

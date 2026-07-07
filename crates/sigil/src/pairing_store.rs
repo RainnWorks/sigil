@@ -151,10 +151,30 @@ pub fn exists() -> bool {
     config_path().map(|p| p.exists()).unwrap_or(false)
 }
 
+/// The biometric prompt shown when authorizing a new pairing (#48). No
+/// em-dash, no emoji (invariant #6).
+const PAIRING_PRESENCE_REASON: &str = "Authorize pairing this phone to Sigil";
+
 /// Persist a completed pairing: seal the daemon identity into the keystore, then
 /// write the public config file 0600.
+///
+/// **Biometric gate (#48):** before anything is persisted, authorizing a new
+/// pairing on a hardware keystore requires a live Touch ID / Secure Enclave
+/// user-presence, independent of DEK delivery. This is deny-closed and is the
+/// first thing `save` does, so a declined or absent biometric refuses the pairing
+/// and NOTHING is written (no identity blob, no config file). Non-biometric dev
+/// keystores (`is_biometric() == false`, only reachable under `SIGIL_DEV_KEYSTORE`
+/// with its loud warning) skip the check so headless dev and tests still pair; the
+/// default real-hardware keystore requires it.
 pub fn save(ks: &dyn Keystore, p: &NewPairing) -> Result<(), PairingStoreError> {
     use std::os::unix::fs::PermissionsExt;
+
+    // 0. Gate on a live hardware biometric before persisting anything. A real
+    //    keystore performs a Secure Enclave user-presence check here; a decline
+    //    returns an error and the pairing is refused with nothing written.
+    if ks.is_biometric() {
+        ks.verify_presence(PAIRING_PRESENCE_REASON)?;
+    }
 
     // 1. Seal the private daemon identity into the keystore blob seam. The bytes
     //    are Zeroizing and are wiped when `secret` drops at the end of this call.
@@ -268,6 +288,7 @@ pub fn remove(ks: &dyn Keystore) -> Result<bool, PairingStoreError> {
 mod tests {
     use super::*;
     use crate::keystore::MemoryKeystore;
+    use crate::secrets::Dek;
 
     /// A private SIGIL_HOME for one test, plus a guard that restores the env.
     /// Holds the process-wide env lock so parallel tests do not clobber it.
@@ -327,6 +348,132 @@ mod tests {
         };
         // Rebuild a daemon identity handle with the same public id for asserts.
         (DeviceIdentity::generate(), daemon_pub, np)
+    }
+
+    /// A keystore that reports as biometric with a scripted presence result, so
+    /// the #48 pairing gate is testable headlessly. Blob/DEK ops delegate to an
+    /// inner [`MemoryKeystore`].
+    struct ScriptedBiometric {
+        inner: MemoryKeystore,
+        grant_presence: bool,
+    }
+    impl ScriptedBiometric {
+        fn new(grant_presence: bool) -> Self {
+            Self {
+                inner: MemoryKeystore::new(),
+                grant_presence,
+            }
+        }
+    }
+    impl Keystore for ScriptedBiometric {
+        fn store_blob(&self, label: &str, data: &[u8]) -> Result<(), KeystoreError> {
+            self.inner.store_blob(label, data)
+        }
+        fn load_blob(&self, label: &str) -> Result<Option<Vec<u8>>, KeystoreError> {
+            self.inner.load_blob(label)
+        }
+        fn delete_blob(&self, label: &str) -> Result<(), KeystoreError> {
+            self.inner.delete_blob(label)
+        }
+        fn is_biometric(&self) -> bool {
+            true
+        }
+        fn has_dek(&self) -> bool {
+            self.inner.has_dek()
+        }
+        fn ensure_dek(&self) -> Result<(), KeystoreError> {
+            self.inner.ensure_dek()
+        }
+        fn unwrap_dek(&self, reason: &str) -> Result<Dek, KeystoreError> {
+            self.inner.unwrap_dek(reason)
+        }
+        fn verify_presence(&self, _reason: &str) -> Result<(), KeystoreError> {
+            if self.grant_presence {
+                Ok(())
+            } else {
+                Err(KeystoreError::Declined)
+            }
+        }
+    }
+
+    #[test]
+    fn a_biometric_keystore_that_grants_presence_persists_the_pairing() {
+        // #48: on a hardware keystore, authorizing a pairing runs the biometric
+        // gate; a granted presence lets it persist normally.
+        let _home = HomeGuard::new("bio-grant");
+        let ks = ScriptedBiometric::new(true);
+        let (_i, _p, np) = new_pairing();
+        save(&ks, &np).expect("a granted biometric persists the pairing");
+        assert!(exists(), "the pairing was written");
+        assert!(
+            ks.load_blob(DAEMON_IDENTITY_LABEL).unwrap().is_some(),
+            "the daemon identity blob was sealed"
+        );
+    }
+
+    #[test]
+    fn a_declined_biometric_refuses_the_pairing_and_writes_nothing() {
+        // #48 deny-closed: a declined Touch ID must refuse the pairing BEFORE any
+        // state is written -- no config file, no identity blob.
+        let _home = HomeGuard::new("bio-deny");
+        let ks = ScriptedBiometric::new(false);
+        let (_i, _p, np) = new_pairing();
+        let err = save(&ks, &np).expect_err("a declined biometric must refuse");
+        assert!(
+            matches!(err, PairingStoreError::Keystore(KeystoreError::Declined)),
+            "the refusal is the biometric decline, got {err:?}"
+        );
+        assert!(
+            !exists(),
+            "no config file may be written on a declined biometric"
+        );
+        assert!(
+            ks.load_blob(DAEMON_IDENTITY_LABEL).unwrap().is_none(),
+            "no identity blob may be sealed on a declined biometric"
+        );
+    }
+
+    #[test]
+    fn a_biometric_keystore_missing_a_verify_presence_override_fails_closed() {
+        // Defense in depth: a keystore that claims is_biometric() but forgets to
+        // override verify_presence inherits the trait default, which errs. The
+        // pairing gate then refuses rather than persisting without a check.
+        struct NoOverride(MemoryKeystore);
+        impl Keystore for NoOverride {
+            fn store_blob(&self, l: &str, d: &[u8]) -> Result<(), KeystoreError> {
+                self.0.store_blob(l, d)
+            }
+            fn load_blob(&self, l: &str) -> Result<Option<Vec<u8>>, KeystoreError> {
+                self.0.load_blob(l)
+            }
+            fn delete_blob(&self, l: &str) -> Result<(), KeystoreError> {
+                self.0.delete_blob(l)
+            }
+            fn is_biometric(&self) -> bool {
+                true
+            }
+            fn has_dek(&self) -> bool {
+                self.0.has_dek()
+            }
+            fn ensure_dek(&self) -> Result<(), KeystoreError> {
+                self.0.ensure_dek()
+            }
+            fn unwrap_dek(&self, r: &str) -> Result<Dek, KeystoreError> {
+                self.0.unwrap_dek(r)
+            }
+            // deliberately no verify_presence override
+        }
+        let _home = HomeGuard::new("bio-noimpl");
+        let ks = NoOverride(MemoryKeystore::new());
+        let (_i, _p, np) = new_pairing();
+        assert!(
+            save(&ks, &np).is_err(),
+            "a biometric keystore with no presence check must fail closed"
+        );
+        assert!(
+            !exists(),
+            "nothing written when the presence check is unavailable"
+        );
     }
 
     #[test]
