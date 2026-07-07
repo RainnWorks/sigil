@@ -190,6 +190,16 @@ pub struct PendingJson {
     /// Coalesced-request count. Always 0: the pending registry does not track
     /// how many identical requests wait behind one park (gap).
     pub coalesced: u32,
+    /// Whether the paired phone has acknowledged receipt of this request (task
+    /// #41). `false` until a sealed delivery receipt lands, and always `false` for
+    /// a local (control-socket) request, which has no phone. DISPLAY ONLY: a
+    /// missing receipt never changes the gating decision, only the requester's
+    /// Sent -> Delivered readout ("couldn't confirm" = still `false` past a bound).
+    #[serde(default)]
+    pub delivered: bool,
+    /// When the receipt landed, unix ms; omitted until then. Display only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_at_ms: Option<u64>,
 }
 
 // --- pairing ---------------------------------------------------------------

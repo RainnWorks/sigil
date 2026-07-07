@@ -269,6 +269,17 @@ impl PendingRegistry {
         out
     }
 
+    /// Bump the version and wake subscribers on behalf of an EXTERNAL in-flight
+    /// source (the remote approver's waiter/delivery set). The local registry has no
+    /// entry of its own for these; this only nudges `subscribe_pending` to
+    /// re-snapshot so a remote request's arrival, delivery receipt, or completion
+    /// surfaces promptly instead of on the 30s keepalive. It touches no waiter and
+    /// resolves nothing.
+    pub fn notify_change(&self) {
+        let mut inner = self.inner.lock().expect("pending registry poisoned");
+        self.bump(&mut inner);
+    }
+
     /// The current change version. A subscriber records this alongside a
     /// snapshot, then calls [`wait_for_change`](Self::wait_for_change) with it.
     pub fn version(&self) -> u64 {

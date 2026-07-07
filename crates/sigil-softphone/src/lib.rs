@@ -326,9 +326,8 @@ impl Softphone {
             PolicyDecision::Deny => ApprovalResponse::deny(&req.request_id, now),
             PolicyDecision::Approve => approve_body(now)?,
             PolicyDecision::ApproveWithLease(ttl) => approve_body(now)?.with_lease(InstallLease {
-                // The daemon derives and trusts its own grant key; this field
-                // is echoed for display only.
-                grant_key: String::new(),
+                // The phone picks only the window; the daemon is the sole lease
+                // authority and mints/binds the grant itself.
                 ttl_ms: ttl.as_millis() as u64,
             }),
         };

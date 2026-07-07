@@ -110,6 +110,12 @@ pub struct Core {
     leases: LeaseStore,
     gate: ApprovalGate,
     pending: Arc<PendingRegistry>,
+    /// The remote approver, when the phone is the factor. Held so the control
+    /// handler can enumerate in-flight remote requests (and their delivery-receipt
+    /// state) onto the `pending` surface the Mac reads. `None` for the local
+    /// factors, which enumerate the [`pending`](Self::pending) registry alone. This
+    /// is the SAME approver the ToDaemon owner loop drives; it is read-only here.
+    remote: Option<Arc<RemoteApprover>>,
     lockdown: AtomicBool,
     proc_table: Box<dyn ProcessTable + Send + Sync>,
     /// The provider registry: a command's config names a provider by id, and the
@@ -211,7 +217,11 @@ fn build_gate(
             // routes each response to the approval waiting for it.
             let approver = Arc::new(
                 RemoteApprover::new(Arc::new(relay), cfg.daemon_identity, cfg.phone)
-                    .with_push(push_store),
+                    .with_push(push_store)
+                    // Share the pending registry so a remote request's arrival,
+                    // delivery receipt, or completion bumps the version a
+                    // `subscribe_pending` client waits on (Sent -> Delivered live).
+                    .with_pending(pending.clone()),
             );
             (Box::new(approver.clone()), Some(approver))
         }
@@ -292,6 +302,7 @@ impl Core {
             leases: LeaseStore::new(),
             gate,
             pending,
+            remote: remote_listener.clone(),
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(SysProcessTable),
             providers: ProviderRegistry::with_defaults(),
@@ -977,12 +988,19 @@ fn leases_json(core: &Core) -> Vec<crate::json::LeaseJson> {
         .collect()
 }
 
-/// The parked requests as the `pending --json` array. Enumerates the local
-/// control-socket queue; the lease policy is carried through from the matched
-/// rule (via the context), while `reason`/`coalesced` are the honest defaults for
-/// that path (see JSON.md).
+/// The parked requests as the `pending --json` array.
+///
+/// Under a local factor (biometric / dev) this enumerates the control-socket
+/// queue; under the phone factor it enumerates the remote approver's in-flight
+/// set instead, carrying the phone's delivery-receipt state (`delivered` /
+/// `delivered_at_ms`) so the Mac can render Sent -> Delivered. A daemon runs one
+/// factor, so in practice exactly one of the two sources is populated. The lease
+/// policy is carried through from the matched rule; `reason`/`coalesced` are the
+/// honest defaults for these paths (see JSON.md).
 fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
-    core.pending
+    // Local control-socket queue: no phone, so never "delivered".
+    let mut rows: Vec<crate::json::PendingJson> = core
+        .pending
         .snapshot()
         .into_iter()
         .map(|s| {
@@ -1017,9 +1035,62 @@ fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
                 expires_ms: s.queued_at_ms + s.timeout_ms,
                 timeout_ms: s.timeout_ms,
                 coalesced: 0,
+                delivered: false,
+                delivered_at_ms: None,
             }
         })
-        .collect()
+        .collect();
+
+    // Remote (phone-factor) in-flight set, if any, carrying delivery state.
+    if let Some(remote) = &core.remote {
+        rows.extend(
+            remote
+                .pending_snapshot()
+                .into_iter()
+                .map(remote_pending_json),
+        );
+    }
+    rows
+}
+
+/// Map one in-flight remote approval to the `pending` DTO. The request is a
+/// plaintext snapshot (names/provenance only, never a secret); `delivered` /
+/// `delivered_at_ms` reflect the phone's receipt (task #41), display only.
+fn remote_pending_json(p: crate::remote::RemotePending) -> crate::json::PendingJson {
+    let req = p.request;
+    crate::json::PendingJson {
+        id: req.request_id,
+        kind: crate::json::request_kind_str(req.kind).to_string(),
+        command: req.command,
+        secrets: req
+            .secrets
+            .into_iter()
+            .map(|r| crate::json::SecretRefJson {
+                provider: r.provider,
+                segments: r.segments,
+                label: r.label,
+            })
+            .collect(),
+        ssh: req.ssh.map(|c| crate::json::SshJson {
+            key_label: c.key_label,
+            host: c.host,
+            fingerprint: c.fingerprint,
+        }),
+        provenance: crate::json::ProvJson {
+            process_chain: req.provenance.process_chain,
+            cwd: req.provenance.cwd,
+            machine: req.provenance.machine,
+            requested_ms: p.queued_at_ms,
+        },
+        leasable: req.lease_policy.is_leasable(),
+        max_lease_secs: req.lease_policy.max_secs(),
+        reason: req.reason,
+        expires_ms: req.expires_at,
+        timeout_ms: req.timeout_ms,
+        coalesced: 0,
+        delivered: p.delivered_at_ms.is_some(),
+        delivered_at_ms: p.delivered_at_ms,
+    }
 }
 
 /// The gated fulfillment path for `sigil <cmd>` (and the shim alias / `sigil run`).
@@ -1671,6 +1742,7 @@ mod tests {
             .with_control_socket(true)
             .with_timeout(timeout);
         let core = Core {
+            remote: None,
             keystore,
             accounts: Mutex::new(accounts),
             threshold: Mutex::new(Default::default()),
@@ -1800,6 +1872,7 @@ mod tests {
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Core {
+            remote: None,
             keystore,
             accounts: Mutex::new(accounts),
             threshold: Mutex::new(Default::default()),
@@ -2251,6 +2324,7 @@ mod tests {
             .with_control_socket(true);
         let config = env_file_config("faketool", env_path.to_str().unwrap());
         let core = Arc::new(Core {
+            remote: None,
             keystore,
             accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
@@ -2369,6 +2443,7 @@ mod tests {
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Arc::new(Core {
+            remote: None,
             keystore,
             accounts: Mutex::new(accounts),
             threshold: Mutex::new(Default::default()),
@@ -2425,6 +2500,7 @@ mod tests {
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Arc::new(Core {
+            remote: None,
             keystore,
             accounts: Mutex::new(AccountStore::default()), // no sealed blob
             threshold: Mutex::new(Default::default()),
@@ -2496,6 +2572,7 @@ mod tests {
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Arc::new(Core {
+            remote: None,
             keystore,
             accounts: Mutex::new(accounts),
             threshold: Mutex::new(Default::default()),
@@ -2568,6 +2645,7 @@ mod tests {
             .with_control_socket(true);
         let config = env_file_config("faketool", env_path.to_str().unwrap());
         let core = Arc::new(Core {
+            remote: None,
             keystore,
             accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
@@ -2649,6 +2727,7 @@ mod tests {
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Arc::new(Core {
+            remote: None,
             keystore,
             accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
@@ -2737,6 +2816,7 @@ mod tests {
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Core {
+            remote: None,
             keystore,
             accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
@@ -2947,6 +3027,7 @@ mod tests {
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver.clone())),
+            remote: Some(approver.clone()),
             pending,
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
@@ -3190,6 +3271,7 @@ mod tests {
             threshold: Mutex::new(store),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver.clone())),
+            remote: Some(approver.clone()),
             pending: Arc::new(PendingRegistry::new()),
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
@@ -3401,6 +3483,7 @@ mod tests {
             threshold: Mutex::new(tstore),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver.clone())),
+            remote: Some(approver.clone()),
             pending: Arc::new(PendingRegistry::new()),
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
@@ -3760,6 +3843,7 @@ mod tests {
         let pending = Arc::new(PendingRegistry::new());
         let (gate, _listener) = build_gate(factor, None, &keystore, &pending).unwrap();
         Arc::new(Core {
+            remote: None,
             keystore,
             accounts: Mutex::new(accounts),
             threshold: Mutex::new(Default::default()),
@@ -4265,6 +4349,7 @@ mod tests {
             .with_control_socket(true);
         let config = env_file_config("faketool", env_path.to_str().unwrap());
         let core = Arc::new(Core {
+            remote: None,
             keystore,
             accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
@@ -4342,6 +4427,7 @@ mod tests {
             .with_control_socket(true)
             .with_timeout(Duration::from_millis(50));
         let core = Core {
+            remote: None,
             keystore,
             accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
