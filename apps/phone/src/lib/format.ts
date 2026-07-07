@@ -64,6 +64,20 @@ export function secretRefLabel(ref: SecretRef): string {
   return head ? `${head} › ${leaf}` : leaf;
 }
 
+/**
+ * A lease-window duration in words for the approve-with-a-window control, e.g.
+ * "45 seconds", "15 minutes", "1 hour". Rounds to the coarsest natural unit;
+ * display only.
+ */
+export function durationWindow(totalSecs: number): string {
+  const s = Math.max(0, Math.round(totalSecs));
+  if (s < 60) return `${s} second${s === 1 ? "" : "s"}`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} minute${m === 1 ? "" : "s"}`;
+  const h = Math.round(m / 60);
+  return `${h} hour${h === 1 ? "" : "s"}`;
+}
+
 /** Render a resolved process chain as "zsh -> claude -> op read". */
 export function processChain(chain: string[]): string {
   return chain.join(" → ");

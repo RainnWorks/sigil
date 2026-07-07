@@ -49,6 +49,23 @@ export interface SecretRef {
   label: string;
 }
 
+/**
+ * A grant the daemon has marked leasable. When present on a request, the
+ * approver may either approve once or approve and keep the grant approved for a
+ * window up to `maxSecs`; when absent the request is run-once (approve-once
+ * only). This is an OFFER the daemon extends, never a provider/account concept
+ * the phone interprets: the phone shows a duration and, on an approve-with-a-
+ * window, echoes back the chosen window (never a grant key it cannot compute).
+ *
+ * Mirrors proto `LeasePolicy` (serde `{"kind":"leasable","maxSecs":N}`). See the
+ * daemon-side counterpart note at the bottom of this file.
+ */
+export interface LeasePolicy {
+  kind: "leasable";
+  /** The longest lease window the daemon will honor for this grant, in seconds. */
+  maxSecs: number;
+}
+
 /** An SSH signature: the two things worth verifying. */
 export interface SshChallenge {
   keyLabel: string;
@@ -138,6 +155,13 @@ export interface ApprovalRequest {
    * approve must produce a `ThresholdPartial` (Z_F) instead of a DEK.
    */
   threshold?: ThresholdChallenge;
+  /**
+   * Present when the daemon marks this grant leasable: the approver may approve
+   * once, or approve and keep it approved for a window up to `maxSecs`. Absent
+   * => run-once, so the sheet offers approve-once only. Offer/display only; the
+   * daemon mints and binds the actual lease from the response's chosen window.
+   */
+  leasePolicy?: LeasePolicy;
   /** Absolute expiry, unix ms. The gauge depletes to this. */
   expiresAt: number;
   /** Full-scale window for the gauge, ms (expiresAt - queuedAt). */
@@ -162,8 +186,14 @@ export interface ApprovalResponse {
    * a wire field.
    */
   partial?: ThresholdPartial | null;
-  /** On approve with "for this session": a lease grant, else null. */
-  lease?: { grantKey: string; ttlMs: number } | null;
+  /**
+   * On approve-with-a-window: the lease duration the approver chose, in ms
+   * (<= `leasePolicy.maxSecs * 1000`). The daemon binds this to the grant it
+   * already resolved for the request; the zero-knowledge phone cannot compute
+   * the grant key, so it sends only the chosen window, never a key. Absent/null
+   * on approve-once and on deny.
+   */
+  lease?: { ttlMs: number } | null;
   /** On deny-and-block: the process name to block, and for how long, else null. */
   block?: { process: string; durationMs: number } | null;
   decidedAt: number;
@@ -187,4 +217,29 @@ export interface PushRegisterMessage {
   /** The APNs device token, lowercase hex. */
   token: string;
   platform: "apns";
+}
+
+/**
+ * Phone -> daemon delivery acknowledgement (task #41). Sealed over the live
+ * session like {@link PushRegisterMessage}, outside the request/response flow:
+ * the instant the phone opens and verifies an inbound {@link ApprovalRequest},
+ * it seals this back so the daemon can advance the requester's UI from "Sent"
+ * to "Delivered". It carries only the `requestId` (opaque to the powerless
+ * relay, which cannot read the seal); it is NOT a decision and never releases
+ * anything. Best-effort: if it cannot be posted the daemon simply keeps showing
+ * "Sent" and falls back to "couldn't confirm", so delivery is never blocked on
+ * the ack.
+ *
+ * DAEMON-SIDE COUNTERPART NEEDED (crates/sigil-proto + daemon, NOT edited here):
+ *   - Add `DeliveryReceipt { request_id }` to the daemon's inbound message enum
+ *     (the same tagged union that already carries `PushRegisterMessage`), keyed
+ *     on `type: "delivered"`.
+ *   - On receipt, flip that request's requester-facing state Sent -> Delivered.
+ *   - If no receipt arrives within a bound, show "couldn't confirm" (the phone
+ *     may be offline or the ack lost); a later approve/deny still resolves it.
+ */
+export interface DeliveryReceiptMessage {
+  type: "delivered";
+  /** The request this acknowledges receipt of; matches the envelope's request id. */
+  requestId: string;
 }

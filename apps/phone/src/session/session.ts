@@ -11,6 +11,7 @@ import {
   type ApprovalRequest,
   type ApprovalResponse,
   type Decision,
+  type DeliveryReceiptMessage,
   type DeviceIdentity,
   type Envelope,
   type PeerIdentity,
@@ -63,6 +64,24 @@ export class SigilSession {
       return;
     }
     store.receive(request);
+    // Task #41: acknowledge receipt so the daemon can advance the requester's
+    // UI Sent -> Delivered. Best-effort and non-blocking: a failed ack leaves
+    // the daemon to fall back to "couldn't confirm"; it never gates display or
+    // the decision path.
+    void this.sendDelivered(request.requestId);
+  }
+
+  /**
+   * Seal and send a {@link DeliveryReceiptMessage} for a just-opened request.
+   * Fails soft: a lost ack only costs the requester the "Delivered" reflection
+   * (the daemon shows "couldn't confirm"), never the approval itself.
+   */
+  private async sendDelivered(requestId: string): Promise<void> {
+    try {
+      await this.sealAndSend<DeliveryReceiptMessage>({ type: "delivered", requestId });
+    } catch (e) {
+      console.warn(`[receipt] delivery ack failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   /**

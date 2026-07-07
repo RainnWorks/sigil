@@ -52,6 +52,9 @@ export function demoRoutineRequest(): ApprovalRequest {
     ],
     risk: "routine",
     reason: undefined,
+    // Leasable grant: the sheet offers approve-once vs keep-approved-for-a-window
+    // (task #57). Run-once demos omit this and show approve-once only.
+    leasePolicy: { kind: "leasable", maxSecs: 900 },
     provenance: {
       processChain: ["zsh", "claude", "op read"],
       cwd: "~/Projects/rowm",

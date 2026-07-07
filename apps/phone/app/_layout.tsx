@@ -9,7 +9,12 @@ import { StatusBar } from "expo-status-bar";
 import { paletteFor } from "@/theme/tokens";
 import { DEMO, store, useSelector } from "@/src/state/store";
 import { armLiveSession } from "@/src/session/controller";
-import { registerPushToken, watchNotificationTaps, watchPushTokenRotation } from "@/src/lib/push";
+import {
+  registerPushToken,
+  watchNotificationTaps,
+  watchPushForeground,
+  watchPushTokenRotation,
+} from "@/src/lib/push";
 import {
   demoReadRequest,
   demoRoutineRequest,
@@ -65,9 +70,13 @@ export default function RootLayout() {
     // Both are safe no-ops while unarmed.
     const offRotation = watchPushTokenRotation();
     const offTaps = watchNotificationTaps();
+    // Re-attempt registration on foreground while armed-but-unregistered (first
+    // attempt raced arming, or permission was flipped on in Settings later).
+    const offForeground = watchPushForeground();
     return () => {
       offRotation();
       offTaps();
+      offForeground();
     };
   }, []);
 
