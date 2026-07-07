@@ -56,11 +56,15 @@
 // orphan). Still OPEN: a deposit that lands in the gap after a disconnect but
 // before ANY reconnecting long-poll re-attaches is handed to the orphaned
 // waiter (it is the only, hence newest, waiter) and is genuinely lost, not
-// merely delayed, for that one delivery. A second, narrower residual: if a
-// client holds two overlapping polls and the NEWER connection dies while the
-// older stays live, that deposit is handed to the dead-newer waiter and lost.
-// Both are bounded, require an actual disconnect on top of unlucky timing, and
-// are what client-side retry/resend must cover regardless of this relay.
+// merely delayed, for that one delivery. A second, narrower residual is NOT
+// reachable by any client shipped today: it would need a client holding two
+// overlapping polls where the NEWER connection dies while the older stays live
+// (the deposit then goes to the dead-newer waiter). Both shipped clients are
+// strictly single-flight per slot (the daemon blocks one GET at a time; the
+// phone aborts its prior poll before a new one), so only a hypothetical future
+// concurrent-poll client could reach it. The disconnect-gap residual above is
+// bounded, requires an actual disconnect on top of unlucky timing, and is what
+// client-side retry/resend must cover regardless of this relay.
 // Confirm on a real Cloudflare deploy whether the edge network delivers a
 // GET's abort signal more reliably than local wrangler dev before treating the
 // disconnect-gap residual as fully closed.
@@ -94,7 +98,12 @@ export const LONG_POLL_MS = 25_000;
  * likeliest orphaned) and takes its place. Small: a single client should never
  * legitimately hold this many at once, and each waiter self-expires after
  * {@link LONG_POLL_MS} regardless. This is the explicit memory bound; the rate
- * limiter is only a coarse backstop, not the mechanism. */
+ * limiter is only a coarse backstop, not the mechanism. A third party cannot
+ * weaponize this to evict or steal from a victim's slot: the two directions are
+ * disjoint waiter lists (neither paired party can evict the other's delivery
+ * waiter, so a flood is self-DoS only), and reaching a slot at all presupposes
+ * the mailbox id, a BLAKE2b hash of the two pinned public keys (256-bit, carried
+ * only inside TLS, never published), so an outsider cannot address it. */
 export const MAX_WAITERS = 8;
 /** Per-mailbox operations allowed per {@link RATE_WINDOW_MS}. Held only in the
  * mailbox's in-memory record; never persisted. Non-load-bearing anti-abuse.

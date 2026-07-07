@@ -980,3 +980,97 @@ be bound to the sealed envelope, would close it if push-spam becomes a concern.
 unit is sound; fix the two P2s (commit the `for_test` isolation; give the SE
 access control an explicit `WhenUnlockedThisDeviceOnly` protection class) and
 clear the hardware residuals before treating the SE path as verified.**
+
+---
+
+## §15 — relay long-poll v5.1: coexisting waiters + newest-wins delivery (commit `33b464f`)
+
+Independent adversarial review of the delivery-semantics change in
+`relay/shared/protocol.ts` (`longPoll`/`wake`/`MAX_WAITERS`). Reviewer did not
+author the change. Focus: delivery integrity (no silent loss beyond honestly
+stated residuals, no starvation/steal by a hostile party, no unbounded memory);
+envelope crypto is unchanged and out of scope. Invariant at stake throughout is
+**everything fails closed** (#5) and the relay's no-silent-drop promise, not
+confidentiality (#3 holds — envelopes stay opaque, and every worst case below is
+a *non-delivery*, never a disclosure).
+
+**The change, restated adversarially.** Old `longPoll` flushed every existing
+waiter empty on each new GET (`waiters.splice(0)`), manufacturing instant-empties
+a client re-fired on (the poll storm). New: waiters coexist, each held its full
+window; `wake` delivers a deposit to the **newest** waiter (`waiters.pop()`);
+`MAX_WAITERS=8` caps memory, and past the cap a new GET drops the **oldest**
+waiter (resolved empty). Both suites green locally (Bun 37 / Worker 21);
+reviewer's scratch suite (`relay/scratch-adversarial.test.ts`, 4 tests) proves
+the four properties below.
+
+| Claim | Enforcing code | Proving test | Verdict |
+|-------|----------------|--------------|---------|
+| **Newest-wins delivers correctly for the shipped clients.** Both the daemon (blocking `reqwest`, one GET at a time) and the phone (`relay-http.ts` `activeWaits` aborts any prior poll before a new one; `phone-relay.ts` `inFlight` collapses concurrent wakes) are **strictly single-flight per slot**. Two waiters therefore only coexist via disconnect-then-reconnect, which makes the OLDER the dead orphan and the NEWER the live reconnect. `wake` → newest → the connection that can still receive. | `wake` (`protocol.ts:325`, `waiters.pop()`); `sigil-relay-client/src/http.rs` (blocking); `apps/phone/src/transport/relay-http.ts:95` (`activeWaits`) | `protocol.test.ts` disconnect/reconnect test; scratch `NOT reachable by a single-flight client…` | **SOUND** |
+| **`MAX_WAITERS` drop-oldest never loses a queued deposit.** Eviction runs only on the empty-slot branch (the `drain` above returned nothing), synchronously, with no `await` between the drain and the `while` loop, so single-threaded JS guarantees the slot is provably empty at eviction; the dropped waiter is resolved `[]` with nothing to lose. | `longPoll` (`protocol.ts:249-273`) | scratch `MAX_WAITERS drop-oldest never loses a queued deposit…` | **SOUND** |
+| **Neither paired party can starve the other's inbound delivery.** `toPhoneWaiters` (phone reading) and `toDaemonWaiters` (daemon reading) are disjoint arrays. A flood of GETs on one slot evicts only that slot's own oldest waiters; it cannot touch the other slot. So one misbehaving side can only self-DoS its own reads. | `Mailbox` (`protocol.ts:130-143`); slot-specific `wake`/`longPoll` calls in `src/index.ts`, `bun/server.ts` | scratch `STRUCTURAL: one party's slot-flood cannot evict the other party's delivery waiter` | **SOUND** |
+| **No duplicate delivery / no misdelivery across mailboxes.** `wake` calls `drain` (empties the list) before handing off; an item leaves the queue exactly once. Waiters are per-mailbox-per-slot, so a deposit can only ever reach one of the two legitimate parties' connections. | `drain` (`protocol.ts:217`), `wake` (`protocol.ts:325`) | reviewed by inspection (drain-empties invariant); Bun/Worker `deposit and drain` | **SOUND** |
+
+### Findings (ranked)
+
+**No P0 or P1.** The change is a net improvement: it removes the fast-empty
+hammer and introduces no new loss vector relative to the prior design (the old
+evict-all design *also* delivered to the newest/only waiter, so it lost in
+exactly the same "newest waiter is dead" case — see below).
+
+**P2 — the two "still open" residuals are one root cause, and honestly stated
+but slightly over-decomposed.** Both open residuals in the module header reduce
+to a single invariant: *`wake` loses a deposit iff the newest waiter is a dead
+orphan at deposit time* (drained into a connection nobody reads).
+- *Residual A (deposit in the disconnect gap):* reachable by the shipped clients
+  — a real disconnect whose abort didn't fire, then a deposit landing before the
+  reconnect re-attaches. Proven real by the scratch `RESIDUAL IS REAL…` test.
+  This is genuine, bounded (one delivery, requires an actual disconnect plus
+  unlucky timing), fail-closed (a lost approval request or response just means
+  no secret is released), and is what client-side resend must cover regardless.
+  Correctly tracked as **task #53** (verify/mitigate at a real Cloudflare deploy).
+- *Residual B ("newer connection dies while older lives"):* the header presents
+  this as a second, distinct residual. **It is not reachable by any shipped
+  client**, because both are strictly single-flight per slot (see row 1): they
+  never hold two genuinely-live overlapping polls on one slot, so the newer of
+  two coexisting waiters is never the dead one. It becomes reachable only for a
+  hypothetical *future* concurrent/multi-poll client. Recommendation: keep it
+  documented, but note explicitly that it is unreachable given today's clients —
+  as written the README slightly overstates its current reachability (harmless
+  direction: it over-warns, it does not under-warn).
+
+**P2 — MAX_WAITERS bounds per-slot waiters, not mailbox count (pre-existing,
+unchanged by this commit).** `MAX_WAITERS=8` caps waiters at 16 per mailbox (8×2
+slots). It does **not** cap the number of distinct mailboxes: the Bun `boxes`
+Map grows one entry per distinct id seen, and the rate limiter is per-mailbox so
+it does not bound distinct-id creation. An attacker who can reach the relay can
+inflate the Map with random ids (each holding held GETs) until the sweep
+(`TTL_MS`, only deletes idle+unwatched boxes) or the OS connection limit stops
+it. The Worker variant offloads this to Cloudflare's isolate lifecycle. This is
+the pre-existing "rate limiter is non-load-bearing; the front is the real bound"
+posture, not a regression from v5.1, and acceptable for a personal/self-host
+deployment — flagged so it is not mistaken for a bound this change added.
+
+**Steal/eviction as a weapon — not reachable by a third party.** Forcing a
+victim's legit waiter out (8 GETs past the cap) and positioning an attacker
+waiter as newest to *steal* the next deposit requires registering GETs on the
+victim's slot, i.e. knowing the `mailbox_id`. That id is
+`BLAKE2b(domain ‖ canonical(pinned_pub_a, pinned_pub_b))` (`fingerprint.rs:83`),
+a 256-bit value derived from two pinned public keys, carried inside TLS to the
+relay and never published — unguessable by a third party. Only the relay
+operator (who sees the id in the URL) is positioned to do this, and a hostile
+relay can already deny delivery arbitrarily; the theft still yields only an
+opaque sealed envelope and a non-approval (fail-closed). Acceptable; worth one
+line in the module header that delivery-slot integrity rests on the mailbox id
+staying unknown to third parties (it does).
+
+**Verdict (independent security-reviewer, not the implementer of `33b464f`).
+The v5.1 coexisting-waiter / newest-wins change is SOUND for delivery
+integrity.** It removes the fast-empty hammer, adds no new message-loss vector,
+cannot be used by one paired party to starve the other, is memory-bounded
+per slot, and every worst case is a bounded, fail-closed non-delivery — never a
+disclosure or a fail-open approval. The one client-reachable residual (deposit
+in the disconnect gap) is real, honestly documented, and correctly deferred to
+task #53 for real-edge verification plus client-side resend. Recommend two
+documentation tightenings (both non-blocking): (1) mark residual B as not
+reachable by today's single-flight clients rather than an open peer of residual
+A; (2) note that slot-steal presupposes knowledge of the unguessable mailbox id.
