@@ -78,7 +78,7 @@ never a secret; it must be readable while the daemon is inert). Two collections:
     {
       "name": "op-read",
       "match": { "command": "op", "argv_contains": ["read"] },
-      "action": { "source": "rowm-op", "risk": "routine" }
+      "action": { "source": "rowm-op", "lease": { "kind": "runOnce" } }
     }
   ]
 }
@@ -133,14 +133,51 @@ closed rather than gating everything).
 | `flag_equals`   | every `{flag,value}` appears (`--flag=value` or `--flag value`)  |
 | `arg_regex`     | (deferred, see below) a regex matches the joined args            |
 
-**Action** — require phone approval, then inject the named source's env, then
-exec:
+**Action** — for a **gate** rule: require phone approval, then inject the named
+source's env, then exec. For an **allow** rule: run the matched command directly
+(passthrough), no approval, no injection.
 
 | field         | meaning                                                          |
 |---------------|------------------------------------------------------------------|
-| `source`      | the `Source.name` to inject from                                 |
-| `risk`        | `routine` \| `elevated` \| `critical`; scales approve friction   |
-| `timeout_sec` | optional per-rule approval timeout; falls back to settings       |
+| `mode`        | `"gate"` (default) or `"allow"`; a missing/unknown mode gates    |
+| `source`      | gate only: the `Source.name` to inject from (omitted for allow)  |
+| `lease`       | gate only: `{"kind":"runOnce"}` (default) or `{"kind":"leasable","maxSecs":N}` |
+| `timeout_sec` | gate only: optional per-rule approval timeout; falls back to settings |
+
+`mode` defaults to `gate` and a missing/unknown mode gates: a hand-edit can never
+silently open a passthrough. An **allow** rule is a pure passthrough — it names no
+source, carries no lease, and needs no approval. It is the inverse of a gate: an
+explicit allowlist entry, scoped strictly to its match (an empty match never
+matches, in either mode, so allow can never become allow-everything). An
+**unmatched** command still fails closed (refuse), distinct from an allow.
+
+`lease` (gate only) replaces the retired `risk` tier: `runOnce` (the default)
+means a fresh phone approval every invocation and no lease is ever granted;
+`leasable` lets an approval also open an auto-approve window up to `maxSecs`,
+which the daemon clamps against. Approve is always a single tap; the policy
+governs only leasing.
+
+### The allow use case: always-allow one subcommand, gate the rest
+
+> "always allow `op account list`, but still gate `op` generally"
+
+Stack a specific **allow** rule ABOVE the general **gate** rule (the manual
+drag-to-order UI does the stacking); first-match-in-config-order is the only
+precedence, so no new logic is needed:
+
+```jsonc
+{ "rules": [
+  { "name": "op-account-list",
+    "match": { "command": "op", "subcommand": "account", "argv_contains": ["list"] },
+    "action": { "mode": "allow" } },
+  { "name": "op",
+    "match": { "command": "op" },
+    "action": { "source": "rowm-op", "lease": { "kind": "runOnce" } } }
+] }
+```
+
+`op account list` matches the allow rule and runs free; any other `op` falls
+through to the gate rule and needs approval.
 
 ### The op use case, with zero op in the core
 
@@ -150,7 +187,7 @@ exec:
 ```jsonc
 { "name": "op-read",
   "match": { "command": "op", "argv_contains": ["read"] },
-  "action": { "source": "rowm-op", "risk": "routine" } }
+  "action": { "source": "rowm-op", "lease": { "kind": "runOnce" } } }
 ```
 
 The engine matches strings; the `1password` provider (named only by
@@ -159,10 +196,11 @@ The core never parses `op://`, never reads `--vault`, never special-cases `op`.
 
 ## Gating path (daemon `fulfill`)
 
-1. `Config::resolve(argv)` -> the first rule whose match holds, resolved against
-   its source into a `ResolvedAction { provider, source_name, source_path,
-   account, env_keys, risk, timeout_sec }`. `None` -> refuse with `sigil config`
-   guidance.
+1. `Config::resolve(argv)` -> the first rule whose match holds, as a `Resolution`:
+   `Allow { rule }` (a passthrough: `fulfill` runs the real command directly via
+   `provider::run_passthrough`, no gate, no injection) or `Gate(ResolvedAction {
+   provider, source_name, source_path, account, env_keys, lease, timeout_sec })`.
+   `None` -> refuse with `sigil config` guidance (unmatched still fails closed).
 2. Look up the provider by id in the `ProviderRegistry`.
 3. If the provider `needs_account()` (op), route the account by the **source's
    `account` label** (not by sniffing argv). `AccountStore::route` now matches an
@@ -189,10 +227,11 @@ sigil config source add <name> --provider <id> [--account <label>] [--path <file
 sigil config source list
 sigil config source remove <name>
 
-sigil config rule add <name> --source <src>
+sigil config rule add <name> [--source <src> | --allow]
       [--command <c>] [--subcommand <s>]
       [--argv-contains <needle> ...] [--flag <f> ...] [--flag-eq <f>=<v> ...]
-      [--risk routine|elevated|critical] [--timeout <sec>]
+      [--leasable [--lease-max <secs>]] [--timeout <sec>]
+      # --allow authors a passthrough rule (no source/lease/timeout); default gates
 sigil config rule list
 sigil config rule remove <name>
 
@@ -201,7 +240,7 @@ sigil config import          # replace whole config from JSON on stdin
 sigil config list            # human summary of sources + rules
 
 # Convenience desugar (keeps the old one-liner + the docs/tests that use it):
-sigil config add <cmd> --provider <id> [--source <path>] [--account <label>] [--risk r]
+sigil config add <cmd> --provider <id> [--source <path>] [--account <label>] [--leasable [--lease-max <secs>]]
       == source add <cmd> + rule add <cmd> matching command==<cmd>
 ```
 
@@ -214,8 +253,9 @@ always-on daemon must not be able to rewrite which commands are gated. Re-run
 - New store: `~/.sigil/config.json`.
 - On load, if `config.json` is absent but the legacy `commands.json` exists, it
   is migrated in memory (and can be written on first mutation): each legacy
-  `CommandConfig{command,provider,source,account,risk}` becomes a `Source`
-  (named after the command) + a `Rule` matching `command == <cmd>`. To preserve
+  `CommandConfig{command,provider,source,account}` becomes a `Source`
+  (named after the command) + a `Rule` matching `command == <cmd>`. The retired
+  `risk` tier on legacy entries is dropped: every migrated rule is run-once. To preserve
   the historical implicit behavior, if no legacy entry named `op` exists, a
   default `op` rule + `1password` source (no account) is synthesized — so Tom's
   existing zero-config `op` keeps working after upgrade. The legacy file is left
@@ -265,8 +305,8 @@ gateable as `sigil proxy …`.
   authoring time. Prefer account labels that are not also vault names.
 
 - Inert-at-rest (#1), secrets-bypass-daemon (#2), fail-closed (#7) are untouched:
-  the config only chooses *which* provider/source/risk; the token and env
-  handling are the same code paths as before.
+  the config only chooses *which* provider/source and its lease policy; the token
+  and env handling are the same code paths as before.
 - **Routing change to review:** account selection moved from argv `--vault`
   sniffing to the source's `account` label, and `route`/`route_exact` now match
   by label OR vault. This touches the v2 threshold routing (`route_exact`), which

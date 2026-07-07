@@ -344,7 +344,7 @@
       <ul>
         <li>pairing · phone approval · leases</li>
         <li>transport · keystore · sealed protocol</li>
-        <li>risk scoring · audit · lockdown</li>
+        <li>lease policy · audit · lockdown</li>
         <li class="cant">produce a secret while at rest</li>
         <li class="cant">read the secret bytes it brokers</li>
       </ul>
@@ -372,7 +372,7 @@
 <div class="cols">
   <div>
     <h4>Layer 1 · Core</h4>
-    <p style="max-width:48ch">The generic machine. Its whole job is: gate a command on a phone, then inject the approved environment into it and run it. It carries the pairing handshake, the sealed and signed protocol, leases, the transport ladder, the keystore seam, risk scoring, the audit log, and lockdown. It has no concept of 1Password or SSH. The protocol types it seals to the phone name no provider: a request carries the raw argv, a list of opaque secret references, and a display hint, never a vault or a field.</p>
+    <p style="max-width:48ch">The generic machine. Its whole job is: gate a command on a phone, then inject the approved environment into it and run it. It carries the pairing handshake, the sealed and signed protocol, leases, the transport ladder, the keystore seam, the per-rule lease policy, the audit log, and lockdown. It has no concept of 1Password or SSH. The protocol types it seals to the phone name no provider: a request carries the raw argv, a list of opaque secret references, and a display hint, never a vault or a field.</p>
   </div>
   <div>
     <h4>Layer 2 · Integrations</h4>
@@ -384,7 +384,7 @@
 
 <h2 id="invoke">The invocation model <span class="badge shipped">shipped</span></h2>
 <div class="prose">
-  <p>The primary primitive is <code>sigil &lt;cmd&gt; [args]</code>. You run <code>sigil op read op://...</code> or <code>sigil gcloud ...</code>: Sigil looks up the configuration for that command, and if it is configured it pings the phone, injects the configured environment on approval, runs the command, and streams the output. If the command has no configuration, Sigil refuses and tells you to add one. It never runs an unconfigured command ungated, because a silent pass-through would be false security.</p>
+  <p>The primary primitive is <code>sigil &lt;cmd&gt; [args]</code>. You run <code>sigil op read op://...</code> or <code>sigil gcloud ...</code>: Sigil looks up the configuration for that command, and if it is configured it pings the phone, injects the configured environment on approval, runs the command, and streams the output. If the command has no configuration, Sigil refuses and tells you to add one. It never runs an unconfigured command ungated, because a silent pass-through would be false security. The one deliberate exception is an <em>allow</em> rule: you can explicitly allowlist a specific match (say <code>op account list</code>) to run straight through, ungated, while a general gate rule still covers the rest of <code>op</code>. Allow is the user's explicit, per-match choice, scoped strictly to that match; an unconfigured command is still refused.</p>
   <p>Reserved <code>sigil</code> verbs (<code>status</code>, <code>pair</code>, <code>daemon</code>, and the rest) always win, so <code>sigil run -- &lt;cmd&gt;</code> is the unambiguous escape hatch for a command that collides with a verb.</p>
 </div>
 
@@ -411,7 +411,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
 
 <ol class="flow">
   <li><span class="who">caller &rarr; integration</span> A command arrives, whether typed as <code>sigil op read ...</code>, intercepted by the shim, or driven by the SSH agent. The integration forwards the argv, the working directory, and the caller's own stdout and stderr descriptors over the local socket.</li>
-  <li><span class="who">core</span> The daemon asks the configured provider to <em>describe</em> the command into opaque secret references for the readout, loads the matching account's <em>encrypted</em> credential, computes a risk level, and deposits a signed, sealed request into the phone's relay mailbox slot, alongside the phone's registered push token. The relay reads that token once, rings a content-free doorbell push to Apple on the daemon's behalf, and forgets it.</li>
+  <li><span class="who">core</span> The daemon asks the configured provider to <em>describe</em> the command into opaque secret references for the readout, loads the matching account's <em>encrypted</em> credential, reads the matched rule's lease policy, and deposits a signed, sealed request into the phone's relay mailbox slot, alongside the phone's registered push token. The relay reads that token once, rings a content-free doorbell push to Apple on the daemon's behalf, and forgets it.</li>
   <li><span class="who">phone</span> A fixed "Approval requested" alert arrives, nothing more; the phone drains the sealed request waiting for it at the relay.</li>
   <li><span class="who">you</span> Glance: which command, which references, which process, from which directory, how long until it expires. Approve with Face ID, or deny with one tap, always.</li>
   <li><span class="who">phone &rarr; core</span> On approve, Face ID unlocks the Secure Enclave key, the unwrap key is sealed to this response inside the audited envelope, and the signed response returns over the same connection. Replay-proof: single-use request id, monotonic per-pairing counter, 90-second window.</li>
@@ -428,7 +428,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
 
 <h2 id="approve">The approval is the interaction</h2>
 <div class="prose">
-  <p>Everything above converges on one screen. Friction on that screen scales with risk; refusing never does.</p>
+  <p>Everything above converges on one screen. Every request is a single calm tap to approve and a single tap to deny; the screen never makes approving harder. What a rule <em>can</em> do is set by its <strong>lease policy</strong>, not by a risk tier: a run-once rule needs a fresh tap every invocation, a leasable rule lets that tap also open a bounded auto-approve window.</p>
 </div>
 
 <div class="stage">
@@ -456,21 +456,20 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
         <div><span class="k">machine</span><span class="v">studio.local</span></div>
         <div><span class="k">when</span><span class="v">just now</span></div>
       </div>
-      <div class="risk">Production vault. First request from this process.</div>
-      <div class="slide"><span class="knob">&rsaquo;</span><span class="lbl">Slide to approve</span></div>
+      <div class="risk">Leasable rule &middot; approve once, or approve for up to 15 min.</div>
+      <div class="slide"><span class="knob">&rsaquo;</span><span class="lbl">Tap to approve</span></div>
       <div class="denybtn">Deny</div>
     </div></div>
-    <p class="mock-cap">The approval sheet at elevated risk: brass gauge counting to expiry, the readout well leading with the reference label, provenance in mono, slide instead of tap. The well renders provider-supplied display segments; the phone never parses what the reference means.</p>
+    <p class="mock-cap">The approval sheet: brass gauge counting to expiry, the readout well leading with the reference label, provenance in mono, one tap to approve. A leasable rule additionally offers "approve for N minutes"; a run-once rule shows only the single tap. The well renders provider-supplied display segments; the phone never parses what the reference means.</p>
   </div>
   <div>
-    <h3 style="margin-top:0">Friction scales with risk; deny never does</h3>
-    <p style="max-width:46ch">The daemon computes risk from source sensitivity, process novelty, and target. Risk changes exactly one thing: the shape of the approve control. Deny is always a single calm tap, because refusing must never be harder than allowing.</p>
+    <h3 style="margin-top:0">One tap; the rule sets what that tap may do</h3>
+    <p style="max-width:46ch">There is no risk tier scaling the control. Every approve is one tap and every deny is one tap. The matched rule carries a lease policy, and that policy changes exactly one thing: whether the tap may <em>also</em> open a bounded auto-approve window.</p>
     <div class="ladder">
-      <div class="rung"><span class="lv" style="color:var(--cobalt)">routine</span><span>Known process, low-sensitivity source</span><span class="act">tap to approve</span></div>
-      <div class="rung"><span class="lv" style="color:var(--brass)">elevated</span><span>Production source, or a process seen for the first time, with one reason line</span><span class="act">slide to approve</span></div>
-      <div class="rung"><span class="lv" style="color:var(--deny)">critical</span><span>Signature to a production host, bulk reads</span><span class="act">hold to approve</span></div>
+      <div class="rung"><span class="lv" style="color:var(--cobalt)">run-once</span><span>The safe default. A fresh phone approval every invocation; a lease is never offered or granted</span><span class="act">tap to approve</span></div>
+      <div class="rung"><span class="lv" style="color:var(--brass)">leasable</span><span>The rule opts in with a per-rule cap; the tap may open a session up to that cap (e.g. <code>gcloud</code> 15m)</span><span class="act">tap, or approve for N min</span></div>
     </div>
-    <p style="max-width:46ch">Every approve additionally passes Face ID: the Secure Enclave will not release the unwrap key without it, so a stolen unlocked phone still cannot approve. Long-press deny offers "Deny and block this process for 1 hour." An SSH request swaps the readout well for key label, host, and challenge fingerprint, the two things worth verifying.</p>
+    <p style="max-width:46ch">Run-once is enforced end to end: even if a compromised approver returns a lease, the daemon refuses it, and an over-long request is clamped down to the rule's cap. Every approve additionally passes Face ID: the Secure Enclave will not release the unwrap key without it, so a stolen unlocked phone still cannot approve. Long-press deny offers "Deny and block this process for 1 hour." An SSH request swaps the readout well for key label, host, and challenge fingerprint, the two things worth verifying.</p>
     <h4>The rest of the app <span class="badge shipped">shipped</span></h4>
     <div class="tblwrap"><table>
       <tr><td class="mono">home</td><td>armed state at a glance: <span class="dim">Armed &middot; studio.local connected &middot; 2 accounts</span>, last decision, lockdown control</td></tr>
