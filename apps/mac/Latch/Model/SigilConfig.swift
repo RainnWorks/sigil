@@ -221,7 +221,6 @@ struct QuickStart: Identifiable, Sendable {
     /// The draft this quick start seeds the editor with.
     func draft() -> RuleDraft {
         var draft = RuleDraft()
-        draft.name = command
         draft.command = command
         draft.env = suggestedKeys.map { EnvRow(key: $0) }
         return draft
@@ -286,10 +285,11 @@ struct EnvSecret: Sendable, Equatable {
 // MARK: - Rule draft
 
 /// The editable state behind the rule editor: a command to match and the inline,
-/// write-once environment to inject. Provider-blind by construction; the backing
-/// `env` source is hidden plumbing the model manages, never named here.
+/// write-once environment to inject. A rule IS its match; it has no user-facing
+/// name. Its config identity (RuleConfig.name) is a unique id the model mints on
+/// save so two rules can share a base command, and the backing `env` source is
+/// hidden plumbing the model manages, never named here.
 struct RuleDraft {
-    var name = ""
     var command = ""
     var subcommand = ""
     var argvContains: [String] = []
@@ -302,9 +302,11 @@ struct RuleDraft {
     var risk: RiskLevel = .routine
     /// Preserved across an edit but not surfaced. nil means "use the global timeout".
     var timeoutSec: Int?
+    /// The config identity of an existing rule, carried across an edit so it stays
+    /// stable (never renamed). nil for a brand-new rule (the model mints one).
+    var ruleName: String?
     /// The hidden `env` source backing an existing rule, carried across an edit so
-    /// its sealed values survive even a rename. nil for a brand-new rule (the
-    /// model allocates one on save).
+    /// its sealed values survive. nil for a brand-new rule (the model allocates one).
     var sourceName: String?
 
     /// The match this draft would author.
@@ -323,7 +325,7 @@ struct RuleDraft {
     /// Seed a draft from an existing rule, for editing in place. The rule's env
     /// source resolves to KEY-only rows (values stay sealed, unknown to the app).
     init(editing rule: RuleConfig, in config: SigilConfig) {
-        name = rule.name
+        ruleName = rule.name
         command = rule.match.command ?? ""
         subcommand = rule.match.subcommand ?? ""
         argvContains = rule.match.argvContains

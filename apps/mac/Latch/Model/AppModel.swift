@@ -177,14 +177,15 @@ final class AppModel {
 
     // MARK: config (rules + their hidden env sources)
 
-    /// Save a rule authored on the Rules screen. Each rule owns a hidden `env`
-    /// source that holds its write-once environment; the model creates and manages
-    /// that source so the user only ever sees the rule. A brand-new rule goes
-    /// through the `rule add` verb (whose targeted errors surface a duplicate
-    /// name); an in-place edit round-trips the whole config through `import`,
-    /// which is atomic and revalidates referential integrity. Either way the
-    /// draft's environment is then sealed: new and replaced VALUES are encrypted
-    /// under the DEK in one pass (one Touch ID), and removed KEYs are dropped.
+    /// Save a rule authored on the Rules screen. A rule is its match; it has no
+    /// user-facing name. The model mints a UNIQUE config identity (and a matching
+    /// hidden `env` source) so `add_rule` can never reject it and the user never
+    /// meets an "already exists": stacking two rules on the same base command (op,
+    /// op with a flag, even a second identical op) is the point, not an error. A
+    /// brand-new rule goes through `rule add`; an edit keeps the existing identity
+    /// and round-trips the whole config through `import` (atomic, revalidated).
+    /// Either way the draft's environment is then sealed: new and replaced VALUES
+    /// are encrypted under the DEK in one pass, and removed KEYs are dropped.
     ///
     /// Returns whether it actually took, so the editor sheet dismisses only on a
     /// real success and stays open (with the reason) on a refusal. The reload runs
@@ -195,21 +196,24 @@ final class AppModel {
         var ok = false
         do {
             let cfg = try await daemon.config()
-            let sourceName = envSourceName(for: draft, in: cfg)
+            // Identity: reuse an edit's stable id; else mint a unique one from the
+            // match. A rule and its hidden source share the string.
+            let name: String = oldName ?? draft.sourceName ?? uniqueName(from: draft.match, in: cfg)
+            let sourceName = draft.sourceName ?? name
             let priorKeys = cfg.source(named: sourceName)?.keys ?? []
-            // Create the hidden env source on first save (an edit reuses the
-            // existing one, so its sealed values survive even a rule rename).
+            // Create the hidden env source on first save (an edit reuses it, so
+            // its sealed values survive).
             if cfg.source(named: sourceName) == nil {
                 try await daemon.addSource(SourceConfig(name: sourceName, provider: envProviderID))
             }
             let rule = RuleConfig(
-                name: draft.name.trimmed,
+                name: name,
                 match: draft.match,
                 action: ActionConfig(source: sourceName, risk: draft.risk.rawValue,
                                      timeoutSec: draft.timeoutSec))
-            if let oldName {
+            if oldName != nil {
                 var updated = try await daemon.config()
-                updated.rules.removeAll { $0.name == oldName || $0.name == rule.name }
+                updated.rules.removeAll { $0.name == name }
                 updated.rules.append(rule)
                 try await daemon.importConfig(updated)
             } else {
@@ -241,18 +245,21 @@ final class AppModel {
         await loadSecondaryScreens()
     }
 
-    /// The hidden `env` source backing a rule: reuse the one an edit carries (so
-    /// its sealed values persist across a rename), else derive a fresh unique name
-    /// from the rule name. The name is never shown; it only wires rule to source.
-    private func envSourceName(for draft: RuleDraft, in cfg: SigilConfig) -> String {
-        if let existing = draft.sourceName { return existing }
-        var name = draft.name.trimmed.sourceSlug
-        var n = 2
-        while cfg.sources.contains(where: { $0.name == name }) {
-            name = "\(draft.name.trimmed.sourceSlug)-\(n)"
-            n += 1
+    /// A unique config identity for a new rule, derived from its match summary
+    /// (e.g. "op", "op-read", "op-account-prod") and disambiguated with a counter
+    /// when that base is already taken, so two rules on the same command coexist.
+    /// Unique across BOTH rule names and source names, since a rule and its hidden
+    /// source share the string. The string is config-side plumbing; the rule's
+    /// display is its match, which may repeat freely.
+    private func uniqueName(from match: MatchConfig, in cfg: SigilConfig) -> String {
+        let base = match.summary.sourceSlug
+        let taken: (String) -> Bool = { n in
+            cfg.rules.contains { $0.name == n } || cfg.sources.contains { $0.name == n }
         }
-        return name
+        if !taken(base) { return base }
+        var n = 2
+        while taken("\(base)-\(n)") { n += 1 }
+        return "\(base)-\(n)"
     }
 
     /// Seal the draft's environment into `source`. New rows (and existing rows the

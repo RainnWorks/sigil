@@ -42,7 +42,7 @@ struct RulesView: View {
             RuleEditorSheet(draft: ctx.draft, editingName: ctx.editingName)
         }
         .confirmationDialog(
-            confirmingRemove.map { "Remove rule \($0.name)?" } ?? "Remove rule?",
+            confirmingRemove.map { "Remove rule \($0.match.summary)?" } ?? "Remove rule?",
             isPresented: Binding(get: { confirmingRemove != nil },
                                  set: { if !$0 { confirmingRemove = nil } }),
             titleVisibility: .visible
@@ -184,15 +184,12 @@ private struct RuleCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            // A rule is its match: the match summary is the label (it may repeat
+            // across rules; the user orders them and the higher one wins).
             HStack(spacing: 8) {
-                Text(rule.name).font(.system(size: 13, weight: .semibold))
-                Spacer()
-            }
-
-            // What it watches for.
-            HStack(spacing: 6) {
                 Text("when").font(.system(size: 10)).foregroundStyle(.tertiary)
-                MonoText(rule.match.summary, size: 11, color: .secondary)
+                Text(rule.match.summary).font(.mono(13, weight: .medium))
+                Spacer()
             }
 
             // What it injects (KEY names only; values are sealed and unreadable).

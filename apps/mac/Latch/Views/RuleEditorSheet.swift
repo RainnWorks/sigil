@@ -31,12 +31,23 @@ struct RuleEditorSheet: View {
 
     private var isEdit: Bool { editingName != nil }
 
-    /// The reason Save is blocked, or nil when the draft is authorable. Ordered so
-    /// the most fundamental gap surfaces first.
+    /// The reason Save is blocked, or nil when the draft is authorable. A rule is
+    /// its match, so the only gates are a non-empty match and a sound environment.
+    /// A rule is NEVER blocked for duplicating another; the model mints a unique
+    /// id, so stacking rules (even an identical one) always succeeds.
     private var blocker: String? {
-        if draft.name.trimmed.isEmpty { return "Give the rule a name." }
         if draft.match.isEmpty { return "Add at least one match condition." }
         return envError
+    }
+
+    /// A soft, non-blocking heads-up when this exact match already exists. The user
+    /// may still add it (they order the list; the higher one wins); this only says
+    /// so out loud. Never disables Save.
+    private var duplicateMatchHint: String? {
+        guard !draft.match.isEmpty else { return nil }
+        guard model.config.rules.contains(where: { $0.match == draft.match && $0.name != editingName })
+        else { return nil }
+        return "Another rule already matches this exactly. Whichever sits higher in your rules list wins first."
     }
 
     /// What is wrong with the environment rows, or nil. Keys must be valid and
@@ -70,7 +81,6 @@ struct RuleEditorSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     if let error = model.lastError { ErrorStrip(message: error) }
-                    nameSection
                     matchSection
                     environmentSection
                 }
@@ -115,19 +125,11 @@ struct RuleEditorSheet: View {
         .padding(.horizontal, 20).padding(.vertical, 14)
     }
 
-    // MARK: name
-
-    private var nameSection: some View {
-        fieldGroup(title: "Name", hint: "A label for this rule, unique across your rules.") {
-            TextField("op-read", text: $draft.name).textFieldStyle(.roundedBorder)
-        }
-    }
-
     // MARK: match
 
     private var matchSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            sectionTitle("Match", "Every condition you set must hold. Leave a field blank to ignore it.")
+            sectionTitle("Match", "The command to gate, and the conditions that must hold. Every condition you set must match; leave a field blank to ignore it. This is also how the rule is labelled.")
 
             twoUp(
                 labelled("Command") {
@@ -143,6 +145,14 @@ struct RuleEditorSheet: View {
             TokenListEditor(title: "Flags present", placeholder: "--vault",
                             tokens: $draft.flagPresent)
             FlagEqEditor(pairs: $draft.flagEquals)
+
+            if let hint = duplicateMatchHint {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "info.circle").font(.system(size: 10)).foregroundStyle(Palette.brass)
+                    Text(hint).font(.system(size: 10)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
     }
 
@@ -175,18 +185,6 @@ struct RuleEditorSheet: View {
             Text(title).font(.system(size: 12, weight: .semibold))
             Text(subtitle).font(.system(size: 10)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    private func fieldGroup<Content: View>(title: String, hint: String?,
-                                           @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title).font(.system(size: 11)).foregroundStyle(.secondary)
-            content()
-            if let hint {
-                Text(hint).font(.system(size: 10)).foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
         }
     }
 
