@@ -112,11 +112,39 @@ impl Account {
     }
 }
 
-/// The account catalogue persisted at `~/.sigil/sigil.db` as JSON.
+/// One inline-`env` source's sealed values. The KEY *names* live in the config
+/// (`config.json`, public) and drive the zero-knowledge readout; only the
+/// **values** live here, and only as ciphertext. `blob` is `nonce || ciphertext`
+/// from [`encrypt_token`] over the serialized `{KEY: VALUE}` map (see
+/// `provider::encode_env_pairs`), base64 for JSON — sealed under the very same
+/// DEK a service-account token is, so the daemon-at-rest holds no plaintext value
+/// (invariant #1). Keyed by the source's `name`, mirroring an account's `label`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealedEnv {
+    /// The [`crate::config::Source::name`] this blob backs.
+    pub name: String,
+    /// `nonce || ciphertext` from [`encrypt_token`], base64 for JSON.
+    pub blob_b64: String,
+}
+
+impl SealedEnv {
+    /// The raw sealed blob bytes (`nonce || ciphertext`).
+    pub fn ciphertext(&self) -> Result<Vec<u8>, SecretsError> {
+        Ok(B64.decode(self.blob_b64.as_bytes())?)
+    }
+}
+
+/// The account catalogue persisted at `~/.sigil/sigil.db` as JSON. It also holds
+/// the inline-`env` sources' sealed value blobs ([`SealedEnv`]) — the same
+/// encrypted store the tokens use, reused rather than a parallel one, so both the
+/// token and the inline-env at-rest guarantees are enforced by one DEK.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AccountStore {
     #[serde(default)]
     pub accounts: Vec<Account>,
+    /// Inline-`env` sealed value blobs, keyed by source name. Ciphertext only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_sources: Vec<SealedEnv>,
 }
 
 impl AccountStore {
@@ -201,6 +229,41 @@ impl AccountStore {
         let before = self.accounts.len();
         self.accounts.retain(|a| a.label != label);
         self.accounts.len() != before
+    }
+
+    /// Seal `ciphertext` (already `nonce || ciphertext` from [`encrypt_token`])
+    /// as the inline-`env` blob for source `name`, replacing any existing one.
+    /// The caller does the encrypt (it holds the DEK); this store only ever holds
+    /// the sealed bytes, never a plaintext value.
+    pub fn set_env_blob(&mut self, name: &str, ciphertext: &[u8]) {
+        let blob_b64 = B64.encode(ciphertext);
+        if let Some(existing) = self.env_sources.iter_mut().find(|e| e.name == name) {
+            existing.blob_b64 = blob_b64;
+        } else {
+            self.env_sources.push(SealedEnv {
+                name: name.to_string(),
+                blob_b64,
+            });
+        }
+    }
+
+    /// The sealed blob bytes for inline-`env` source `name`, if one is stored.
+    /// `Some(Err(..))` only on a corrupt (non-base64) record. The daemon decrypts
+    /// this after approval; nothing here is ever plaintext.
+    pub fn env_blob(&self, name: &str) -> Option<Result<Vec<u8>, SecretsError>> {
+        self.env_sources
+            .iter()
+            .find(|e| e.name == name)
+            .map(SealedEnv::ciphertext)
+    }
+
+    /// Remove the sealed blob for inline-`env` source `name`. Returns true if one
+    /// was removed. Called when a key is unset to empty, or the source is removed,
+    /// so no orphaned secret ciphertext outlives its source.
+    pub fn remove_env_blob(&mut self, name: &str) -> bool {
+        let before = self.env_sources.len();
+        self.env_sources.retain(|e| e.name != name);
+        self.env_sources.len() != before
     }
 
     /// Pick the account for a routing `hint`. The hint is a source's configured
@@ -410,6 +473,65 @@ mod tests {
         let acct = loaded.route(Some("Engineering")).unwrap();
         let pt = decrypt_token(&dek, &acct.ciphertext().unwrap()).unwrap();
         assert_eq!(&pt[..], b"super-secret-token");
+
+        std::env::remove_var("SIGIL_HOME");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn env_blob_is_ciphertext_at_rest_and_round_trips() {
+        // The inline-env sealed blob must persist as ciphertext keyed by the
+        // source name: the VALUE never appears on disk, only the (public) name and
+        // the sealed bytes, and it decrypts+decodes back to the exact pairs.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("sigil-envblob-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("SIGIL_HOME", &tmp);
+
+        let dek = generate_dek();
+        let pairs = vec![
+            (
+                "API_KEY".to_string(),
+                Zeroizing::new("super-secret-value-xyz".to_string()),
+            ),
+            ("REGION".to_string(), Zeroizing::new("eu".to_string())),
+        ];
+        let encoded = crate::provider::encode_env_pairs(&pairs);
+        let ct = encrypt_token(&dek, &encoded).unwrap();
+        let mut store = AccountStore::default();
+        store.set_env_blob("deploy", &ct);
+        store.save().unwrap();
+
+        // At rest: the sealed VALUE must not appear; the source NAME (public) may.
+        let raw = std::fs::read(AccountStore::path().unwrap()).unwrap();
+        let raw = String::from_utf8_lossy(&raw);
+        assert!(
+            !raw.contains("super-secret-value-xyz"),
+            "plaintext inline-env value leaked into the store"
+        );
+        assert!(raw.contains("deploy"), "the source name should be present");
+
+        // Round-trip: load, open, decode, exact pairs back.
+        let mut loaded = AccountStore::load().unwrap();
+        let ct2 = loaded.env_blob("deploy").expect("blob present").unwrap();
+        let plain = decrypt_token(&dek, &ct2).unwrap();
+        let back = crate::provider::decode_env_pairs(&plain).unwrap();
+        let map: std::collections::HashMap<_, _> = back
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_string()))
+            .collect();
+        assert_eq!(map.get("API_KEY").unwrap(), "super-secret-value-xyz");
+        assert_eq!(map.get("REGION").unwrap(), "eu");
+
+        // Remove leaves no orphan.
+        assert!(loaded.remove_env_blob("deploy"));
+        assert!(loaded.env_blob("deploy").is_none());
+        assert!(
+            !loaded.remove_env_blob("deploy"),
+            "second remove is a no-op"
+        );
 
         std::env::remove_var("SIGIL_HOME");
         std::fs::remove_dir_all(&tmp).ok();

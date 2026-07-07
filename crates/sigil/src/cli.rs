@@ -259,9 +259,14 @@ usage: sigil-config <cmd> [args...]   author rules/sources, manage accounts
 
   add <cmd> --provider <id> [--source <p>] [--account <l>] [--risk <r>]
                     convenience: author a source + rule for one command
-                    (providers: 1password, env-file)
+                    (providers: 1password, env-file, env)
   source add <name> --provider <id> [--account <l>] [--path <f>]
                     add a named secret source; also: source list|remove
+  source env set <name> --key <KEY>    seal one inline env VALUE (read from
+                    stdin, never argv) under the DEK; --stdin reads KEY=VALUE
+                    lines instead. source env unset <name> --key <KEY> removes
+                    one. Values are AES-256-GCM at rest; list/export show only
+                    KEY names
   rule add <name> --source <s> [--command <c>] [--subcommand <s>]
                     [--argv-contains <str>...] [--flag <f>...] [--flag-eq <f>=<v>...]
                     [--risk <r>] [--timeout <sec>]   a match -> gate + inject
@@ -2464,9 +2469,11 @@ fn cmd_config_source(args: &[String], json: bool) -> i32 {
         Some("add") => config_source_add(&args[1..], json),
         Some("list") | None => config_source_list(json),
         Some("remove") | Some("rm") => config_source_remove(args.get(1).map(String::as_str), json),
+        Some("env") => cmd_config_source_env(&args[1..], json),
         _ => {
             eprintln!(
-                "usage: sigil-config source <add <name> --provider <id> | list | remove <name>>"
+                "usage: sigil-config source <add <name> --provider <id> | list | remove <name> | \
+                 env <set|unset> <name> ...>"
             );
             2
         }
@@ -2515,9 +2522,12 @@ fn config_source_add(args: &[String], json: bool) -> i32 {
     };
     let src = crate::config::Source {
         name: name.clone(),
-        provider,
+        provider: provider.clone(),
         account,
         path,
+        // The inline `env` source starts with no keys; values are added securely
+        // via `source env set` (which reads them from stdin, never argv).
+        keys: Vec::new(),
     };
     if let Err(e) = cfg.add_source(src) {
         eprintln!("sigil: {e}");
@@ -2526,8 +2536,13 @@ fn config_source_add(args: &[String], json: bool) -> i32 {
     if !save_config(&cfg) {
         return 1;
     }
+    let hint = if provider == crate::provider::EnvProvider::ID {
+        format!(" (set values: sigil-config source env set {name} --key <KEY>)")
+    } else {
+        String::new()
+    };
     print_config_result(
-        &ControlResult::line(true, format!("source {name} added")),
+        &ControlResult::line(true, format!("source {name} added{hint}")),
         json,
     )
 }
@@ -2552,12 +2567,21 @@ fn config_source_list(json: bool) -> i32 {
     println!("{}", s.cobalt("sources"));
     println!();
     for src in &cfg.sources {
-        let extra = src
-            .account
-            .as_deref()
-            .or(src.path.as_deref())
-            .map(|x| format!(" \u{b7} {x}"))
-            .unwrap_or_default();
+        // For the inline `env` source, show the KEY names (never values, which
+        // are not here at all). For others, the account label or env-file path.
+        let extra = if src.provider == crate::provider::EnvProvider::ID {
+            if src.keys.is_empty() {
+                " \u{b7} (no keys set)".to_string()
+            } else {
+                format!(" \u{b7} {}", src.keys.join(", "))
+            }
+        } else {
+            src.account
+                .as_deref()
+                .or(src.path.as_deref())
+                .map(|x| format!(" \u{b7} {x}"))
+                .unwrap_or_default()
+        };
         println!(
             "  {}  {}{}",
             pad(&src.name, 16),
@@ -2577,9 +2601,16 @@ fn config_source_remove(name: Option<&str>, json: bool) -> i32 {
         Some(c) => c,
         None => return 1,
     };
+    // If this was an inline `env` source, its sealed values must go too, so no
+    // orphaned secret ciphertext outlives the source.
+    let was_env =
+        matches!(cfg.source(name), Some(src) if src.provider == crate::provider::EnvProvider::ID);
     let result = match cfg.remove_source(name) {
         Ok(true) => {
             if !save_config(&cfg) {
+                return 1;
+            }
+            if was_env && !purge_env_blob(name) {
                 return 1;
             }
             ControlResult::line(true, format!("source {name} removed"))
@@ -2588,6 +2619,354 @@ fn config_source_remove(name: Option<&str>, json: bool) -> i32 {
         Err(e) => ControlResult::line(false, e),
     };
     print_config_result(&result, json)
+}
+
+/// Remove any sealed inline-`env` value blob named `name` from the account store,
+/// so removing a source (or clearing its last key) leaves no orphaned ciphertext.
+/// A no-op when there is no blob. Returns false (having printed) on a store error.
+fn purge_env_blob(name: &str) -> bool {
+    let mut store = match AccountStore::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("sigil: loading account store: {e}");
+            return false;
+        }
+    };
+    if store.remove_env_blob(name) {
+        if let Err(e) = store.save() {
+            eprintln!("sigil: saving account store: {e}");
+            return false;
+        }
+    }
+    true
+}
+
+/// Provision (idempotently) and unwrap the host DEK for a config-side seal, the
+/// same key `sigil account add` seals tokens under. On a Secure Enclave keystore
+/// this is where Touch ID fires. `None` (with a printed error) on any failure.
+fn unwrap_host_dek(reason: &str) -> Option<crate::secrets::Dek> {
+    let ks = keystore::for_host();
+    if let Err(e) = ks.ensure_dek() {
+        eprintln!(
+            "sigil: provisioning the DEK: {}\n  (detail: {e})",
+            keystore::dek_error_hint(&e)
+        );
+        return None;
+    }
+    match ks.unwrap_dek(reason) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            eprintln!(
+                "sigil: unwrapping the DEK: {}\n  (detail: {e})",
+                keystore::dek_error_hint(&e)
+            );
+            None
+        }
+    }
+}
+
+/// Whether `k` is a safe environment variable name to inject: non-empty and free
+/// of `=`, NUL, and ASCII whitespace/control, so it can never corrupt the child's
+/// env or the sealed wire. Deliberately permissive on the rest (some tools use
+/// `.`/`-` in names); the injection is `Command::env`, not a shell.
+fn valid_env_key(k: &str) -> bool {
+    !k.is_empty()
+        && !k
+            .bytes()
+            .any(|b| b == b'=' || b == 0 || b.is_ascii_whitespace() || b.is_ascii_control())
+}
+
+/// Read one secret VALUE from stdin into a wiped buffer (never argv; argv leaks in
+/// `ps`). Strips a trailing newline (the shell's, as with token entry), requires
+/// UTF-8, and allows empty (a KEY set to ""). `None` (printed) on a read/UTF-8
+/// error.
+fn read_secret_value_stdin() -> Option<Zeroizing<String>> {
+    let mut buf = Zeroizing::new(Vec::new());
+    if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
+        eprintln!("sigil: reading the value from stdin: {e}");
+        return None;
+    }
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+        buf.pop();
+    }
+    match std::str::from_utf8(&buf) {
+        Ok(s) => Some(Zeroizing::new(s.to_string())),
+        Err(_) => {
+            eprintln!("sigil: the value is not valid UTF-8; refusing to store it");
+            None
+        }
+    }
+}
+
+fn cmd_config_source_env(args: &[String], json: bool) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("set") => config_source_env_set(&args[1..], json),
+        Some("unset") => config_source_env_unset(&args[1..], json),
+        _ => {
+            eprintln!(
+                "usage: sigil-config source env <set <name> --key <KEY> | set <name> --stdin | \
+                 unset <name> --key <KEY>>\n  \
+                 (set --key reads the VALUE from stdin; --stdin reads KEY=VALUE lines from stdin)"
+            );
+            2
+        }
+    }
+}
+
+/// Load the config and confirm `name` is an existing inline-`env` source. `None`
+/// (printed) otherwise, so the env verbs never touch a non-env source.
+fn load_env_source(name: &str) -> Option<crate::config::Config> {
+    let cfg = load_config()?;
+    match cfg.source(name) {
+        Some(src) if src.provider == crate::provider::EnvProvider::ID => Some(cfg),
+        Some(src) => {
+            eprintln!(
+                "sigil: source {name} is a '{}' source, not an inline env source",
+                src.provider
+            );
+            None
+        }
+        None => {
+            eprintln!(
+                "sigil: no source named {name}; create one first: \
+                 sigil-config source add {name} --provider env"
+            );
+            None
+        }
+    }
+}
+
+/// Decode the stored sealed blob for `name` into a mutable pair list, decrypting
+/// under `dek`. An absent blob yields an empty list (first key being set). `Err`
+/// (printed) on a store or decrypt error.
+fn load_env_pairs(
+    store: &AccountStore,
+    name: &str,
+    dek: &crate::secrets::Dek,
+) -> Result<Vec<(String, Zeroizing<String>)>, ()> {
+    match store.env_blob(name) {
+        None => Ok(Vec::new()),
+        Some(Err(e)) => {
+            eprintln!("sigil: reading the sealed env blob: {e}");
+            Err(())
+        }
+        Some(Ok(ct)) => {
+            let plain = crate::secrets::decrypt_token(dek, &ct).map_err(|e| {
+                eprintln!("sigil: opening the sealed env blob: {e}");
+            })?;
+            let pairs = crate::provider::decode_env_pairs(&plain).ok_or_else(|| {
+                eprintln!("sigil: the sealed env blob is corrupt; unset and re-set its keys");
+            })?;
+            Ok(pairs.to_vec())
+        }
+    }
+}
+
+/// Re-seal `pairs` under `dek` into the store for `name` (or remove the blob when
+/// empty), persist the store, then sync the config source's KEY-name list to the
+/// pair set and persist the config. Returns false (printed) on any failure. This
+/// is the one writer that keeps the sealed values (`sigil.db`) and the public KEY
+/// names (`config.json`) in lockstep.
+fn seal_env_pairs(
+    mut cfg: crate::config::Config,
+    name: &str,
+    pairs: &[(String, Zeroizing<String>)],
+    dek: &crate::secrets::Dek,
+) -> bool {
+    let mut store = match AccountStore::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("sigil: loading account store: {e}");
+            return false;
+        }
+    };
+    if pairs.is_empty() {
+        store.remove_env_blob(name);
+    } else {
+        let encoded = crate::provider::encode_env_pairs(pairs);
+        let ct = match crate::secrets::encrypt_token(dek, &encoded) {
+            Ok(ct) => ct,
+            Err(e) => {
+                eprintln!("sigil: sealing the env values: {e}");
+                return false;
+            }
+        };
+        store.set_env_blob(name, &ct);
+    }
+    if let Err(e) = store.save() {
+        eprintln!("sigil: saving account store: {e}");
+        return false;
+    }
+    // Sync the public KEY names onto the source (sorted+unique for a stable
+    // export), never the values.
+    let mut keys: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
+    keys.sort();
+    keys.dedup();
+    if let Some(src) = cfg.sources.iter_mut().find(|s| s.name == name) {
+        src.keys = keys;
+    }
+    save_config(&cfg)
+}
+
+fn config_source_env_set(args: &[String], json: bool) -> i32 {
+    let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
+        eprintln!(
+            "usage: sigil-config source env set <name> --key <KEY>   (VALUE from stdin)\n       \
+             sigil-config source env set <name> --stdin        (KEY=VALUE lines from stdin)"
+        );
+        return 2;
+    };
+    let Some(cfg) = load_env_source(&name) else {
+        return 1;
+    };
+
+    // Gather the (KEY, VALUE) updates from stdin. Two shapes: a single --key with
+    // its VALUE on stdin (so a value may hold '='), or --stdin bulk KEY=VALUE
+    // lines. Either way values arrive on stdin, never argv.
+    let single_key = flag_value(args, "--key").map(str::to_string);
+    let updates: Vec<(String, Zeroizing<String>)> = if let Some(key) = single_key {
+        if !valid_env_key(&key) {
+            eprintln!("sigil: '{key}' is not a valid environment variable name");
+            return 2;
+        }
+        let Some(value) = read_secret_value_stdin() else {
+            return 1;
+        };
+        vec![(key, value)]
+    } else if has_flag(args, "--stdin") {
+        match read_env_pairs_stdin() {
+            Some(u) if u.is_empty() => {
+                eprintln!("sigil: no KEY=VALUE lines on stdin");
+                return 2;
+            }
+            Some(u) => u,
+            None => return 1,
+        }
+    } else {
+        eprintln!("sigil: pass --key <KEY> (VALUE on stdin) or --stdin (KEY=VALUE lines on stdin)");
+        return 2;
+    };
+
+    let Some(dek) = unwrap_host_dek(&format!("Seal env values for {name}")) else {
+        return 1;
+    };
+    // Read the current pairs (to merge onto), then release the store; seal reloads
+    // it fresh so no stale copy is held across the merge.
+    let store = match AccountStore::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("sigil: loading account store: {e}");
+            return 1;
+        }
+    };
+    let mut pairs = match load_env_pairs(&store, &name, &dek) {
+        Ok(p) => p,
+        Err(()) => return 1,
+    };
+    drop(store);
+
+    // Merge the updates: replace an existing KEY in place, else append.
+    let set_names: Vec<String> = updates.iter().map(|(k, _)| k.clone()).collect();
+    for (k, v) in updates {
+        if let Some(existing) = pairs.iter_mut().find(|(ek, _)| ek == &k) {
+            existing.1 = v;
+        } else {
+            pairs.push((k, v));
+        }
+    }
+
+    if !seal_env_pairs(cfg, &name, &pairs, &dek) {
+        return 1;
+    }
+    print_config_result(
+        &ControlResult::line(
+            true,
+            format!("sealed {} value(s) on {name}", set_names.len()),
+        ),
+        json,
+    )
+}
+
+fn config_source_env_unset(args: &[String], json: bool) -> i32 {
+    let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
+        eprintln!("usage: sigil-config source env unset <name> --key <KEY>");
+        return 2;
+    };
+    let Some(key) = flag_value(args, "--key").map(str::to_string) else {
+        eprintln!("usage: sigil-config source env unset <name> --key <KEY>");
+        return 2;
+    };
+    let Some(cfg) = load_env_source(&name) else {
+        return 1;
+    };
+    let Some(dek) = unwrap_host_dek(&format!("Re-seal env values for {name}")) else {
+        return 1;
+    };
+    let store = match AccountStore::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("sigil: loading account store: {e}");
+            return 1;
+        }
+    };
+    let mut pairs = match load_env_pairs(&store, &name, &dek) {
+        Ok(p) => p,
+        Err(()) => return 1,
+    };
+    drop(store);
+    let before = pairs.len();
+    pairs.retain(|(k, _)| k != &key);
+    if pairs.len() == before {
+        return print_config_result(
+            &ControlResult::line(false, format!("no key {key} on {name}")),
+            json,
+        );
+    }
+    if !seal_env_pairs(cfg, &name, &pairs, &dek) {
+        return 1;
+    }
+    print_config_result(
+        &ControlResult::line(true, format!("removed key {key} from {name}")),
+        json,
+    )
+}
+
+/// Read `KEY=VALUE` lines from stdin into wiped buffers for a bulk env set. Blank
+/// lines and `#` comments are skipped; the KEY is trimmed and validated; the VALUE
+/// is taken verbatim after the first `=` (no trimming or quote-stripping, so it is
+/// exactly what the caller sent). `None` (printed) on a read/UTF-8 error or an
+/// invalid key.
+fn read_env_pairs_stdin() -> Option<Vec<(String, Zeroizing<String>)>> {
+    let mut buf = Zeroizing::new(Vec::new());
+    if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
+        eprintln!("sigil: reading KEY=VALUE lines from stdin: {e}");
+        return None;
+    }
+    let text = match std::str::from_utf8(&buf) {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!("sigil: stdin is not valid UTF-8; refusing to store it");
+            return None;
+        }
+    };
+    let mut out: Vec<(String, Zeroizing<String>)> = Vec::new();
+    for raw in text.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            eprintln!("sigil: line without '=': {:?}", line);
+            return None;
+        };
+        let key = key.trim().to_string();
+        if !valid_env_key(&key) {
+            eprintln!("sigil: '{key}' is not a valid environment variable name");
+            return None;
+        }
+        out.push((key, Zeroizing::new(value.to_string())));
+    }
+    Some(out)
 }
 
 fn cmd_config_rule(args: &[String], json: bool) -> i32 {
@@ -2845,6 +3224,11 @@ fn config_import(json: bool) -> i32 {
     if !save_config(&cfg) {
         return 1;
     }
+    // Prune any sealed env blob whose inline-env source is not in the new config,
+    // so an import that drops an env source leaves no orphaned secret ciphertext.
+    // (Import carries KEY names + a provider tag only; it can never carry a value,
+    // so this only ever removes ciphertext, never introduces plaintext.)
+    prune_orphan_env_blobs(&cfg);
     print_config_result(
         &ControlResult::line(
             true,
@@ -2856,6 +3240,32 @@ fn config_import(json: bool) -> i32 {
         ),
         json,
     )
+}
+
+/// Remove sealed env blobs from the account store whose inline-env source is
+/// absent from `cfg` (an import dropped it). Best-effort: a store error is logged,
+/// not fatal to the import that already succeeded.
+fn prune_orphan_env_blobs(cfg: &crate::config::Config) {
+    let mut store = match AccountStore::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("sigil: pruning orphan env blobs: {e}");
+            return;
+        }
+    };
+    let live: std::collections::HashSet<&str> = cfg
+        .sources
+        .iter()
+        .filter(|s| s.provider == crate::provider::EnvProvider::ID)
+        .map(|s| s.name.as_str())
+        .collect();
+    let before = store.env_sources.len();
+    store.env_sources.retain(|e| live.contains(e.name.as_str()));
+    if store.env_sources.len() != before {
+        if let Err(e) = store.save() {
+            eprintln!("sigil: saving account store after prune: {e}");
+        }
+    }
 }
 
 /// `sigil-config add <cmd> --provider <id> …`: the convenience desugar. Authors a
@@ -2901,6 +3311,7 @@ fn config_add(args: &[String], json: bool) -> i32 {
         provider: provider.clone(),
         account,
         path: path.clone(),
+        keys: Vec::new(),
     };
     if let Err(e) = cfg.add_source(src) {
         eprintln!("sigil: {e}");
@@ -2984,9 +3395,16 @@ fn config_remove(cmd: Option<&str>, json: bool) -> i32 {
         None => return 1,
     };
     let removed_rule = cfg.remove_rule(cmd);
+    // If the like-named source is an inline env source, its sealed values must go
+    // too (checked before removal, while the source is still present).
+    let was_env =
+        matches!(cfg.source(cmd), Some(src) if src.provider == crate::provider::EnvProvider::ID);
     // Remove the like-named source too, but only if nothing else references it.
     let removed_source = matches!(cfg.remove_source(cmd), Ok(true));
     if (removed_rule || removed_source) && !save_config(&cfg) {
+        return 1;
+    }
+    if removed_source && was_env && !purge_env_blob(cmd) {
         return 1;
     }
     let result = if removed_rule || removed_source {

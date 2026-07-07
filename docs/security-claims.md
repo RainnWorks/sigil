@@ -468,6 +468,36 @@ fail-closed-looping) **and rule 1 against both `own_binary()` and
 was aligned so code and brief agree. Note A/B closed; §18 is now sound with no
 open recommendations.
 
+## 19. The inline `env` provider (sealed KEY=VALUE injection)
+
+The inline `env` provider (provider id `env`) lets the user set secret VALUES
+directly (`KEY=VALUE`) instead of pointing at a plaintext env-file. It is the
+same direct-injection *shape* as §12's `env-file` — resolved values transit
+daemon RAM only as the child's spawn env, for the spawn instant, and it never
+leases — but unlike `env-file` the values are **sealed at rest under the DEK**,
+so the daemon-at-rest holds no plaintext value (invariant #1) even here. This
+section records behavior and residuals; the verdict is the independent
+reviewer's.
+
+| Claim | Enforcing code | Proving test |
+|-------|----------------|--------------|
+| VALUES are **never in `config.json`**: the config holds only the KEY names (public) plus the provider tag; the values are AES-256-GCM sealed under the DEK in the account store (`sigil.db`), keyed by the source name, exactly as a service-account token is | `config.rs::Source::keys` (names only, `#[serde skip_if empty]`), `secrets.rs::{SealedEnv,AccountStore::{set_env_blob,env_blob,remove_env_blob}}` (ciphertext, base64), `provider.rs::encode_env_pairs` (sealed plaintext) | `secrets.rs::env_blob_is_ciphertext_at_rest_and_round_trips` (greps the on-disk store: the VALUE is absent, the NAME present), `config.rs::resolve_flattens_inline_env_keys_and_source_name` (names round-trip, values were never there) |
+| The value never reaches **argv** (`ps`-visible): `source env set --key` reads the VALUE from stdin into a `Zeroizing` buffer; `--stdin` reads `KEY=VALUE` lines the same way; the CLI rejects a value on argv by construction (there is no value flag) | `cli.rs::{read_secret_value_stdin,read_env_pairs_stdin,config_source_env_set}` | manual E2E (values piped on stdin); reviewed by inspection |
+| `describe()` is **zero-knowledge**: it surfaces the KEY NAMES only (from config), never a value, and never reads the sealed blob (which it could not open pre-approval anyway) | `provider.rs::EnvProvider::describe` (maps `source.keys` to `SecretRef`s), `daemon.rs::fulfill` (builds `SourceView{keys}` before the decision) | `provider.rs::env_provider_flags_and_describe_shows_keys_not_values` |
+| The blob is **decrypted only after the grant**: the ciphertext is fetched before the approval wait (safe to hold), the DEK arrives with the phone approval (or is unwrapped from the keystore on a local approval, the same as `op`), is used for the one decrypt, and is dropped at once | `daemon.rs::fulfill` (`sealed_ct` fetched pre-decision; the `else if let Some(ct)=&sealed_ct` arm unwraps `outcome.dek`/keystore, `decrypt_token`, `drop(dek)`) | `daemon.rs::inline_env_command_runs_gated_and_injects_sealed_values` |
+| The decrypted pairs live in a `Zeroizing` map wiped at end of `run()`; the decode borrows out of the `Zeroizing` plaintext with `str::from_utf8` (no owned/un-zeroized value `String`) and fails closed on truncation or non-UTF-8 without panicking | `provider.rs::{decode_env_pairs,EnvProvider::run,spawn_with_env}`, `daemon.rs::fulfill` (`drop(sealed_env)`) | `provider.rs::{env_encode_decode_round_trips_including_awkward_values,env_decode_rejects_truncated_and_bad_utf8_without_panicking,env_provider_injects_decrypted_pairs_into_the_child}` |
+| **Never leases** (`needs_account()==false`, `needs_sealed_env()==true`): like `env-file`, resolved values must not persist in daemon RAM across a TTL, so it is gated on every run | `provider.rs::EnvProvider::{needs_account,needs_sealed_env}`, `daemon.rs::fulfill` (the sealed-env arm never calls `leases.grant`; the lease short-circuit is `if needs_account`) | `daemon.rs::inline_env_command_runs_gated_and_injects_sealed_values` (`leases.active()==0`) |
+| An **unset** source (no sealed blob) fails closed, never runs the child with a blank environment | `daemon.rs::fulfill` (`sealed_ct == None` → `fail_closed`) | `daemon.rs::inline_env_with_no_sealed_values_fails_closed` |
+| `list`/`export` cannot leak a value (they render config only, which has no value), and `import` cannot round-trip a value into the clear (config carries names only); removing the source or clearing its last key **removes the sealed blob** (no orphan ciphertext), and an import that drops an env source prunes its blob | `cli.rs::{config_source_list,config_export,config_import,purge_env_blob,prune_orphan_env_blobs,seal_env_pairs}` | manual E2E (remove purges `env_sources`); reviewed by inspection |
+
+The seal/open wire is length-prefixed (`u32 klen|key|u32 vlen|value`), pre-sized
+so the encode buffer never reallocates, so a VALUE may hold any bytes (newline,
+`=`, quotes) without an escaping ambiguity and decode borrows without a
+non-zeroized copy. See **residual 13** for the two un-wiped copies this shape
+inherits from §12 (the `Command` env map and the child's environ) — identical to
+`env-file`, plus the CLI-side merge copy at set time (the user is providing the
+value, so it is in CLI RAM regardless; held `Zeroizing`).
+
 ---
 
 ## Residuals (honest limits)
@@ -655,6 +685,28 @@ These are real and deliberately surfaced, not defects hidden.
     validate. Severity: **None today (local-only, fail-closed); a tripwire for the
     integration step.** Enforcing code: `se_ecies.rs` module docs §"Binding and
     sender authentication".
+
+13. **The inline `env` provider inherits §12's direct-injection RAM residual (by
+    design, bounded), improved by sealing the values at rest.** Like `env-file`
+    (residual 9), on an approved run the resolved VALUES transit daemon RAM as the
+    child's spawn env: a second, un-wiped `OsString` copy sits in
+    `std::process::Command`'s env map (std frees but does not scrub it, bounded to
+    the spawn — the same std limitation as the op SA token in residual #3), and the
+    child's `/proc/<pid>/environ` carries the values for its lifetime (readable by a
+    same-UID process; inherent to any inject-env-and-exec model, and same-UID is
+    already the boundary Sigil does not defend below). The daemon's own decrypted
+    copy is `Zeroizing`, wiped on drop, and never logged; leasing is disabled so
+    resolved values never persist across a TTL. **Improvement over `env-file`:** the
+    values are AES-256-GCM sealed under the DEK at rest (`sigil.db`), so — unlike a
+    plaintext env-file readable by any same-UID process at any time — the
+    daemon-at-rest holds no plaintext value (invariant #1 holds for this provider).
+    One extra transient copy exists at **set time**: `sigil-config source env set`
+    decrypts the current blob, merges the new pair, and re-seals; the merged pairs
+    (and the value the user is supplying, which is in CLI RAM regardless) are held
+    `Zeroizing` for that CLI invocation only. Severity: **Medium at run time
+    (inherent to direct injection, same as §12), reduced at rest (sealed, not
+    plaintext).** Enforcing code: `provider.rs::{EnvProvider,spawn_with_env,
+    decode_env_pairs}`, `daemon.rs::fulfill`, `cli.rs::seal_env_pairs`. See §19.
 
 ---
 

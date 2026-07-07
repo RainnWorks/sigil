@@ -92,13 +92,22 @@ A named, pluggable `SecretProvider` configuration referenced by rules. `op` /
 | field      | meaning                                                             |
 |------------|--------------------------------------------------------------------|
 | `name`     | unique id a rule's action references                               |
-| `provider` | provider id in the registry (`1password`, `env-file`, …)           |
+| `provider` | provider id in the registry (`1password`, `env-file`, `env`, …)    |
 | `account`  | optional: the 1Password account label to route (op provider)       |
 | `path`     | optional: the env-file path whose KEY=VALUEs are injected          |
+| `keys`     | optional: the inline `env` provider's KEY **names** (values sealed) |
 
-`account`/`path` are the provider-specific knobs. New provider types add their
-own optional fields; the engine never interprets them, it hands the whole source
-to the provider. Nothing here is op-only in the *engine's* eyes.
+`account`/`path`/`keys` are the provider-specific knobs. New provider types add
+their own optional fields; the engine never interprets them, it hands the whole
+source to the provider. Nothing here is op-only in the *engine's* eyes.
+
+The inline `env` provider stores only KEY **names** here (public, for the
+zero-knowledge readout); the VALUES are AES-256-GCM sealed under the DEK in the
+account store (`sigil.db`), keyed by the source `name`, exactly like a
+service-account token — so `config.json` never holds a secret value. Set/change
+them with `sigil-config source env set <name> --key <KEY>` (VALUE read from
+stdin, never argv) or `--stdin` (KEY=VALUE lines); `source env unset` removes
+one, and removing the source removes its sealed blob.
 
 ### Rule = Match -> Action
 
@@ -151,16 +160,21 @@ The core never parses `op://`, never reads `--vault`, never special-cases `op`.
 ## Gating path (daemon `fulfill`)
 
 1. `Config::resolve(argv)` -> the first rule whose match holds, resolved against
-   its source into a `ResolvedAction { provider, source_path, account, risk,
-   timeout_sec }`. `None` -> refuse with `sigil config` guidance.
+   its source into a `ResolvedAction { provider, source_name, source_path,
+   account, env_keys, risk, timeout_sec }`. `None` -> refuse with `sigil config`
+   guidance.
 2. Look up the provider by id in the `ProviderRegistry`.
 3. If the provider `needs_account()` (op), route the account by the **source's
    `account` label** (not by sniffing argv). `AccountStore::route` now matches an
    account by label OR vault, single-account fallback unchanged. v2 threshold
-   routing matches by label too.
-4. Gate on the phone (or lease short-circuit for account-backed providers).
-5. On approval, decrypt the token / read the env-file, run the provider on the
-   caller's fds. Invariants #1/#2/#7 unchanged: token ciphertext at rest, op
+   routing matches by label too. If the provider `needs_sealed_env()` (inline
+   `env`), fetch its sealed value blob from the account store by `source_name`
+   (ciphertext, held across the approval wait; decrypted only after the grant).
+4. Gate on the phone (or lease short-circuit for account-backed providers; the
+   direct-injection shapes, `env-file` and inline `env`, never lease).
+5. On approval, decrypt the token / open the sealed inline-`env` blob under the
+   DEK / read the env-file, run the provider on the caller's fds. Invariants
+   #1/#2/#7 unchanged: token and inline-`env` values are ciphertext at rest, op
    child stdout splices to the client fd, every failure fails closed.
 
 `parse_vault` is deleted from the core. Account selection is configuration, not

@@ -357,6 +357,7 @@
       <ul>
         <li><span class="b">1Password</span> via op + SA token</li>
         <li><span class="b">env-file / static</span> (reference impl)</li>
+        <li><span class="b">inline env</span> (KEY=VALUE, sealed at rest)</li>
         <li class="pl">bitwarden</li>
         <li class="pl">aws-vault · doppler</li>
       </ul>
@@ -377,7 +378,7 @@
     <h4>Layer 2 · Integrations</h4>
     <p style="max-width:48ch">How a request enters the core. <code>sigil &lt;cmd&gt;</code> is the primitive; the transparent PATH shim is a thin alias to it; the SSH agent is a distinct integration whose event is a signature rather than an injection. Each integration's only job is to turn some external trigger into a core request and hand back the result.</p>
     <h4 style="margin-top:24px">Layer 3 · Providers</h4>
-    <p style="max-width:48ch">Where the secrets come from, behind the <code>SecretProvider</code> trait. A provider parses its own reference syntax for the readout, and injects its credential so the child resolves and streams its own secrets. It never returns a value to the daemon. 1Password ships as provider #1; a direct-injection <code>env-file</code> provider ships as #2 (the reference impl that proves the seam is not op-shaped), and the id-keyed provider registry that dispatches between them is built.</p>
+    <p style="max-width:48ch">Where the secrets come from, behind the <code>SecretProvider</code> trait. A provider parses its own reference syntax for the readout, and injects its credential so the child resolves and streams its own secrets. It never returns a value to the daemon. 1Password ships as provider #1; a direct-injection <code>env-file</code> provider ships as #2 (the reference impl that proves the seam is not op-shaped); an inline <code>env</code> provider ships as #3 (KEY=VALUE pairs whose values are sealed at rest under the DEK, exactly like a token, and injected after approval, with only the KEY names in the readout); and the id-keyed provider registry that dispatches between them is built.</p>
   </div>
 </div>
 
@@ -490,6 +491,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
   <tr><th>Provider</th><th>Credential injected</th><th>Status</th></tr>
   <tr><td class="mono">1password</td><td>service-account token &rarr; <code>OP_SERVICE_ACCOUNT_TOKEN</code>; the <code>op</code> child resolves <code>op://</code> references and streams them</td><td><span class="badge shipped">shipped &amp; tested</span></td></tr>
   <tr><td class="mono">env-file</td><td>a static file of key/value pairs; the reference implementation that proves the seam is real, not op-shaped</td><td><span class="badge shipped">shipped</span></td></tr>
+  <tr><td class="mono">env</td><td>inline KEY=VALUE pairs; the values are AES-256-GCM sealed at rest under the DEK (like a token) and injected after approval, with only the KEY names in the readout</td><td><span class="badge shipped">shipped</span></td></tr>
   <tr><td class="mono">bitwarden</td><td><code>bw</code> session credential</td><td><span class="badge planned">planned</span></td></tr>
   <tr><td class="mono">aws-vault &middot; doppler</td><td>each an impl of the same trait</td><td><span class="badge planned">planned</span></td></tr>
 </table></div>

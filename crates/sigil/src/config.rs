@@ -49,6 +49,15 @@ pub struct Source {
     /// approval (the `env-file` provider).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Provider-specific: for the inline `env` provider, the KEY **names** whose
+    /// VALUES are injected after approval. The names are not secret and drive the
+    /// zero-knowledge readout (the phone shows "will set FOO, BAR"); the VALUES
+    /// are NEVER stored here. They are AES-256-GCM sealed under the DEK in the
+    /// account store (`sigil.db`), keyed by this source's `name`, exactly like a
+    /// service-account token. Empty for every other provider. Kept sorted+unique
+    /// by the CLI so `export`/`list` render deterministically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
 }
 
 /// One `{flag, value}` equality condition, e.g. `--project=prod`.
@@ -196,10 +205,17 @@ pub struct ResolvedAction {
     pub rule: String,
     /// The provider id backing the source.
     pub provider: String,
+    /// The source's name, i.e. the key under which the inline `env` provider's
+    /// sealed value blob is stored in the account store. The daemon uses it to
+    /// fetch that blob; empty of meaning for other providers.
+    pub source_name: String,
     /// The provider-specific source path (`env-file`); empty for op.
     pub source_path: Option<String>,
     /// The account label to route (op); `None` for direct-injection providers.
     pub account: Option<String>,
+    /// The inline `env` provider's KEY names (for `describe`); empty otherwise.
+    /// Names only, never values (values are sealed in the account store).
+    pub env_keys: Vec<String>,
     /// The approve-friction policy.
     pub risk: RiskLevel,
     /// Optional per-rule approval timeout in seconds.
@@ -290,6 +306,7 @@ impl Config {
                 provider: c.provider,
                 account: c.account,
                 path: c.source,
+                keys: Vec::new(),
             });
             cfg.rules.push(Rule {
                 name: c.command.clone(),
@@ -319,6 +336,7 @@ impl Config {
             provider: crate::provider::OpProvider::ID.to_string(),
             account: None,
             path: None,
+            keys: Vec::new(),
         });
         self.rules.push(Rule {
             name: "op".to_string(),
@@ -392,8 +410,10 @@ impl Config {
             return Some(ResolvedAction {
                 rule: rule.name.clone(),
                 provider: src.provider.clone(),
+                source_name: src.name.clone(),
                 source_path: src.path.clone(),
                 account: src.account.clone(),
+                env_keys: src.keys.clone(),
                 risk: rule.action.risk,
                 timeout_sec: rule.action.timeout_sec,
             });
@@ -574,6 +594,7 @@ mod tests {
             provider: "1password".into(),
             account: Some("Rowm".into()),
             path: None,
+            keys: Vec::new(),
         })
         .unwrap();
         cfg.add_source(Source {
@@ -581,6 +602,7 @@ mod tests {
             provider: "env-file".into(),
             account: None,
             path: Some("/x/.env".into()),
+            keys: Vec::new(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -626,6 +648,47 @@ mod tests {
     }
 
     #[test]
+    fn resolve_flattens_inline_env_keys_and_source_name() {
+        // An inline env source carries KEY names (never values) and its name is
+        // the blob key the daemon fetches; resolve() must surface both.
+        let mut cfg = Config::default();
+        cfg.add_source(Source {
+            name: "deploy-env".into(),
+            provider: crate::provider::EnvProvider::ID.into(),
+            account: None,
+            path: None,
+            keys: vec!["TOKEN".into(), "REGION".into()],
+        })
+        .unwrap();
+        cfg.add_rule(Rule {
+            name: "deploy".into(),
+            match_: Match {
+                command: Some("deploy".into()),
+                ..Match::default()
+            },
+            action: Action {
+                source: "deploy-env".into(),
+                risk: RiskLevel::Elevated,
+                timeout_sec: None,
+            },
+        })
+        .unwrap();
+        let r = cfg.resolve(&argv(&["deploy", "--now"])).unwrap();
+        assert_eq!(r.provider, "env");
+        assert_eq!(r.source_name, "deploy-env");
+        assert_eq!(r.env_keys, vec!["TOKEN".to_string(), "REGION".to_string()]);
+        assert_eq!(r.source_path, None);
+        assert_eq!(r.account, None);
+
+        // The KEY names round-trip through JSON; values were never here to leak.
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"keys\""));
+        assert!(json.contains("TOKEN"));
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sources, cfg.sources);
+    }
+
+    #[test]
     fn gates_command_is_command_keyed() {
         let mut cfg = Config::default();
         cfg.add_source(Source {
@@ -633,6 +696,7 @@ mod tests {
             provider: "env-file".into(),
             account: None,
             path: Some("/x".into()),
+            keys: Vec::new(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -682,6 +746,7 @@ mod tests {
                 provider: "env-file".into(),
                 account: None,
                 path: Some("/x/.env".into()),
+                keys: Vec::new(),
             }],
             rules: vec![
                 Rule {
@@ -747,6 +812,7 @@ mod tests {
             provider: "env-file".into(),
             account: None,
             path: Some("/x".into()),
+            keys: Vec::new(),
         })
         .unwrap();
         assert!(
@@ -772,6 +838,7 @@ mod tests {
             provider: "env-file".into(),
             account: None,
             path: Some("/x".into()),
+            keys: Vec::new(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -832,6 +899,7 @@ mod tests {
             provider: "1password".into(),
             account: Some("Rowm".into()),
             path: None,
+            keys: Vec::new(),
         })
         .unwrap();
         cfg.add_rule(Rule {

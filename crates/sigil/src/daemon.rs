@@ -914,6 +914,13 @@ fn fulfill(
     };
     let source = action.source_path.as_deref().unwrap_or("");
     let needs_account = provider.needs_account();
+    let needs_sealed_env = provider.needs_sealed_env();
+    // What `describe` reads: the env-file path or the inline env KEY names. Names
+    // only; no secret value is read here (pre-approval, zero-knowledge readout).
+    let view = crate::provider::SourceView {
+        path: source,
+        keys: &action.env_keys,
+    };
 
     let scope = argv.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
     let caller = lease::walk_ancestry(core.proc_table.as_ref(), peer.unwrap_or(-1));
@@ -972,12 +979,36 @@ fn fulfill(
         None => (String::new(), None),
     };
 
+    // For the inline `env` provider, fetch its sealed value blob now (ciphertext,
+    // safe to hold across the approval wait) and release the store lock. It is
+    // decrypted only AFTER the grant, so no plaintext value crosses the wait. A
+    // source with no values set fails closed rather than injecting nothing.
+    let sealed_ct = if needs_sealed_env {
+        let store = core.accounts.lock().expect("accounts poisoned");
+        match store.env_blob(&action.source_name) {
+            Some(Ok(ct)) => Some(ct),
+            Some(Err(e)) => return fail_closed(stderr, &format!("sigil env store error: {e}\n")),
+            None => {
+                return fail_closed(
+                    stderr,
+                    &format!(
+                        "sigil: inline env source '{0}' has no sealed values; set them with: \
+                         sigil-config source env set {0} --key <KEY>\n",
+                        action.source_name
+                    ),
+                )
+            }
+        }
+    } else {
+        None
+    };
+
     // A live lease short-circuits the approval — only for account-backed
     // providers, whose credential is what a lease holds. Direct-injection
     // providers are gated on every run.
     if needs_account {
         if let Some(token) = core.leases.token_for(&gk, &account_label, &scope) {
-            let refs = provider.describe(argv, source);
+            let refs = provider.describe(argv, &view);
             core.record_audit(
                 &uuid::Uuid::now_v7().to_string(),
                 provider.kind(argv),
@@ -997,6 +1028,7 @@ fn fulfill(
                 stdout,
                 stderr,
                 proxy_depth: child_depth,
+                env: None,
             });
         }
     }
@@ -1025,7 +1057,7 @@ fn fulfill(
         provenance: caller.provenance(),
         cwd: cwd.to_string(),
         command: argv.to_vec(),
-        secret_refs: provider.describe(argv, source),
+        secret_refs: provider.describe(argv, &view),
         kind: provider.kind(argv),
         risk: action.risk,
         ssh: None,
@@ -1047,13 +1079,18 @@ fn fulfill(
         return fail_closed(stderr, "request denied\n");
     }
 
-    // Account-backed providers need the decrypted token; direct-injection
-    // providers source their own env and need no credential.
+    // What each provider shape needs on approval: an account-backed provider
+    // needs the decrypted token (`credential`); the inline `env` provider needs
+    // its sealed values opened (`sealed_env`); `env-file` needs neither. These
+    // are mutually exclusive arms of one if/else so each may consume the
+    // approval's key material (`outcome.dek` / `outcome.zf`) without a move
+    // conflict.
     //
     // v2 accounts open the token by the two-party combine: the phone returned its
     // partial Z_F with the approval, and the daemon combines it with its Mac share
     // m (loaded into mlock'd memory for this one op) to derive K and decrypt. No
     // full private key is ever assembled; m, K, and the token are all zeroized.
+    let mut sealed_env: Option<crate::provider::EnvVars> = None;
     let credential = if let Some((_, record)) = &v2 {
         let zf = match outcome.zf.as_deref() {
             Some(zf) => zf,
@@ -1109,6 +1146,31 @@ fn fulfill(
                 .grant(gk, &account_label, &scope, token.clone(), ttl);
         }
         Some(token)
+    } else if let Some(ct) = &sealed_ct {
+        // Inline `env`: open the sealed value blob now that the request is
+        // granted. The DEK arrives with the phone approval (or is unwrapped from
+        // the keystore on a local approval, the same as `op`), is used for this
+        // one decrypt, and is dropped at once. No lease: like env-file, resolved
+        // values must never persist across a TTL.
+        let dek = match outcome.dek {
+            Some(dek) => dek,
+            None => match core.keystore.unwrap_dek(&format!("Approve {scope}")) {
+                Ok(dek) => dek,
+                Err(e) => {
+                    return fail_closed(stderr, &format!("sigil could not unwrap the key: {e}\n"))
+                }
+            },
+        };
+        let plain = match secrets::decrypt_token(&dek, ct) {
+            Ok(p) => p,
+            Err(e) => return fail_closed(stderr, &format!("sigil env decrypt failed: {e}\n")),
+        };
+        drop(dek);
+        match crate::provider::decode_env_pairs(&plain) {
+            Some(pairs) => sealed_env = Some(pairs),
+            None => return fail_closed(stderr, "sigil: inline env blob is corrupt; re-set it\n"),
+        }
+        None
     } else {
         None
     };
@@ -1124,10 +1186,11 @@ fn fulfill(
         core.grant_via(),
     );
 
-    // Run through the provider: it injects the credential (op) or the source
-    // env-vars (env-file) and streams output straight to the caller's fds. For
-    // op the daemon holds only the credential; for env-file the resolved values
-    // transit only as the child's spawn env (see the provider module docs).
+    // Run through the provider: it injects the credential (op), the env-file's
+    // own values, or the inline env's decrypted pairs, and streams output straight
+    // to the caller's fds. For op the daemon holds only the credential; for the
+    // direct-injection shapes the resolved values transit only as the child's
+    // spawn env (see the provider module docs).
     let code = provider.run(ProviderRun {
         command: argv,
         cwd,
@@ -1137,8 +1200,10 @@ fn fulfill(
         stdout,
         stderr,
         proxy_depth: child_depth,
+        env: sealed_env.as_ref(),
     });
     drop(credential); // zeroized here (Token is Zeroizing) when present
+    drop(sealed_env); // zeroized here (EnvVars is Zeroizing) when present
     code
 }
 
@@ -1225,6 +1290,7 @@ mod tests {
             provider: OpProvider::ID.into(),
             account: None,
             path: None,
+            keys: Vec::new(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -1254,6 +1320,7 @@ mod tests {
             provider: EnvFileProvider::ID.into(),
             account: None,
             path: Some(path.into()),
+            keys: Vec::new(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -1288,6 +1355,7 @@ mod tests {
                 provider: OpProvider::ID.into(),
                 account: Some(account.into()),
                 path: None,
+                keys: Vec::new(),
             })
             .unwrap();
             cfg.add_rule(Rule {
@@ -1850,6 +1918,163 @@ mod tests {
         // A direct-injection provider is never leased (no credential to hold in
         // RAM across a TTL), even though the decision would allow it.
         assert_eq!(core.leases.active(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A config gating `<command>` to the inline `env` provider named `<command>`
+    /// with the given KEY names. The sealed values live in the account store (not
+    /// here), keyed by the same name.
+    fn env_inline_config(command: &str, keys: &[&str]) -> Config {
+        use crate::config::{Action, Match, Rule, Source};
+        let mut cfg = Config::default();
+        cfg.add_source(Source {
+            name: command.into(),
+            provider: crate::provider::EnvProvider::ID.into(),
+            account: None,
+            path: None,
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+        })
+        .unwrap();
+        cfg.add_rule(Rule {
+            name: command.into(),
+            match_: Match {
+                command: Some(command.into()),
+                ..Match::default()
+            },
+            action: Action {
+                source: command.into(),
+                risk: RiskLevel::Routine,
+                timeout_sec: None,
+            },
+        })
+        .unwrap();
+        cfg
+    }
+
+    #[test]
+    fn inline_env_command_runs_gated_and_injects_sealed_values() {
+        // End to end through the daemon: a configured inline `env` command is
+        // gated, the daemon opens the DEK-sealed values on approval, and the child
+        // sees the exact KEY=VALUEs — no account and no lease, values only in RAM.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("envinline");
+        let bindir = dir.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = bindir.join("faketool");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\nprintf 'tok=%s region=%s' \"$TOKEN\" \"$REGION\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Seal the values under the keystore DEK, exactly as `sigil-config source
+        // env set` would, and stash the ciphertext in the account store.
+        let keystore = MemoryKeystore::with_dek();
+        let dek = keystore.unwrap_dek("test").unwrap();
+        let pairs = vec![
+            ("TOKEN".to_string(), Zeroizing::new("sealed-9".to_string())),
+            ("REGION".to_string(), Zeroizing::new("eu".to_string())),
+        ];
+        let encoded = crate::provider::encode_env_pairs(&pairs);
+        let ct = crate::secrets::encrypt_token(&dek, &encoded).unwrap();
+        drop(dek);
+        let mut accounts = AccountStore::default();
+        accounts.set_env_blob("faketool", &ct);
+
+        let keystore: Arc<dyn Keystore> = Arc::new(keystore);
+        let pending = Arc::new(PendingRegistry::new());
+        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+            .with_dev(DevMode::Approve)
+            .with_control_socket(true);
+        let core = Arc::new(Core {
+            keystore,
+            accounts: Mutex::new(accounts),
+            threshold: Mutex::new(Default::default()),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(approver)),
+            pending,
+            lockdown: AtomicBool::new(false),
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::with_defaults(),
+            config: env_inline_config("faketool", &["TOKEN", "REGION"]),
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::DevInsecure,
+            ssh_signers: Vec::new(),
+            audit: None,
+        });
+
+        let prev = std::env::var_os("PATH");
+        let mut search = vec![bindir.clone()];
+        if let Some(p) = &prev {
+            search.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
+        let (read_end, write_end) = pipe();
+        let code = fulfill(
+            &core,
+            &["faketool".into()],
+            "",
+            None,
+            0,
+            None,
+            Some(write_end),
+            None,
+        );
+        match prev {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert_eq!(code, 0);
+        assert_eq!(read_all(read_end), "tok=sealed-9 region=eu");
+        // Like every direct-injection shape, the inline env provider never leases.
+        assert_eq!(core.leases.active(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn inline_env_with_no_sealed_values_fails_closed() {
+        // A configured inline env source whose values were never set must refuse,
+        // not run the child with a blank environment.
+        let dir = tmpdir("envinline-empty");
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::with_dek());
+        let pending = Arc::new(PendingRegistry::new());
+        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+            .with_dev(DevMode::Approve)
+            .with_control_socket(true);
+        let core = Arc::new(Core {
+            keystore,
+            accounts: Mutex::new(AccountStore::default()), // no sealed blob
+            threshold: Mutex::new(Default::default()),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(approver)),
+            pending,
+            lockdown: AtomicBool::new(false),
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::with_defaults(),
+            config: env_inline_config("faketool", &["TOKEN"]),
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::DevInsecure,
+            ssh_signers: Vec::new(),
+            audit: None,
+        });
+
+        let (read_end, write_end) = pipe();
+        let code = fulfill(
+            &core,
+            &["faketool".into()],
+            "",
+            None,
+            0,
+            None,
+            Some(write_end),
+            None,
+        );
+        assert_ne!(code, 0, "an unset inline env source must fail closed");
+        assert_eq!(read_all(read_end), "", "no output on a refused run");
         std::fs::remove_dir_all(&dir).ok();
     }
 

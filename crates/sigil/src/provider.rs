@@ -80,6 +80,27 @@ pub struct ProviderRun<'a> {
     /// proxy depth + 1. A tool the child re-invokes through a Sigil alias sees
     /// this and the alias's own fuse bounds the chain (see [`crate::proxy`]).
     pub proxy_depth: u32,
+    /// For the inline [`EnvProvider`]: the decrypted KEY=VALUE pairs the daemon
+    /// opened from the source's sealed blob *after* approval, to inject into the
+    /// child. `None` for every other provider (`op` injects a credential;
+    /// `env-file` reads its own file). Like every direct-injection value these
+    /// live only in this borrowed, zeroize-on-drop buffer for the spawn instant
+    /// (see the module memory note and `EnvProvider`).
+    pub env: Option<&'a EnvVars>,
+}
+
+/// The provider-specific slice of a source's config passed to
+/// [`SecretProvider::describe`]. Each provider reads only the field its shape
+/// uses: `op` reads neither (it works off argv plus the injected credential),
+/// `env-file` reads `path`, the inline `env` provider reads `keys`. It carries
+/// KEY **names** only, never values — values are sealed at rest and decrypted
+/// only post-approval into [`ProviderRun::env`], never touched by `describe`.
+#[derive(Default, Clone, Copy)]
+pub struct SourceView<'a> {
+    /// The env-file path (`env-file` provider); empty otherwise.
+    pub path: &'a str,
+    /// The inline env KEY names (`env` provider); empty otherwise.
+    pub keys: &'a [String],
 }
 
 /// A pluggable source of secrets. See the module docs for the memory invariant
@@ -92,17 +113,29 @@ pub trait SecretProvider: Send + Sync {
     fn kind(&self, command: &[String]) -> RequestKind;
 
     /// Describe the secrets `command` will resolve, as provider-agnostic
-    /// [`SecretRef`]s for the approval screen. `source` is the command config's
-    /// provider source (e.g. the env-file path); providers that do not need it
-    /// ignore it. This runs *before* approval, so it must never read secret
-    /// values into memory.
-    fn describe(&self, command: &[String], source: &str) -> Vec<SecretRef>;
+    /// [`SecretRef`]s for the approval screen. `source` carries the config's
+    /// provider-specific fields (env-file path, inline env KEY names); providers
+    /// that do not need it ignore it. This runs *before* approval, so it must
+    /// never read secret values into memory (only KEY names, which are public).
+    fn describe(&self, command: &[String], source: &SourceView) -> Vec<SecretRef>;
 
     /// Whether the daemon must decrypt a stored account token for this provider
     /// (true for `op`) or the provider sources its own secrets (false for
-    /// `env-file`). When false the daemon skips the account routing, the DEK
-    /// unwrap, and leasing entirely.
+    /// `env-file` and the inline `env` provider). When false the daemon skips the
+    /// account routing and leasing entirely; a provider may still need the DEK to
+    /// open its own sealed values (see [`needs_sealed_env`](Self::needs_sealed_env)).
     fn needs_account(&self) -> bool;
+
+    /// Whether the daemon must open this provider's DEK-sealed inline values (the
+    /// inline `env` provider). When true the daemon fetches the source's sealed
+    /// blob from the account store, unwraps the DEK on approval, decrypts it, and
+    /// hands the KEY=VALUE pairs to [`run`](Self::run) via [`ProviderRun::env`].
+    /// Distinct from [`needs_account`](Self::needs_account) (a routed 1Password
+    /// token, which leases) and from a plaintext env-file (no DEK at all). Never
+    /// leases: like env-file, resolved values must not persist across a TTL.
+    fn needs_sealed_env(&self) -> bool {
+        false
+    }
 
     /// Run the command with the environment injected, wiring resolved output to
     /// the caller's fds. Returns the child exit code. Fails closed to a non-zero
@@ -122,11 +155,17 @@ pub struct ProviderRegistry {
 }
 
 impl ProviderRegistry {
-    /// The shipping registry: `op` (provider #1) plus the `env-file` reference
-    /// provider (#2) that proves the abstraction with a distinct injection shape.
+    /// The shipping registry: `op` (provider #1), the `env-file` reference
+    /// provider (#2) that proves the abstraction with a distinct injection shape,
+    /// and the inline `env` provider (#3) that seals KEY=VALUE pairs at rest under
+    /// the DEK and injects them after approval.
     pub fn with_defaults() -> Self {
         Self {
-            providers: vec![Box::new(OpProvider::new()), Box::new(EnvFileProvider)],
+            providers: vec![
+                Box::new(OpProvider::new()),
+                Box::new(EnvFileProvider),
+                Box::new(EnvProvider),
+            ],
         }
     }
 
@@ -202,7 +241,7 @@ impl SecretProvider for OpProvider {
         RequestKind::SecretRead
     }
 
-    fn describe(&self, command: &[String], _source: &str) -> Vec<SecretRef> {
+    fn describe(&self, command: &[String], _source: &SourceView) -> Vec<SecretRef> {
         command.iter().filter_map(|arg| op_reference(arg)).collect()
     }
 
@@ -293,22 +332,23 @@ impl SecretProvider for EnvFileProvider {
         RequestKind::SecretRead
     }
 
-    fn describe(&self, _command: &[String], source: &str) -> Vec<SecretRef> {
-        if source.is_empty() {
+    fn describe(&self, _command: &[String], source: &SourceView) -> Vec<SecretRef> {
+        let path = source.path;
+        if path.is_empty() {
             return Vec::new();
         }
         // Display only, and deliberately *without* reading the file: naming the
         // source shows the approver where the env comes from without pulling any
         // secret value into memory before the decision is made.
-        let label = std::path::Path::new(source)
+        let label = std::path::Path::new(path)
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or(source)
+            .unwrap_or(path)
             .to_string();
         vec![SecretRef {
             provider: Self::ID.to_string(),
-            reference: source.to_string(),
-            segments: vec![source.to_string()],
+            reference: path.to_string(),
+            segments: vec![path.to_string()],
             label,
         }]
     }
@@ -352,50 +392,8 @@ impl SecretProvider for EnvFileProvider {
             );
         }
 
-        // Resolve the real underlying binary (skipping our own shim alias) so a
-        // command named like a shimmed tool still runs the true executable.
-        let Some(real) = paths::find_real(&run.command[0]) else {
-            eprintln!("sigil daemon: no `{}` found on PATH to run", run.command[0]);
-            return 127;
-        };
-
-        let mut cmd = Command::new(&real);
-        cmd.args(run.command.iter().skip(1));
-        if !run.cwd.is_empty() {
-            cmd.current_dir(run.cwd);
-        }
-        for (k, v) in vars.iter() {
-            cmd.env(k, v);
-        }
-        // The proxy recursion fuse: the child (and anything it re-invokes through
-        // a Sigil alias) carries the incremented depth so the alias's own guard
-        // can bound a runaway loop. Harmless to a non-proxied tool.
-        cmd.env(crate::proxy::DEPTH_ENV, run.proxy_depth.to_string());
-        // Splice the caller's fds to the child. An ABSENT fd defaults to
-        // Stdio::null(), never inherit: the daemon's own stdio (a same-UID
-        // launchd log) must never become a sink for a tool's secret output
-        // (airtight invariant #2). The conforming path always supplies all three.
-        cmd.stdin(run.stdin.map_or_else(Stdio::null, Stdio::from));
-        cmd.stdout(run.stdout.map_or_else(Stdio::null, Stdio::from));
-        cmd.stderr(run.stderr.map_or_else(Stdio::null, Stdio::from));
-
-        let code = match cmd.status() {
-            Ok(s) => s
-                .code()
-                .or_else(|| s.signal().map(|sig| 128 + sig))
-                .unwrap_or(1),
-            Err(e) => {
-                eprintln!("sigil daemon: spawning {} failed: {e}", run.command[0]);
-                127
-            }
-        };
-        // `vars` is Zeroizing and is wiped when it drops below. `cmd`'s own env
-        // map holds a second, un-wiped copy of each value (std's `Command` stores
-        // env as plain `OsString` and does not zeroize): that copy is freed, not
-        // scrubbed, when `cmd` drops here. This is the same std limitation as the
-        // op SA-token copy (security-claims residual #3), bounded to the spawn.
-        drop(vars);
-        code
+        spawn_with_env(run, &vars)
+        // `vars` (Zeroizing) is wiped when it drops here at end of scope.
     }
 
     fn probe(&self, _credential: &[u8]) -> Result<Vec<String>, ProviderError> {
@@ -403,10 +401,190 @@ impl SecretProvider for EnvFileProvider {
     }
 }
 
-/// The parsed env-file: `(KEY, VALUE)` pairs where the key is a plain var name
-/// and each value lives in a [`Zeroizing`] buffer; the whole vec is `Zeroizing`
-/// so it is wiped when the map drops after the spawn.
-type EnvVars = Zeroizing<Vec<(String, Zeroizing<String>)>>;
+/// Provider #3: an inline **env** provider that injects KEY=VALUE pairs whose
+/// VALUES are sealed at rest under the DEK (the same AES-256-GCM the account
+/// tokens use) rather than sourced from a plaintext file.
+///
+/// It is the same direct-injection *shape* as [`EnvFileProvider`] — the resolved
+/// values transit daemon RAM only as the child's spawn env, for the spawn instant,
+/// and it never leases — with one difference: the values do not live in the clear
+/// anywhere. The config holds only the KEY *names* (public, for the readout); the
+/// VALUES are ciphertext in the account store, keyed by the source name, and are
+/// decrypted by the daemon *after approval* into [`ProviderRun::env`]. So the
+/// daemon-at-rest holds no plaintext value (invariant #1) even for this
+/// direct-injection provider, and [`describe`](SecretProvider::describe) shows the
+/// approver the KEY names ("will set FOO, BAR"), never a value (zero-knowledge).
+#[derive(Debug, Default, Clone)]
+pub struct EnvProvider;
+
+impl EnvProvider {
+    pub const ID: &'static str = "env";
+}
+
+impl SecretProvider for EnvProvider {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn kind(&self, _command: &[String]) -> RequestKind {
+        RequestKind::SecretRead
+    }
+
+    fn describe(&self, _command: &[String], source: &SourceView) -> Vec<SecretRef> {
+        // KEY names only. They are not secret; they come from the config, never
+        // from the sealed blob, so no value is read here (pre-approval).
+        source
+            .keys
+            .iter()
+            .map(|k| SecretRef {
+                provider: Self::ID.to_string(),
+                reference: k.clone(),
+                segments: vec![k.clone()],
+                label: k.clone(),
+            })
+            .collect()
+    }
+
+    fn needs_account(&self) -> bool {
+        false
+    }
+
+    fn needs_sealed_env(&self) -> bool {
+        true
+    }
+
+    fn run(&self, run: ProviderRun) -> i32 {
+        if run.command.is_empty() {
+            eprintln!("sigil daemon: env provider got an empty command");
+            return 1;
+        }
+        // The daemon opens the sealed blob after approval and hands us the pairs;
+        // no values were ever read pre-approval. A missing map is a fail-closed
+        // bug in the caller, not a secret to inject.
+        // Copy the borrowed reference out (it points at the daemon's decrypted
+        // buffer, not at `run`), so `run` can then be moved into the spawn helper.
+        let Some(vars) = run.env else {
+            eprintln!("sigil daemon: env provider got no sealed values to inject");
+            return 1;
+        };
+        spawn_with_env(run, vars)
+    }
+
+    fn probe(&self, _credential: &[u8]) -> Result<Vec<String>, ProviderError> {
+        Err(ProviderError::Unsupported)
+    }
+}
+
+/// Spawn the caller's command with `vars` injected into the child's environment
+/// and the caller's fds spliced straight to it. Shared by the two direct-injection
+/// providers ([`EnvFileProvider`] reads its `vars` from a file, [`EnvProvider`]
+/// from a decrypted blob) so the reviewed splice/exec discipline lives in one
+/// place. Returns the child exit code; fails closed to non-zero.
+///
+/// The values in `vars` are `Zeroizing` (wiped by the caller on drop); `cmd`'s own
+/// env map holds a second, un-wiped `OsString` copy that std frees but does not
+/// scrub when `cmd` drops here (same std limitation as the op SA-token copy,
+/// security-claims residual #3/#9), bounded to the spawn.
+fn spawn_with_env(run: ProviderRun, vars: &[(String, Zeroizing<String>)]) -> i32 {
+    // Resolve the real underlying binary (skipping our own shim alias) so a
+    // command named like a shimmed tool still runs the true executable.
+    let Some(real) = paths::find_real(&run.command[0]) else {
+        eprintln!("sigil daemon: no `{}` found on PATH to run", run.command[0]);
+        return 127;
+    };
+
+    let mut cmd = Command::new(&real);
+    cmd.args(run.command.iter().skip(1));
+    if !run.cwd.is_empty() {
+        cmd.current_dir(run.cwd);
+    }
+    for (k, v) in vars.iter() {
+        cmd.env(k, v.as_str());
+    }
+    // The proxy recursion fuse: the child (and anything it re-invokes through
+    // a Sigil alias) carries the incremented depth so the alias's own guard
+    // can bound a runaway loop. Harmless to a non-proxied tool.
+    cmd.env(crate::proxy::DEPTH_ENV, run.proxy_depth.to_string());
+    // Splice the caller's fds to the child. An ABSENT fd defaults to
+    // Stdio::null(), never inherit: the daemon's own stdio (a same-UID
+    // launchd log) must never become a sink for a tool's secret output
+    // (airtight invariant #2). The conforming path always supplies all three.
+    cmd.stdin(run.stdin.map_or_else(Stdio::null, Stdio::from));
+    cmd.stdout(run.stdout.map_or_else(Stdio::null, Stdio::from));
+    cmd.stderr(run.stderr.map_or_else(Stdio::null, Stdio::from));
+
+    match cmd.status() {
+        Ok(s) => s
+            .code()
+            .or_else(|| s.signal().map(|sig| 128 + sig))
+            .unwrap_or(1),
+        Err(e) => {
+            eprintln!("sigil daemon: spawning {} failed: {e}", run.command[0]);
+            127
+        }
+    }
+}
+
+/// The parsed env pairs: `(KEY, VALUE)` where the key is a plain var name and
+/// each value lives in a [`Zeroizing`] buffer; the whole vec is `Zeroizing` so it
+/// is wiped when the map drops after the spawn. Shared by the env-file parse and
+/// the inline-env seal/open path.
+pub type EnvVars = Zeroizing<Vec<(String, Zeroizing<String>)>>;
+
+/// Serialize inline-env `(KEY, VALUE)` pairs into the plaintext the daemon seals
+/// under the DEK. The wire is length-prefixed (`u32 key_len | key | u32 val_len |
+/// value`, all little-endian) rather than a text/`.env` format so a VALUE may
+/// contain **any** bytes (newlines, `=`, quotes) without an escaping ambiguity,
+/// and so decoding can borrow slices out of the (`Zeroizing`) plaintext without
+/// allocating a non-zeroized copy of any value.
+///
+/// The buffer is pre-sized to the exact length so it never reallocates: no
+/// partial-secret bytes are left in a freed-not-scrubbed intermediate. The
+/// returned buffer is `Zeroizing`, wiped on drop; the caller encrypts it and
+/// drops it at once.
+pub fn encode_env_pairs(pairs: &[(String, Zeroizing<String>)]) -> Zeroizing<Vec<u8>> {
+    let total: usize = pairs.iter().map(|(k, v)| 8 + k.len() + v.len()).sum();
+    let mut buf = Vec::with_capacity(total);
+    for (k, v) in pairs {
+        buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+        buf.extend_from_slice(k.as_bytes());
+        buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        buf.extend_from_slice(v.as_bytes());
+    }
+    Zeroizing::new(buf)
+}
+
+/// Parse the plaintext [`encode_env_pairs`] produced (after the daemon or CLI has
+/// AES-256-GCM-decrypted the sealed blob) back into [`EnvVars`]. Borrows key and
+/// value slices out of `bytes` (which the caller holds in a `Zeroizing` buffer);
+/// each value lands in a fresh `Zeroizing` string. Returns `None` on any
+/// truncation or non-UTF-8 content (fail closed, no partial/lossy copy), never
+/// panicking on hostile input.
+pub fn decode_env_pairs(bytes: &[u8]) -> Option<EnvVars> {
+    let mut out: Vec<(String, Zeroizing<String>)> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let klen = read_u32(bytes, &mut i)? as usize;
+        let key = std::str::from_utf8(bytes.get(i..i.checked_add(klen)?)?)
+            .ok()?
+            .to_string();
+        i += klen;
+        let vlen = read_u32(bytes, &mut i)? as usize;
+        let val = std::str::from_utf8(bytes.get(i..i.checked_add(vlen)?)?).ok()?;
+        out.push((key, Zeroizing::new(val.to_string())));
+        i += vlen;
+    }
+    Some(Zeroizing::new(out))
+}
+
+/// Read a little-endian `u32` at `*i`, advancing `*i` by 4. `None` if fewer than
+/// 4 bytes remain (a truncated blob fails closed).
+fn read_u32(bytes: &[u8], i: &mut usize) -> Option<u32> {
+    let end = i.checked_add(4)?;
+    let n = u32::from_le_bytes(bytes.get(*i..end)?.try_into().ok()?);
+    *i = end;
+    Some(n)
+}
 
 /// Parse a minimal `.env`: one `KEY=VALUE` per line, `#` comments and blank lines
 /// skipped, an optional leading `export `, and optional matching single/double
@@ -511,7 +689,7 @@ mod tests {
                 "read".into(),
                 "op://Engineering/.env/password".into(),
             ],
-            "",
+            &SourceView::default(),
         );
         assert_eq!(refs.len(), 1);
         let r = &refs[0];
@@ -524,7 +702,10 @@ mod tests {
     #[test]
     fn describe_is_empty_without_a_reference() {
         assert!(OpProvider::new()
-            .describe(&["op".into(), "vault".into(), "list".into()], "")
+            .describe(
+                &["op".into(), "vault".into(), "list".into()],
+                &SourceView::default()
+            )
             .is_empty());
     }
 
@@ -581,6 +762,7 @@ mod tests {
             cwd: "",
             credential: Some(&credential),
             source: "",
+            env: None,
             proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
@@ -634,6 +816,7 @@ mod tests {
             cwd: "",
             credential: None,
             source: env_path.to_str().unwrap(),
+            env: None,
             proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
@@ -684,6 +867,7 @@ mod tests {
             cwd: "",
             credential: None,
             source: env_path.to_str().unwrap(),
+            env: None,
             proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
@@ -698,5 +882,143 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(read_all(read_end), "key=live-key-42 region=eu");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn pairs(kv: &[(&str, &str)]) -> Vec<(String, Zeroizing<String>)> {
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), Zeroizing::new(v.to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn env_encode_decode_round_trips_including_awkward_values() {
+        // A value with '=', a newline, quotes, and unicode must survive the
+        // length-prefixed wire byte-for-byte (no text-format escaping ambiguity).
+        let input = pairs(&[
+            ("API_KEY", "live=key\nwith-newline"),
+            ("QUOTED", "\"has quotes' and spaces\""),
+            ("EMPTY", ""),
+            ("UNI", "héllo-世界"),
+        ]);
+        let blob = encode_env_pairs(&input);
+        let back = decode_env_pairs(&blob).expect("valid blob decodes");
+        let got: std::collections::HashMap<_, _> = back
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_string()))
+            .collect();
+        assert_eq!(got.get("API_KEY").unwrap(), "live=key\nwith-newline");
+        assert_eq!(got.get("QUOTED").unwrap(), "\"has quotes' and spaces\"");
+        assert_eq!(got.get("EMPTY").unwrap(), "");
+        assert_eq!(got.get("UNI").unwrap(), "héllo-世界");
+    }
+
+    #[test]
+    fn env_decode_rejects_truncated_and_bad_utf8_without_panicking() {
+        // A truncated length prefix, an over-long declared length, and non-UTF-8
+        // key/value bytes must all fail closed to None, never panic or over-read.
+        assert!(decode_env_pairs(&[0x03, 0x00]).is_none(), "truncated len");
+        // klen=4 but only 2 key bytes follow.
+        assert!(decode_env_pairs(&[0x04, 0, 0, 0, b'A', b'B']).is_none());
+        // klen=1, key 'A', vlen=2, but only 1 value byte -> truncated value.
+        assert!(decode_env_pairs(&[0x01, 0, 0, 0, b'A', 0x02, 0, 0, 0, b'x']).is_none());
+        // klen=1 but the "key" byte is invalid UTF-8.
+        assert!(decode_env_pairs(&[0x01, 0, 0, 0, 0xff, 0x00, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn env_provider_flags_and_describe_shows_keys_not_values() {
+        assert_eq!(EnvProvider.id(), "env");
+        // Direct-injection: no account, no leasing; but it does open a sealed blob.
+        assert!(!EnvProvider.needs_account());
+        assert!(EnvProvider.needs_sealed_env());
+        assert!(matches!(
+            EnvProvider.probe(b"x"),
+            Err(ProviderError::Unsupported)
+        ));
+        // describe() surfaces the KEY names only (from config), never a value.
+        let keys = vec!["FOO".to_string(), "BAR".to_string()];
+        let refs = EnvProvider.describe(
+            &["deploy".into()],
+            &SourceView {
+                path: "",
+                keys: &keys,
+            },
+        );
+        let labels: Vec<_> = refs.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, vec!["FOO", "BAR"]);
+        assert!(refs.iter().all(|r| r.provider == "env"));
+    }
+
+    #[test]
+    fn env_provider_is_a_registry_default() {
+        let reg = ProviderRegistry::with_defaults();
+        assert_eq!(reg.get(EnvProvider::ID).map(|p| p.id()), Some("env"));
+        assert!(reg.ids().contains(&"env"));
+    }
+
+    #[test]
+    fn env_provider_injects_decrypted_pairs_into_the_child() {
+        // The inline provider injects the pairs the daemon hands it (as if just
+        // decrypted from the sealed blob), and no account credential is involved.
+        let dir = std::env::temp_dir().join(format!("sigil-envinline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bindir = dir.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = bindir.join("faketool");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\nprintf 'key=%s region=%s' \"$API_KEY\" \"$REGION\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("PATH");
+        let mut search = vec![bindir.clone()];
+        if let Some(p) = &prev {
+            search.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
+
+        let vars: EnvVars = Zeroizing::new(pairs(&[("API_KEY", "sealed-42"), ("REGION", "us")]));
+        let (read_end, write_end) = pipe();
+        let code = EnvProvider.run(ProviderRun {
+            command: &["faketool".into()],
+            cwd: "",
+            credential: None,
+            source: "",
+            proxy_depth: 1,
+            stdin: None,
+            stdout: Some(write_end),
+            stderr: None,
+            env: Some(&vars),
+        });
+
+        match prev {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        assert_eq!(code, 0);
+        assert_eq!(read_all(read_end), "key=sealed-42 region=us");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn env_provider_fails_closed_with_no_pairs() {
+        // A missing sealed map is a fail-closed bug, not something to inject blank.
+        let code = EnvProvider.run(ProviderRun {
+            command: &["faketool".into()],
+            cwd: "",
+            credential: None,
+            source: "",
+            proxy_depth: 1,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            env: None,
+        });
+        assert_eq!(code, 1, "no sealed values must fail closed");
     }
 }
