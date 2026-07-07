@@ -22,6 +22,9 @@ final class AppModel {
     private(set) var pending: [PendingRequest] = []
     private(set) var paired: PairedDevice?
     private(set) var settings = AppSettings()
+    /// The if-this-then-that config: the rules the daemon gates on and the
+    /// sources they inject from. Authored on the Rules screen.
+    private(set) var config = SigilConfig()
 
     /// The last daemon error, surfaced as a calm banner rather than an alert.
     var lastError: String?
@@ -123,6 +126,7 @@ final class AppModel {
         accounts = (try? await daemon.accounts()) ?? accounts
         history = (try? await daemon.history()) ?? history
         settings = (try? await daemon.settings()) ?? settings
+        config = (try? await daemon.config()) ?? config
     }
 
     // MARK: actions
@@ -202,6 +206,83 @@ final class AppModel {
         } catch {
             lastError = describe(error)
             return nil
+        }
+    }
+
+    // MARK: config (rules + sources)
+
+    /// Save a rule authored on the Rules screen. The chosen ingredient (a
+    /// 1Password account or an env file) is resolved to a config source first,
+    /// creating a 1Password source pointer on the fly when one does not exist yet,
+    /// so the user never hand-authors the source/rule wiring. A brand-new rule
+    /// goes through the `rule add` verb (whose targeted errors surface a duplicate
+    /// name or unknown source); an in-place edit round-trips the whole config
+    /// through `import`, which is atomic and revalidates referential integrity.
+    func saveRule(_ draft: RuleDraft, source ingredient: Account, replacing oldName: String?) async {
+        defer { Task { await loadSecondaryScreens() } }
+        do {
+            let sourceName = try await ensureSource(for: ingredient)
+            let rule = RuleConfig(
+                name: draft.name.trimmed,
+                match: draft.match,
+                action: ActionConfig(source: sourceName, risk: draft.risk.rawValue,
+                                     timeoutSec: draft.timeoutSec))
+            if let oldName {
+                // Edit: replace the rule wholesale. `ensureSource` may have just
+                // added a source, so refetch the current config to include it,
+                // drop the old (and any same-named) rule, then import.
+                var cfg = try await daemon.config()
+                cfg.rules.removeAll { $0.name == oldName || $0.name == rule.name }
+                cfg.rules.append(rule)
+                try await daemon.importConfig(cfg)
+            } else {
+                try await daemon.addRule(rule)
+            }
+            lastError = nil
+        } catch {
+            lastError = describe(error)
+        }
+    }
+
+    func removeRule(_ rule: RuleConfig) async {
+        do {
+            try await daemon.removeRule(name: rule.name)
+            lastError = nil
+        } catch {
+            lastError = describe(error)
+        }
+        await loadSecondaryScreens()
+    }
+
+    /// Resolve an ingredient (an account or env file the user picked) to a config
+    /// source name a rule can reference, creating the source if it does not exist.
+    /// env-file ingredients already are config sources; a 1Password credential is
+    /// referenced through a source that routes it by label.
+    private func ensureSource(for ingredient: Account) async throws -> String {
+        let cfg = try await daemon.config()
+        switch ingredient.provider {
+        case .envFile:
+            if cfg.sources.contains(where: { $0.name == ingredient.id }) { return ingredient.id }
+            try await daemon.addSource(SourceConfig(
+                name: ingredient.id, provider: SourceProvider.envFile.rawValue,
+                account: nil, path: ingredient.path))
+            return ingredient.id
+        case .onePassword:
+            if let existing = cfg.sources.first(where: {
+                $0.provider == SourceProvider.onePassword.rawValue && $0.account == ingredient.label
+            }) {
+                return existing.name
+            }
+            var name = ingredient.label.sourceSlug
+            var n = 2
+            while cfg.sources.contains(where: { $0.name == name }) {
+                name = "\(ingredient.label.sourceSlug)-\(n)"
+                n += 1
+            }
+            try await daemon.addSource(SourceConfig(
+                name: name, provider: SourceProvider.onePassword.rawValue,
+                account: ingredient.label, path: nil))
+            return name
         }
     }
 

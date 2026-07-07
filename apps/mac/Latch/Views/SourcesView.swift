@@ -1,12 +1,14 @@
-//  AccountsView.swift
-//  Configured secret sources: a 1Password service-account token (live vault
-//  probe warns if it sees no usable vault) or an env-file path. 1Password is
-//  provider #1, not the only shape; add starts with a provider picker.
+//  SourcesView.swift
+//  Sources: where the secrets a rule injects come from. A 1Password
+//  service-account token (live vault probe warns if it sees no usable vault) or
+//  an env file. 1Password is one source among peers, not the only shape; add
+//  starts with a provider picker. A Rule (the Rules screen) references one of
+//  these to inject after the phone approves.
 
 import SwiftUI
 import UniformTypeIdentifiers
 
-struct AccountsView: View {
+struct SourcesView: View {
     @Environment(AppModel.self) private var model
     @State private var showingAdd = false
     @State private var rotating: Account?
@@ -18,6 +20,7 @@ struct AccountsView: View {
                 if model.accounts.isEmpty {
                     emptyState
                 } else {
+                    header
                     ForEach(model.accounts) { account in
                         AccountCard(account: account,
                                     onRotate: { rotating = account },
@@ -27,7 +30,7 @@ struct AccountsView: View {
             }
             .padding(20)
         }
-        .navigationTitle("Accounts")
+        .navigationTitle("Sources")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button { showingAdd = true } label: { Label("Add", systemImage: "plus") }
@@ -38,11 +41,18 @@ struct AccountsView: View {
         .task { await model.loadSecondaryScreens() }
     }
 
+    private var header: some View {
+        Text("Where secrets come from. A rule on the Rules screen injects from one of these after your phone approves; secret values never leave the source the daemon reads them from.")
+            .font(.system(size: 11)).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("No sources").font(.system(size: 13, weight: .semibold))
-            Text("Add a 1Password service-account token or an env file. Either way, secret values never leave the source the daemon reads them from.")
+            Text("No sources yet").font(.system(size: 13, weight: .semibold))
+            Text("A source is where a secret comes from: a 1Password service-account token or an env file. Add one here, then write a rule that injects from it. Either way, secret values never leave the source the daemon reads them from.")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             Button("Add a source") { showingAdd = true }
                 .buttonStyle(.glassProminent).tint(Palette.cobalt).padding(.top, 4)
         }
@@ -129,6 +139,13 @@ struct AddAccountSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     var rotating: Account?
+
+    /// Add starts on this provider (a recipe pins it when it opens this inline);
+    /// rotate ignores it, since rotate only ever applies to a 1Password token.
+    init(rotating: Account? = nil, initialProvider: SourceProvider = .onePassword) {
+        self.rotating = rotating
+        _provider = State(initialValue: initialProvider)
+    }
 
     @State private var provider: SourceProvider = .onePassword
     @State private var label = ""
@@ -274,8 +291,8 @@ struct AddAccountSheet: View {
     }
 }
 
-#Preview("Accounts") {
-    NavigationStack { AccountsView() }
+#Preview("Sources") {
+    NavigationStack { SourcesView() }
         .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
         .frame(width: 640, height: 560)
 }

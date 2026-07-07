@@ -29,6 +29,7 @@ actor MockDaemonClient: DaemonClient {
     private var macMode: MacApprovalsMode
     private var locked: Bool
     private var appSettings: AppSettings
+    private var configStore: SigilConfig
 
     init(scenario: MockScenario = .armedIdle) {
         self.scenario = scenario
@@ -40,6 +41,7 @@ actor MockDaemonClient: DaemonClient {
         self.macMode = (scenario == .hardenedPhoneOnly) ? .hardenedPhoneOnly : .enabled
         self.locked = (scenario == .lockedDown)
         self.appSettings = Fixtures.settings
+        self.configStore = Fixtures.config
     }
 
     private var factor: Factor {
@@ -116,6 +118,41 @@ actor MockDaemonClient: DaemonClient {
     }
 
     func removeAccount(_ account: Account) { accountsStore.removeAll { $0.id == account.id } }
+
+    // MARK: config (rules + sources)
+    // The mock mirrors core's referential rules loosely enough that the editor's
+    // happy path and refusals both demo: a duplicate name or a dangling/held
+    // source throws, everything else mutates the in-memory config.
+
+    func config() -> SigilConfig { configStore }
+
+    func addSource(_ source: SourceConfig) throws {
+        guard !configStore.sources.contains(where: { $0.name == source.name }) else {
+            throw DaemonError.cli("source \(source.name) already exists (remove it first to replace)")
+        }
+        configStore.sources.append(source)
+    }
+
+    func removeSource(name: String) throws {
+        if let rule = configStore.rules.first(where: { $0.action.source == name }) {
+            throw DaemonError.cli("source \(name) is still used by rule \(rule.name); remove the rule first")
+        }
+        configStore.sources.removeAll { $0.name == name }
+    }
+
+    func addRule(_ rule: RuleConfig) throws {
+        guard !configStore.rules.contains(where: { $0.name == rule.name }) else {
+            throw DaemonError.cli("rule \(rule.name) already exists (remove it first to replace)")
+        }
+        guard configStore.source(named: rule.action.source) != nil else {
+            throw DaemonError.cli("rule \(rule.name) references unknown source \(rule.action.source)")
+        }
+        configStore.rules.append(rule)
+    }
+
+    func removeRule(name: String) { configStore.rules.removeAll { $0.name == name } }
+
+    func importConfig(_ config: SigilConfig) { configStore = config }
 
     func leases() -> [Lease] { locked ? [] : leasesStore }
 
@@ -268,10 +305,30 @@ enum Fixtures {
 
     static let paired = PairedDevice(id: "dev-phone", name: "iPhone",
                                      sasWords: ["tide", "brass", "anchor", "harbor", "dusk", "iron"],
-                                     relayURL: "https://relay.rowm.space", pairedAt: Date().addingTimeInterval(-86_400 * 9))
+                                     relayURL: "https://relay.rainn.works", pairedAt: Date().addingTimeInterval(-86_400 * 9))
+
+    /// A representative config: a 1Password source gating `op` and an env-file
+    /// source gating `gcloud`, so the Rules screen renders both providers and the
+    /// source picker has ingredients. Names mirror the credential/source fixtures.
+    static let config = SigilConfig(
+        version: 1,
+        sources: [
+            SourceConfig(name: "rowm-work", provider: "1password", account: "Rowm work"),
+            SourceConfig(name: "ci-secrets", provider: "env-file", account: nil,
+                         path: "/Users/tom/.config/sigil/ci-secrets.env"),
+        ],
+        rules: [
+            RuleConfig(name: "op",
+                       match: MatchConfig(command: "op"),
+                       action: ActionConfig(source: "rowm-work", risk: "routine", timeoutSec: nil)),
+            RuleConfig(name: "gcloud",
+                       match: MatchConfig(command: "gcloud", argvContains: ["auth"],
+                                          flagEquals: [FlagEqConfig(flag: "--project", value: "prod")]),
+                       action: ActionConfig(source: "ci-secrets", risk: "elevated", timeoutSec: 90)),
+        ])
 
     static let settings = AppSettings(approvalTimeoutSec: 120, notificationsEnabled: true,
-                                      historyRetentionDays: 30, relayURL: "https://relay.rowm.space",
+                                      historyRetentionDays: 30, relayURL: "https://relay.rainn.works",
                                       reduceMotion: false)
 
     /// A representative pairing payload (base64) for QR rendering in mock/preview.

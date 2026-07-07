@@ -1,17 +1,24 @@
 //  RootWindow.swift
 //  The configurator: a source-list sidebar and a detail pane, a System Settings
-//  sibling. Six sections, personal-tool scale.
+//  sibling. Personal-tool scale.
+//
+//  The spine of the app is two authoring surfaces, Rules and Sources: a Rule
+//  watches for a command and gates it on the phone; a Source is where the secret
+//  it injects comes from. Everything else (Status, Pairing, Leases, History,
+//  Settings) supports those two. The app gates any command, not one vendor's:
+//  1Password is one source among peers, never the app's identity.
 
 import SwiftUI
 
 enum SidebarTab: String, CaseIterable, Identifiable {
-    case status, accounts, pairing, leases, history, settings
+    case status, rules, sources, pairing, leases, history, settings
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .status: return "Status"
-        case .accounts: return "Accounts"
+        case .rules: return "Rules"
+        case .sources: return "Sources"
         case .pairing: return "Pairing"
         case .leases: return "Leases"
         case .history: return "History"
@@ -21,7 +28,8 @@ enum SidebarTab: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .status: return "dot.radiowaves.left.and.right"
-        case .accounts: return "key.horizontal"
+        case .rules: return "arrow.triangle.branch"
+        case .sources: return "key.horizontal"
         case .pairing: return "qrcode"
         case .leases: return "clock.arrow.circlepath"
         case .history: return "list.bullet.rectangle"
@@ -54,7 +62,8 @@ struct RootWindow: View {
     @ViewBuilder private var detail: some View {
         switch selection {
         case .status: StatusView()
-        case .accounts: AccountsView()
+        case .rules: RulesView()
+        case .sources: SourcesView()
         case .pairing: PairingView()
         case .leases: LeasesView()
         case .history: HistoryView()

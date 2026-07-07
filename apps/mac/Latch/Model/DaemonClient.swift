@@ -56,6 +56,24 @@ protocol DaemonClient: Sendable {
     /// config source), which is why this takes the whole `Account`.
     func removeAccount(_ account: Account) async throws
 
+    // Config (the if-this-then-that rules + the sources they inject from).
+    // Loaded whole via `sigil-config export`; authored via the `rule`/`source`
+    // verbs; an in-place edit round-trips through `import` (export, mutate the
+    // one rule, replace). The daemon only reads this store, so all of it is
+    // sigil-config-side, never the always-on daemon.
+    func config() async throws -> SigilConfig
+    /// `sigil-config source add <name> --provider … [--account …] [--path …]`.
+    func addSource(_ source: SourceConfig) async throws
+    /// `sigil-config source remove <name>`. Refuses while a rule references it.
+    func removeSource(name: String) async throws
+    /// `sigil-config rule add <name> --source … [match flags…] [--risk …] [--timeout …]`.
+    func addRule(_ rule: RuleConfig) async throws
+    /// `sigil-config rule remove <name>`.
+    func removeRule(name: String) async throws
+    /// `sigil-config import` (whole config on stdin). Validates referential
+    /// integrity before persisting; used for an in-place rule edit.
+    func importConfig(_ config: SigilConfig) async throws
+
     // Leases
     func leases() async throws -> [Lease]
     func revokeLease(grantPrefix: String) async throws -> ControlResult

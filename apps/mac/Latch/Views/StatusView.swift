@@ -42,7 +42,7 @@ struct StatusView: View {
 
     @ViewBuilder private var instrumentPanel: some View {
         if let s = model.status {
-            Section(title: "Instrument", subtitle: "every op request is gated: lease, else a fresh approval; fails closed") {
+            Section(title: "Instrument", subtitle: "every gated command needs a lease, else a fresh approval; fails closed") {
                 VStack(spacing: 10) {
                     StatusRow(ok: s.daemonUp, warn: false, label: "daemon",
                               value: s.daemonUp ? s.socketPath : "socket not listening", mono: true,

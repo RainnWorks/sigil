@@ -245,6 +245,49 @@ struct CLIDaemonClient: DaemonClient {
         }
     }
 
+    // MARK: config (rules + sources)
+
+    /// The whole config as `sigil-config export` emits it (the same JSON `list
+    /// --json` prints): `{version, sources:[…], rules:[…]}`.
+    func config() async throws -> SigilConfig {
+        try decode(SigilConfig.self, await runConfig(["export"]))
+    }
+
+    func addSource(_ source: SourceConfig) async throws {
+        var args = ["source", "add", source.name, "--provider", source.provider]
+        if let account = source.account { args += ["--account", account] }
+        if let path = source.path { args += ["--path", path] }
+        args.append("--json")
+        _ = try await runConfig(args)
+    }
+
+    func removeSource(name: String) async throws {
+        _ = try await runConfig(["source", "remove", name, "--json"])
+    }
+
+    func addRule(_ rule: RuleConfig) async throws {
+        var args = ["rule", "add", rule.name, "--source", rule.action.source]
+        let m = rule.match
+        if let command = m.command { args += ["--command", command] }
+        if let subcommand = m.subcommand { args += ["--subcommand", subcommand] }
+        for needle in m.argvContains { args += ["--argv-contains", needle] }
+        for flag in m.flagPresent { args += ["--flag", flag] }
+        for fe in m.flagEquals { args += ["--flag-eq", "\(fe.flag)=\(fe.value)"] }
+        args += ["--risk", rule.action.risk]
+        if let timeout = rule.action.timeoutSec { args += ["--timeout", String(timeout)] }
+        args.append("--json")
+        _ = try await runConfig(args)
+    }
+
+    func removeRule(name: String) async throws {
+        _ = try await runConfig(["rule", "remove", name, "--json"])
+    }
+
+    func importConfig(_ config: SigilConfig) async throws {
+        let body = try JSONEncoder().encode(config)
+        _ = try await runConfig(["import", "--json"], stdin: body)
+    }
+
     func leases() async throws -> [Lease] {
         try decode([LeaseDTO].self, await run(["lease", "list", "--json"])).map { $0.model() }
     }

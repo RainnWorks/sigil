@@ -149,6 +149,13 @@ struct SocketDaemonClient: DaemonClient {
     }
     func removeAccount(_ account: Account) async throws { try await cli.removeAccount(account) }
 
+    func config() async throws -> SigilConfig { try await cli.config() }
+    func addSource(_ source: SourceConfig) async throws { try await cli.addSource(source) }
+    func removeSource(name: String) async throws { try await cli.removeSource(name: name) }
+    func addRule(_ rule: RuleConfig) async throws { try await cli.addRule(rule) }
+    func removeRule(name: String) async throws { try await cli.removeRule(name: name) }
+    func importConfig(_ config: SigilConfig) async throws { try await cli.importConfig(config) }
+
     func settings() async throws -> AppSettings { try await cli.settings() }
     func saveSettings(_ settings: AppSettings) async throws { try await cli.saveSettings(settings) }
     func wipe() async throws -> ControlResult { try await cli.wipe() }
