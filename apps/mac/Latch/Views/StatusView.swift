@@ -53,16 +53,6 @@ struct StatusView: View {
                               label: "shim", value: s.shim.issue ?? s.shim.path, mono: true,
                               fixTitle: s.shim.kind == .healthy ? nil : "Install shim",
                               fix: s.shim.kind == .healthy ? nil : { Task { await model.installShim() } })
-                    Divider()
-                    StatusRow(ok: s.opFound, label: "op", value: s.opPath ?? "no op on PATH", mono: true)
-                    Divider()
-                    StatusRow(ok: s.factor.tone != .warn, warn: s.factor.tone == .warn,
-                              label: "factor", value: "\(s.factor.label) · \(s.factor.detail)")
-                    if let reachable = s.relayReachable {
-                        Divider()
-                        StatusRow(ok: reachable, warn: !reachable, label: "relay",
-                                  value: reachable ? (s.relayURL ?? "reachable") : "unreachable", mono: true)
-                    }
                 }
             }
         } else {
