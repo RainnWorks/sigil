@@ -217,30 +217,36 @@ private struct RuleCard: View {
     let onEdit: () -> Void
     let onRemove: () -> Void
 
+    /// Hover lifts the whole card: the border warms to cobalt and the grip lights
+    /// up, so a row reads as a distinct, grabbable object rather than a flat blob.
+    @State private var hovering = false
     private var keys: [String] { source?.keys ?? [] }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            // A rule is its match: the match summary is the label (it may repeat
-            // across rules; the user drags to order them and the higher one wins).
-            // The grip signals the whole row is draggable; the rank names its
-            // precedence, so the ordering reads as deliberate.
+            // Primary line: the match is what the rule IS. The grip on the left
+            // signals the whole row lifts to reorder; the rank on the right names
+            // its precedence (top = #1 = wins first). The summary may repeat across
+            // rules, and the user drags to order them, so the higher one wins.
             HStack(spacing: 8) {
-                Image(systemName: "line.3.horizontal")
-                    .font(.system(size: 11)).foregroundStyle(.tertiary)
-                    .accessibilityHidden(true)
+                grip
                 Text("when").font(.system(size: 10)).foregroundStyle(.tertiary)
                 Text(rule.match.summary).font(.mono(13, weight: .medium))
-                Spacer()
-                Text("#\(rank)").font(.mono(10)).foregroundStyle(.tertiary)
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 8)
+                Text("#\(rank)").font(.mono(11, weight: .medium)).foregroundStyle(.secondary)
                     .accessibilityLabel("Precedence \(rank)")
             }
 
-            // What it injects (KEY names only; values are sealed and unreadable).
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
+            // Secondary line: the KEY names it injects (values are sealed, never
+            // shown). "sets" pins to the top of the chips, which wrap as whole
+            // units below.
+            HStack(alignment: .top, spacing: 6) {
                 Text("sets").font(.system(size: 10)).foregroundStyle(.tertiary)
+                    .padding(.top, 3)
                 if keys.isEmpty {
                     Text("no environment").font(.system(size: 11)).foregroundStyle(.tertiary)
+                        .padding(.top, 1)
                 } else {
                     FlowKeys(keys: keys)
                 }
@@ -256,23 +262,95 @@ private struct RuleCard: View {
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.background.secondary, in: .rect(cornerRadius: 12))
+        .overlay(
+            // A hairline edge gives each card its own footprint against the pane;
+            // it warms on hover to reinforce that the row is liftable.
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(hovering ? Palette.cobalt.opacity(0.30) : Color.primary.opacity(0.08),
+                              lineWidth: 1)
+        )
+        .onHover { hovering = $0 }
+    }
+
+    /// The reorder handle. It does not itself drive the drag (the whole List row
+    /// lifts via `.onMove`); it is the visible affordance, so it takes the grab
+    /// cursor and brightens with the card to read as "grab me".
+    private var grip: some View {
+        Image(systemName: "line.3.horizontal")
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(hovering ? Palette.cobalt : Color.secondary)
+            .frame(width: 20, height: 24)
+            .background(hovering ? Palette.cobalt.opacity(0.10) : Color.clear,
+                        in: .rect(cornerRadius: 6))
+            .pointerStyle(.grabIdle)
+            .accessibilityHidden(true)
     }
 }
 
-/// The KEY names as small mono capsules, wrapping across lines.
+/// The KEY names as mono chips that wrap as whole units and never break a key
+/// mid-identifier. A key too wide for the row truncates with an ellipsis and
+/// keeps its full name in a hover tooltip.
 private struct FlowKeys: View {
     let keys: [String]
     var body: some View {
-        // A rule rarely injects more than a handful of keys, so a simple wrapping
-        // HStack via a LazyVGrid of adaptive chips reads cleanly without a custom
-        // flow layout.
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 90), spacing: 6, alignment: .leading)],
-                  alignment: .leading, spacing: 6) {
+        FlowLayout(spacing: 6, lineSpacing: 6) {
             ForEach(keys, id: \.self) { key in
-                MonoText(key, size: 11, color: .secondary)
-                    .padding(.horizontal, 6).padding(.vertical, 2)
+                Text(key)
+                    .font(.mono(11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .padding(.horizontal, 7).padding(.vertical, 2)
                     .background(Palette.cobalt.opacity(0.10), in: .capsule)
+                    .help(key)
             }
+        }
+    }
+}
+
+/// A minimal wrapping layout: places subviews left to right and drops to the next
+/// line when the current one is full, so chips wrap as whole units. A subview
+/// wider than the row is clamped to the row width (its own truncation then
+/// applies) rather than overflowing.
+private struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+    var lineSpacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var x: CGFloat = 0, y: CGFloat = 0, lineHeight: CGFloat = 0, widest: CGFloat = 0
+        for sub in subviews {
+            var size = sub.sizeThatFits(.unspecified)
+            size.width = min(size.width, maxWidth)
+            if x > 0, x + size.width > maxWidth {
+                y += lineHeight + lineSpacing
+                x = 0
+                lineHeight = 0
+            }
+            x += size.width + spacing
+            lineHeight = max(lineHeight, size.height)
+            widest = max(widest, min(x - spacing, maxWidth))
+        }
+        let width = maxWidth.isFinite ? maxWidth : widest
+        return CGSize(width: width, height: y + lineHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let maxWidth = bounds.width
+        var x: CGFloat = 0, y: CGFloat = 0, lineHeight: CGFloat = 0
+        for sub in subviews {
+            var size = sub.sizeThatFits(.unspecified)
+            size.width = min(size.width, maxWidth)
+            if x > 0, x + size.width > maxWidth {
+                y += lineHeight + lineSpacing
+                x = 0
+                lineHeight = 0
+            }
+            sub.place(at: CGPoint(x: bounds.minX + x, y: bounds.minY + y),
+                      anchor: .topLeading,
+                      proposal: ProposedViewSize(width: size.width, height: size.height))
+            x += size.width + spacing
+            lineHeight = max(lineHeight, size.height)
         }
     }
 }
@@ -291,17 +369,12 @@ private extension View {
     }
 }
 
-#Preview("Rules") {
-    NavigationStack { RulesView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
-        .frame(width: 720, height: 640)
-}
-
-// A layered list where two rules match the same base command: the specific
-// `op --account=prod` sits above the general `op`, so it wins first. This is the
-// precedence the drag-to-reorder exists to author.
-#Preview("Rules - ordering") {
-    let layered = SigilConfig(
+/// A layered config for previews: two rules match the same base command (the
+/// specific `op --account=prod` above the general `op`, so it wins first) plus a
+/// two-key `aws` rule. Exercises ordering, a long single key
+/// (OP_SERVICE_ACCOUNT_TOKEN), and multi-key chip wrapping in one list.
+private func previewLayeredConfig() -> SigilConfig {
+    SigilConfig(
         version: 1,
         sources: [
             SourceConfig(name: "op-prod", provider: "env", keys: ["OP_SERVICE_ACCOUNT_TOKEN"]),
@@ -321,10 +394,30 @@ private extension View {
                        match: MatchConfig(command: "aws"),
                        action: ActionConfig(source: "aws", risk: "routine", timeoutSec: nil)),
         ])
+}
+
+#Preview("Rules") {
     NavigationStack { RulesView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: layered),
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+        .frame(width: 720, height: 640)
+}
+
+// The precedence the drag-to-reorder exists to author, at a comfortable width.
+#Preview("Rules - ordering") {
+    NavigationStack { RulesView() }
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: previewLayeredConfig()),
                               approver: MockApprover()))
         .frame(width: 720, height: 640)
+}
+
+// The same list at a narrow width: the long key and the two-key aws rule must
+// wrap as whole chips and truncate cleanly, never breaking mid-identifier and
+// never overflowing into a horizontal scroll.
+#Preview("Rules - narrow") {
+    NavigationStack { RulesView() }
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: previewLayeredConfig()),
+                              approver: MockApprover()))
+        .frame(width: 360, height: 620)
 }
 
 #Preview("Rules - empty") {
