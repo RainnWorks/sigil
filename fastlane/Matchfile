@@ -1,0 +1,12 @@
+# Shared App Store signing via fastlane match, mirroring the TileCam/GlassView
+# setup. match stores the App Store distribution certificate + provisioning
+# profiles AES-encrypted in a SEPARATE PRIVATE repo (github.com/rainnworks/
+# ios-certificates). MATCH_GIT_URL + MATCH_PASSWORD come from ~/tilecam-build/
+# ci.env locally (or GHA secrets in CI). Local dev could also use Xcode
+# automatic signing, but this repo's local codesign hits errSecInternalComponent
+# from a non-interactive shell, so we use match locally too.
+git_url(ENV["MATCH_GIT_URL"])
+storage_mode("git")
+type("appstore")
+app_identifier(["works.rainn.sigil"])
+# team_id + auth come from the lane (App Store Connect API key).
