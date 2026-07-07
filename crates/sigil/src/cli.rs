@@ -2950,13 +2950,15 @@ fn read_env_pairs_stdin() -> Option<Vec<(String, Zeroizing<String>)>> {
         }
     };
     let mut out: Vec<(String, Zeroizing<String>)> = Vec::new();
-    for raw in text.lines() {
+    for (idx, raw) in text.lines().enumerate() {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
         if line.trim().is_empty() || line.trim_start().starts_with('#') {
             continue;
         }
+        // Report the line NUMBER, never its content: a mistakenly-piped secret line
+        // must not be echoed to the terminal/logs.
         let Some((key, value)) = line.split_once('=') else {
-            eprintln!("sigil: line without '=': {:?}", line);
+            eprintln!("sigil: line {}: no '=' found", idx + 1);
             return None;
         };
         let key = key.trim().to_string();

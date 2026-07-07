@@ -1167,7 +1167,29 @@ fn fulfill(
         };
         drop(dek);
         match crate::provider::decode_env_pairs(&plain) {
-            Some(pairs) => sealed_env = Some(pairs),
+            Some(pairs) => {
+                // Readout integrity (invariant #3): the approver consented to
+                // exactly the KEY set the readout/audit was built from
+                // (`action.env_keys`, i.e. `describe`). The sealed blob must inject
+                // that same set and nothing else. A divergence would silently set a
+                // key the human never saw; it can arise from a crash between the two
+                // saves in `cli::seal_env_pairs` (blob updated, config not) or an
+                // import that kept the source NAME but changed its keys while a stale
+                // blob under that name survived. Fail closed on any mismatch rather
+                // than inject what was not approved.
+                let injected: std::collections::BTreeSet<&str> =
+                    pairs.iter().map(|(k, _)| k.as_str()).collect();
+                let consented: std::collections::BTreeSet<&str> =
+                    action.env_keys.iter().map(String::as_str).collect();
+                if injected != consented {
+                    return fail_closed(
+                        stderr,
+                        "sigil: inline env keys do not match what was approved; \
+                         refusing (re-set the source's values)\n",
+                    );
+                }
+                sealed_env = Some(pairs);
+            }
             None => return fail_closed(stderr, "sigil: inline env blob is corrupt; re-set it\n"),
         }
         None
@@ -2075,6 +2097,90 @@ mod tests {
         );
         assert_ne!(code, 0, "an unset inline env source must fail closed");
         assert_eq!(read_all(read_end), "", "no output on a refused run");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn inline_env_blob_keys_must_match_the_approved_set_or_fail_closed() {
+        // Readout integrity: the sealed blob carries an EXTRA key (BAR) the config
+        // (and therefore the approval readout) never listed. Injecting it would set
+        // a var the human never consented to, so fulfill must refuse and inject
+        // nothing, even though the crypto opens fine.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("envinline-drift");
+        let bindir = dir.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = bindir.join("faketool");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\nprintf 'tok=%s bar=%s' \"$TOKEN\" \"$BAR\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Seal TWO keys, but configure the source (and thus the readout) with ONE.
+        let keystore = MemoryKeystore::with_dek();
+        let dek = keystore.unwrap_dek("test").unwrap();
+        let pairs = vec![
+            ("TOKEN".to_string(), Zeroizing::new("sealed".to_string())),
+            ("BAR".to_string(), Zeroizing::new("hidden".to_string())),
+        ];
+        let encoded = crate::provider::encode_env_pairs(&pairs);
+        let ct = crate::secrets::encrypt_token(&dek, &encoded).unwrap();
+        drop(dek);
+        let mut accounts = AccountStore::default();
+        accounts.set_env_blob("faketool", &ct);
+
+        let keystore: Arc<dyn Keystore> = Arc::new(keystore);
+        let pending = Arc::new(PendingRegistry::new());
+        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+            .with_dev(DevMode::Approve)
+            .with_control_socket(true);
+        let core = Arc::new(Core {
+            keystore,
+            accounts: Mutex::new(accounts),
+            threshold: Mutex::new(Default::default()),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(approver)),
+            pending,
+            lockdown: AtomicBool::new(false),
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::with_defaults(),
+            config: env_inline_config("faketool", &["TOKEN"]), // readout: TOKEN only
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::DevInsecure,
+            ssh_signers: Vec::new(),
+            audit: None,
+        });
+
+        let prev = std::env::var_os("PATH");
+        let mut search = vec![bindir.clone()];
+        if let Some(p) = &prev {
+            search.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
+        let (read_end, write_end) = pipe();
+        let code = fulfill(
+            &core,
+            &["faketool".into()],
+            "",
+            None,
+            0,
+            None,
+            Some(write_end),
+            None,
+        );
+        match prev {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        assert_ne!(
+            code, 0,
+            "a blob whose keys diverge from the readout must refuse"
+        );
+        assert_eq!(read_all(read_end), "", "nothing injected on a refused run");
         std::fs::remove_dir_all(&dir).ok();
     }
 

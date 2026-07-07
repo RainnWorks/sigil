@@ -488,6 +488,8 @@ reviewer's.
 | The decrypted pairs live in a `Zeroizing` map wiped at end of `run()`; the decode borrows out of the `Zeroizing` plaintext with `str::from_utf8` (no owned/un-zeroized value `String`) and fails closed on truncation or non-UTF-8 without panicking | `provider.rs::{decode_env_pairs,EnvProvider::run,spawn_with_env}`, `daemon.rs::fulfill` (`drop(sealed_env)`) | `provider.rs::{env_encode_decode_round_trips_including_awkward_values,env_decode_rejects_truncated_and_bad_utf8_without_panicking,env_provider_injects_decrypted_pairs_into_the_child}` |
 | **Never leases** (`needs_account()==false`, `needs_sealed_env()==true`): like `env-file`, resolved values must not persist in daemon RAM across a TTL, so it is gated on every run | `provider.rs::EnvProvider::{needs_account,needs_sealed_env}`, `daemon.rs::fulfill` (the sealed-env arm never calls `leases.grant`; the lease short-circuit is `if needs_account`) | `daemon.rs::inline_env_command_runs_gated_and_injects_sealed_values` (`leases.active()==0`) |
 | An **unset** source (no sealed blob) fails closed, never runs the child with a blank environment | `daemon.rs::fulfill` (`sealed_ct == None` → `fail_closed`) | `daemon.rs::inline_env_with_no_sealed_values_fails_closed` |
+| **Readout integrity (invariant #3):** the decoded blob's KEY set is reconciled against `action.env_keys` (the set the phone readout/audit was built from) *before* injection; any divergence fails closed. This closes the two ways names could drift from values without breaking crypto — a crash between the store save and config save in `seal_env_pairs`, and an import that kept a source NAME but changed its keys while a stale blob survived — so the approver can never consent to "will set FOO" and have the child receive a hidden BAR | `daemon.rs::fulfill` (the sealed-env arm's `BTreeSet` compare of decoded keys vs `action.env_keys` → `fail_closed`) | `daemon.rs::inline_env_blob_keys_must_match_the_approved_set_or_fail_closed` (blob has an extra key vs config → refused, nothing injected) |
+| Bulk `--stdin` parse errors report the **line NUMBER, never the line content**, so a mistakenly-piped secret line is not echoed to the terminal/logs | `cli.rs::read_env_pairs_stdin` (`"line {n}: no '=' found"`) | reviewed by inspection |
 | `list`/`export` cannot leak a value (they render config only, which has no value), and `import` cannot round-trip a value into the clear (config carries names only); removing the source or clearing its last key **removes the sealed blob** (no orphan ciphertext), and an import that drops an env source prunes its blob | `cli.rs::{config_source_list,config_export,config_import,purge_env_blob,prune_orphan_env_blobs,seal_env_pairs}` | manual E2E (remove purges `env_sources`); reviewed by inspection |
 
 The seal/open wire is length-prefixed (`u32 klen|key|u32 vlen|value`), pre-sized
@@ -497,6 +499,94 @@ non-zeroized copy. See **residual 13** for the two un-wiped copies this shape
 inherits from §12 (the `Command` env map and the child's environ) — identical to
 `env-file`, plus the CLI-side merge copy at set time (the user is providing the
 value, so it is in CLI RAM regardless; held `Zeroizing`).
+
+**Independent review verdict — CONFIRMED SOUND for the crypto/at-rest core; one
+P2 readout-integrity gap and two P2 hygiene notes, none a value leak.** Written by
+the security-reviewer, which did **not** author the inline `env` provider
+(rust-core); not a self-certification. The six implementer claims were verified,
+not taken on faith:
+
+- **At-rest is ciphertext (claim 1) — CONFIRMED.** The on-disk `sigil.db` grep
+  test proves the VALUE is absent and only the (public) source name + sealed bytes
+  persist; `config.json` carries KEY names only (`Source::keys`,
+  `skip_serializing_if = "Vec::is_empty"`). Values are sealed with the same
+  AES-256-GCM `encrypt_token` under the DEK as service-account tokens. No value
+  reaches a log/error/`{:?}` on the seal or decrypt paths (decrypt/decode failures
+  print the GCM error or a fixed "corrupt" string, never plaintext).
+- **list/export/import cannot leak a value (claim 2) — CONFIRMED.** Export/list
+  render config only (no value present to render); import carries names + provider
+  tag, so it can only ever *remove* ciphertext (prune), never introduce plaintext.
+- **`describe()` is zero-knowledge (claim 3) — CONFIRMED for values.** The
+  approval request's `secret_refs` and the audit label are built from KEY names
+  only; no value crosses the wire or enters the sealed request.
+- **decrypt→inject→zeroize, never leases (claim 4) — CONFIRMED.** The DEK
+  (`Zeroizing<[u8;32]>`) is opened only after the grant (phone-delivered
+  `outcome.dek`, or a local keystore unwrap on a local approval — the same v1
+  model as `op`), used for one decrypt, `drop`ped at once; the decoded pairs
+  (`Zeroizing`) are dropped after the spawn instant; the sealed-env arm never
+  calls `leases.grant` and the lease short-circuit is `if needs_account`. The
+  reused `spawn_with_env` splice/exec path is #22's reviewed one.
+- **remove/unset purges the blob (claim 5) — CONFIRMED.** `remove_env_blob` on
+  source-remove, empty-after-unset, and `prune_orphan_env_blobs` on import; no
+  orphan accumulation.
+- **DEK/value buffers zeroized on set/unset (claim 6) — CONFIRMED.** `Dek` and
+  `Token` are `Zeroizing`; the CLI holds value buffers as `Zeroizing<String>`,
+  reads them from stdin never argv (no `ps` leak), and the merge copy is
+  `Zeroizing`.
+- **Hostile input — CONFIRMED fail-closed.** `decode_env_pairs` uses checked
+  slicing and `str::from_utf8`, returning `None` (fail closed) on truncation, an
+  over-long length, or non-UTF-8 without panicking; a tampered `sigil.db` fails the
+  GCM tag on decrypt (a same-UID attacker cannot forge attacker-chosen values, only
+  *relocate* an existing blob — see the P2 below); `valid_env_key` rejects `=`,
+  NUL, whitespace, and control bytes; the proxy-depth env is set *after* the
+  injected pairs so a supplied key cannot spoof the recursion fuse.
+
+**P2-1 (readout-integrity gap): the phone readout (`describe`/audit, from
+`config.keys`) is never reconciled with what is actually injected (the decoded
+sealed blob).** `fulfill` injects whatever `decode_env_pairs` yields, while the
+approver was shown `action.env_keys` from the config. Nothing checks the two key
+*sets* agree. They can diverge two ways, both without breaking any crypto: (a) a
+crash between `store.save()` and `save_config()` in `seal_env_pairs` (the store is
+persisted with the new keys before the config is), leaving the blob ahead of the
+config; (b) an `import` of a config whose env source keeps its **name** but changes
+its `keys` list while a pre-existing blob under that name (with different keys)
+remains — `prune_orphan_env_blobs` only drops blobs whose *name* is gone. Outcome:
+the approver consents to "will set FOO" but the child is injected FOO **and** a
+hidden BAR. This is **not a value leak** (values are never shown to the phone in
+either case) — it is a readout-*accuracy* break of invariant #3's "the approver
+sees what will happen." Proven with a scratch test (config `[TOKEN]`, blob
+`{TOKEN, SECRET}`): the readout showed `TOKEN`, the child received
+`secret=hidden-exfil`. **Fix:** after `decode_env_pairs` in `fulfill`, assert the
+decoded key set equals `action.env_keys` and `fail_closed` on mismatch (this also
+closes the crash window and the import-leftover case); or inject only keys present
+in `action.env_keys`. Severity **P2**: reaching it needs a crash or a same-UID
+config/import manipulation, and same-UID is already outside the defended boundary —
+but readout integrity is a stated approval property, so a cheap inject-time check
+is warranted.
+
+**P2-2 (terminal echo of raw stdin): `read_env_pairs_stdin` prints a malformed
+line verbatim** — `eprintln!("sigil: line without '=': {:?}", line)`. On the
+`--stdin` bulk path a piped line lacking `=` is reflected to stderr; if the user
+accidentally pipes secret-bearing content, a bare-secret line is echoed to the
+terminal/logs. Low blast radius (CLI-side, the user's own terminal, malformed
+input only), but it is the one place raw stdin is reflected. **Fix:** report the
+line index only, not its content.
+
+**P2-3 (at-rest threat-model note): inline-`env` values are sealed under the
+host/v1 DEK, not the v2 two-party threshold key.** Unlike a v2 `op` account (whose
+token the daemon **cannot** open without the phone's partial), an inline-`env`
+value is recoverable by a **local** approval — the daemon unwraps the host DEK from
+the keystore itself (Touch ID / SE presence, `outcome.dek == None` path). This is
+by design and identical to v1 accounts and local-approval mode, and is a strict
+improvement over the plaintext `env-file` (§12) — but it means inline-`env` does
+**not** inherit v2's "daemon cannot open it alone" guarantee. Worth stating plainly
+in residual 13 so inline-`env` is not assumed to have threshold-grade at-rest
+protection.
+
+Net: the sealing, zeroization, fail-closed decoding, no-lease, and
+zero-knowledge-of-values properties all hold as claimed. The one substantive
+finding (P2-1) is a readout/injection reconciliation gap that should get an
+inject-time key-set check; the other two are hygiene. No P0/P1.
 
 ---
 
