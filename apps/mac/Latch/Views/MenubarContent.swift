@@ -170,7 +170,9 @@ private struct PendingCard: View {
 
             if canApproveLocally {
                 HStack(spacing: 8) {
-                    ApproveCapsule(title: "Approve", enabled: true) { onApprove(false) }
+                    // When a lease is on offer the pair reads once-vs-window, matching
+                    // the phone ("Approve once" beside "Keep approved for ...").
+                    ApproveCapsule(title: request.leasable ? "Approve once" : "Approve", enabled: true) { onApprove(false) }
                     Button("Deny", role: .destructive, action: onDeny)
                         .buttonStyle(.glass)
                         .tint(Palette.rust)
@@ -178,8 +180,8 @@ private struct PendingCard: View {
                 // The lease affordance appears only when the matched rule permits
                 // one; a run-once rule never offers it (the daemon would refuse it).
                 if request.leasable {
-                    Button(request.maxLeaseSecs.map { "Approve as session lease (up to \(LeaseDuration.short($0)))" }
-                           ?? "Approve as session lease") { onApprove(true) }
+                    Button(request.maxLeaseSecs.map { "Keep approved for \(LeaseDuration.short($0))" }
+                           ?? "Keep approved for a while") { onApprove(true) }
                         .buttonStyle(.plain)
                         .font(.system(size: 10))
                         .foregroundStyle(Palette.seaGreen)

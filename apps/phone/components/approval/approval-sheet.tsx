@@ -1,7 +1,7 @@
 /**
  * The hero: the approval sheet body. Composes the origin header + brass gauge,
- * type banner, readout well, provenance, the risk line, and the risk-scaled
- * approve control alongside the always-one-tap deny.
+ * type banner, readout well, provenance, the reason line, and the
+ * always-one-tap approve control alongside the always-one-tap deny.
  *
  * Zero-knowledge approver: this sheet renders only the opaque, Mac-provided
  * DISPLAY fields (caller / command / reason / a display-only `kind` hint, plus
@@ -38,9 +38,6 @@ import { TypeBanner } from "./type-banner";
 
 /** A fixed slot for the gate/status note so the controls below never shift. */
 const STATUS_SLOT_HEIGHT = 34;
-
-const riskDot = (risk: PendingRequest["request"]["risk"], p: ReturnType<typeof useTheme>) =>
-  risk === "critical" ? p.deny : risk === "elevated" ? p.brass : p.cobalt;
 
 export function ApprovalSheet({
   pending,
@@ -182,7 +179,7 @@ export function ApprovalSheet({
             {request.reason ? (
               <View style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
                 <View
-                  style={{ width: 7, height: 7, borderRadius: 99, backgroundColor: riskDot(request.risk, p) }}
+                  style={{ width: 7, height: 7, borderRadius: 99, backgroundColor: p.cobalt }}
                 />
                 <Sans size={14} tone="muted" style={{ flexShrink: 1 }}>
                   {request.reason}

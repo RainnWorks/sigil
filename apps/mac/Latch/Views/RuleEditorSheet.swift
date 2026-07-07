@@ -207,7 +207,7 @@ struct RuleEditorSheet: View {
             .labelsHidden()
 
             Text(draft.leasable
-                 ? "One approval may open a session window; later runs auto-approve until it lapses."
+                 ? "One approval may open a session window; later runs auto-approve until it expires."
                  : "Every run needs a fresh approval.")
                 .font(.system(size: 10)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

@@ -147,7 +147,7 @@ export async function registerPushToken(): Promise<void> {
       console.log(`${TAG} token fetched, length ${token.length}`);
     } catch (e) {
       console.error(`${TAG} token fetch failed: ${errMsg(e)}`);
-      setDiag("failed", "Could not register for push. Approvals still arrive by relay poll.");
+      setDiag("failed", "Could not register the doorbell. Approvals still arrive by relay poll.");
       return;
     }
 

@@ -1,9 +1,9 @@
 /**
  * The approve capsule. TAP-ONLY: no slide, no hold anywhere (task #57). The
  * hardware-gated Face ID gate in the parent is the real authorization, so this
- * control only signals intent with a light haptic; risk is conveyed by the risk
- * dot on the reason line, not by making the gesture harder. Deny is likewise a
- * single tap, so refusing is never heavier than allowing.
+ * control only signals intent with a light haptic; the reason line carries an
+ * optional heads-up dot, and the gesture itself is never made harder. Deny is
+ * likewise a single tap, so refusing is never heavier than allowing.
  *
  * Two variants let the sheet offer, when a request is leasable, an "Approve
  * once" primary beside a "Keep approved for <window>" secondary:

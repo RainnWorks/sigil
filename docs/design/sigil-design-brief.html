@@ -201,12 +201,12 @@
   .prov .v { color: oklch(0.88 0.008 238); text-align: right; }
   .risk { display: flex; gap: 8px; align-items: baseline; margin: 14px 2px 18px; font-size: 0.78rem; color: var(--term-brass); }
   .risk::before { content: ""; width: 7px; height: 7px; border-radius: 99px; background: var(--term-brass); align-self: center; flex: none; }
-  .slide {
-    background: oklch(0.42 0.1 231); border-radius: 999px; height: 56px;
-    display: flex; align-items: center; padding: 5px; position: relative; overflow: hidden;
+  .tapcap {
+    border-radius: 999px; height: 52px; display: grid; place-items: center;
+    font-size: 0.95rem; font-weight: 500;
   }
-  .slide .knob { width: 46px; height: 46px; border-radius: 99px; background: oklch(0.97 0.004 235); color: oklch(0.42 0.1 231); display: grid; place-items: center; font-size: 1.1rem; flex: none; }
-  .slide .lbl { flex: 1; text-align: center; color: oklch(0.97 0.004 235); font-size: 0.95rem; font-weight: 500; padding-right: 46px; }
+  .tapcap.primary { background: oklch(0.42 0.1 231); color: oklch(0.97 0.004 235); }
+  .tapcap.secondary { margin-top: 8px; border: 1px solid oklch(0.5 0.12 231 / 0.6); color: oklch(0.72 0.09 235); }
   .denybtn { margin-top: 12px; text-align: center; padding: 13px; border-radius: 999px; border: 1px solid oklch(0.5 0.12 25 / 0.65); color: oklch(0.74 0.13 25); font-size: 0.95rem; }
   .mock-cap { font-size: 0.8rem; color: var(--muted); margin-top: 14px; max-width: 40ch; }
 
@@ -457,14 +457,15 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
         <div><span class="k">when</span><span class="v">just now</span></div>
       </div>
       <div class="risk">Leasable rule &middot; approve once, or approve for up to 15 min.</div>
-      <div class="slide"><span class="knob">&rsaquo;</span><span class="lbl">Tap to approve</span></div>
+      <div class="tapcap primary">Approve once</div>
+      <div class="tapcap secondary">Keep approved for 15 min</div>
       <div class="denybtn">Deny</div>
     </div></div>
     <p class="mock-cap">The approval sheet: brass gauge counting to expiry, the readout well leading with the reference label, provenance in mono, one tap to approve. A leasable rule additionally offers "approve for N minutes"; a run-once rule shows only the single tap. The well renders provider-supplied display segments; the phone never parses what the reference means.</p>
   </div>
   <div>
     <h3 style="margin-top:0">One tap; the rule sets what that tap may do</h3>
-    <p style="max-width:46ch">There is no risk tier scaling the control. Every approve is one tap and every deny is one tap. The matched rule carries a lease policy, and that policy changes exactly one thing: whether the tap may <em>also</em> open a bounded auto-approve window.</p>
+    <p style="max-width:46ch">There is no risk tier scaling the control. Every approve is one tap and every deny is one tap. The matched rule carries a lease policy, and that policy changes exactly one thing: whether the tap may <em>also</em> open a bounded auto-approve window. Any reason line the request carries is a display-only heads-up; it never scales the gesture.</p>
     <div class="ladder">
       <div class="rung"><span class="lv" style="color:var(--cobalt)">run-once</span><span>The safe default. A fresh phone approval every invocation; a lease is never offered or granted</span><span class="act">tap to approve</span></div>
       <div class="rung"><span class="lv" style="color:var(--brass)">leasable</span><span>The rule opts in with a per-rule cap; the tap may open a session up to that cap (e.g. <code>gcloud</code> 15m)</span><span class="act">tap, or approve for N min</span></div>
@@ -678,7 +679,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
     <h4>Type and shape</h4>
     <p style="max-width:46ch">SF Pro for UI voice via Dynamic Type; SF Mono for content voice: paths, fingerprints, process chains, timestamps, all tabular. No display face; the wordmark is lowercase mono. Native squircle control shapes everywhere; the single bespoke control is the full-radius approve capsule, because it is the most important interaction in the product.</p>
     <h4>Motion</h4>
-    <p style="max-width:46ch">Platform motion plus exactly three custom movements: the brass gauge depleting (a real clock), the finger-driven approve track, and the commit haptic with a symbol change. Lockdown gets one weightier seal from cobalt to rust. Reduced motion collapses the gauge to a numeric countdown. No confetti, ever.</p>
+    <p style="max-width:46ch">Platform motion plus a small set of custom movements: the brass gauge depleting (a real clock), the approve capsule press-in with its commit haptic and symbol change, and one weightier lockdown seal from cobalt to rust. There is no drag track: approve is a tap, never a swipe. Reduced motion collapses the gauge to a numeric countdown. No confetti, ever.</p>
   </div>
   <div>
     <h4>Voice</h4>
