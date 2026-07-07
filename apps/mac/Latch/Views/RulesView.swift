@@ -28,7 +28,13 @@ struct RulesView: View {
         .navigationTitle("Rules")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button { editor = EditorContext(draft: RuleDraft(), editingName: nil) } label: {
+                // The toolbar add is the from-scratch path: a custom draft whose
+                // source picker spans every provider, not one pinned kind.
+                Button {
+                    var draft = RuleDraft()
+                    draft.custom = true
+                    editor = EditorContext(draft: draft, editingName: nil)
+                } label: {
                     Label("Add", systemImage: "plus")
                 }
             }
@@ -67,7 +73,9 @@ struct RulesView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Your rules").font(.system(size: 13, weight: .semibold))
             if model.config.rules.isEmpty {
-                emptyState
+                // Hold the teaching block until the first load lands, so it never
+                // flashes before config arrives or on a pane re-select.
+                if model.secondaryLoaded { emptyState }
             } else {
                 ForEach(model.config.rules) { rule in
                     RuleCard(rule: rule,

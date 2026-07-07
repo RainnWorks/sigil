@@ -18,7 +18,9 @@ struct SourcesView: View {
             VStack(alignment: .leading, spacing: 16) {
                 if let error = model.lastError { ErrorStrip(message: error) }
                 if model.accounts.isEmpty {
-                    emptyState
+                    // Wait for the first load before teaching an empty state, so it
+                    // never flashes before sources arrive or on a pane re-select.
+                    if model.secondaryLoaded { emptyState }
                 } else {
                     header
                     ForEach(model.accounts) { account in
@@ -140,14 +142,15 @@ struct AddAccountSheet: View {
     @Environment(\.dismiss) private var dismiss
     var rotating: Account?
 
-    /// Add starts on this provider (a recipe pins it when it opens this inline);
-    /// rotate ignores it, since rotate only ever applies to a 1Password token.
-    init(rotating: Account? = nil, initialProvider: SourceProvider = .onePassword) {
+    /// Add starts on this provider; it defaults to env-file so op is not the
+    /// premise (a recipe pins it when it opens this inline). Rotate ignores it,
+    /// since rotate only ever applies to a 1Password token.
+    init(rotating: Account? = nil, initialProvider: SourceProvider = .envFile) {
         self.rotating = rotating
         _provider = State(initialValue: initialProvider)
     }
 
-    @State private var provider: SourceProvider = .onePassword
+    @State private var provider: SourceProvider = .envFile
     @State private var label = ""
     @State private var token = ""
     @State private var name = ""

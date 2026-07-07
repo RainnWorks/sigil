@@ -125,7 +125,9 @@ enum SourceProvider: String, Sendable, Equatable, CaseIterable, Identifiable {
 struct Account: Identifiable, Equatable, Sendable {
     let id: String
     var label: String
-    var provider: SourceProvider = .onePassword
+    // Defaults to env-file so op is provider #1, not the premise; every real
+    // construction sets this explicitly from the wire anyway.
+    var provider: SourceProvider = .envFile
     /// 1Password only: vaults the token can route to (probed live at add
     /// time). Empty is a warning state: service accounts cannot see built-in
     /// Personal/Shared. Always empty for env-file.

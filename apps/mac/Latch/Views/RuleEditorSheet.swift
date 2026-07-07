@@ -74,7 +74,9 @@ struct RuleEditorSheet: View {
         }
         .frame(width: 540, height: 640)
         .sheet(isPresented: $addingSource) {
-            AddAccountSheet(initialProvider: pinnedProvider ?? .onePassword)
+            // A recipe pins the provider; the neutral custom path defaults to an
+            // env file rather than 1Password, so op is not the premise.
+            AddAccountSheet(initialProvider: pinnedProvider ?? .envFile)
         }
     }
 
@@ -183,6 +185,8 @@ struct RuleEditorSheet: View {
                 ForEach(RiskLevel.allCases) { risk in Text(risk.displayName).tag(risk) }
             }
             .pickerStyle(.segmented).labelsHidden()
+            Text(riskGloss).font(.system(size: 10)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
             Toggle(isOn: $usesTimeout.animation()) {
                 Text("Custom approval timeout").font(.system(size: 12))
@@ -198,6 +202,9 @@ struct RuleEditorSheet: View {
                     }
                 }
             }
+            Text("If no decision arrives before the timeout, the request fails closed and is denied.")
+                .font(.system(size: 10)).foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .onChange(of: usesTimeout) { _, on in
             if !on { draft.timeoutSec = nil }
@@ -211,17 +218,25 @@ struct RuleEditorSheet: View {
         guard let ingredient = selectedIngredient else { return }
         saving = true
         defer { saving = false }
-        let before = model.config.rules
-        await model.saveRule(draft, source: ingredient, replacing: editingName)
-        // Dismiss only when it actually took: on a refusal the model leaves
-        // lastError set and the config unchanged, so the sheet stays open with the
-        // reason showing rather than pretending it worked.
-        if model.lastError == nil, model.config.rules != before || isEdit {
+        // Dismiss only when the save actually took. On a refusal the model leaves
+        // lastError set and returns false, so the sheet stays open with the reason
+        // showing rather than pretending it worked.
+        if await model.saveRule(draft, source: ingredient, replacing: editingName) {
             dismiss()
         }
     }
 
     // MARK: helpers
+
+    /// A one-line gloss of what the selected risk changes on the phone. Deny is
+    /// always one tap; risk only scales the approve side.
+    private var riskGloss: String {
+        switch draft.risk {
+        case .routine: return "Routine: approve with a single tap on your phone."
+        case .elevated: return "Elevated: approve takes a deliberate confirm, so it is not a reflex tap."
+        case .critical: return "Critical: approve takes the firmest confirmation the phone offers."
+        }
+    }
 
     private func sourceLabel(_ account: Account) -> String {
         let where_ = account.provider == .envFile ? (account.path ?? account.label) : account.label
@@ -312,6 +327,7 @@ private struct TokenListEditor: View {
                         Image(systemName: "minus.circle").font(.system(size: 12))
                     }
                     .buttonStyle(.plain).foregroundStyle(.secondary)
+                    .accessibilityLabel("Remove \(token)")
                 }
                 .padding(.horizontal, 8).padding(.vertical, 4)
                 .background(.quaternary, in: .rect(cornerRadius: 6))
@@ -355,6 +371,7 @@ private struct FlagEqEditor: View {
                         Image(systemName: "minus.circle").font(.system(size: 12))
                     }
                     .buttonStyle(.plain).foregroundStyle(.secondary)
+                    .accessibilityLabel("Remove \(pair.flag)=\(pair.value)")
                 }
                 .padding(.horizontal, 8).padding(.vertical, 4)
                 .background(.quaternary, in: .rect(cornerRadius: 6))

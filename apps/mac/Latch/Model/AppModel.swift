@@ -25,6 +25,10 @@ final class AppModel {
     /// The if-this-then-that config: the rules the daemon gates on and the
     /// sources they inject from. Authored on the Rules screen.
     private(set) var config = SigilConfig()
+    /// Whether the first secondary load (accounts, config, history, settings) has
+    /// completed. The Rules and Sources screens gate their teaching empty state on
+    /// this so it never flashes before the load or on a pane re-select.
+    private(set) var secondaryLoaded = false
 
     /// The last daemon error, surfaced as a calm banner rather than an alert.
     var lastError: String?
@@ -127,6 +131,7 @@ final class AppModel {
         history = (try? await daemon.history()) ?? history
         settings = (try? await daemon.settings()) ?? settings
         config = (try? await daemon.config()) ?? config
+        secondaryLoaded = true
     }
 
     // MARK: actions
@@ -218,8 +223,14 @@ final class AppModel {
     /// goes through the `rule add` verb (whose targeted errors surface a duplicate
     /// name or unknown source); an in-place edit round-trips the whole config
     /// through `import`, which is atomic and revalidates referential integrity.
-    func saveRule(_ draft: RuleDraft, source ingredient: Account, replacing oldName: String?) async {
-        defer { Task { await loadSecondaryScreens() } }
+    ///
+    /// Returns whether it actually took, so the editor sheet dismisses only on a
+    /// real success and stays open (with the reason) on a refusal. The reload runs
+    /// inline before returning: a detached refresh Task cannot be observed by the
+    /// caller's synchronous check.
+    @discardableResult
+    func saveRule(_ draft: RuleDraft, source ingredient: Account, replacing oldName: String?) async -> Bool {
+        var ok = false
         do {
             let sourceName = try await ensureSource(for: ingredient)
             let rule = RuleConfig(
@@ -239,9 +250,15 @@ final class AppModel {
                 try await daemon.addRule(rule)
             }
             lastError = nil
+            ok = true
         } catch {
             lastError = describe(error)
         }
+        // A repoint or a failed add can leave a 1Password routing source with no
+        // rule; sweep those up so they do not silently accumulate.
+        await pruneOrphanSources()
+        await loadSecondaryScreens()
+        return ok
     }
 
     func removeRule(_ rule: RuleConfig) async {
@@ -251,6 +268,7 @@ final class AppModel {
         } catch {
             lastError = describe(error)
         }
+        await pruneOrphanSources()
         await loadSecondaryScreens()
     }
 
@@ -283,6 +301,21 @@ final class AppModel {
                 name: name, provider: SourceProvider.onePassword.rawValue,
                 account: ingredient.label, path: nil))
             return name
+        }
+    }
+
+    /// Remove 1Password routing sources no rule references any more. These are
+    /// pure plumbing the editor creates on the fly (`ensureSource`); env-file
+    /// sources are user-managed ingredients on the Sources screen and are left
+    /// alone even when unreferenced, since a user may add one before its rule.
+    private func pruneOrphanSources() async {
+        guard let cfg = try? await daemon.config() else { return }
+        let referenced = Set(cfg.rules.map(\.action.source))
+        let orphans = cfg.sources.filter {
+            $0.provider == SourceProvider.onePassword.rawValue && !referenced.contains($0.name)
+        }
+        for orphan in orphans {
+            try? await daemon.removeSource(name: orphan.name)
         }
     }
 

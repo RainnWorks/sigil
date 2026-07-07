@@ -214,7 +214,7 @@ struct Recipe: Identifiable, Sendable {
     static let catalog: [Recipe] = [
         Recipe(id: "1Password CLI",
                title: "1Password CLI",
-               subtitle: "Gate op read and op item get on your phone before a secret is read.",
+               subtitle: "Gate op on your phone before any secret is read.",
                symbol: "key.horizontal",
                provider: .onePassword, command: "op", risk: .routine),
         Recipe(id: "gcloud",
@@ -227,11 +227,10 @@ struct Recipe: Identifiable, Sendable {
                subtitle: "Inject AWS credentials from an env file when aws runs.",
                symbol: "cloud",
                provider: .envFile, command: "aws", risk: .elevated),
-        Recipe(id: "SSH key",
-               title: "SSH key",
-               subtitle: "Gate ssh and inject its key material from an env file.",
-               symbol: "terminal",
-               provider: .envFile, command: "ssh", risk: .elevated),
+        // No SSH recipe yet: SSH signing is a separate first-class flow (the
+        // phone-gated ssh-agent, RequestKind.sshSignature), not an env-file
+        // injection, so there is no honest source a recipe could name here until
+        // an ssh-agent source provider exists.
         Recipe(id: "Env file",
                title: "Env file",
                subtitle: "Inject a KEY=VALUE file into any command you name.",
@@ -291,10 +290,14 @@ struct RuleDraft {
         timeoutSec = rule.action.timeoutSec
         // Resolve the rule's config source back to a picker key: an env-file
         // source keys on its own name; a 1Password source keys on the credential
-        // label it routes, so the picker lands on the same ingredient.
+        // label it routes, so the picker lands on the same ingredient. Editing
+        // pins the provider to the rule's own (custom = false) so the source
+        // picker stays within it; silently repointing an op gate at an env file is
+        // not something a rule edit should allow. A cross-provider change is a
+        // deliberate remove-and-recreate.
         if let src = config.source(named: rule.action.source) {
             provider = src.knownProvider ?? .envFile
-            custom = true
+            custom = false
             switch src.knownProvider {
             case .onePassword: sourceKey = src.account ?? src.name
             default: sourceKey = src.name
