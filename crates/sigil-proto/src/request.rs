@@ -475,6 +475,105 @@ impl DeliveryReceipt {
     }
 }
 
+/// Why a ring-all request stopped being actionable, broadcast to the OTHER
+/// paired devices so they dismiss their copy (#36 multi-device). Carries no
+/// secret and no decision detail: a device learns only THAT the request is over,
+/// never who resolved it or how a v1/v2 secret was released.
+///
+/// Serializes `snake_case` to match the phone's TypeScript union.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionStatus {
+    /// A device approved or denied it (first-wins). The others dismiss it; the
+    /// zero-knowledge broadcast deliberately does not say which of the two.
+    Settled,
+    /// The request timed out on the daemon before any device answered.
+    Expired,
+    /// The daemon withdrew it (lockdown, restart, or the requester went away).
+    Withdrawn,
+}
+
+/// A daemon -> phone resolution broadcast (#36 multi-device ring-all / first-wins).
+///
+/// When a gated request has been deposited to EVERY paired device and one of them
+/// resolves it (or it expires / is withdrawn), the daemon seals this per-device to
+/// the OTHER devices so their pending sheet dismisses instead of lingering until
+/// its own timeout. It is the ToPhone-direction sibling of the phone's
+/// [`DeliveryReceipt`]: metadata only, releases nothing, gates nothing.
+///
+/// **Wire contract (shared with `apps/phone`).** Serializes with a
+/// `"type":"resolution"` discriminator so the phone's inbound demux tells it apart
+/// from an (untagged) [`ApprovalRequest`] on the same ToPhone channel; `request_id`
+/// (wire: `requestId`) names the request it settles, and `status` says why.
+///
+/// It is sealed, signed, and replay-protected exactly like every other envelope on
+/// the daemon->phone counter, so a hostile relay can neither forge one (to dismiss
+/// a real pending request the human should still see) nor replay one. Because it is
+/// zero-knowledge, a forged-but-somehow-valid one could at worst hide a prompt, and
+/// hiding a prompt only ever fails closed (the secret is not released); it can never
+/// cause a release.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolutionBroadcast {
+    /// The wire discriminator. Always [`ResolutionBroadcast::TYPE`] on a conforming
+    /// message; validated by [`ToPhoneMessage::from_value`] before dispatch.
+    #[serde(rename = "type")]
+    pub message_type: String,
+    /// The request this settles; correlates to a pending request on the phone.
+    pub request_id: String,
+    /// Why it is no longer actionable.
+    pub status: ResolutionStatus,
+}
+
+impl ResolutionBroadcast {
+    /// The locked `type` discriminator value.
+    pub const TYPE: &'static str = "resolution";
+
+    /// Build a broadcast for `request_id` with `status`, stamping the discriminator.
+    pub fn new(request_id: impl Into<String>, status: ResolutionStatus) -> Self {
+        Self {
+            message_type: Self::TYPE.to_string(),
+            request_id: request_id.into(),
+            status,
+        }
+    }
+}
+
+/// A daemon -> phone message on an established session's `ToPhone` channel.
+///
+/// Two shapes share this channel: the (untagged, legacy) [`ApprovalRequest`] and
+/// the tagged [`ResolutionBroadcast`]. This mirrors [`ToDaemonMessage`] on the
+/// return path: the daemon's demux there tells a response from a tagged
+/// registration/receipt; the phone's demux here tells a request from a tagged
+/// resolution. The discriminator is the `type` field: `"resolution"` selects
+/// [`ResolutionBroadcast`]; its absence is an [`ApprovalRequest`]. A hand-rolled
+/// peek is used deliberately instead of a `#[serde(untagged)]` enum so
+/// [`ApprovalRequest`]'s wire shape stays byte-for-byte unchanged (the pinned
+/// vectors and the pairing transcript must not shift).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ToPhoneMessage {
+    /// A fresh approval request to display.
+    Request(Box<ApprovalRequest>),
+    /// A resolution of an already-shown request: dismiss it. Never a decision and
+    /// never a release; display only.
+    Resolution(ResolutionBroadcast),
+}
+
+impl ToPhoneMessage {
+    /// Classify an already-decrypted payload [`serde_json::Value`] (the plaintext an
+    /// [`Envelope`](crate::Envelope) opened to). Fails closed: a value that is
+    /// neither a valid resolution nor a valid request is an error the caller drops.
+    /// A `ResolutionBroadcast` is boxed-free (small); an `ApprovalRequest` is boxed
+    /// to keep the enum small.
+    pub fn from_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        let tag = value.get("type").and_then(serde_json::Value::as_str);
+        match tag {
+            Some(ResolutionBroadcast::TYPE) => Ok(Self::Resolution(serde_json::from_value(value)?)),
+            _ => Ok(Self::Request(Box::new(serde_json::from_value(value)?))),
+        }
+    }
+}
+
 /// A phone -> daemon message on an established session's `ToDaemon` channel.
 ///
 /// Three shapes share this channel: the (untagged, legacy) [`ApprovalResponse`],
@@ -779,6 +878,75 @@ mod tests {
         // half-built receipt that could touch delivery state.
         let bogus = serde_json::json!({ "type": "delivered" });
         assert!(ToDaemonMessage::from_value(bogus).is_err());
+    }
+
+    #[test]
+    fn resolution_broadcast_serializes_the_locked_wire_contract() {
+        // Matches apps/phone's `{ type: "resolution", requestId, status }`.
+        let rb = ResolutionBroadcast::new("req-7", ResolutionStatus::Settled);
+        let json = serde_json::to_string(&rb).unwrap();
+        assert!(json.contains("\"type\":\"resolution\""));
+        assert!(json.contains("\"requestId\":\"req-7\""));
+        assert!(json.contains("\"status\":\"settled\""));
+        let back: ResolutionBroadcast = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, rb);
+
+        // Every status round-trips with its snake_case wire spelling.
+        for (status, wire) in [
+            (ResolutionStatus::Settled, "settled"),
+            (ResolutionStatus::Expired, "expired"),
+            (ResolutionStatus::Withdrawn, "withdrawn"),
+        ] {
+            let j = serde_json::to_string(&ResolutionBroadcast::new("r", status)).unwrap();
+            assert!(j.contains(&format!("\"status\":\"{wire}\"")));
+        }
+    }
+
+    #[test]
+    fn to_phone_message_classifies_by_the_type_tag() {
+        // A tagged resolution is a Resolution; an untagged ApprovalRequest is a
+        // Request. This is the phone's inbound demux decision, proven here.
+        let rb = ResolutionBroadcast::new("req-9", ResolutionStatus::Withdrawn);
+        let rb_val = serde_json::to_value(&rb).unwrap();
+        assert_eq!(
+            ToPhoneMessage::from_value(rb_val).unwrap(),
+            ToPhoneMessage::Resolution(rb)
+        );
+
+        let req = ApprovalRequest {
+            request_id: "req-9".into(),
+            kind: RequestKind::SecretRead,
+            command: vec!["op".into(), "read".into()],
+            secrets: vec![secret_ref()],
+            ssh: None,
+            provenance: Provenance {
+                process_chain: vec!["op".into()],
+                cwd: "/p".into(),
+                machine: "mac".into(),
+                requested_at: 1,
+            },
+            lease_policy: LeasePolicy::RunOnce,
+            reason: None,
+            threshold: None,
+            expires_at: 2,
+            timeout_ms: 90_000,
+        };
+        let req_val = serde_json::to_value(&req).unwrap();
+        // An ApprovalRequest carries no `type`, so it classifies as a Request.
+        assert!(req_val.get("type").is_none());
+        assert_eq!(
+            ToPhoneMessage::from_value(req_val).unwrap(),
+            ToPhoneMessage::Request(Box::new(req))
+        );
+    }
+
+    #[test]
+    fn to_phone_message_fails_closed_on_a_bogus_resolution() {
+        // A payload tagged as a resolution but missing the required fields is an
+        // error the caller drops, never a half-built dismissal that could hide a
+        // real pending prompt.
+        let bogus = serde_json::json!({ "type": "resolution" });
+        assert!(ToPhoneMessage::from_value(bogus).is_err());
     }
 
     #[test]

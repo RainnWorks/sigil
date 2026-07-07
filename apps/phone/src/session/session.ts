@@ -10,6 +10,7 @@ import {
   agreementSecretKey,
   type ApprovalRequest,
   type ApprovalResponse,
+  classifyToPhone,
   type Decision,
   type DeliveryReceiptMessage,
   type DeviceIdentity,
@@ -51,9 +52,14 @@ export class SigilSession {
   }
 
   private handleInbound(envelope: Envelope): void {
-    let request: ApprovalRequest;
+    let payload: unknown;
     try {
-      request = open<ApprovalRequest>(this.cfg.sodium, envelope, {
+      // Open once to a raw payload; the crypto (signature, replay, decryption) is
+      // verified by `open` regardless of which ToPhone shape this turns out to be.
+      // Both an ApprovalRequest and a ResolutionBroadcast ride the same sealed,
+      // signed, single-use envelope on the daemon->phone counter, so a hostile
+      // relay can neither forge nor replay either.
+      payload = open<unknown>(this.cfg.sodium, envelope, {
         sender: this.cfg.daemonPub,
         recipientAgreementSecret: agreementSecretKey(this.cfg.sodium, this.cfg.phone),
         guard: this.inboundGuard,
@@ -63,6 +69,18 @@ export class SigilSession {
       // silently. Fail closed.
       return;
     }
+    // Demux by the `type` tag, mirroring the daemon's ToDaemon demux.
+    const msg = classifyToPhone(payload);
+    if (!msg) return; // malformed: drop it (fail closed)
+    if (msg.kind === "resolution") {
+      // #36: another paired device resolved this ring-all request (or it expired /
+      // was withdrawn). Dismiss our copy. Zero-knowledge: we learn only that it is
+      // over, never who resolved it or how. Never a decision, never a release, and
+      // never acknowledged with a delivery receipt.
+      store.dismissResolved(msg.resolution.requestId, msg.resolution.status);
+      return;
+    }
+    const request = msg.request;
     store.receive(request);
     // Task #41: acknowledge receipt so the daemon can advance the requester's
     // UI Sent -> Delivered. Best-effort and non-blocking: a failed ack leaves

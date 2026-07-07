@@ -10,7 +10,8 @@
 
 use sigil_proto::{
     DeliveryReceipt, DeviceIdentity, Envelope, OpenError, PeerIdentity, PushRegister, ReplayError,
-    ReplayGuard, ToDaemonMessage, REPLAY_WINDOW_MS,
+    ReplayGuard, ResolutionBroadcast, ResolutionStatus, ToDaemonMessage, ToPhoneMessage,
+    REPLAY_WINDOW_MS,
 };
 
 /// A paired sender (phone) and recipient (daemon), plus the honest replay guard
@@ -407,6 +408,86 @@ fn delivery_receipt_rides_the_sealed_signed_replay_protected_envelope() {
 
     // The exact bytes replayed are rejected (single-use request id): a relay cannot
     // replay a receipt to re-mark delivery.
+    assert_eq!(
+        env.open::<serde_json::Value>(&sender.peer_identity(), &recipient.agreement, &mut guard),
+        Err(OpenError::Replay(ReplayError::DuplicateRequest))
+    );
+}
+
+// --- the resolution broadcast (#36 multi-device) rides the same proofs ---------
+
+#[test]
+fn resolution_broadcast_rides_the_sealed_signed_replay_protected_envelope() {
+    // A ResolutionBroadcast is the daemon->phone sibling of the DeliveryReceipt:
+    // sealed, it is confidential to the relay, its signature covers every field,
+    // and it is single-use. Delivered honestly it opens and the phone's demux
+    // classifies it as a Resolution; a tampered or replayed copy is rejected
+    // exactly as any other payload, so a hostile relay can neither FORGE a
+    // dismissal (to hide a real pending prompt from the human) nor REPLAY one. And
+    // even a forged-but-valid dismissal only ever fails closed: hiding a prompt
+    // withholds a release, it can never cause one.
+    let sender = DeviceIdentity::generate(); // the daemon, on ToPhone
+    let recipient = DeviceIdentity::generate(); // a paired phone
+    let pairing_id = [0x7c; 32];
+    let mut guard = ReplayGuard::new();
+
+    let rb = ResolutionBroadcast::new("req-RING", ResolutionStatus::Settled);
+    let env = Envelope::seal(
+        &rb,
+        pairing_id,
+        1,
+        &sender.signing,
+        &recipient.peer_identity(),
+    )
+    .expect("seal");
+
+    // The relay cannot read it: opened with a stranger's agreement secret it fails
+    // to decrypt even with the true sender's public key.
+    let stranger = DeviceIdentity::generate();
+    assert_eq!(
+        env.open::<ResolutionBroadcast>(
+            &sender.peer_identity(),
+            &stranger.agreement,
+            &mut ReplayGuard::new()
+        ),
+        Err(OpenError::Decrypt)
+    );
+
+    // A bit-flip in the ciphertext breaks the signature (no forged dismissal).
+    let tampered = MaliciousRelay::flip_ciphertext(&env);
+    assert_eq!(
+        tampered.open::<serde_json::Value>(
+            &sender.peer_identity(),
+            &recipient.agreement,
+            &mut ReplayGuard::new()
+        ),
+        Err(OpenError::BadSignature)
+    );
+
+    // A forged envelope from a key the phone does not pin is rejected: the relay
+    // cannot manufacture a dismissal for a request the human should still see.
+    let forged = MaliciousRelay::new().forge(pairing_id, &recipient.peer_identity(), 1);
+    assert_eq!(
+        forged.open::<serde_json::Value>(
+            &recipient.peer_identity(), // phone still pins the DAEMON, not this key
+            &recipient.agreement,
+            &mut ReplayGuard::new()
+        ),
+        Err(OpenError::BadSignature)
+    );
+
+    // Honest delivery opens to a Value, and the phone's demux classifies it as a
+    // Resolution for the settled request id.
+    let value: serde_json::Value = env
+        .open(&sender.peer_identity(), &recipient.agreement, &mut guard)
+        .expect("open");
+    assert_eq!(
+        ToPhoneMessage::from_value(value).unwrap(),
+        ToPhoneMessage::Resolution(rb)
+    );
+
+    // The exact bytes replayed are rejected (single-use request id): a relay cannot
+    // replay a resolution to re-dismiss (or, at scale, to suppress) a later prompt.
     assert_eq!(
         env.open::<serde_json::Value>(&sender.peer_identity(), &recipient.agreement, &mut guard),
         Err(OpenError::Replay(ReplayError::DuplicateRequest))

@@ -239,3 +239,64 @@ export interface DeliveryReceiptMessage {
   /** The request this acknowledges receipt of; matches the envelope's request id. */
   requestId: string;
 }
+
+/**
+ * Why a ring-all request stopped being actionable (#36 multi-device). Mirrors
+ * proto `ResolutionStatus` (serde snake_case). The zero-knowledge broadcast
+ * deliberately does NOT say which device resolved it or whether it was an approve
+ * or a deny: a phone learns only THAT its copy is over.
+ */
+export type ResolutionStatus = "settled" | "expired" | "withdrawn";
+
+/**
+ * Daemon -> phone resolution broadcast (#36 multi-device ring-all / first-wins).
+ * Mirrors proto `ResolutionBroadcast`. When a gated request has been rung to every
+ * paired device and one of them resolves it (or it expires / is withdrawn), the
+ * daemon seals this to the OTHER devices so their pending sheet dismisses instead
+ * of lingering until its own timeout.
+ *
+ * It is the ToPhone-direction sibling of {@link DeliveryReceiptMessage}: sealed
+ * over the live session, metadata only. It carries only `requestId` + `status`,
+ * releases nothing, and gates nothing. `type` is the discriminant that lets the
+ * inbound demux tell it apart from an {@link ApprovalRequest} (which carries no
+ * `type`) arriving in the same envelope slot.
+ */
+export interface ResolutionBroadcastMessage {
+  type: "resolution";
+  /** The request this settles; matches a pending request's `requestId`. */
+  requestId: string;
+  /** Why it is no longer actionable. */
+  status: ResolutionStatus;
+}
+
+/**
+ * An opened daemon -> phone payload: either a fresh {@link ApprovalRequest} to
+ * display (untagged, legacy) or a tagged {@link ResolutionBroadcastMessage} to
+ * dismiss one. Mirrors proto `ToPhoneMessage`. {@link classifyToPhone} is the
+ * single place the phone decides which one an opened envelope is.
+ */
+export type ToPhoneMessage =
+  | { kind: "request"; request: ApprovalRequest }
+  | { kind: "resolution"; resolution: ResolutionBroadcastMessage };
+
+/**
+ * Classify an opened (decrypted, verified) ToPhone payload by its `type` tag,
+ * mirroring proto `ToPhoneMessage::from_value`. `"resolution"` selects a
+ * dismissal; its absence is an approval request. Fails closed: a `"resolution"`
+ * tag with a missing/blank `requestId` returns `null` so the caller drops it
+ * rather than dismissing an unknown request. Kept a pure function so it is unit
+ * testable without a live session.
+ */
+export function classifyToPhone(payload: unknown): ToPhoneMessage | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const tag = (payload as { type?: unknown }).type;
+  if (tag === "resolution") {
+    const p = payload as Partial<ResolutionBroadcastMessage>;
+    if (typeof p.requestId !== "string" || p.requestId.length === 0) return null;
+    if (p.status !== "settled" && p.status !== "expired" && p.status !== "withdrawn") return null;
+    return { kind: "resolution", resolution: { type: "resolution", requestId: p.requestId, status: p.status } };
+  }
+  // No `type` (or an unknown one): treat as an approval request. The session's
+  // envelope open already validated the crypto; shape errors surface downstream.
+  return { kind: "request", request: payload as ApprovalRequest };
+}

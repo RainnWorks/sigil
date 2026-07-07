@@ -28,8 +28,8 @@ pub use pairing::{
 pub use replay::{ReplayError, ReplayGuard};
 pub use request::{
     ApprovalRequest, ApprovalResponse, BlockDirective, Decision, DeliveryReceipt, InstallLease,
-    LeasePolicy, Provenance, PushRegister, RequestKind, SecretRef, SshChallenge,
-    ThresholdChallenge, ThresholdPartial, ToDaemonMessage,
+    LeasePolicy, Provenance, PushRegister, RequestKind, ResolutionBroadcast, ResolutionStatus,
+    SecretRef, SshChallenge, ThresholdChallenge, ThresholdPartial, ToDaemonMessage, ToPhoneMessage,
 };
 pub use se_ecies::{unwrap_dek_p256, wrap_dek_p256, SeEciesError};
 pub use threshold::{
