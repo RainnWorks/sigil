@@ -10,9 +10,9 @@ Paths are relative to the repo root. Test names are the `#[test]` fn names;
 run any with `cargo test <name>`.
 
 **Authorship convention (review integrity).** The claim/code/test rows and the
-residuals are maintained by whoever touches the surface. But a *verdict* — any
+residuals are maintained by whoever touches the surface. But a *verdict*, any
 "reviewed and found sound" / "CONFIRMED SOUND" statement about whether a
-construction is correct — is written **only by an independent security-reviewer
+construction is correct, is written **only by an independent security-reviewer
 that did not author the code under review**, never by the implementer
 (self-certification is not a verdict). A proving-test cell reading "reviewed by
 inspection" is a narrower thing: a reviewer's note that a specific claim is
@@ -24,8 +24,8 @@ verdict. Sweep at `747b3a4`: the only construction verdict in this document is
 Reviewed at commit `3d005aa` (the first end-to-end remote-approval loop).
 Extended at commit `ee49ee3` (any-CLI generalization: provider registry, the
 `env-file` direct-injection provider, the pluggable SSH signer, and the
-CLI-only pairing persistence) — sections 11–13 and residuals 9–11 below.
-Extended again at commit `747b3a4` (the P-256 Secure Enclave DEK wrap) — section
+CLI-only pairing persistence), sections 11-13 and residuals 9-11 below.
+Extended again at commit `747b3a4` (the P-256 Secure Enclave DEK wrap), section
 14 and residual 12; and the env-file invalid-UTF-8 residual was fixed (see §12).
 
 ---
@@ -97,17 +97,17 @@ Extended again at commit `747b3a4` (the P-256 Secure Enclave DEK wrap) — secti
 | A dev/in-memory keystore can never count as the biometric approving factor | `keystore.rs::Keystore::is_biometric` (default `false`), `approve.rs::LocalApprover::decide_local` (guard `is_biometric() && has_dek()`) | `keystore.rs::memory_keystore_is_not_a_biometric_factor`, `approve.rs::dev_autoapprove_grants_without_biometrics` (grant only via explicit dev switch) |
 | Only the macOS Secure Enclave keystore reports biometric, and its unwrap refuses until verified on hardware | `keystore_macos.rs::MacKeystore::is_biometric` (`true`), `unwrap_dek` (`NeedsVerification`) | `keystore_macos.rs::se_paths_refuse_until_verified` |
 | Deny / timeout always fails closed (never a grant) | `approve.rs::LocalApprover::decide_local` (timeout → `Deny`), `remote.rs::RemoteApprover::decide` (`unwrap_or Deny`) | `approve.rs::local_timeout_fails_closed`, `daemon.rs::denied_request_fails_closed_and_delivers_no_secret` |
-| The Secure Enclave DEK unwrap fires Touch ID on real hardware | `keystore_macos.rs::unwrap_dek` | **UNPROVEN — PARTIAL**: FFI is documented but returns `NeedsVerification`; must be exercised on a Mac (see NEEDS-VERIFICATION block). Until then, the shipping local approver falls through to the control socket (see Residuals). |
+| The Secure Enclave DEK unwrap fires Touch ID on real hardware | `keystore_macos.rs::unwrap_dek` | **UNPROVEN, PARTIAL**: FFI is documented but returns `NeedsVerification`; must be exercised on a Mac (see NEEDS-VERIFICATION block). Until then, the shipping local approver falls through to the control socket (see Residuals). |
 
 ## 7. Caller identity is daemon-verified (invariant #6)
 
 | Claim | Enforcing code | Proving test |
 |-------|----------------|--------------|
-| Peer pid is read from the kernel, not the client | `lease.rs::peer_pid` (`LOCAL_PEERPID`/`SO_PEERCRED`) | **UNPROVEN — PARTIAL** on hardware (`NEEDS-VERIFICATION` in `lease.rs`); logic exercised via injected pid in daemon tests |
+| Peer pid is read from the kernel, not the client | `lease.rs::peer_pid` (`LOCAL_PEERPID`/`SO_PEERCRED`) | **UNPROVEN, PARTIAL** on hardware (`NEEDS-VERIFICATION` in `lease.rs`); logic exercised via injected pid in daemon tests |
 | Ancestry is walked kernel-side; the grant key binds code identity, never pids | `lease.rs::walk_ancestry`, `grant_key` (excludes pids) | `lease.rs::ancestry_walk_is_root_first_and_stops_at_init`, `grant_key_ignores_recycled_pids`, `grant_key_changes_with_root_scope_or_ancestry` |
 | The ancestry walk terminates on cycles / bounded depth | `lease.rs::walk_ancestry` (`MAX_ANCESTRY_DEPTH`, `seen` set) | `lease.rs::ancestry_walk_terminates_on_a_cycle` |
 | A phone-claimed grant key is ignored; the daemon derives and trusts its own | `daemon.rs::fulfill` (uses `gk`), `request.rs::InstallLease` (echo only), `softphone/lib.rs` (empty `grant_key`) | reviewed by inspection; exercised by `daemon.rs::lease_decision_covers_the_next_identical_request` |
-| The ancestor "code identity" is a real code-signing measurement | `lease.rs::SysProcessTable::identity` | **UNPROVEN — PARTIAL**: interim BLAKE2b of the exe bytes; the design calls for the cdhash / Developer ID (NEEDS-VERIFICATION in `lease.rs`) |
+| The ancestor "code identity" is a real code-signing measurement | `lease.rs::SysProcessTable::identity` | **UNPROVEN, PARTIAL**: interim BLAKE2b of the exe bytes; the design calls for the cdhash / Developer ID (NEEDS-VERIFICATION in `lease.rs`) |
 
 ## 8. Fail closed, leases bounded, lockdown (invariants #7, #8)
 
@@ -145,7 +145,7 @@ Extended again at commit `747b3a4` (the P-256 Secure Enclave DEK wrap) — secti
 | The public config file is 0600 and holds no key material | `pairing_store.rs::save` (`set_permissions 0o600`) | `pairing_store.rs::config_file_is_0600_and_holds_no_dek` |
 | An attacker with the whole disk cannot produce a secret: tokens are ciphertext under the DEK the daemon does not hold; the stolen state can only *ask* the phone, which requires a fresh hardware-gated approval | `pairing_store.rs` (no DEK persisted), `daemon.rs::fulfill` (DEK arrives per-approval), `remote.rs` | `daemon.rs::reloaded_pairing_serves_a_secret_over_the_real_relay` (reloaded identity serves a secret ONLY via the phone's sealed DEK, `has_dek()==false`) |
 | A half-broken pairing (config present, keystore identity gone) surfaces loudly instead of silently failing | `pairing_store.rs::load` (`MissingIdentity`/`CorruptIdentity`), `daemon.rs::load_remote_pairing` (logs, treats as no-pairing → fails closed) | `pairing_store.rs::config_present_but_identity_missing_is_a_loud_error` |
-| The bootstrap **rendezvous mailbox** is domain-separated and non-invertible: leaking it reveals nothing about the secret | `pairing.rs::rendezvous_mailbox` (`BLAKE2b(RENDEZVOUS_DOMAIN ‖ daemon.verifying ‖ daemon.agreement ‖ secret)`, distinct from `mailbox_id`/`fingerprint`/confirm-tag domains; secret is 256-bit CSPRNG so preimage-resistant) | reviewed by inspection (domain constants distinct; length-prefixed absorb is injective); **UNPROVEN** by a dedicated test — no negative test asserts domain separation of the rendezvous id |
+| The bootstrap **rendezvous mailbox** is domain-separated and non-invertible: leaking it reveals nothing about the secret | `pairing.rs::rendezvous_mailbox` (`BLAKE2b(RENDEZVOUS_DOMAIN ‖ daemon.verifying ‖ daemon.agreement ‖ secret)`, distinct from `mailbox_id`/`fingerprint`/confirm-tag domains; secret is 256-bit CSPRNG so preimage-resistant) | reviewed by inspection (domain constants distinct; length-prefixed absorb is injective); **UNPROVEN** by a dedicated test, no negative test asserts domain separation of the rendezvous id |
 | Pairing message 1 (`PairingResponse`) travels the relay as MAC-authenticated plaintext carrying only public data (phone pubkey, nonce, tag); substitution is rejected | `pairing.rs::PairingResponse::verify`, `relay-client/src/rendezvous_ws.rs` (moves opaque strings only, no envelope/key handling) | the full `pairing_mitm.rs` suite (message 1 is exactly what it attacks) |
 | Persisting a pairing auto-selects the phone factor with no dev flag | `daemon.rs::{load_remote_pairing,build_gate}` (`Factor::Phone`) | `daemon.rs::build_gate_selects_the_phone_approver_from_a_persisted_config` |
 
@@ -162,7 +162,7 @@ the security boundary between them is stated honestly, not blurred.
 | The env-file **source path comes only from the CLI-side config (0600), never from the caller's argv**, so a caller cannot redirect env-file at an arbitrary file (`/etc/shadow`, a co-worker's `.env`) | `daemon.rs::fulfill` (`source = cfg.source`, argv is never consulted for the source), `command.rs` (config is a CLI-only mutation surface) | reviewed by inspection; the config-store add/get/remove path is `command.rs::add_get_remove_round_trip_and_reject_duplicates` |
 | A command that **shadows a reserved verb** fails toward the built-in verb (safe), never toward ungated execution; the escape hatch is `sigil run -- <cmd>` | `cli.rs::main` dispatch + `is_reserved_verb`, `shim.rs::dispatch` (the daemon's `fulfill` is the sole injection chokepoint) | `cli.rs::reserved_verbs_take_precedence_over_command_dispatch` |
 | Argv is passed to the child as **separate argv entries, never a shell string** (no shell-injection surface); the real binary is resolved via PATH skipping the shim | `provider.rs::{OpProvider,EnvFileProvider}::run` (`Command::new(real).args(...)`), `paths::{find_real,find_real_op}` | `daemon.rs::env_file_command_runs_gated_and_injects_env`, `provider.rs::run_streams_op_child_output_to_the_caller_fd` |
-| A **down daemon** makes the shim exec the bare tool with **no injected secret** (fail-safe: nothing is released); a protocol error while the daemon is **up** fails closed (exit 70), never runs ungated | `shim.rs::dispatch` (`Ok`→exit code; `forward` error→exit 70; only a *down* socket → `exec_real`), `shim.rs::exec_real` (no env injected) | reviewed by inspection (the module contract; no negative test asserts the exec fallback injects nothing) — **UNPROVEN** by a dedicated test |
+| A **down daemon** makes the shim exec the bare tool with **no injected secret** (fail-safe: nothing is released); a protocol error while the daemon is **up** fails closed (exit 70), never runs ungated | `shim.rs::dispatch` (`Ok`→exit code; `forward` error→exit 70; only a *down* socket → `exec_real`), `shim.rs::exec_real` (no env injected) | reviewed by inspection (the module contract; no negative test asserts the exec fallback injects nothing), **UNPROVEN** by a dedicated test |
 
 ## 12. The `env-file` direct-injection provider (invariant #2, honestly relaxed)
 
@@ -174,9 +174,9 @@ RAM, and the doc is explicit about the exact residual that buys.
 |-------|----------------|--------------|
 | `describe()` names the source **without reading it**, so no secret value enters daemon memory before the decision | `provider.rs::EnvFileProvider::describe` (uses `Path::file_name` only, never `read`) | reviewed by inspection; `provider.rs::env_file_parses_pairs_and_strips_quotes_and_comments` covers the parser that runs only at `run()` time |
 | The file is read into a `Zeroizing` buffer and every value lands in a `Zeroizing` string; both are wiped when the map drops at end of `run()` | `provider.rs::{EnvFileProvider::run,parse_env_file}` (`Zeroizing::new(bytes)`, `Zeroizing<Vec<(String, Zeroizing<String>)>>`) | `provider.rs::env_file_provider_injects_the_vars_into_the_child` (values reach the child), parser by `env_file_parses_pairs_and_strips_quotes_and_comments` |
-| **Leasing is disabled for env-file**: a lease would hold resolved values in RAM across a TTL, so a direct-injection provider is gated on **every** run — even when the decision grants a session lease | `daemon.rs::fulfill` (the lease short-circuit and the `grant` are both inside `if needs_account` / `if let Some(ciphertext)`, and `EnvFileProvider::needs_account()==false`) | `daemon.rs::env_file_lease_decision_grants_no_lease` (Lease decision → runs once, `leases.active()==0`), `env_file_command_runs_gated_and_injects_env` (`active()==0`) |
+| **Leasing is disabled for env-file**: a lease would hold resolved values in RAM across a TTL, so a direct-injection provider is gated on **every** run, even when the decision grants a session lease | `daemon.rs::fulfill` (the lease short-circuit and the `grant` are both inside `if needs_account` / `if let Some(ciphertext)`, and `EnvFileProvider::needs_account()==false`) | `daemon.rs::env_file_lease_decision_grants_no_lease` (Lease decision → runs once, `leases.active()==0`), `env_file_command_runs_gated_and_injects_env` (`active()==0`) |
 | `needs_account()==false` correctly gates that env-file **never** routes an account, unwraps the DEK, or touches leasing | `provider.rs::EnvFileProvider::needs_account`, `daemon.rs::fulfill` (all account/DEK/lease work guarded by `needs_account`) | `provider.rs::op_provider_needs_an_account_and_env_file_does_not`, `daemon.rs::env_file_command_runs_gated_and_injects_env` |
-| No value is ever logged: every env-file error line names the **path / io error only** | `provider.rs::EnvFileProvider::run` (all `eprintln!` carry `run.source` or `command[0]`, never a value) | reviewed by inspection (no negative-logging assertion) — **UNPROVEN** by test |
+| No value is ever logged: every env-file error line names the **path / io error only** | `provider.rs::EnvFileProvider::run` (all `eprintln!` carry `run.source` or `command[0]`, never a value) | reviewed by inspection (no negative-logging assertion), **UNPROVEN** by test |
 | The parser cannot panic on hostile input, and an **invalid-UTF-8** file fails closed with no owned/un-zeroized `String` allocated (borrows with `str::from_utf8`, returns `None`; `split_once` guard; `len() >= 2` quote guard) | `provider.rs::{parse_env_file,EnvFileProvider::run}` | `provider.rs::{env_file_parses_pairs_and_strips_quotes_and_comments,env_file_with_invalid_utf8_is_rejected,env_file_run_fails_closed_on_invalid_utf8}` |
 
 See **residual 9** for the two un-wiped copies this shape unavoidably leaves (the
@@ -204,7 +204,7 @@ signature to the signer that owns the key. Two signers ship (`OpSshSigner`,
 public key resolved from `<path>.pub` at arm time but reads the private key at
 sign time, and does not re-verify that the produced signature matches the
 advertised public key. A same-UID attacker who swaps the private-key file
-between arm and sign makes the agent emit a signature under a *different* key —
+between arm and sign makes the agent emit a signature under a *different* key,
 which the SSH client then rejects (it does not match the offered identity), so
 this breaks the connection rather than forging anything. A same-UID file swap is
 already outside Sigil's boundary. Not a distinct escalation; noted for
@@ -213,16 +213,16 @@ completeness.
 ## 14. The P-256 Secure Enclave DEK wrap (`747b3a4`)
 
 The Mac local-approval factor unwraps the DEK *inside* the Secure Enclave under
-Touch ID, and the SE holds only P-256 keys — so the Mac-SE wrap is a second,
+Touch ID, and the SE holds only P-256 keys, so the Mac-SE wrap is a second,
 independent envelope of the same DEK (the phone path is unchanged X25519). It
 reproduces Apple's `kSecKeyAlgorithmECIESEncryptionCofactorVariableIVX963SHA256AESGCM`
 so `SecKeyCreateDecryptedData` opens it.
 
-**Independent review verdict — CONFIRMED SOUND.** This verdict is written by the
+**Independent review verdict, CONFIRMED SOUND.** This verdict is written by the
 security-reviewer, which did **not** author `se_ecies.rs` (implemented by
 rust-core in `747b3a4`); per the review-integrity rule the implementer documents
 behavior and residuals, and only the independent reviewer records a "reviewed"
-verdict — this is not a self-certification. The adversarial pass covered the
+verdict, this is not a self-certification. The adversarial pass covered the
 construction against Apple's spec (the AES-128-not-256 and VariableIV gotchas),
 on-curve point validation of both the recipient and ephemeral keys, per-wrap
 IV/key freshness (no GCM nonce reuse), zeroization of every secret intermediate,
@@ -234,7 +234,7 @@ needed. The only outstanding item is on-device interop
 
 | Claim | Enforcing code | Proving test |
 |-------|----------------|--------------|
-| The construction matches Apple's ECIES exactly: ephemeral P-256 → cofactor ECDH (P-256 h=1) → ANSI-X9.63 KDF-SHA256 with sharedInfo = ephemeral X9.63 pubkey → **AES-128** key ‖ 16-byte **variable IV** → AES-128-GCM, empty AAD, 16-byte tag; wire `eph_pub(65) ‖ ct(32) ‖ tag(16) = 113` | `se_ecies.rs::{wrap_dek_p256,x963_kdf_sha256,split_key_iv,Aes128GcmVarIv}` | `se_ecies.rs::{wrap_unwrap_round_trips_the_dek,sealed_blob_has_the_apple_wire_length,x963_kdf_matches_a_known_answer}`; on-device interop is **UNPROVEN — NEEDS-VERIFICATION** (`apps/mac/Tools/se-selftest.swift`, blob must read 113) |
+| The construction matches Apple's ECIES exactly: ephemeral P-256 → cofactor ECDH (P-256 h=1) → ANSI-X9.63 KDF-SHA256 with sharedInfo = ephemeral X9.63 pubkey → **AES-128** key ‖ 16-byte **variable IV** → AES-128-GCM, empty AAD, 16-byte tag; wire `eph_pub(65) ‖ ct(32) ‖ tag(16) = 113` | `se_ecies.rs::{wrap_dek_p256,x963_kdf_sha256,split_key_iv,Aes128GcmVarIv}` | `se_ecies.rs::{wrap_unwrap_round_trips_the_dek,sealed_blob_has_the_apple_wire_length,x963_kdf_matches_a_known_answer}`; on-device interop is **UNPROVEN, NEEDS-VERIFICATION** (`apps/mac/Tools/se-selftest.swift`, blob must read 113) |
 | The recipient and ephemeral public keys are **validated as on-curve X9.63 points** (identity/garbage refused); P-256 is prime-order so no small-subgroup surface | `se_ecies.rs::{wrap_dek_p256,unwrap_dek_p256}` (`PublicKey::from_sec1_bytes`) | `se_ecies.rs::{a_non_point_recipient_key_is_refused,a_tampered_ephemeral_key_is_rejected}` |
 | Every wrap uses a **fresh ephemeral key** → fresh shared secret → fresh AES key **and** IV, so there is never a `(key, IV)` reuse across wraps (the GCM catastrophe) | `se_ecies.rs::wrap_dek_p256` (`EphemeralSecret::random` per call) | `se_ecies.rs::each_wrap_uses_a_fresh_ephemeral_key` |
 | A wrong SE key or any tampered byte fails closed (GCM auth); no DEK leaks; a truncated blob is refused before any crypto | `se_ecies.rs::unwrap_dek_p256` | `se_ecies.rs::{wrong_se_key_cannot_unwrap,a_tampered_ciphertext_is_rejected,a_truncated_blob_is_rejected}` |
@@ -256,7 +256,7 @@ argv-sniffing is deleted; account routing is now the matched source's configured
 `account` label, and `AccountStore::route` / `ThresholdAccountStore::{route,
 route_exact}` match by **label OR vault**.
 
-**Independent review verdict — CONFIRMED SOUND (two low-severity hardening
+**Independent review verdict, CONFIRMED SOUND (two low-severity hardening
 notes).** Written by the security-reviewer, which did **not** author `config.rs`
 or the `fulfill` rewrite (rust-core, `b66404c`); per the review-integrity rule
 this is not a self-certification. The adversarial pass covered: whether a crafted
@@ -267,11 +267,11 @@ removing the `op` hardwiring opens a fail-open path; and whether the deferred
 | Claim | Enforcing code | Proving test |
 |-------|----------------|--------------|
 | Account routing is **config-derived, never caller-argv-derived**: the hint is the matched source's `account` label; the caller's argv no longer influences which account unlocks (it only selects which of Tom's own rules matches, and every match still requires a fresh approval/lease). This is *stronger* than the old `--vault` sniff | `daemon.rs::fulfill` (`vault = action.account.clone()`; `parse_vault` deleted), `config.rs::Config::resolve` | `daemon.rs::v1_and_v2_accounts_coexist_and_each_takes_its_own_path`, `config::tests::resolve_first_match_wins_and_flattens_source` |
-| The v2 threshold path selects **one** account atomically (`record.clone()`): the phone's partial `Z_F` is agreed against that record's `E` and combined with the SAME account's Mac share `m` and token ciphertext — no cross-account share splicing is reachable via label/vault confusion | `daemon.rs::fulfill` (`v2 = store.route_exact(...).map(\|a\| (label, a.record.clone()))`), `threshold.rs::route_exact` | `daemon.rs::remote_v2_threshold_approval_decrypts_via_two_party_combine`, `threshold::tests::each_account_gets_a_unique_ephemeral_and_routes`, `full_two_of_two_round_trip_{raw_x,x963}` |
+| The v2 threshold path selects **one** account atomically (`record.clone()`): the phone's partial `Z_F` is agreed against that record's `E` and combined with the SAME account's Mac share `m` and token ciphertext, no cross-account share splicing is reachable via label/vault confusion | `daemon.rs::fulfill` (`v2 = store.route_exact(...).map(\|a\| (label, a.record.clone()))`), `threshold.rs::route_exact` | `daemon.rs::remote_v2_threshold_approval_decrypts_via_two_party_combine`, `threshold::tests::each_account_gets_a_unique_ephemeral_and_routes`, `full_two_of_two_round_trip_{raw_x,x963}` |
 | `route_exact` stays **exact** when v1 accounts coexist (v2 claims only a label/vault match, never the single-account fallback), so a migration store never lets v2 over-capture a v1 request | `daemon.rs::fulfill` (`route_exact(...).or_else(\|\| if v1_empty { route(...) } else { None })`) | `daemon.rs::v1_and_v2_accounts_coexist_and_each_takes_its_own_path` |
 | An invocation that **no rule matches** is refused, never run ungated; removing `default_op`/`parse_vault` leaves **no** built-in rule for any command (a zero-config daemon refuses everything until configured) | `config.rs::Config::resolve` (`None`), `daemon.rs::fulfill` (`fail_closed`) | `daemon.rs::unconfigured_command_is_refused_with_a_config_hint`, `config::tests::empty_match_never_matches` |
 | An **empty match** never matches (a malformed/partial rule fails closed, never gates every command) | `config.rs::Match::matches` (`is_empty() -> false`) | `config::tests::empty_match_never_matches`, `add_rule_rejects_unknown_source_and_empty_match` |
-| The deferred **`arg_regex` cannot be smuggled into an always-true match**: `Match::matches` returns `false` whenever `arg_regex.is_some()`, independent of how the config was authored — so even a hand-edited/imported regex rule is a dead rule (fails closed), only ever *more* restrictive, never always-true | `config.rs::Match::matches` (`if self.arg_regex.is_some() { return false }`) | `config::tests::regex_condition_is_deferred_and_fails_closed` |
+| The deferred **`arg_regex` cannot be smuggled into an always-true match**: `Match::matches` returns `false` whenever `arg_regex.is_some()`, independent of how the config was authored, so even a hand-edited/imported regex rule is a dead rule (fails closed), only ever *more* restrictive, never always-true | `config.rs::Match::matches` (`if self.arg_regex.is_some() { return false }`) | `config::tests::regex_condition_is_deferred_and_fails_closed` |
 | Invariants #1/#2/#7 unchanged: the config only chooses provider/source/risk; token-ciphertext-at-rest, op-child-stdout->client-fd, and the fail-closed branches are the same code paths | `daemon.rs::fulfill` (unchanged token/provider handling), `config.rs` (routing only) | the full `daemon::tests` suite (inert-at-rest, denial-fails-closed) passes unchanged |
 
 **Low-severity hardening note A (config-authoring ambiguity, not caller-exploitable).**
@@ -290,7 +290,7 @@ the account/threshold stores.
 integrity (`cli.rs::config_import` rejects an unknown source / empty match), so a
 dangling source cannot arrive via the CLI or import; only a direct hand-edit of
 the 0600 `config.json` (a same-UID write, already outside Sigil's boundary) can
-reach it, and the worst effect is a *downgrade* to a later broader rule — still
+reach it, and the worst effect is a *downgrade* to a later broader rule, still
 gated, never ungated. Recommend a matched-rule-with-unknown-source hard
 fail-closed (refuse the invocation) rather than fall through, so a misconfigured
 specific rule can never silently resolve to a broader one. Informational.
@@ -302,7 +302,7 @@ provider/account display surfaces, and all Mac-outcome reasoning, becoming a
 pure provider-blind approve/deny approver that renders only the opaque
 Mac-provided display fields.
 
-**Independent review verdict — CONFIRMED SOUND.** Written by the
+**Independent review verdict, CONFIRMED SOUND.** Written by the
 security-reviewer, which did **not** author the phone reduction (phone-approver);
 not a self-certification. The adversarial pass covered: whether removing R5
 creates a new display-spoof materially worse than the accepted residual #7;
@@ -314,12 +314,12 @@ the crypto is byte-identical.
 | Removing R5 creates **no** new attack worse than residual #7. A hostile relay gains nothing (the request rides the Ed25519-signed `Envelope` + replay guard; any tamper breaks the signature). A compromised Mac controls BOTH the displayed `secret_refs` AND the challenge `label`/`accountId`, so R5's fuzzy token-overlap was trivially self-satisfiable and never stopped the residual-#7 spoof; the "inconsistent request" R5 caught maps to no capable-adversary primitive | `envelope.rs::open`, `replay.rs::ReplayGuard`; phone `controller.ts::liveApproveThreshold` (no consent check, SE gate is the key release) | `proto/tests/hostile_relay.rs` (26 attacks) + `pairing_mitm.rs` pass unchanged; the phone gates the KEY not the display truth |
 | The honest residual is correctly a **Mac-trust boundary, not a phone one**: a compromised Mac can spoof the display; the phone gates the SE key-agreement / DEK read behind Face ID, and the human declining an unexpected request is the backstop | `controller.ts::liveApprove{,Threshold}` (Face ID gate), residual #7 | reviewed by inspection; consistent with residual #7 |
 | The phone learns only **TRANSPORT** status, never **OUTCOME**: `ApproveOutcome = sent \| refused \| no-session \| error`; "sent" means only that the response left the phone. All Mac-outcome copy ("Secret delivered" / "No secret was delivered" / "Could not reach your Mac") is removed for phone-local facts ("Approved. Sent." / "Denied." / "Request expired." / cause-neutral "That didn't go through.") | `controller.ts::liveApprove` (doc: "does not learn, and must not infer, whether the Mac then unlocked or delivered anything"), `approval-sheet.tsx::{DecisionSent,TerminalStatus}` | `bun run proto:selftest` green; grep confirms no approval-time outcome inference remains (only zero-knowledge doc-comments + legitimate pairing-msg-1 transport facts) |
-| **Crypto byte-identical.** The only crypto-path edit is the Face ID `reason` string (`Approve ${label}` -> `"Approve request"`), which is a display-only `LAContext` prompt — the ECDH is `sharedSecretFromKeyAgreement(f, E)`, independent of `reason`. `requests.ts` is doc-comment only; wire fields unchanged; `ephemeralPub` is the sole crypto input, authenticated by the enclosing signed envelope; `accountId`/`seKeyId` travel in one signed challenge | phone `SigilSeModule.swift::computePartial` (reason feeds only the prompt), `controller.ts` (loadDek/computePartial/shapeEcdh/session.respond unchanged), `requests.ts` (doc only) | phone protocol **vectors 15/15**, `proto:selftest` all green (envelope, replay, forged-sender, wrong-recipient, tamper, fingerprint/mailbox, pairing tag/rendezvous vs rust); Rust `sigil-proto` 26 pass |
+| **Crypto byte-identical.** The only crypto-path edit is the Face ID `reason` string (`Approve ${label}` -> `"Approve request"`), which is a display-only `LAContext` prompt, the ECDH is `sharedSecretFromKeyAgreement(f, E)`, independent of `reason`. `requests.ts` is doc-comment only; wire fields unchanged; `ephemeralPub` is the sole crypto input, authenticated by the enclosing signed envelope; `accountId`/`seKeyId` travel in one signed challenge | phone `SigilSeModule.swift::computePartial` (reason feeds only the prompt), `controller.ts` (loadDek/computePartial/shapeEcdh/session.respond unchanged), `requests.ts` (doc only) | phone protocol **vectors 15/15**, `proto:selftest` all green (envelope, replay, forged-sender, wrong-recipient, tamper, fingerprint/mailbox, pairing tag/rendezvous vs rust); Rust `sigil-proto` 26 pass |
 
 **Minor doc-drift (non-security, both changes).** A stale comment at
 `apps/phone/modules/sigil-se/ios/SigilSeModule.swift:138` still reads "Bind the
 Face-ID prompt to the account being unlocked (R5): the reason is the account
-label" — the reason is now the generic "Approve request". Flagged to the
+label", the reason is now the generic "Approve request". Flagged to the
 phone-approver to clean; not a vulnerability.
 
 **R5 mapping in this doc:** no §/row mapped R5 to phone code (the sweep found
@@ -335,7 +335,7 @@ terminal. The claim is that the daemon only *passes* the fd (never reads it), so
 invariant #2 (no caller/secret bytes in daemon memory) holds for the input
 direction too.
 
-**Independent review verdict — CONFIRMED SOUND on the happy path (two
+**Independent review verdict, CONFIRMED SOUND on the happy path (two
 low-severity hardening notes).** Written by the security-reviewer, which did
 **not** author the splice (config-cli, `538fd70`); not a self-certification. The
 adversarial pass covered: whether the daemon ever reads/buffers/inspects stdin;
@@ -348,17 +348,17 @@ new hostile surface (weird fd, blocking-stdin stall).
 | The daemon **only passes** the stdin fd, never `read()`s / buffers / inspects it: its sole consumer is `cmd.stdin(Stdio::from(fd))`. No caller/secret byte enters daemon memory for the input direction (invariant #2 holds for input) | `provider.rs::{OpProvider,EnvFileProvider}::run` (`Stdio::from(run.stdin)`), `daemon.rs::{handle_conn,fulfill}` (threads the fd through, never reads it) | `daemon.rs::caller_stdin_is_spliced_to_the_tool_child` (bytes written to the caller-side pipe reach the child; the daemon reads nothing) |
 | **fd ownership/lifetime is correct**: every received fd is wrapped in `OwnedFd` (closed exactly once on drop); the daemon never `dup`s, so it retains no readable copy; on every fail-closed early return the unused stdin/stdout `OwnedFd`s drop (close) rather than splice | `local.rs::recv_with_fds` (`OwnedFd::from_raw_fd`), `daemon.rs::fulfill` (owned params dropped on early return), `provider.rs::run` (`Stdio::from` moves ownership to the child spawn) | `local.rs::op_fd_passing_and_reply_roundtrip_over_a_socketpair`, `daemon.rs::full_loop_over_the_socket_with_local_control_approval` |
 | **No cross-request / cross-client fd confusion**; ordering preserved: each connection is a separate `spawn_blocking` task with its own `recv_frame` -> its own `OwnedFd` set on its own stack; the shim sends `[stdin, stdout, stderr]` and the daemon reads `next()/next()/next()` in the same order (SCM_RIGHTS preserves array order) | `daemon.rs::serve` (per-conn `spawn_blocking`), `handle_conn` (positional `fds.next()`), `shim.rs::forward` (`[inp, out, err]`) | `daemon.rs::caller_stdin_is_spliced_to_the_tool_child`, `dev_autoapprove_full_loop_delivers_secret_to_caller` |
-| **Fails closed on the input path**: there is no daemon-buffered-stdin fallback anywhere — the daemon never reads stdin, so a missing/failed fd cannot fall through to daemon-read input; the child simply gets `None` for that slot | `daemon.rs::fulfill`, `provider.rs::run` (no daemon read of stdin exists) | reviewed by inspection (grep: `run.stdin`'s only use is `Stdio::from`) |
+| **Fails closed on the input path**: there is no daemon-buffered-stdin fallback anywhere, the daemon never reads stdin, so a missing/failed fd cannot fall through to daemon-read input; the child simply gets `None` for that slot | `daemon.rs::fulfill`, `provider.rs::run` (no daemon read of stdin exists) | reviewed by inspection (grep: `run.stdin`'s only use is `Stdio::from`) |
 | A **malicious client passing a weird fd** as stdin gains nothing: the daemon splices it to the child (same UID as the attacker) and never acts on the fd's identity, so it is no more than what the attacker could feed a tool it ran itself | `provider.rs::run` (passthrough only) | reviewed by inspection; same trust model as the pre-existing stdout/stderr passing |
 
-**Low-severity hardening note A (missing-fd inherit — invariant-#2-adjacent,
+**Low-severity hardening note A (missing-fd inherit, invariant-#2-adjacent,
 defense-in-depth).** The daemon does not validate that a `Run` frame carries
 exactly three descriptors, and a missing fd makes the child **inherit the
 daemon's** corresponding stdio (`provider.rs::run`: `if let Some(fd) = run.stdout
 { cmd.stdout(Stdio::from(fd)) }` with no `else` -> std default is *inherit*). So a
 non-conforming same-UID client that sends fewer than three fds (e.g. zero) makes
 an approved `op` child write its **secret to the daemon's inherited stdout**
-(under launchd, a same-UID-readable log) instead of to the caller — secret bytes
+(under launchd, a same-UID-readable log) instead of to the caller, secret bytes
 leaving the intended splice path. The `None`->inherit pattern pre-dates this
 change for stdout/stderr, but the stdin splice makes the three-fd positional
 contract load-bearing with still no validation, and a *short* count now also
@@ -366,7 +366,7 @@ contract load-bearing with still no validation, and a *short* count now also
 stdout]`, leaving `stderr = None` -> inherit and shifting stdout). Bounded:
 requires a crafted non-standard frame from a same-UID client **and** a granted
 approval or active lease, and a same-UID attacker can read the secret more
-directly — no real escalation. Cheap to close and recommended for an airtight
+directly, no real escalation. Cheap to close and recommended for an airtight
 invariant #2: (a) reject a `Run` frame whose fd count != 3 (fail closed), and
 (b) default an absent child stdio to `Stdio::null()` rather than inherit, so the
 daemon's own stdio can never become a sink for tool output.
@@ -380,7 +380,7 @@ same-UID-readable stdio can never sink a tool's secret output. Proven by
 `daemon.rs::run_frame_with_wrong_fd_count_is_refused` (a 2-fd frame -> exit 1, no
 output) with the happy-path splice unchanged (`caller_stdin_is_spliced_to_the_tool_child`).
 
-**Low-severity hardening note B (caller-stdin stall — DoS, post-approval +
+**Low-severity hardening note B (caller-stdin stall, DoS, post-approval +
 same-UID).** Splicing the caller's stdin lets a compromised caller pin a daemon
 blocking-thread: pre-change the child inherited the daemon's stdin (effectively
 `/dev/null` under launchd, so a stdin read hit EOF); post-change the child reads
@@ -400,7 +400,7 @@ tests above were exercised by supplying the `proxy` module into a detached
 worktree. Flagged to the team so the proxy module lands committed and the tree
 builds clean (not a defect in the splice itself). **Update:** the proxy module is
 now committed (`f5448cf`) and the tree builds (`91aab46` also landed Finding A's
-fix — the `Run` fd path is now airtight); see §18.
+fix, the `Run` fd path is now airtight); see §18.
 
 ## 18. The auto-aliasing proxy (`f5448cf`, `65d75d2`)
 
@@ -410,7 +410,7 @@ re-enters as `sigil op ...` -> gates on the phone -> execs the **real** `op`
 (resolved with the proxy excluded). Management is `sigil-config proxy
 add|remove|list|status|doctor|env`. Design: `docs/design/proxy-aliasing.md`.
 
-**Independent review verdict — CONFIRMED SOUND (two low-severity notes, neither a
+**Independent review verdict, CONFIRMED SOUND (two low-severity notes, neither a
 distinct exploit).** Written by the security-reviewer, which did **not** author
 the proxy (proxy-shim / rust-core); not a self-certification. The proxy is a
 PATH/resolution convenience layer that **correctly disclaims being a containment
@@ -422,16 +422,16 @@ a security decision, and does not weaken caller identity (#6) or secret handling
 | Claim | Enforcing code | Proving test |
 |-------|----------------|--------------|
 | `find_real` cannot be steered to an **attacker binary** via symlinks: `canonicalize` resolves a symlink / symlink-chain / real-looking symlink-into-the-proxy-dir to the running `sigil` binary, and rule 1 (canonical == `own_binary`) excludes it **in any directory** | `paths.rs::find_real` (skip `canon == own`), `proxy.rs::alias_target` | `proxy::a_stray_alias_symlink_outside_the_proxy_dir_is_not_the_real_tool`, `drift_when_a_real_binary_precedes_the_alias_is_a_bypass`, `healthy_when_alias_is_first_and_points_at_current` |
-| The **daemon-up** path is immune to **caller PATH poisoning**: the `Run` frame carries only `argv`/`cwd`/`proxy_depth`/fds — never the caller's `PATH`/env — so the daemon resolves the real binary in its **own** trusted (launchd-pinned) `PATH`; a caller cannot redirect what the daemon spawns or steer the injected SA token to an attacker binary. The daemon-**down** path uses the caller's `PATH` but injects **no** secret (transparent exec), so a poisoned `PATH` there just runs the caller's own binary with no token — identical to no-Sigil | `local.rs::Frame::Run` (no env field), `provider.rs::OpProvider::resolve` -> `paths::find_real` (daemon env), `shim.rs::exec_real` (no env injected) | reviewed by inspection; `daemon.rs` provider tests spawn from the daemon's own resolution |
-| A **hard copy** of the `sigil` binary planted as `<cmd>` (not caught by canonical equality) **fails closed**: `find_real` returns it -> re-enter -> loop, bounded by the depth fuse to exit 70 (shim) / daemon refuse at `MAX_DEPTH`. No ungated run, no secret leak — a bounded self-DoS requiring same-UID to plant a copy of the binary | `shim.rs::dispatch` (`depth_exceeded` -> exit 70), `daemon.rs::fulfill` (`proxy_depth >= MAX_DEPTH` -> `fail_closed`) | `daemon.rs::proxy_depth_is_incremented_on_the_child_and_fuses_at_the_limit`, `proxy::depth_fuse_reads_and_increments` |
+| The **daemon-up** path is immune to **caller PATH poisoning**: the `Run` frame carries only `argv`/`cwd`/`proxy_depth`/fds, never the caller's `PATH`/env, so the daemon resolves the real binary in its **own** trusted (launchd-pinned) `PATH`; a caller cannot redirect what the daemon spawns or steer the injected SA token to an attacker binary. The daemon-**down** path uses the caller's `PATH` but injects **no** secret (transparent exec), so a poisoned `PATH` there just runs the caller's own binary with no token, identical to no-Sigil | `local.rs::Frame::Run` (no env field), `provider.rs::OpProvider::resolve` -> `paths::find_real` (daemon env), `shim.rs::exec_real` (no env injected) | reviewed by inspection; `daemon.rs` provider tests spawn from the daemon's own resolution |
+| A **hard copy** of the `sigil` binary planted as `<cmd>` (not caught by canonical equality) **fails closed**: `find_real` returns it -> re-enter -> loop, bounded by the depth fuse to exit 70 (shim) / daemon refuse at `MAX_DEPTH`. No ungated run, no secret leak, a bounded self-DoS requiring same-UID to plant a copy of the binary | `shim.rs::dispatch` (`depth_exceeded` -> exit 70), `daemon.rs::fulfill` (`proxy_depth >= MAX_DEPTH` -> `fail_closed`) | `daemon.rs::proxy_depth_is_incremented_on_the_child_and_fuses_at_the_limit`, `proxy::depth_fuse_reads_and_increments` |
 | **PATH-order bypass is documented as a residual, never claimed prevented.** A real `<cmd>` before the proxy routes an *unmodified* caller ungated; `doctor` reports it as an operator convenience, and a caller that *wants* to skip the gate always can (real binary is never moved). No code treats PATH order as a control | `proxy.rs::ProxyStatus::issue` ("a real {cmd} precedes the proxy on PATH (requests would be ungated)"), `docs/design/proxy-aliasing.md` §"not a containment boundary" | `proxy::drift_when_a_real_binary_precedes_the_alias_is_a_bypass` |
-| The **recursion guard cannot be cleared to escape gating.** `proxy_depth` is used in exactly one decision — `fulfill`'s `>= MAX_DEPTH -> fail_closed` (deny, safe direction) — and is **never** consulted by the phone gate, account routing, caller-identity derivation, or lease keys. Setting `SIGIL_PROXY_DEPTH` high -> self-deny; setting it to 0 -> only prolongs a loop that exists solely if `find_real` is buggy (self-DoS), never a bypass; `saturating_add` prevents wrap | `daemon.rs::fulfill` (sole `proxy_depth` decision + `child_depth` env), `proxy.rs::{current_depth,depth_exceeded,next_depth_value}` | `daemon.rs::proxy_depth_is_incremented_on_the_child_and_fuses_at_the_limit`, `proxy::depth_fuse_reads_and_increments` |
+| The **recursion guard cannot be cleared to escape gating.** `proxy_depth` is used in exactly one decision, `fulfill`'s `>= MAX_DEPTH -> fail_closed` (deny, safe direction), and is **never** consulted by the phone gate, account routing, caller-identity derivation, or lease keys. Setting `SIGIL_PROXY_DEPTH` high -> self-deny; setting it to 0 -> only prolongs a loop that exists solely if `find_real` is buggy (self-DoS), never a bypass; `saturating_add` prevents wrap | `daemon.rs::fulfill` (sole `proxy_depth` decision + `child_depth` env), `proxy.rs::{current_depth,depth_exceeded,next_depth_value}` | `daemon.rs::proxy_depth_is_incremented_on_the_child_and_fuses_at_the_limit`, `proxy::depth_fuse_reads_and_increments` |
 | Caller identity (#6) is **not weakened**: the daemon derives identity from the kernel peer pid + ancestry walk, independent of anything the proxy supplies (argv/cwd/depth are decorative for identity) | `daemon.rs::handle_conn` (`peer = lease::peer_pid`), `lease.rs::walk_ancestry` | existing `lease.rs` ancestry/grant-key suite (unchanged) |
 | Fail-closed (#7): a resolution failure execs nothing (`exit 127`); a protocol fault while the daemon is up is `exit 70`, never an ungated run; only a **down** daemon execs transparently (by design, injecting no secret) | `shim.rs::{exec_real,forward}` (127 / 70), `daemon.rs::fulfill` | reviewed by inspection; `shim.rs` module contract |
 
 **Low-severity note A (doc-vs-code + defense-in-depth): the runtime `find_real`
 implements only rule 1, not the proxy-dir exclusion (rule 2) the design claims.**
-`docs/design/proxy-aliasing.md` §"hard problem 1(a)" states two exclusion rules —
+`docs/design/proxy-aliasing.md` §"hard problem 1(a)" states two exclusion rules,
 (1) canonical == `current_exe` **and** (2) skip any candidate inside the proxy
 dir. `paths::find_real` (the resolver that actually chooses what to exec/spawn)
 implements only rule 1; rule 2 exists only in the **diagnostic** path
@@ -439,9 +439,9 @@ implements only rule 1; rule 2 exists only in the **diagnostic** path
 executable resident in `~/.sigil/bin` under a tool's name (a hard copy, a script,
 or a same-UID-planted non-sigil binary) is not excluded by `find_real`, so the
 daemon-up path would treat it as "the real tool" and spawn it **with the injected
-SA token**. Every route requires same-UID write to `~/.sigil/bin` — already
+SA token**. Every route requires same-UID write to `~/.sigil/bin`, already
 game-over (such an attacker can read the approved tool's `/proc/<pid>/environ` or
-replace the real binary), so it is not a distinct escalation — but it is a real
+replace the real binary), so it is not a distinct escalation, but it is a real
 gap between the doc's claimed guarantee and the code, and it diverges from the
 diagnostic path. **Recommend implementing rule 2 in `find_real`** (skip any
 candidate whose parent canonicalises to `shim_bin_dir()`): trivial, restores
@@ -463,7 +463,7 @@ Display-only; no execution/security impact. Recommend `find_real` exclude agains
 **RESOLVED (`0fc85a9`).** Both notes landed and are verified sound. `find_real`
 now delegates to a testable pure core `find_real_in(cmd, path, own, alias_target,
 proxy_dir)` that applies **rule 2** (skip any candidate whose parent dir
-canonicalises to the proxy dir — so a non-symlink executable planted in
+canonicalises to the proxy dir, so a non-symlink executable planted in
 `~/.sigil/bin` is excluded, closing the daemon-up credential-injection corner and
 making the hard-copy-in-proxy-dir case resolve to the real tool instead of
 fail-closed-looping) **and rule 1 against both `own_binary()` and
@@ -478,9 +478,9 @@ open recommendations.
 
 The inline `env` provider (provider id `env`) lets the user set secret VALUES
 directly (`KEY=VALUE`) instead of pointing at a plaintext env-file. It is the
-same direct-injection *shape* as §12's `env-file` — resolved values transit
+same direct-injection *shape* as §12's `env-file`, resolved values transit
 daemon RAM only as the child's spawn env, for the spawn instant, and it never
-leases — but unlike `env-file` the values are **sealed at rest under the DEK**,
+leases, but unlike `env-file` the values are **sealed at rest under the DEK**,
 so the daemon-at-rest holds no plaintext value (invariant #1) even here. This
 section records behavior and residuals; the verdict is the independent
 reviewer's.
@@ -494,7 +494,7 @@ reviewer's.
 | The decrypted pairs live in a `Zeroizing` map wiped at end of `run()`; the decode borrows out of the `Zeroizing` plaintext with `str::from_utf8` (no owned/un-zeroized value `String`) and fails closed on truncation or non-UTF-8 without panicking | `provider.rs::{decode_env_pairs,EnvProvider::run,spawn_with_env}`, `daemon.rs::fulfill` (`drop(sealed_env)`) | `provider.rs::{env_encode_decode_round_trips_including_awkward_values,env_decode_rejects_truncated_and_bad_utf8_without_panicking,env_provider_injects_decrypted_pairs_into_the_child}` |
 | **Never leases** (`needs_account()==false`, `needs_sealed_env()==true`): like `env-file`, resolved values must not persist in daemon RAM across a TTL, so it is gated on every run | `provider.rs::EnvProvider::{needs_account,needs_sealed_env}`, `daemon.rs::fulfill` (the sealed-env arm never calls `leases.grant`; the lease short-circuit is `if needs_account`) | `daemon.rs::inline_env_command_runs_gated_and_injects_sealed_values` (`leases.active()==0`) |
 | An **unset** source (no sealed blob) fails closed, never runs the child with a blank environment | `daemon.rs::fulfill` (`sealed_ct == None` → `fail_closed`) | `daemon.rs::inline_env_with_no_sealed_values_fails_closed` |
-| **Readout integrity (invariant #3):** the decoded blob's KEY set is reconciled against `action.env_keys` (the set the phone readout/audit was built from) *before* injection; any divergence fails closed. This closes the two ways names could drift from values without breaking crypto — a crash between the store save and config save in `seal_env_pairs`, and an import that kept a source NAME but changed its keys while a stale blob survived — so the approver can never consent to "will set FOO" and have the child receive a hidden BAR | `daemon.rs::fulfill` (the sealed-env arm's `BTreeSet` compare of decoded keys vs `action.env_keys` → `fail_closed`) | `daemon.rs::inline_env_blob_keys_must_match_the_approved_set_or_fail_closed` (blob has an extra key vs config → refused, nothing injected) |
+| **Readout integrity (invariant #3):** the decoded blob's KEY set is reconciled against `action.env_keys` (the set the phone readout/audit was built from) *before* injection; any divergence fails closed. This closes the two ways names could drift from values without breaking crypto, a crash between the store save and config save in `seal_env_pairs`, and an import that kept a source NAME but changed its keys while a stale blob survived, so the approver can never consent to "will set FOO" and have the child receive a hidden BAR | `daemon.rs::fulfill` (the sealed-env arm's `BTreeSet` compare of decoded keys vs `action.env_keys` → `fail_closed`) | `daemon.rs::inline_env_blob_keys_must_match_the_approved_set_or_fail_closed` (blob has an extra key vs config → refused, nothing injected) |
 | Bulk `--stdin` parse errors report the **line NUMBER, never the line content**, so a mistakenly-piped secret line is not echoed to the terminal/logs | `cli.rs::read_env_pairs_stdin` (`"line {n}: no '=' found"`) | reviewed by inspection |
 | `list`/`export` cannot leak a value (they render config only, which has no value), and `import` cannot round-trip a value into the clear (config carries names only); removing the source or clearing its last key **removes the sealed blob** (no orphan ciphertext), and an import that drops an env source prunes its blob | `cli.rs::{config_source_list,config_export,config_import,purge_env_blob,prune_orphan_env_blobs,seal_env_pairs}` | manual E2E (remove purges `env_sources`); reviewed by inspection |
 
@@ -502,48 +502,48 @@ The seal/open wire is length-prefixed (`u32 klen|key|u32 vlen|value`), pre-sized
 so the encode buffer never reallocates, so a VALUE may hold any bytes (newline,
 `=`, quotes) without an escaping ambiguity and decode borrows without a
 non-zeroized copy. See **residual 13** for the two un-wiped copies this shape
-inherits from §12 (the `Command` env map and the child's environ) — identical to
+inherits from §12 (the `Command` env map and the child's environ), identical to
 `env-file`, plus the CLI-side merge copy at set time (the user is providing the
 value, so it is in CLI RAM regardless; held `Zeroizing`).
 
-**Independent review verdict — CONFIRMED SOUND for the crypto/at-rest core; one
+**Independent review verdict, CONFIRMED SOUND for the crypto/at-rest core; one
 P2 readout-integrity gap and two P2 hygiene notes, none a value leak.** Written by
 the security-reviewer, which did **not** author the inline `env` provider
 (rust-core); not a self-certification. The six implementer claims were verified,
 not taken on faith:
 
-- **At-rest is ciphertext (claim 1) — CONFIRMED.** The on-disk `sigil.db` grep
+- **At-rest is ciphertext (claim 1), CONFIRMED.** The on-disk `sigil.db` grep
   test proves the VALUE is absent and only the (public) source name + sealed bytes
   persist; `config.json` carries KEY names only (`Source::keys`,
   `skip_serializing_if = "Vec::is_empty"`). Values are sealed with the same
   AES-256-GCM `encrypt_token` under the DEK as service-account tokens. No value
   reaches a log/error/`{:?}` on the seal or decrypt paths (decrypt/decode failures
   print the GCM error or a fixed "corrupt" string, never plaintext).
-- **list/export/import cannot leak a value (claim 2) — CONFIRMED.** Export/list
+- **list/export/import cannot leak a value (claim 2), CONFIRMED.** Export/list
   render config only (no value present to render); import carries names + provider
   tag, so it can only ever *remove* ciphertext (prune), never introduce plaintext.
-- **`describe()` is zero-knowledge (claim 3) — CONFIRMED for values.** The
+- **`describe()` is zero-knowledge (claim 3), CONFIRMED for values.** The
   approval request's `secret_refs` and the audit label are built from KEY names
   only; no value crosses the wire or enters the sealed request.
-- **decrypt→inject→zeroize, never leases (claim 4) — CONFIRMED.** The DEK
+- **decrypt→inject→zeroize, never leases (claim 4), CONFIRMED.** The DEK
   (`Zeroizing<[u8;32]>`) is opened only after the grant (phone-delivered
-  `outcome.dek`, or a local keystore unwrap on a local approval — the same v1
+  `outcome.dek`, or a local keystore unwrap on a local approval, the same v1
   model as `op`), used for one decrypt, `drop`ped at once; the decoded pairs
   (`Zeroizing`) are dropped after the spawn instant; the sealed-env arm never
   calls `leases.grant` and the lease short-circuit is `if needs_account`. The
   reused `spawn_with_env` splice/exec path is #22's reviewed one.
-- **remove/unset purges the blob (claim 5) — CONFIRMED.** `remove_env_blob` on
+- **remove/unset purges the blob (claim 5), CONFIRMED.** `remove_env_blob` on
   source-remove, empty-after-unset, and `prune_orphan_env_blobs` on import; no
   orphan accumulation.
-- **DEK/value buffers zeroized on set/unset (claim 6) — CONFIRMED.** `Dek` and
+- **DEK/value buffers zeroized on set/unset (claim 6), CONFIRMED.** `Dek` and
   `Token` are `Zeroizing`; the CLI holds value buffers as `Zeroizing<String>`,
   reads them from stdin never argv (no `ps` leak), and the merge copy is
   `Zeroizing`.
-- **Hostile input — CONFIRMED fail-closed.** `decode_env_pairs` uses checked
+- **Hostile input, CONFIRMED fail-closed.** `decode_env_pairs` uses checked
   slicing and `str::from_utf8`, returning `None` (fail closed) on truncation, an
   over-long length, or non-UTF-8 without panicking; a tampered `sigil.db` fails the
   GCM tag on decrypt (a same-UID attacker cannot forge attacker-chosen values, only
-  *relocate* an existing blob — see the P2 below); `valid_env_key` rejects `=`,
+  *relocate* an existing blob, see the P2 below); `valid_env_key` rejects `=`,
   NUL, whitespace, and control bytes; the proxy-depth env is set *after* the
   injected pairs so a supplied key cannot spoof the recursion fuse.
 
@@ -556,22 +556,22 @@ crash between `store.save()` and `save_config()` in `seal_env_pairs` (the store 
 persisted with the new keys before the config is), leaving the blob ahead of the
 config; (b) an `import` of a config whose env source keeps its **name** but changes
 its `keys` list while a pre-existing blob under that name (with different keys)
-remains — `prune_orphan_env_blobs` only drops blobs whose *name* is gone. Outcome:
+remains, `prune_orphan_env_blobs` only drops blobs whose *name* is gone. Outcome:
 the approver consents to "will set FOO" but the child is injected FOO **and** a
 hidden BAR. This is **not a value leak** (values are never shown to the phone in
-either case) — it is a readout-*accuracy* break of invariant #3's "the approver
+either case), it is a readout-*accuracy* break of invariant #3's "the approver
 sees what will happen." Proven with a scratch test (config `[TOKEN]`, blob
 `{TOKEN, SECRET}`): the readout showed `TOKEN`, the child received
 `secret=hidden-exfil`. **Fix:** after `decode_env_pairs` in `fulfill`, assert the
 decoded key set equals `action.env_keys` and `fail_closed` on mismatch (this also
 closes the crash window and the import-leftover case); or inject only keys present
 in `action.env_keys`. Severity **P2**: reaching it needs a crash or a same-UID
-config/import manipulation, and same-UID is already outside the defended boundary —
+config/import manipulation, and same-UID is already outside the defended boundary,
 but readout integrity is a stated approval property, so a cheap inject-time check
 is warranted.
 
 **P2-2 (terminal echo of raw stdin): `read_env_pairs_stdin` prints a malformed
-line verbatim** — `eprintln!("sigil: line without '=': {:?}", line)`. On the
+line verbatim**, `eprintln!("sigil: line without '=': {:?}", line)`. On the
 `--stdin` bulk path a piped line lacking `=` is reflected to stderr; if the user
 accidentally pipes secret-bearing content, a bare-secret line is echoed to the
 terminal/logs. Low blast radius (CLI-side, the user's own terminal, malformed
@@ -581,10 +581,10 @@ line index only, not its content.
 **P2-3 (at-rest threat-model note): inline-`env` values are sealed under the
 host/v1 DEK, not the v2 two-party threshold key.** Unlike a v2 `op` account (whose
 token the daemon **cannot** open without the phone's partial), an inline-`env`
-value is recoverable by a **local** approval — the daemon unwraps the host DEK from
+value is recoverable by a **local** approval, the daemon unwraps the host DEK from
 the keystore itself (Touch ID / SE presence, `outcome.dek == None` path). This is
 by design and identical to v1 accounts and local-approval mode, and is a strict
-improvement over the plaintext `env-file` (§12) — but it means inline-`env` does
+improvement over the plaintext `env-file` (§12), but it means inline-`env` does
 **not** inherit v2's "daemon cannot open it alone" guarantee. Worth stating plainly
 in residual 13 so inline-`env` is not assumed to have threshold-grade at-rest
 protection.
@@ -676,7 +676,7 @@ docs): it unlocks nothing and the doorbell payload is a static string.
   `PushHint` on a deposit, the daemon signs no push, and `push.json` stays 0600
   under `~/.sigil`. None of that changed.
 
-**Independent review verdict — CONFIRMED SOUND (no findings; three accepted
+**Independent review verdict, CONFIRMED SOUND (no findings; three accepted
 residuals).** Written by the security-reviewer, which did **not** author the
 demux-owner refactor (`7cbb24b`) or the allow-mode / lease-policy engine
 (`e51b4ef`); per the review-integrity rule this is not a self-certification. The
@@ -743,7 +743,7 @@ one-line test would harden the invariant against a future refactor that drops th
 
 These are real and deliberately surfaced, not defects hidden.
 
-1. **The local control-socket approver is not an adversarial gate — now gated
+1. **The local control-socket approver is not an adversarial gate, now gated
    behind an explicit arm-time factor policy (MITIGATED).** The control socket
    is same-UID-forgeable: an approval is granted by whoever sends
    `Frame::Approve { id }` on the 0600 unix socket, and the request `id` is only
@@ -754,9 +754,9 @@ These are real and deliberately surfaced, not defects hidden.
    The mitigation, added with the network transport: at arm time the daemon
    resolves an explicit **approving factor** (`factor.rs::resolve`,
    `daemon.rs::build_gate`), in order:
-   - a **paired phone** reachable over a `Transport` (`RemoteApprover`) — the
+   - a **paired phone** reachable over a `Transport` (`RemoteApprover`), the
      sealed, signed `ApprovalResponse` a same-UID peer cannot forge;
-   - a **verified hardware biometric** (`Keystore::is_biometric()` true) — the
+   - a **verified hardware biometric** (`Keystore::is_biometric()` true), the
      Secure Enclave unwrap is the gate;
    - otherwise **fail closed**: a `NullApprover` denies every gated request,
      **unless** started with `--dev-insecure` / `SIGIL_DEV_INSECURE=1`.
@@ -827,7 +827,7 @@ These are real and deliberately surfaced, not defects hidden.
 7. **The "inert at rest" claim is strong for cold-disk theft, weaker for live
    same-UID compromise.** Cold-disk theft yields only `pairing.json` (public);
    the daemon private identity is in the login Keychain, encrypted at rest, so a
-   powered-off disk/backup reveals no key material — the strong form of the
+   powered-off disk/backup reveals no key material, the strong form of the
    claim holds. But an attacker running live as Tom with the Keychain unlocked
    can read the identity blob and then originate `ApprovalRequest`s to the phone
    with **attacker-chosen provenance** (`process_chain`, `cwd`, `machine` are
@@ -846,15 +846,15 @@ These are real and deliberately surfaced, not defects hidden.
    destroyed." As of the rendezvous work the secret is *also* an input to
    `rendezvous_mailbox` (a distinct one-way BLAKE2b over `domain ‖ daemon_pub ‖
    secret`). This is a second, independent one-way use of a 256-bit CSPRNG value
-   — no key reuse across a shared construction, no oracle, non-invertible — so it
+, no key reuse across a shared construction, no oracle, non-invertible, so it
    is not a weakness, but the sentence in `docs/design/pairing.md` should be
    updated to name both uses. Flagged to the doc owner.
 
 9. **The `env-file` provider relaxes invariant #2: resolved secret VALUES
    transit daemon RAM, and two copies are un-wiped (by design, bounded).** Unlike
-   the `op` shape — where the daemon injects only a *credential* and the `op`
+   the `op` shape, where the daemon injects only a *credential* and the `op`
    child streams the resolved secret straight to the caller's fd, so no secret
-   value ever enters the daemon — a direct-injection provider **is** the source:
+   value ever enters the daemon, a direct-injection provider **is** the source:
    it reads KEY=VALUE pairs and places the actual values into the child's
    environment. The daemon holds those values in a `Zeroizing` buffer that is
    wiped on drop, and never logs them (`provider.rs::EnvFileProvider::run`). But
@@ -888,7 +888,7 @@ These are real and deliberately surfaced, not defects hidden.
     On an approved `SIGN_REQUEST` the `OpSshSigner` fetches the key via the
     service account into a `Zeroizing` buffer, signs once, and wipes. Because the
     SA token can read the *whole* key, a compromise at the instant of an approved
-    request leaks durable signing power, not one signature — strictly worse than
+    request leaks durable signing power, not one signature, strictly worse than
     a secret release. The seam does not change this; it isolates it to that one
     signer (`FileSshSigner` reads a local file into `Zeroizing` with the same
     per-signature discipline, and a future SE-resident signer would keep the key
@@ -911,8 +911,8 @@ These are real and deliberately surfaced, not defects hidden.
     public key gives confidentiality and (via GCM) integrity, but not *sender*
     authentication: the SE public key is public, so anyone can wrap an arbitrary
     value to it. This is safe as designed because the wrap is produced and consumed
-    **locally** — the daemon wraps the DEK to the same Mac's SE key, and the SE
-    unwraps it under Touch ID — so forging or swapping the stored blob already
+    **locally**, the daemon wraps the DEK to the same Mac's SE key, and the SE
+    unwraps it under Touch ID, so forging or swapping the stored blob already
     requires same-UID write (outside Sigil's boundary) and yields only a fail-closed
     denial (a substituted DEK cannot decrypt the real AES-256-GCM token ciphertext),
     never a secret. AAD binding is **impossible** anyway: `SecKeyCreateDecryptedData`
@@ -930,14 +930,14 @@ These are real and deliberately surfaced, not defects hidden.
     (residual 9), on an approved run the resolved VALUES transit daemon RAM as the
     child's spawn env: a second, un-wiped `OsString` copy sits in
     `std::process::Command`'s env map (std frees but does not scrub it, bounded to
-    the spawn — the same std limitation as the op SA token in residual #3), and the
+    the spawn, the same std limitation as the op SA token in residual #3), and the
     child's `/proc/<pid>/environ` carries the values for its lifetime (readable by a
     same-UID process; inherent to any inject-env-and-exec model, and same-UID is
     already the boundary Sigil does not defend below). The daemon's own decrypted
     copy is `Zeroizing`, wiped on drop, and never logged; leasing is disabled so
     resolved values never persist across a TTL. **Improvement over `env-file`:** the
-    values are AES-256-GCM sealed under the DEK at rest (`sigil.db`), so — unlike a
-    plaintext env-file readable by any same-UID process at any time — the
+    values are AES-256-GCM sealed under the DEK at rest (`sigil.db`), so, unlike a
+    plaintext env-file readable by any same-UID process at any time, the
     daemon-at-rest holds no plaintext value (invariant #1 holds for this provider).
     One extra transient copy exists at **set time**: `sigil-config source env set`
     decrypts the current blob, merges the new pair, and re-seals; the merged pairs
@@ -948,7 +948,7 @@ These are real and deliberately surfaced, not defects hidden.
     decode_env_pairs}`, `daemon.rs::fulfill`, `cli.rs::seal_env_pairs`. See §19.
 
 14. **Pairing-authorization biometric now gates the persist step, independent of
-    DEK delivery (#48) — implementer behavior note, awaiting an independent
+    DEK delivery (#48), implementer behavior note, awaiting an independent
     verdict.** `pairing_store::save` runs a hardware user-presence check
     (`Keystore::verify_presence`, gated on `is_biometric()`) as its FIRST action,
     before any state is written, and deny-closes: a declined or unavailable
@@ -956,7 +956,7 @@ These are real and deliberately surfaced, not defects hidden.
     config file). On the real macOS keystore `verify_presence` reuses the same
     Secure Enclave `.biometryCurrentSet` private-key op the approval path uses
     (`keystore_macos.rs::verify_presence` -> `unwrap_dek`), performed purely as a
-    presence probe and the recovered `Zeroizing` DEK dropped immediately — no DEK
+    presence probe and the recovered `Zeroizing` DEK dropped immediately, no DEK
     crosses any boundary, which is what makes the gate independent of DEK
     *delivery*. **Residual A (double biometric prompt on real hardware):** the
     pairing ceremony still unwraps the DEK to seal it to the phone
@@ -980,7 +980,7 @@ These are real and deliberately surfaced, not defects hidden.
     on-hardware Touch ID firing is **UNPROVEN** (shares the §6 NEEDS-VERIFICATION
     gap: the SE op is exercised only against the memory stand-in in tests).
 
-15. **Config hot-reload swaps the rule set live and stays fail-closed (#59) —
+15. **Config hot-reload swaps the rule set live and stays fail-closed (#59),
     implementer behavior note, awaiting an independent verdict.** A watcher thread
     stat-polls `~/.sigil/config.json` every 2s and, on an mtime change, calls
     `Core::reload_config`, which loads and fully parses the file and only THEN
@@ -989,22 +989,22 @@ These are real and deliberately surfaced, not defects hidden.
     (`ConfigCell::store`) is on the `Ok` arm exclusively; a malformed, truncated
     (half-written save), or unreadable file returns `Err` WITHOUT touching the
     cell, so the last-good rules stay in force and gating is never downgraded by a
-    bad reload — a bad reload never falls open, nor to refuse-all. **Torn-read
+    bad reload, a bad reload never falls open, nor to refuse-all. **Torn-read
     safety:** a gating decision takes `ConfigCell::snapshot` (read-lock, clone the
     `Arc`, unlock) and evaluates the whole `resolve` against that one `Arc`, so a
     reload landing mid-decision is invisible to it (it sees the entire old or the
     entire new config, never a blend). **Residuals:** (a) legacy `commands.json`
-    is not watched — only `config.json`, the current authoring surface — so a raw
+    is not watched, only `config.json`, the current authoring surface, so a raw
     legacy edit still needs a restart (migration is one-time); (b) removing
     `config.json` entirely reloads to the empty default, which refuses every
     command (fail-closed, but a surprising "everything stopped" if deleted by
-    accident); (c) the poll is mtime-based on APFS's high-resolution timestamps —
+    accident); (c) the poll is mtime-based on APFS's high-resolution timestamps,
     a same-nanosecond rewrite of identical length is theoretically missed, but
     edits here are human-paced and single-user. Proving tests:
     `daemon.rs::{config_hot_reload_swaps_in_the_on_disk_rules,
     config_reload_is_fail_closed_on_a_malformed_file}`.
 
-16. **One authoritative default socket, resolved with zero environment (#59) —
+16. **One authoritative default socket, resolved with zero environment (#59),
     implementer behavior note.** `local::socket_path` and `sshagent::socket_path`
     both derive from a single `local::runtime_dir` anchored on the stable per-user
     temp dir (`confstr(_CS_DARWIN_USER_TEMP_DIR)` on macOS), not the `$TMPDIR` env
@@ -1068,7 +1068,7 @@ correctly fixes and that must be committed.
    `confirm`), a process that can only write `"confirm"` to the pair
    subprocess's stdin cannot complete a pairing: it still faces a fresh
    Secure-Enclave biometric it cannot satisfy. The stdin `confirm` and the
-   biometric are *not* separable into a single reusable authorization — the
+   biometric are *not* separable into a single reusable authorization, the
    biometric is enforced by the SE key's own access control on
    `SecKeyCreateDecryptedData`, not by any token the caller holds. Encoded as a
    regression test: `pair.rs::the_dek_is_never_unwrapped_when_the_sas_is_declined`
@@ -1080,7 +1080,7 @@ correctly fixes and that must be committed.
    implementer (errSecUserCanceled `-128` vs errSecAuthFailed `-25293`) is a
    *classification* question, not a safety one: the **only** success path out of
    `unwrap_dek` is a non-null `plaintext_ref` of exactly 32 bytes
-   (`keystore_macos.rs:249`-`279`). Every `CFError` — whichever code — routes
+   (`keystore_macos.rs:249`-`279`). Every `CFError`, whichever code, routes
    through `cf_error_to_keystore` to either `Declined` or `Backend`, and **both**
    abort the pairing ceremony (`pair.rs:162` bails) and deny in the local-approve
    path (`approve.rs:420`-`422`: only `Ok(_dek)` approves; `Declined` denies;
@@ -1113,11 +1113,11 @@ correctly fixes and that must be committed.
 
 ### CONFIRMED FINDINGS (code-level, need a fix)
 
-- **P2 — the SE access control is created with a NULL protection class,
+- **P2, the SE access control is created with a NULL protection class,
   diverging from every reference and the design's stated intent.**
   `keystore_macos.rs:186`-`189` calls
   `SecAccessControl::create_with_flags(...)`, which in security-framework 2.11.1
-  is `create_with_protection(None, flags)` — it passes a **null** protection
+  is `create_with_protection(None, flags)`, it passes a **null** protection
   value to `SecAccessControlCreateWithFlags`
   (`.cargo/.../security-framework-2.11.1/src/access_control.rs:51`-`76`). Every
   Swift counterpart pins `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`
@@ -1134,11 +1134,11 @@ correctly fixes and that must be committed.
   be corrected before the on-hardware verification, or the verification will
   test the wrong construction.
 
-- **P2 (data-loss footgun, not disclosure) — the committed 37035ee hardware
+- **P2 (data-loss footgun, not disclosure), the committed 37035ee hardware
   test deletes the REAL production DEK blob.** As committed, the ignored test
   `se_dek_round_trips_through_a_real_touch_id` ran `MacKeystore::new()` (real
   labels) and `delete_blob(DEK_ENVELOPE_LABEL)` (the real production envelope),
-  then `ensure_dek()` — minting a **fresh** DEK under the real label. Running it
+  then `ensure_dek()`, minting a **fresh** DEK under the real label. Running it
   on Tom's Mac would have bricked every account whose token was sealed under the
   prior DEK (the new DEK cannot decrypt them; fails closed, but the tokens are
   unrecoverable without re-add). **Resolved in HEAD by df78e8f** ("make the SE
@@ -1148,7 +1148,7 @@ correctly fixes and that must be committed.
   `SE_KEY_LABEL`/`DEK_ENVELOPE_LABEL`. Recorded so the reason the isolation
   exists is not lost: never let a hardware test run against the real labels.
 
-### RESIDUALS — require Tom's on-hardware verification (cannot be settled statically)
+### RESIDUALS, require Tom's on-hardware verification (cannot be settled statically)
 
 - **Declined-biometric error code** (`ERR_SEC_USER_CANCELED` `-128` vs
   `ERR_SEC_AUTH_FAILED` `-25293`, `keystore_macos.rs:66`-`79`): confirm which
@@ -1163,26 +1163,26 @@ correctly fixes and that must be committed.
   Rust-side self-consistency. Confirm with `apps/mac/Tools/se-selftest.swift`
   and the ignored round-trip test on Apple-silicon with an enrolled biometric.
 - **`.biometryCurrentSet` mandates biometric with no passcode fallback** on
-  macOS as documented — confirm the prompt is biometric-only and that a fresh
+  macOS as documented, confirm the prompt is biometric-only and that a fresh
   evaluation fires on *each* unwrap (no LAContext is passed, so there is no
   biometric-reuse window by construction; verify the OS honors that).
 - **Generic prompt copy (social-engineering residual).** `unwrap_dek` does not
   thread `reason` into an `LAContext`, so the Touch ID sheet shows default
   system copy. The biometric therefore proves *fresh human presence at DEK
-  release*, not *human authorizing this specific device* — the device-binding
+  release*, not *human authorizing this specific device*, the device-binding
   backstop remains the human's SAS-word eyeball comparison, not the biometric.
   Acceptable (the SAS is the MITM gate; the biometric is presence), but until an
   `LAContext` names the action the prompt cannot itself disambiguate a
   legitimate pairing from a same-UID-triggered one to a distracted user.
 
-### SECONDARY — relay v4 trust-model relaxation (opinion, not the primary verdict)
+### SECONDARY, relay v4 trust-model relaxation (opinion, not the primary verdict)
 
 The end-to-end crypto **still holds** despite the relay becoming a
 content-free "blind doorbell": every envelope remains opaque and sealed by
 `crates/sigil-proto` (Ed25519 sender auth + `crypto_box`/threshold + replay guard),
 the relay never parses one, and the push body is fixed and generic. The relay's
-new powers — a shared publisher APNs signing key held as a platform secret, and
-a phone push token seen transiently per deposit and never stored — do not let it
+new powers, a shared publisher APNs signing key held as a platform secret, and
+a phone push token seen transiently per deposit and never stored, do not let it
 read a secret, forge an approval, or learn an outcome. Invariant #3's "powerless
 and anonymous" is genuinely relaxed to "blind doorbell, holds a push secret";
 the README records this honestly and defers the verdict here, which is correct.
@@ -1192,7 +1192,7 @@ acceptable residual with a named limit: a party who has already obtained a
 victim's push token (itself not secret-bearing) can ring that phone's doorbell
 and evade the cap by rotating the `mailbox_id` in the deposit URL, since the cap
 is keyed per mailbox and the push targets whatever token the body carries. Worst
-case is generic "Approval requested" notification spam / battery drain — **not**
+case is generic "Approval requested" notification spam / battery drain, **not**
 a secret disclosure and **not** an approval (the phone still needs the real
 sealed request plus a biometric to approve anything). Acceptable as a
 nuisance-only vector; a per-token bucket, or requiring the doorbell deposit to
@@ -1205,7 +1205,7 @@ clear the hardware residuals before treating the SE path as verified.**
 
 ---
 
-## §15 — relay long-poll v5.1: coexisting waiters + newest-wins delivery (commit `33b464f`)
+## §15, relay long-poll v5.1: coexisting waiters + newest-wins delivery (commit `33b464f`)
 
 Independent adversarial review of the delivery-semantics change in
 `relay/shared/protocol.ts` (`longPoll`/`wake`/`MAX_WAITERS`). Reviewer did not
@@ -1213,7 +1213,7 @@ author the change. Focus: delivery integrity (no silent loss beyond honestly
 stated residuals, no starvation/steal by a hostile party, no unbounded memory);
 envelope crypto is unchanged and out of scope. Invariant at stake throughout is
 **everything fails closed** (#5) and the relay's no-silent-drop promise, not
-confidentiality (#3 holds — envelopes stay opaque, and every worst case below is
+confidentiality (#3 holds, envelopes stay opaque, and every worst case below is
 a *non-delivery*, never a disclosure).
 
 **The change, restated adversarially.** Old `longPoll` flushed every existing
@@ -1237,14 +1237,14 @@ the four properties below.
 **No P0 or P1.** The change is a net improvement: it removes the fast-empty
 hammer and introduces no new loss vector relative to the prior design (the old
 evict-all design *also* delivered to the newest/only waiter, so it lost in
-exactly the same "newest waiter is dead" case — see below).
+exactly the same "newest waiter is dead" case, see below).
 
-**P2 — the two "still open" residuals are one root cause, and honestly stated
+**P2, the two "still open" residuals are one root cause, and honestly stated
 but slightly over-decomposed.** Both open residuals in the module header reduce
 to a single invariant: *`wake` loses a deposit iff the newest waiter is a dead
 orphan at deposit time* (drained into a connection nobody reads).
 - *Residual A (deposit in the disconnect gap):* reachable by the shipped clients
-  — a real disconnect whose abort didn't fire, then a deposit landing before the
+, a real disconnect whose abort didn't fire, then a deposit landing before the
   reconnect re-attaches. Proven real by the scratch `RESIDUAL IS REAL…` test.
   This is genuine, bounded (one delivery, requires an actual disconnect plus
   unlucky timing), fail-closed (a lost approval request or response just means
@@ -1256,11 +1256,11 @@ orphan at deposit time* (drained into a connection nobody reads).
   never hold two genuinely-live overlapping polls on one slot, so the newer of
   two coexisting waiters is never the dead one. It becomes reachable only for a
   hypothetical *future* concurrent/multi-poll client. Recommendation: keep it
-  documented, but note explicitly that it is unreachable given today's clients —
+  documented, but note explicitly that it is unreachable given today's clients,
   as written the README slightly overstates its current reachability (harmless
   direction: it over-warns, it does not under-warn).
 
-**P2 — MAX_WAITERS bounds per-slot waiters, not mailbox count (pre-existing,
+**P2, MAX_WAITERS bounds per-slot waiters, not mailbox count (pre-existing,
 unchanged by this commit).** `MAX_WAITERS=8` caps waiters at 16 per mailbox (8×2
 slots). It does **not** cap the number of distinct mailboxes: the Bun `boxes`
 Map grows one entry per distinct id seen, and the rate limiter is per-mailbox so
@@ -1270,15 +1270,15 @@ inflate the Map with random ids (each holding held GETs) until the sweep
 it. The Worker variant offloads this to Cloudflare's isolate lifecycle. This is
 the pre-existing "rate limiter is non-load-bearing; the front is the real bound"
 posture, not a regression from v5.1, and acceptable for a personal/self-host
-deployment — flagged so it is not mistaken for a bound this change added.
+deployment, flagged so it is not mistaken for a bound this change added.
 
-**Steal/eviction as a weapon — not reachable by a third party.** Forcing a
+**Steal/eviction as a weapon, not reachable by a third party.** Forcing a
 victim's legit waiter out (8 GETs past the cap) and positioning an attacker
 waiter as newest to *steal* the next deposit requires registering GETs on the
 victim's slot, i.e. knowing the `mailbox_id`. That id is
 `BLAKE2b(domain ‖ canonical(pinned_pub_a, pinned_pub_b))` (`fingerprint.rs:83`),
 a 256-bit value derived from two pinned public keys, carried inside TLS to the
-relay and never published — unguessable by a third party. Only the relay
+relay and never published, unguessable by a third party. Only the relay
 operator (who sees the id in the URL) is positioned to do this, and a hostile
 relay can already deny delivery arbitrarily; the theft still yields only an
 opaque sealed envelope and a non-approval (fail-closed). Acceptable; worth one
@@ -1289,7 +1289,7 @@ staying unknown to third parties (it does).
 The v5.1 coexisting-waiter / newest-wins change is SOUND for delivery
 integrity.** It removes the fast-empty hammer, adds no new message-loss vector,
 cannot be used by one paired party to starve the other, is memory-bounded
-per slot, and every worst case is a bounded, fail-closed non-delivery — never a
+per slot, and every worst case is a bounded, fail-closed non-delivery, never a
 disclosure or a fail-open approval. The one client-reachable residual (deposit
 in the disconnect gap) is real, honestly documented, and correctly deferred to
 task #53 for real-edge verification plus client-side resend. Recommend two
@@ -1401,20 +1401,20 @@ changes.** Every adversarial item below verified sound against the code, not the
 implementer notes. The residuals are pre-existing, honestly documented, and
 fail-closed.
 
-### #59 config hot-reload + one authoritative socket — GREEN
+### #59 config hot-reload + one authoritative socket, GREEN
 
 - **Fail-closed swap: GREEN.** `Core::reload_config` (`daemon.rs:341`) reaches
   `ConfigCell::store` ONLY on the `Ok(cfg)` arm of `Config::load()`; the `Err`
   arm returns the error string WITHOUT touching the cell, so a malformed,
   truncated (half-written save), or unreadable file leaves the last-good `Arc`
-  in force. It never falls open and never downgrades to refuse-all — it keeps
+  in force. It never falls open and never downgrades to refuse-all, it keeps
   exactly what last parsed. Proven by
   `config_reload_is_fail_closed_on_a_malformed_file` (corrupts `config.json`,
   asserts `op` still gates after the failed reload) and
   `config_hot_reload_swaps_in_the_on_disk_rules`.
 - **Torn-read safety: GREEN.** `ConfigCell` is `RwLock<Arc<Config>>`. A gating
-  decision takes `snapshot()` (`daemon.rs:1144`) — read-lock, clone the `Arc`,
-  unlock — and evaluates the entire `resolve` against that one pinned `Arc`. A
+  decision takes `snapshot()` (`daemon.rs:1144`), read-lock, clone the `Arc`,
+  unlock, and evaluates the entire `resolve` against that one pinned `Arc`. A
   concurrent `store()` write-swaps a *new* `Arc` and drops the caller's
   reference to the old one only when the last snapshot holder releases it. A
   reload landing mid-`resolve` is therefore invisible: whole-old or whole-new,
@@ -1422,7 +1422,7 @@ fail-closed.
 - **Socket: GREEN.** The default runtime dir resolves from
   `confstr(_CS_DARWIN_USER_TEMP_DIR)` (`local.rs::darwin_user_temp_dir`), the
   OS-provided per-user temp dir (`/var/folders/.../T/`), not the
-  attacker-strippable `$TMPDIR` env var — this is a *reduction* in attack
+  attacker-strippable `$TMPDIR` env var, this is a *reduction* in attack
   surface versus the prior `$TMPDIR` derivation, which an attacker could
   override to redirect the bind. `prepare_socket` still forces the parent dir
   0700 (`daemon.rs:822`) and both sockets 0600 (`daemon.rs:620,629`);
@@ -1431,15 +1431,15 @@ fail-closed.
   `SIGIL_SSH_SOCK` remain full-path overrides; pointing a *client* elsewhere
   requires already controlling the victim's environment (a pre-existing
   compromise at which the secret is directly interceptable), and pointing the
-  *daemon* elsewhere requires controlling its launch — neither is a new lever.
+  *daemon* elsewhere requires controlling its launch, neither is a new lever.
 
-### #48 pairing biometric gate — GREEN
+### #48 pairing biometric gate, GREEN
 
 - **First action in the single chokepoint, deny-closed: GREEN.**
   `pairing_store::save` (`pairing_store.rs:169`) runs
   `if ks.is_biometric() { ks.verify_presence(PAIRING_PRESENCE_REASON)? }` as
   step 0, before the identity blob seal (step 1) and the config write. A decline
-  returns `Err` and NOTHING is written — proven by
+  returns `Err` and NOTHING is written, proven by
   `a_declined_biometric_refuses_the_pairing_and_writes_nothing` (asserts no
   config file, no identity blob). `save` is the only writer of
   `DAEMON_IDENTITY_LABEL`; both production callers (`cli.rs:1392,1503`) route
@@ -1452,7 +1452,7 @@ fail-closed.
 - **Real hardware check: GREEN.** `MacKeystore::verify_presence`
   (`keystore_macos.rs`) performs the same `SecKeyCreateDecryptedData` SE
   private-key op (`.biometryCurrentSet`) the approval unwrap uses, purely as a
-  presence probe, and drops the recovered `Zeroizing` DEK immediately — no DEK
+  presence probe, and drops the recovered `Zeroizing` DEK immediately, no DEK
   crosses any boundary. The dev bypass is reachable only when
   `is_biometric() == false`, which only `SIGIL_DEV_KEYSTORE` (behind its own
   loud warning) produces; the gate simply never calls `verify_presence` in that
@@ -1460,7 +1460,7 @@ fail-closed.
   (shares the §6 NEEDS-VERIFICATION residual; Tom's device checklist covers it).
   Not a code finding.
 
-### #41 delivery receipt — GREEN (highest-risk new inbound; verified hardest)
+### #41 delivery receipt, GREEN (highest-risk new inbound; verified hardest)
 
 - **(a) Never mistaken for / never resolves a decision: GREEN.**
   `ToDaemonMessage::from_value` classifies strictly by the `type` tag:
@@ -1482,13 +1482,13 @@ fail-closed.
   inbound kind, matching the phone's single monotonic outbound counter. A
   `Delivered` advances `last_counter` exactly as a `Response` would. Worst case
   under relay reordering (hold a `Response`, deliver a later `Delivered` first)
-  is a `CounterRegression` rejection of the delayed message — i.e. fail-closed
+  is a `CounterRegression` rejection of the delayed message, i.e. fail-closed
   deny of the *display or the decision*, never a bypass. `mark_delivered` itself
   only sets `delivered_at_ms` when unset (idempotent; duplicate/unknown/late =
   no-op).
 - **(d) `pending` surface is display-only; no local-approval bypass: GREEN.**
   Remote in-flight requests are enumerated onto `pending_json` from
-  `RemoteApprover::pending_snapshot` (names/provenance only — an
+  `RemoteApprover::pending_snapshot` (names/provenance only, an
   `ApprovalRequest` never carries a secret value). The control `Approve`/`Deny`
   frames call `core.pending.resolve` (`daemon.rs:885,896`), which targets the
   LOCAL `PendingRegistry`; a phone-gated request lives in the RemoteApprover
@@ -1497,7 +1497,7 @@ fail-closed.
   `Factor::DevInsecure`, not `Factor::Phone`. No new path lets a local
   `approve/deny` resolve a phone-gated `request_id`.
 
-### lease-response wire (daemon sole lease authority) — GREEN
+### lease-response wire (daemon sole lease authority), GREEN
 
 - **GREEN.** `InstallLease` lost its `grant_key` field entirely (proto struct is
   `{ ttl_ms }`); no code can trust a phone-supplied key because the field no
@@ -1507,18 +1507,18 @@ fail-closed.
   `daemon.rs:1208`) and clamps via `action.lease.clamp_secs`
   (`daemon.rs:1354`): run-once -> `None` -> no lease; leasable ->
   `min(requested, max_secs)`. A hostile approver cannot widen a lease past the
-  rule cap nor convert run-once to a lease — the per-rule policy is re-enforced
+  rule cap nor convert run-once to a lease, the per-rule policy is re-enforced
   daemon-side regardless of what the phone returns. `leasable_rule_clamps_an_
   over_cap_lease_to_the_rule_max` and the run-once tests cover it. The softphone
   now sets only `ttl_ms`.
 
-### relay #53 offer-then-drain — GREEN (residual judged acceptable)
+### relay #53 offer-then-drain, GREEN (residual judged acceptable)
 
 - **GREEN.** `wake` (`protocol.ts:365`) now offers `list.map(i => i.blob)` and
   empties the buffer (`list.length = 0`) ONLY after a waiter returns `true`
   (was live/unsettled). A settled waiter returns `false` (`longPoll`'s waiter
   closure guards on `settled`), leaving every `Item` in place with its ORIGINAL
-  `exp` — no TTL reset, no reorder, no drain-into-void for a waiter whose death
+  `exp`, no TTL reset, no reorder, no drain-into-void for a waiter whose death
   we can observe. `MAX_WAITERS` (8), coexisting-waiters, and newest-wins
   (`waiters.pop()`) are intact; the drop-oldest-at-cap path resolves with `[]`
   on a provably-empty slot. The `Waiter: (blobs) => boolean` contract has no
@@ -1536,7 +1536,7 @@ fail-closed.
   and flags confirming edge abort-signal behaviour on a real Cloudflare deploy.
   Judged acceptable.
 
-### Cross-cutting invariants — GREEN
+### Cross-cutting invariants, GREEN
 
 Daemon-at-rest inert (config hot-reload swaps rules only; no token/DEK involved),
 secret-bytes-never-in-daemon-memory (the receipt and the `pending` snapshot carry
@@ -1562,12 +1562,12 @@ sigil-direct, plus proto/relay-client/softphone integration + doctests);
 **clean**. Em-dash (U+2014) / en-dash (U+2013) / emoji scan of every added line
 in both commits: **none**.
 
-**Overall verdict: GREEN. No P0/P1/P2 findings. Ship-clear, and — more to the
-point — dormant, so nothing here can affect the shipping path until an operator
+**Overall verdict: GREEN. No P0/P1/P2 findings. Ship-clear, and, more to the
+point, dormant, so nothing here can affect the shipping path until an operator
 deliberately wires it.** Every scope item verified sound against the code, not
 the implementer notes.
 
-### Dormancy — CONFIRMED for both features
+### Dormancy, CONFIRMED for both features
 
 - **#36 `broadcast_resolution` is dormant: CONFIRMED.** `grep` across `crates`
   and `apps` finds exactly one definition (`remote.rs:466`) and callers ONLY in
@@ -1582,13 +1582,13 @@ the implementer notes.
   `sigil-direct` / `sigil_direct` / `DirectLink` / `FallbackTransport` /
   `verify_link` finds ZERO references outside `crates/sigil-direct/` itself. The
   crate is a workspace member (so it compiles and is tested) but is a dependency
-  of no other crate — not `sigil`, not the phone. Production `build_gate`
+  of no other crate, not `sigil`, not the phone. Production `build_gate`
   (`daemon.rs:219`) wires `RemoteApprover::new(Arc::new(relay), …)` on a raw
   `DaemonRelay`, never a `FallbackTransport`; no primary is ever installed and
   the relay remains the sole transport. The phone `LadderTransport` is likewise
   imported nowhere in the shipping session wiring.
 
-### #36 resolution broadcast — GREEN (per scope item)
+### #36 resolution broadcast, GREEN (per scope item)
 
 - **(a) Sealed + signed + replay-protected; a hostile relay can neither forge
   nor replay a dismissal: GREEN.** `ResolutionBroadcast` rides the identical
@@ -1603,13 +1603,13 @@ the implementer notes.
   `remote.rs::broadcast_resolution_deposits_a_sealed_dismissal_the_phone_can_open`,
   including the replay rejection on the phone's guard.
 - **(b) Worst a hostile relay can do is withhold/delay; never a release, never
-  an approval: GREEN.** The type carries only `{request_id, status}` — no DEK, no
+  an approval: GREEN.** The type carries only `{request_id, status}`, no DEK, no
   Z_F, no decision detail (`ResolutionStatus` deliberately does not say approve
   vs deny). A dropped/delayed broadcast degrades to single-device behavior: the
   loser device's own request timeout still expires the sheet
   (`broadcast_resolution` doc + `deposit_and_wait` fail-closed timeout). A
   (cryptographically impossible) forged-but-valid one at most hides a prompt,
-  which withholds a release — it can never cause one, because the phone's
+  which withholds a release, it can never cause one, because the phone's
   `dismissResolved` records a neutral outcome and touches no key.
 - **(c) Touches no waiter channel, no ReplayGuard, no DEK/Z_F: GREEN.**
   `broadcast_resolution` (`remote.rs:466-484`) shares only the daemon->phone
@@ -1621,21 +1621,21 @@ the implementer notes.
 - **(d) Phone `dismissResolved` records a zero-knowledge neutral entry and
   cannot release anything: GREEN.** `store.ts::dismissResolved` no-ops on an
   unknown or already-terminal request (`approved`/`denied`/`expired`), then
-  records `"superseded"` (or `"expired"` for an expiry) — never `approved`/
+  records `"superseded"` (or `"expired"` for an expiry), never `approved`/
   `denied`. `HistoryEntry.decision` is widened to `Decision | "expired" |
   "superseded"`; `RequestState` gains a terminal `"superseded"`. It carries no
   DEK path and cannot transition a request into an approve. `classifyToPhone`
   fails closed: a `"resolution"` tag with a missing/blank `requestId` or an
   out-of-set `status` returns `null` and the caller drops it. `handleInbound`
   opens the envelope ONCE to a raw payload (crypto verified regardless of shape),
-  then demuxes — so a resolution rides the same signature/replay/decrypt gate as
+  then demuxes, so a resolution rides the same signature/replay/decrypt gate as
   a request, and is never acknowledged with a delivery receipt.
 - **Wire-shape stability: GREEN.** `ToPhoneMessage::from_value` uses a
   hand-rolled `type`-tag peek (not `#[serde(untagged)]`), so the untagged
   `ApprovalRequest` wire shape is byte-for-byte unchanged and the pinned vectors
   / pairing transcript do not shift. Mirrors the audited ToDaemon demux.
 
-### #51 direct transport — GREEN (per scope item)
+### #51 direct transport, GREEN (per scope item)
 
 - **(a) Carries only opaque sealed envelopes; a rogue LAN/TCP peer's frames fail
   `Envelope::open` and are dropped: GREEN.** `DirectLink` frames the exact
@@ -1662,7 +1662,7 @@ the implementer notes.
   and `verify_link_times_out_when_nothing_arrives`. The mDNS `ServiceRecord.hint`
   is explicitly a non-secret dial discriminator, never the mailbox id, never
   trusted.
-- **(d) Downgrade safety — active LAN MITM is at worst a one-timeout
+- **(d) Downgrade safety, active LAN MITM is at worst a one-timeout
   fail-closed denial, never a forge/leak: GREEN (with a named residual).** A MITM
   can complete a TCP handshake and relay the phone's genuine verification envelope
   to get promoted, then black-hole traffic. The consequence is a `recv`/`send`
@@ -1687,16 +1687,16 @@ the implementer notes.
   synchronised. `DirectListener::accept` hands back an explicitly UNVERIFIED link;
   at rest it holds no keys and grants nothing until `verify_link` promotes it.
 - **(f) OFF by default, relay remains default: GREEN.** Covered under Dormancy
-  above — no crate depends on `sigil-direct`, and `build_gate` wires the raw
+  above, no crate depends on `sigil-direct`, and `build_gate` wires the raw
   relay.
 
-### Cross-cutting invariants — GREEN
+### Cross-cutting invariants, GREEN
 
 Daemon-at-rest inert (neither feature holds a token/DEK; the resolution broadcast
 and the direct link carry only opaque ciphertext), secret-bytes-never-in-daemon-
 memory (a `ResolutionBroadcast` is `{request_id, status}`; a `DirectLink` frame is
 an opaque `Envelope` never parsed for secret material), relay powerless/anonymous
-(no key-distribution role added — the mDNS record is untrusted and the envelope
+(no key-distribution role added, the mDNS record is untrusted and the envelope
 layer is the sole trust boundary), fail-closed everywhere (verify gate, drop/
 truncation, timeout, unknown tag), and zero em-dash / zero emoji in user-facing
 strings all hold across these diffs.
