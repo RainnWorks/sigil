@@ -476,6 +476,7 @@ struct PendingDTO: Decodable {
     // local approver knows whether it may offer "approve for N minutes".
     let leasable: Bool?; let max_lease_secs: Int?
     let reason: String?; let expires_ms: Int; let timeout_ms: Int; let coalesced: Int?
+    let delivered: Bool?; let delivered_at_ms: Int?
     func model() -> PendingRequest {
         PendingRequest(id: id, kind: RequestKind(rawValue: kind) ?? .secretRead, command: command,
                        secrets: secrets.map { SecretRef(provider: $0.provider, segments: $0.segments, label: $0.label) },
@@ -485,7 +486,9 @@ struct PendingDTO: Decodable {
                                               requestedAt: Date(timeIntervalSince1970: Double(provenance.requested_ms) / 1000)),
                        leasable: leasable ?? false, maxLeaseSecs: max_lease_secs, reason: reason,
                        expiresAt: Date(timeIntervalSince1970: Double(expires_ms) / 1000),
-                       timeoutSec: Double(timeout_ms) / 1000, coalesced: coalesced ?? 0)
+                       timeoutSec: Double(timeout_ms) / 1000, coalesced: coalesced ?? 0,
+                       delivered: delivered ?? false,
+                       deliveredAt: delivered_at_ms.map { Date(timeIntervalSince1970: Double($0) / 1000) })
     }
 }
 

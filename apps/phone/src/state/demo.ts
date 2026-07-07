@@ -29,7 +29,6 @@ export function demoReadRequest(overrides: Partial<ApprovalRequest> = {}): Appro
       machine: "studio.local",
       requestedAt: now,
     },
-    risk: "elevated",
     reason: "Production vault. First request from this process.",
     expiresAt: now + 60_000,
     timeoutMs: 60_000,
@@ -50,7 +49,6 @@ export function demoRoutineRequest(): ApprovalRequest {
         label: ".env",
       },
     ],
-    risk: "routine",
     reason: undefined,
     // Leasable grant: the sheet offers approve-once vs keep-approved-for-a-window
     // (task #57). Run-once demos omit this and show approve-once only.
@@ -118,7 +116,6 @@ export function demoSshRequest(): ApprovalRequest {
       machine: "studio.local",
       requestedAt: now,
     },
-    risk: "critical",
     reason: "Signature to a production host.",
     expiresAt: now + 90_000,
     timeoutMs: 90_000,

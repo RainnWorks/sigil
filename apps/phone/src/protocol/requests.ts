@@ -19,9 +19,6 @@
  * base64 of the raw 32-byte DEK, confidential by virtue of the enclosing seal.
  */
 
-/** Risk scales the approve control only. Deny is always one tap. */
-export type RiskLevel = "routine" | "elevated" | "critical";
-
 /**
  * How the approver should *render* a request. A DISPLAY HINT ONLY: it selects a
  * layout, never how the daemon fulfills the request (that is the provider seam's
@@ -146,8 +143,7 @@ export interface ApprovalRequest {
   /** Present for "ssh_signature". */
   ssh?: SshChallenge;
   provenance: Provenance;
-  risk: RiskLevel;
-  /** One reason line for elevated / critical (e.g. "Production vault."). */
+  /** One optional display-only heads-up line (e.g. "Production vault."). */
   reason?: string;
   /**
    * The v2 threshold challenge for a v2 account; absent on v1 requests and on

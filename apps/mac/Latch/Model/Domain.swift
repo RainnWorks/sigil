@@ -180,6 +180,10 @@ struct PendingRequest: Identifiable, Equatable, Sendable {
     var timeoutSec: TimeInterval
     /// How many identical requests coalesced behind this one.
     var coalesced: Int = 0
+    /// The phone acknowledged receipt (Sent vs Delivered). Display only: a
+    /// missing receipt reads as "couldn't confirm" and never gates the decision.
+    var delivered: Bool = false
+    var deliveredAt: Date?
 
     func remaining(now: Date) -> TimeInterval { max(0, expiresAt.timeIntervalSince(now)) }
     func fraction(now: Date) -> Double {

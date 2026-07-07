@@ -162,6 +162,12 @@ private struct PendingCard: View {
                 if request.coalesced > 0 {
                     Text("+\(request.coalesced) coalesced").font(.system(size: 10)).foregroundStyle(.tertiary)
                 }
+                Spacer()
+                // Sent until the phone acknowledges receipt, then Delivered. A
+                // missing receipt just stays Sent; it never blocks approval.
+                Text(request.delivered ? "Delivered" : "Sent")
+                    .font(.system(size: 10))
+                    .foregroundStyle(request.delivered ? Palette.seaGreen : Color(.tertiaryLabelColor))
             }
             if let reason = request.reason {
                 Text(reason).font(.system(size: 10)).foregroundStyle(.secondary)
