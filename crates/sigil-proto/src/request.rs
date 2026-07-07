@@ -49,14 +49,67 @@ use serde::{Deserialize, Serialize};
 
 use crate::pairing::Dek;
 
-/// Risk level for the request. Scales the approve control on the phone only;
-/// deny is always one tap.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
-#[serde(rename_all = "lowercase")]
-pub enum RiskLevel {
-    Routine,
-    Elevated,
-    Critical,
+/// Per-rule **lease policy**: whether the approver may grant an auto-approve
+/// window for this request, and its cap. This replaces the retired risk tier
+/// (routine/elevated/critical), which only scaled approve-control friction and
+/// gated nothing.
+///
+/// * [`RunOnce`](Self::RunOnce): every invocation needs a fresh phone approval;
+///   a lease is NEVER offered or granted (and the daemon refuses one even if a
+///   compromised approver tries to install it).
+/// * [`Leasable`](Self::Leasable): the approver MAY grant an auto-approve window
+///   up to `max_secs`; a longer request is clamped down to the cap by the daemon.
+///
+/// The **default is [`RunOnce`](Self::RunOnce)** — the safe default: a rule only
+/// becomes leasable when explicitly set. It rides *inside* the sealed/signed
+/// [`Envelope`](crate::Envelope): it is part of what the approver consents to, so
+/// the phone can offer "approve for N minutes" only when the rule allows it.
+///
+/// One tap approves on the phone regardless of policy; policy governs only
+/// whether that tap may *also* open a lease window, never the friction of the tap.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum LeasePolicy {
+    /// Fresh approval every invocation; no lease is ever offered or granted. The
+    /// default: a rule leases only when explicitly made leasable.
+    #[default]
+    RunOnce,
+    /// The approver may grant a session lease up to `max_secs` seconds. The field
+    /// is renamed explicitly (the enum-level `rename_all` renames only the variant
+    /// tags, not struct-variant fields) so the wire spelling is `maxSecs`.
+    Leasable {
+        #[serde(rename = "maxSecs")]
+        max_secs: u32,
+    },
+}
+
+impl LeasePolicy {
+    /// Whether this policy permits any lease at all.
+    pub fn is_leasable(&self) -> bool {
+        matches!(self, LeasePolicy::Leasable { .. })
+    }
+
+    /// Whether this is the run-once (never-lease) policy. Used as a
+    /// `skip_serializing_if` predicate so the default omits from on-disk config.
+    pub fn is_run_once(&self) -> bool {
+        matches!(self, LeasePolicy::RunOnce)
+    }
+
+    /// The per-rule cap in seconds if leasable, else `None` (run-once).
+    pub fn max_secs(&self) -> Option<u32> {
+        match self {
+            LeasePolicy::Leasable { max_secs } => Some(*max_secs),
+            LeasePolicy::RunOnce => None,
+        }
+    }
+
+    /// Clamp a *requested* lease duration (seconds) to what this policy allows:
+    /// `None` for run-once (never lease), else `min(requested, cap)`. This is the
+    /// single authority a granting daemon consults, so a run-once rule cannot be
+    /// leased and a leasable rule cannot be over-leased past its cap.
+    pub fn clamp_secs(&self, requested_secs: u32) -> Option<u32> {
+        self.max_secs().map(|cap| requested_secs.min(cap))
+    }
 }
 
 /// How the approver should *render* a request. A DISPLAY HINT ONLY: it tells the
@@ -167,8 +220,14 @@ pub struct ApprovalRequest {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ssh: Option<SshChallenge>,
     pub provenance: Provenance,
-    pub risk: RiskLevel,
-    /// One reason line for elevated / critical requests.
+    /// The rule's lease policy: whether this tap may also open an auto-approve
+    /// window and its cap. Rides inside the seal so it is part of what the
+    /// approver consents to; the phone offers "approve for N minutes" only when
+    /// this is [`LeasePolicy::Leasable`]. Defaults to [`LeasePolicy::RunOnce`]
+    /// when absent, so an older/omitting peer fails safe to run-once.
+    #[serde(default)]
+    pub lease_policy: LeasePolicy,
+    /// One optional reason line the approver renders under the command.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reason: Option<String>,
     /// The v2 threshold challenge for a v2 account; absent on v1 requests and on
@@ -443,7 +502,7 @@ mod tests {
                 machine: "mac".into(),
                 requested_at: 1_720_000_000_000,
             },
-            risk: RiskLevel::Routine,
+            lease_policy: LeasePolicy::RunOnce,
             reason: None,
             threshold: None,
             expires_at: 1_720_000_090_000,
@@ -451,6 +510,9 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"requestId\":\"req-1\""));
+        // Run-once serializes as the tagged, camelCase discriminated union.
+        assert!(json.contains("\"leasePolicy\":{\"kind\":\"runOnce\"}"));
+        assert!(!json.contains("\"risk\""));
         assert!(json.contains("\"kind\":\"secret_read\""));
         assert!(json.contains("\"command\":[\"op\",\"read\""));
         assert!(json.contains("\"provider\":\"1password\""));
@@ -463,6 +525,37 @@ mod tests {
         assert!(!json.contains("\"reason\""));
         let back: ApprovalRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back, req);
+    }
+
+    #[test]
+    fn lease_policy_defaults_to_run_once_and_clamps() {
+        // The default is the safe one: run-once, never leasable.
+        assert_eq!(LeasePolicy::default(), LeasePolicy::RunOnce);
+        assert!(!LeasePolicy::RunOnce.is_leasable());
+        assert_eq!(LeasePolicy::RunOnce.max_secs(), None);
+        // Run-once refuses any lease, whatever the request asks for.
+        assert_eq!(LeasePolicy::RunOnce.clamp_secs(60), None);
+
+        let leasable = LeasePolicy::Leasable { max_secs: 900 };
+        assert!(leasable.is_leasable());
+        assert_eq!(leasable.max_secs(), Some(900));
+        // Under the cap passes through; over the cap clamps down.
+        assert_eq!(leasable.clamp_secs(300), Some(300));
+        assert_eq!(leasable.clamp_secs(5_000), Some(900));
+        assert_eq!(leasable.clamp_secs(900), Some(900));
+    }
+
+    #[test]
+    fn lease_policy_round_trips_through_json_camel_case() {
+        let once = LeasePolicy::RunOnce;
+        let j1 = serde_json::to_string(&once).unwrap();
+        assert_eq!(j1, "{\"kind\":\"runOnce\"}");
+        assert_eq!(serde_json::from_str::<LeasePolicy>(&j1).unwrap(), once);
+
+        let leas = LeasePolicy::Leasable { max_secs: 900 };
+        let j2 = serde_json::to_string(&leas).unwrap();
+        assert_eq!(j2, "{\"kind\":\"leasable\",\"maxSecs\":900}");
+        assert_eq!(serde_json::from_str::<LeasePolicy>(&j2).unwrap(), leas);
     }
 
     #[test]
@@ -516,7 +609,7 @@ mod tests {
                 machine: "mac".into(),
                 requested_at: 1,
             },
-            risk: RiskLevel::Routine,
+            lease_policy: LeasePolicy::RunOnce,
             reason: None,
             threshold: None,
             expires_at: 2,

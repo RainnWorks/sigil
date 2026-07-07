@@ -28,13 +28,15 @@ Each echoes one account object (same shape as a `list` element).
 ### `sigil config list --json`
 ```json
 [ { "command": str, "provider": str, "source": str?, "account": str?,
-    "risk": "routine|elevated|critical" }, ... ]
+    "mode": "gate" | "allow",
+    "lease": { "kind": "runOnce" } | { "kind": "leasable", "maxSecs": int } }, ... ]
 ```
 
 ### `sigil config add <cmd> --provider <id> [...] --json`
 Echoes the one added command object (same shape as a `list` element). Validated
-CLI-side: an unknown provider or risk, or an `env-file` provider without
-`--source`, is rejected (exit 2) before the store is written.
+CLI-side: an unknown provider, a `--lease-max` without `--leasable` (or a
+non-positive cap), or an `env-file` provider without `--source`, is rejected
+(exit 2) before the store is written.
 
 ### `sigil config remove <cmd> --json`
 Returns the control shape `{ "ok": bool, "lines": [str] }` (`ok:false` when no

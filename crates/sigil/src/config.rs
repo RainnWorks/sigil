@@ -4,7 +4,7 @@
 //! tool. This module is the core of that generality and holds **zero** concept
 //! of 1Password. An invocation (argv) is matched against an ordered list of
 //! [`Rule`]s; the first whose [`Match`] holds selects an [`Action`], which names
-//! a [`Source`] (a pluggable provider configuration) to inject from and a risk
+//! a [`Source`] (a pluggable provider configuration) to inject from and a lease
 //! policy to gate under. `op` is one provider id among peers, named only inside a
 //! user-authored source; the engine here never parses `op://`, reads `--vault`,
 //! or special-cases any command.
@@ -26,7 +26,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use sigil_proto::RiskLevel;
+use sigil_proto::LeasePolicy;
 
 /// The current on-disk config schema version. Bumped only on a breaking layout
 /// change; the loader tolerates a missing field via `serde(default)`.
@@ -166,24 +166,60 @@ fn flag_equals(argv: &[String], flag: &str, value: &str) -> bool {
     false
 }
 
-/// What to do on a match: gate under a risk policy, then inject the named
-/// source's environment, then exec.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Action {
-    /// The [`Source::name`] to inject from.
-    pub source: String,
-    /// Risk policy: scales the approve control on the phone (deny is always one
-    /// tap). Serializes lowercase (`routine` / `elevated` / `critical`).
-    #[serde(default = "default_risk")]
-    pub risk: RiskLevel,
-    /// Optional per-rule approval timeout in seconds; falls back to the global
-    /// setting when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_sec: Option<u32>,
+/// Whether a matched rule **gates** its command (phone approval + env injection,
+/// under the lease policy) or **allows** it straight through (a passthrough: run
+/// directly, no approval, no injection, no lease).
+///
+/// The default is [`Gate`](RuleMode::Gate): a missing or unknown mode must gate,
+/// never allow, so a config authored before this field, or a hand-edit that drops
+/// it, fails safe to gating rather than silently opening a passthrough. `allow`
+/// is only ever the user's explicit, per-match choice.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RuleMode {
+    /// Require phone approval and inject the named source, honoring the lease policy.
+    #[default]
+    Gate,
+    /// Passthrough: run the matched command directly, ungated and uninjected. An
+    /// explicit allowlist entry, scoped strictly to the rule's match.
+    Allow,
 }
 
-fn default_risk() -> RiskLevel {
-    RiskLevel::Routine
+impl RuleMode {
+    pub fn is_gate(&self) -> bool {
+        matches!(self, RuleMode::Gate)
+    }
+    pub fn is_allow(&self) -> bool {
+        matches!(self, RuleMode::Allow)
+    }
+}
+
+/// What to do on a match. For a [`Gate`](RuleMode::Gate) rule: gate under the
+/// lease policy, then inject the named source's environment, then exec. For an
+/// [`Allow`](RuleMode::Allow) rule: nothing but run the command directly (no
+/// `source`, no `lease`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Action {
+    /// Gate (default) or allow (passthrough). See [`RuleMode`].
+    #[serde(default)]
+    pub mode: RuleMode,
+    /// The [`Source::name`] to inject from. Required (non-empty) for a gate rule;
+    /// **empty for an allow rule**, which injects nothing (the empty string is
+    /// omitted on disk).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    /// Lease policy for a gate rule: whether an approval may also open an
+    /// auto-approve window and its cap. Defaults to (and omits, on disk)
+    /// [`LeasePolicy::RunOnce`], so a rule missing this field fails safe to
+    /// run-once. Meaningless for an allow rule, where it stays run-once and is
+    /// never consulted. Serializes only when leasable, e.g.
+    /// `{"kind":"leasable","maxSecs":900}`.
+    #[serde(default, skip_serializing_if = "LeasePolicy::is_run_once")]
+    pub lease: LeasePolicy,
+    /// Optional per-rule approval timeout in seconds; falls back to the global
+    /// setting when absent. Unused by an allow rule (no approval).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_sec: Option<u32>,
 }
 
 /// One rule: a match paired with the action to take when it holds.
@@ -196,9 +232,22 @@ pub struct Rule {
     pub action: Action,
 }
 
-/// The resolved gating decision for an invocation: the matched rule flattened
+/// What [`Config::resolve`] decides for an invocation. `None` from resolve means
+/// "refuse" (unmatched, or a matched-but-broken gate rule); this enum is the
+/// matched outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Resolution {
+    /// A passthrough: run the matched command directly, ungated and uninjected.
+    /// Carries the matched rule name for the audit line only.
+    Allow { rule: String },
+    /// A gate: approve on the phone, then inject and exec per the [`ResolvedAction`].
+    Gate(ResolvedAction),
+}
+
+/// The resolved GATE decision for an invocation: the matched gate rule flattened
 /// with its source into what [`fulfill`](crate::daemon) needs. Mirrors the fields
 /// the old per-command config carried, plus the rule/source names for auditing.
+/// An allow rule resolves to [`Resolution::Allow`] instead, carrying none of this.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedAction {
     /// The matched rule's name (for diagnostics/audit).
@@ -216,8 +265,10 @@ pub struct ResolvedAction {
     /// The inline `env` provider's KEY names (for `describe`); empty otherwise.
     /// Names only, never values (values are sealed in the account store).
     pub env_keys: Vec<String>,
-    /// The approve-friction policy.
-    pub risk: RiskLevel,
+    /// The rule's lease policy: whether an approval may open an auto-approve
+    /// window and its cap. The daemon consults this as the sole authority when
+    /// deciding whether to grant (and how long to grant) a lease.
+    pub lease: LeasePolicy,
     /// Optional per-rule approval timeout in seconds.
     pub timeout_sec: Option<u32>,
 }
@@ -292,7 +343,9 @@ impl Config {
     /// Build a config from the legacy per-command entries: each becomes a source
     /// named after its command plus a rule matching `command == <cmd>`. If no
     /// legacy entry named `op` exists, synthesize the historical implicit `op`
-    /// default so a zero-config `op` keeps working after upgrade.
+    /// default so a zero-config `op` keeps working after upgrade. The retired
+    /// per-command risk tier is dropped: every migrated rule is run-once (the safe
+    /// default), and a command becomes leasable only by re-authoring it.
     fn from_legacy(legacy: LegacyStore) -> Self {
         let mut cfg = Self::default();
         let mut have_op = false;
@@ -315,8 +368,9 @@ impl Config {
                     ..Match::default()
                 },
                 action: Action {
+                    mode: RuleMode::Gate,
                     source: source_name,
-                    risk: c.risk,
+                    lease: LeasePolicy::RunOnce,
                     timeout_sec: None,
                 },
             });
@@ -345,8 +399,9 @@ impl Config {
                 ..Match::default()
             },
             action: Action {
+                mode: RuleMode::Gate,
                 source: OP_SOURCE.to_string(),
-                risk: RiskLevel::Routine,
+                lease: LeasePolicy::RunOnce,
                 timeout_sec: None,
             },
         });
@@ -386,37 +441,49 @@ impl Config {
             .any(|r| r.match_.command.as_deref() == Some(cmd))
     }
 
-    /// Resolve the first rule that matches `argv`, flattened with its source into
-    /// a [`ResolvedAction`]. `None` means "refuse" — the daemon fails closed and
-    /// points at `sigil-config`.
+    /// Resolve the first rule that matches `argv` into a [`Resolution`]. `None`
+    /// means "refuse" — the daemon fails closed and points at `sigil-config`.
+    /// First-match-in-config-order (the drag-to-order layering) is the ONLY
+    /// precedence: stack a specific `Allow` rule above a general `Gate` rule and
+    /// the specific match wins.
     ///
-    /// A rule whose action names an **unknown source** makes the whole resolution
-    /// fail closed (`None`), it does NOT fall through to a later, broader rule.
-    /// Falling through would be a fail-OPEN downgrade: a malformed or hand-edited
-    /// high-priority rule could silently route the command to a broader rule the
-    /// author did not intend for it. Invariant #5 ("everything fails closed") wins
-    /// over convenience here; `sigil-config` and `import` validate referential
-    /// integrity up front, so a dangling source only arises from a hand-edit, and
-    /// the safe answer to a hand-edited-broken rule is to refuse.
-    pub fn resolve(&self, argv: &[String]) -> Option<ResolvedAction> {
+    /// An **allow** rule resolves to [`Resolution::Allow`]: a passthrough, no
+    /// source lookup, no gate. A **gate** rule flattens with its source into a
+    /// [`ResolvedAction`]. A gate rule whose action names an **unknown source**
+    /// makes the whole resolution fail closed (`None`), it does NOT fall through
+    /// to a later, broader rule. Falling through would be a fail-OPEN downgrade: a
+    /// malformed or hand-edited high-priority rule could silently route the command
+    /// to a broader rule the author did not intend for it. Invariant #5 wins over
+    /// convenience; `sigil-config` and `import` validate referential integrity up
+    /// front, so a dangling source only arises from a hand-edit, and the safe
+    /// answer to a hand-edited-broken rule is to refuse. An **unmatched**
+    /// invocation is likewise `None` (refuse) — never a silent passthrough.
+    pub fn resolve(&self, argv: &[String]) -> Option<Resolution> {
         for rule in &self.rules {
             if !rule.match_.matches(argv) {
                 continue;
             }
+            if rule.action.mode.is_allow() {
+                // Explicit, user-authored ungating, scoped strictly to this match.
+                // No source, no injection, no gate.
+                return Some(Resolution::Allow {
+                    rule: rule.name.clone(),
+                });
+            }
             let Some(src) = self.source(&rule.action.source) else {
-                // Matched, but its source is gone: refuse, never downgrade.
+                // Matched gate rule, but its source is gone: refuse, never downgrade.
                 return None;
             };
-            return Some(ResolvedAction {
+            return Some(Resolution::Gate(ResolvedAction {
                 rule: rule.name.clone(),
                 provider: src.provider.clone(),
                 source_name: src.name.clone(),
                 source_path: src.path.clone(),
                 account: src.account.clone(),
                 env_keys: src.keys.clone(),
-                risk: rule.action.risk,
+                lease: rule.action.lease,
                 timeout_sec: rule.action.timeout_sec,
-            });
+            }));
         }
         None
     }
@@ -447,8 +514,11 @@ impl Config {
         Ok(self.sources.len() != before)
     }
 
-    /// Add a rule, rejecting a duplicate name, an empty match, or an action that
-    /// references a source that does not exist.
+    /// Add a rule, rejecting a duplicate name or an empty match. A gate rule must
+    /// name an existing source; an allow rule must carry no source and no lease
+    /// (it is a pure passthrough). An empty match is rejected in BOTH modes, so an
+    /// allow rule can never become an allow-everything (a match-less rule already
+    /// never matches, but rejecting it up front makes the intent explicit).
     pub fn add_rule(&mut self, rule: Rule) -> Result<(), String> {
         if self.rules.iter().any(|r| r.name == rule.name) {
             return Err(format!(
@@ -459,11 +529,32 @@ impl Config {
         if rule.match_.is_empty() {
             return Err("a rule needs at least one match condition".to_string());
         }
-        if self.source(&rule.action.source).is_none() {
-            return Err(format!(
-                "rule {} references unknown source {}",
-                rule.name, rule.action.source
-            ));
+        match rule.action.mode {
+            RuleMode::Allow => {
+                if !rule.action.source.is_empty() {
+                    return Err(format!(
+                        "allow rule {} must not name a source (it injects nothing)",
+                        rule.name
+                    ));
+                }
+                if rule.action.lease.is_leasable() {
+                    return Err(format!(
+                        "allow rule {} cannot be leasable (it never gates)",
+                        rule.name
+                    ));
+                }
+            }
+            RuleMode::Gate => {
+                if rule.action.source.is_empty() {
+                    return Err(format!("gate rule {} needs a --source", rule.name));
+                }
+                if self.source(&rule.action.source).is_none() {
+                    return Err(format!(
+                        "rule {} references unknown source {}",
+                        rule.name, rule.action.source
+                    ));
+                }
+            }
         }
         self.rules.push(rule);
         Ok(())
@@ -477,27 +568,18 @@ impl Config {
     }
 }
 
-/// Parse a risk level from a CLI string. `None` on an unknown value so the caller
-/// can reject it rather than silently defaulting.
-pub fn parse_risk(s: &str) -> Option<RiskLevel> {
-    match s.to_ascii_lowercase().as_str() {
-        "routine" => Some(RiskLevel::Routine),
-        "elevated" => Some(RiskLevel::Elevated),
-        "critical" => Some(RiskLevel::Critical),
-        _ => None,
+/// A short human label for a lease policy, for `rule list` and `list` display.
+/// Run-once renders `run-once`; leasable renders `leasable(<n>s)`.
+pub fn lease_str(lease: LeasePolicy) -> String {
+    match lease {
+        LeasePolicy::RunOnce => "run-once".to_string(),
+        LeasePolicy::Leasable { max_secs } => format!("leasable({max_secs}s)"),
     }
 }
 
-/// The lowercase label for a risk level, for display and JSON.
-pub fn risk_str(risk: RiskLevel) -> &'static str {
-    match risk {
-        RiskLevel::Routine => "routine",
-        RiskLevel::Elevated => "elevated",
-        RiskLevel::Critical => "critical",
-    }
-}
-
-/// The legacy `commands.json` shape, read once for migration only.
+/// The legacy `commands.json` shape, read once for migration only. The old
+/// per-command `risk` tier is intentionally not read: migrated rules are all
+/// run-once (see [`Config::from_legacy`]).
 #[derive(Deserialize)]
 struct LegacyStore {
     #[serde(default)]
@@ -512,8 +594,6 @@ struct LegacyCommand {
     source: Option<String>,
     #[serde(default)]
     account: Option<String>,
-    #[serde(default = "default_risk")]
-    risk: RiskLevel,
 }
 
 #[cfg(test)]
@@ -522,6 +602,15 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Unwrap a resolution as a gate action, panicking on an allow (the common
+    /// case for the gate-focused tests below).
+    fn gate(r: Resolution) -> ResolvedAction {
+        match r {
+            Resolution::Gate(a) => a,
+            Resolution::Allow { rule } => panic!("expected a gate resolution, got allow({rule})"),
+        }
     }
 
     #[test]
@@ -613,8 +702,9 @@ mod tests {
                 ..Match::default()
             },
             action: Action {
+                mode: RuleMode::Gate,
                 source: "rowm-op".into(),
-                risk: RiskLevel::Elevated,
+                lease: LeasePolicy::Leasable { max_secs: 900 },
                 timeout_sec: Some(60),
             },
         })
@@ -626,21 +716,22 @@ mod tests {
                 ..Match::default()
             },
             action: Action {
+                mode: RuleMode::Gate,
                 source: "gc".into(),
-                risk: RiskLevel::Routine,
+                lease: LeasePolicy::RunOnce,
                 timeout_sec: None,
             },
         })
         .unwrap();
 
-        let r = cfg.resolve(&argv(&["op", "read", "op://V/i/f"])).unwrap();
+        let r = gate(cfg.resolve(&argv(&["op", "read", "op://V/i/f"])).unwrap());
         assert_eq!(r.rule, "op-read");
         assert_eq!(r.provider, "1password");
         assert_eq!(r.account.as_deref(), Some("Rowm"));
-        assert_eq!(r.risk, RiskLevel::Elevated);
+        assert_eq!(r.lease, LeasePolicy::Leasable { max_secs: 900 });
         assert_eq!(r.timeout_sec, Some(60));
 
-        let g = cfg.resolve(&argv(&["gcloud", "auth"])).unwrap();
+        let g = gate(cfg.resolve(&argv(&["gcloud", "auth"])).unwrap());
         assert_eq!(g.provider, "env-file");
         assert_eq!(g.source_path.as_deref(), Some("/x/.env"));
 
@@ -667,13 +758,14 @@ mod tests {
                 ..Match::default()
             },
             action: Action {
+                mode: RuleMode::Gate,
                 source: "deploy-env".into(),
-                risk: RiskLevel::Elevated,
+                lease: LeasePolicy::RunOnce,
                 timeout_sec: None,
             },
         })
         .unwrap();
-        let r = cfg.resolve(&argv(&["deploy", "--now"])).unwrap();
+        let r = gate(cfg.resolve(&argv(&["deploy", "--now"])).unwrap());
         assert_eq!(r.provider, "env");
         assert_eq!(r.source_name, "deploy-env");
         assert_eq!(r.env_keys, vec!["TOKEN".to_string(), "REGION".to_string()]);
@@ -706,8 +798,9 @@ mod tests {
                 ..Match::default()
             },
             action: Action {
+                mode: RuleMode::Gate,
                 source: "s".into(),
-                risk: RiskLevel::Routine,
+                lease: LeasePolicy::RunOnce,
                 timeout_sec: None,
             },
         })
@@ -721,8 +814,9 @@ mod tests {
                 ..Match::default()
             },
             action: Action {
+                mode: RuleMode::Gate,
                 source: "s".into(),
-                risk: RiskLevel::Routine,
+                lease: LeasePolicy::RunOnce,
                 timeout_sec: None,
             },
         })
@@ -757,8 +851,9 @@ mod tests {
                         ..Match::default()
                     },
                     action: Action {
+                        mode: RuleMode::Gate,
                         source: "GONE".into(), // dangling on purpose
-                        risk: RiskLevel::Routine,
+                        lease: LeasePolicy::RunOnce,
                         timeout_sec: None,
                     },
                 },
@@ -769,8 +864,9 @@ mod tests {
                         ..Match::default()
                     },
                     action: Action {
+                        mode: RuleMode::Gate,
                         source: "real".into(),
-                        risk: RiskLevel::Routine,
+                        lease: LeasePolicy::RunOnce,
                         timeout_sec: None,
                     },
                 },
@@ -785,7 +881,7 @@ mod tests {
         // A command the broken rule does NOT match still resolves via the broad
         // rule (the fail-closed is scoped to the matched-but-broken rule).
         assert_eq!(
-            cfg.resolve(&argv(&["op", "item", "get"])).unwrap().rule,
+            gate(cfg.resolve(&argv(&["op", "item", "get"])).unwrap()).rule,
             "broad"
         );
     }
@@ -801,8 +897,9 @@ mod tests {
                     ..Match::default()
                 },
                 action: Action {
+                    mode: RuleMode::Gate,
                     source: "nope".into(),
-                    risk: RiskLevel::Routine,
+                    lease: LeasePolicy::RunOnce,
                     timeout_sec: None,
                 },
             })
@@ -820,8 +917,9 @@ mod tests {
                 name: "empty".into(),
                 match_: Match::default(),
                 action: Action {
+                    mode: RuleMode::Gate,
                     source: "s".into(),
-                    risk: RiskLevel::Routine,
+                    lease: LeasePolicy::RunOnce,
                     timeout_sec: None,
                 },
             })
@@ -848,8 +946,9 @@ mod tests {
                 ..Match::default()
             },
             action: Action {
+                mode: RuleMode::Gate,
                 source: "s".into(),
-                risk: RiskLevel::Routine,
+                lease: LeasePolicy::RunOnce,
                 timeout_sec: None,
             },
         })
@@ -868,12 +967,13 @@ mod tests {
         )
         .unwrap();
         let cfg = Config::from_legacy(legacy);
-        let g = cfg.resolve(&argv(&["gcloud", "auth"])).unwrap();
+        let g = gate(cfg.resolve(&argv(&["gcloud", "auth"])).unwrap());
         assert_eq!(g.provider, "env-file");
         assert_eq!(g.source_path.as_deref(), Some("/x/.env"));
-        assert_eq!(g.risk, RiskLevel::Elevated);
+        // The retired risk tier is dropped on migration: every rule is run-once.
+        assert_eq!(g.lease, LeasePolicy::RunOnce);
         // op still resolves by the synthesized default.
-        let op = cfg.resolve(&argv(&["op", "read", "x"])).unwrap();
+        let op = gate(cfg.resolve(&argv(&["op", "read", "x"])).unwrap());
         assert_eq!(op.provider, "1password");
         assert_eq!(op.account, None);
     }
@@ -886,9 +986,9 @@ mod tests {
         .unwrap();
         let cfg = Config::from_legacy(legacy);
         assert_eq!(cfg.rules.iter().filter(|r| r.name == "op").count(), 1);
-        let op = cfg.resolve(&argv(&["op", "read"])).unwrap();
+        let op = gate(cfg.resolve(&argv(&["op", "read"])).unwrap());
         assert_eq!(op.account.as_deref(), Some("Rowm"));
-        assert_eq!(op.risk, RiskLevel::Critical);
+        assert_eq!(op.lease, LeasePolicy::RunOnce);
     }
 
     #[test]
@@ -909,8 +1009,9 @@ mod tests {
                 ..Match::default()
             },
             action: Action {
+                mode: RuleMode::Gate,
                 source: "s".into(),
-                risk: RiskLevel::Routine,
+                lease: LeasePolicy::RunOnce,
                 timeout_sec: None,
             },
         })
@@ -921,5 +1022,198 @@ mod tests {
         assert_eq!(back.sources, cfg.sources);
         // The rename: the field serializes as "match".
         assert!(json.contains("\"match\""));
+    }
+
+    #[test]
+    fn action_defaults_to_run_once_when_lease_field_absent() {
+        // A rule authored before the lease field (or hand-edited to drop it) must
+        // deserialize to run-once, the safe default: never silently leasable.
+        let cfg: Config = serde_json::from_str(
+            r#"{"version":1,
+                "sources":[{"name":"s","provider":"env-file","path":"/x/.env"}],
+                "rules":[{"name":"r","match":{"command":"gcloud"},"action":{"source":"s"}}]}"#,
+        )
+        .unwrap();
+        let r = gate(cfg.resolve(&argv(&["gcloud", "auth"])).unwrap());
+        assert_eq!(r.lease, LeasePolicy::RunOnce);
+    }
+
+    #[test]
+    fn leasable_policy_round_trips_through_config_json() {
+        // A leasable rule with a cap survives export -> import byte-for-byte, and
+        // resolve() surfaces the cap the daemon clamps against.
+        let mut cfg = Config::default();
+        cfg.add_source(Source {
+            name: "gc".into(),
+            provider: "1password".into(),
+            account: Some("Rowm".into()),
+            path: None,
+            keys: Vec::new(),
+        })
+        .unwrap();
+        cfg.add_rule(Rule {
+            name: "gcloud".into(),
+            match_: Match {
+                command: Some("gcloud".into()),
+                ..Match::default()
+            },
+            action: Action {
+                mode: RuleMode::Gate,
+                source: "gc".into(),
+                lease: LeasePolicy::Leasable { max_secs: 900 },
+                timeout_sec: None,
+            },
+        })
+        .unwrap();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"kind\":\"leasable\""));
+        assert!(json.contains("\"maxSecs\":900"));
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rules, cfg.rules);
+        let r = gate(back.resolve(&argv(&["gcloud", "auth"])).unwrap());
+        assert_eq!(r.lease, LeasePolicy::Leasable { max_secs: 900 });
+    }
+
+    #[test]
+    fn allow_rule_resolves_to_passthrough_and_layers_above_a_gate() {
+        // The `op account list` use case: a specific ALLOW rule stacked ABOVE the
+        // general GATE rule. First-match-in-order is the only precedence.
+        let mut cfg = Config::default();
+        cfg.add_source(Source {
+            name: "op".into(),
+            provider: "1password".into(),
+            account: None,
+            path: None,
+            keys: Vec::new(),
+        })
+        .unwrap();
+        cfg.add_rule(Rule {
+            name: "op-account-list".into(),
+            match_: Match {
+                command: Some("op".into()),
+                subcommand: Some("account".into()),
+                argv_contains: vec!["list".into()],
+                ..Match::default()
+            },
+            action: Action {
+                mode: RuleMode::Allow,
+                source: String::new(),
+                lease: LeasePolicy::RunOnce,
+                timeout_sec: None,
+            },
+        })
+        .unwrap();
+        cfg.add_rule(Rule {
+            name: "op".into(),
+            match_: Match {
+                command: Some("op".into()),
+                ..Match::default()
+            },
+            action: Action {
+                mode: RuleMode::Gate,
+                source: "op".into(),
+                lease: LeasePolicy::RunOnce,
+                timeout_sec: None,
+            },
+        })
+        .unwrap();
+
+        // The specific allow rule wins for `op account list`.
+        assert_eq!(
+            cfg.resolve(&argv(&["op", "account", "list"])),
+            Some(Resolution::Allow {
+                rule: "op-account-list".into()
+            })
+        );
+        // Any other `op` falls through to the gate rule.
+        let g = gate(cfg.resolve(&argv(&["op", "read", "x"])).unwrap());
+        assert_eq!(g.rule, "op");
+        assert_eq!(g.provider, "1password");
+        // An unmatched command still refuses (never a silent passthrough).
+        assert!(cfg.resolve(&argv(&["kubectl", "get"])).is_none());
+
+        // The allow rule round-trips and carries no source/lease on disk.
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"mode\":\"allow\""));
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rules, cfg.rules);
+    }
+
+    #[test]
+    fn add_rule_rejects_an_allow_with_a_source_or_lease_and_a_gate_without() {
+        let mut cfg = Config::default();
+        cfg.add_source(Source {
+            name: "s".into(),
+            provider: "env-file".into(),
+            account: None,
+            path: Some("/x".into()),
+            keys: Vec::new(),
+        })
+        .unwrap();
+        // An allow rule that names a source is rejected (it injects nothing).
+        assert!(cfg
+            .add_rule(Rule {
+                name: "bad-allow".into(),
+                match_: Match {
+                    command: Some("op".into()),
+                    ..Match::default()
+                },
+                action: Action {
+                    mode: RuleMode::Allow,
+                    source: "s".into(),
+                    lease: LeasePolicy::RunOnce,
+                    timeout_sec: None,
+                },
+            })
+            .is_err());
+        // An allow rule that is leasable is rejected (it never gates).
+        assert!(cfg
+            .add_rule(Rule {
+                name: "leasable-allow".into(),
+                match_: Match {
+                    command: Some("op".into()),
+                    ..Match::default()
+                },
+                action: Action {
+                    mode: RuleMode::Allow,
+                    source: String::new(),
+                    lease: LeasePolicy::Leasable { max_secs: 60 },
+                    timeout_sec: None,
+                },
+            })
+            .is_err());
+        // A gate rule with no source is rejected.
+        assert!(cfg
+            .add_rule(Rule {
+                name: "sourceless-gate".into(),
+                match_: Match {
+                    command: Some("op".into()),
+                    ..Match::default()
+                },
+                action: Action {
+                    mode: RuleMode::Gate,
+                    source: String::new(),
+                    lease: LeasePolicy::RunOnce,
+                    timeout_sec: None,
+                },
+            })
+            .is_err());
+        // A valid allow rule (no source, run-once) is accepted.
+        assert!(cfg
+            .add_rule(Rule {
+                name: "good-allow".into(),
+                match_: Match {
+                    command: Some("op".into()),
+                    subcommand: Some("account".into()),
+                    ..Match::default()
+                },
+                action: Action {
+                    mode: RuleMode::Allow,
+                    source: String::new(),
+                    lease: LeasePolicy::RunOnce,
+                    timeout_sec: None,
+                },
+            })
+            .is_ok());
     }
 }

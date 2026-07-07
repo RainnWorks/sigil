@@ -475,6 +475,17 @@ impl SecretProvider for EnvProvider {
     }
 }
 
+/// Run the caller's command as a pure **passthrough**: the real underlying
+/// binary (skipping the Sigil shim alias), the caller's fds spliced straight to
+/// it, and **no** environment injected. This backs an `allow` rule (an explicit,
+/// user-authored ungating): no approval, no credential, no secret. It reuses the
+/// exact reviewed splice/exec discipline of [`spawn_with_env`] (invariant-#2 fd
+/// handling, the proxy-depth fuse) so a passthrough is a gate minus the injection,
+/// not a second exec path. Returns the child exit code; fails closed to non-zero.
+pub fn run_passthrough(run: ProviderRun) -> i32 {
+    spawn_with_env(run, &[])
+}
+
 /// Spawn the caller's command with `vars` injected into the child's environment
 /// and the caller's fds spliced straight to it. Shared by the two direct-injection
 /// providers ([`EnvFileProvider`] reads its `vars` from a file, [`EnvProvider`]

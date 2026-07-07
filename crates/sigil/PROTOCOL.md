@@ -96,7 +96,7 @@ the runtime facts (lockdown, live leases, the pending set, the audit log).
   "secrets": [ { "provider": str, "segments": [str], "label": str } ],
   "ssh": { "key_label": str, "host": str, "fingerprint": str }?,
   "provenance": { "process_chain": [str], "cwd": str, "machine": str, "requested_ms": int },
-  "risk": "routine|elevated|critical", "reason": str?,
+  "leasable": bool, "max_lease_secs": int?, "reason": str?,
   "expires_ms": int, "timeout_ms": int, "coalesced": int }
 ```
 
@@ -174,9 +174,12 @@ See `JSON.md` for those mutation output shapes.
 - `account.health`/`detail`/`last_used_ms`: no token-expiry model → `healthy`/null.
 - `account.id`: equals the label (the store keys by unique label).
 - `lease.caller`: empty — a lease retains the grant key, not the provenance.
-- `pending.risk`/`reason`/`coalesced`: `routine`/null/0 — the local
-  control-socket path does no risk scoring and the registry does not count
-  coalesced waiters.
+- `pending.leasable`/`max_lease_secs`: carried through from the matched rule's
+  lease policy (`leasable=false` + omitted cap for a run-once rule). A local
+  approver must not offer "approve for N minutes" when `leasable` is false, and
+  clamps any window to `max_lease_secs`; the daemon re-checks regardless.
+- `pending.reason`/`coalesced`: null/0 — the local control-socket path sets no
+  reason line and the registry does not count coalesced waiters.
 - `pair.name`: fixed `"iPhone"` — the ceremony captures no device name.
 - `history.decision == "expired"`: reserved; a timed-out local approval currently
   records `denied`.

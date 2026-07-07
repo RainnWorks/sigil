@@ -410,7 +410,7 @@ mod tests {
     }
 
     fn sample_request(id: &str) -> ApprovalRequest {
-        use sigil_proto::{Provenance, RiskLevel, SecretRef};
+        use sigil_proto::{LeasePolicy, Provenance, SecretRef};
         ApprovalRequest {
             request_id: id.to_string(),
             kind: RequestKind::SecretRead,
@@ -432,7 +432,7 @@ mod tests {
                 machine: "mac".into(),
                 requested_at: NOW,
             },
-            risk: RiskLevel::Routine,
+            lease_policy: LeasePolicy::RunOnce,
             reason: None,
             threshold: None,
             expires_at: NOW + 90_000,

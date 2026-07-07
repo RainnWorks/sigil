@@ -257,7 +257,7 @@ fn print_config_help() {
 
 usage: sigil-config <cmd> [args...]   author rules/sources, manage accounts
 
-  add <cmd> --provider <id> [--source <p>] [--account <l>] [--risk <r>]
+  add <cmd> --provider <id> [--source <p>] [--account <l>] [--leasable [--lease-max <secs>]]
                     convenience: author a source + rule for one command
                     (providers: 1password, env-file, env)
   source add <name> --provider <id> [--account <l>] [--path <f>]
@@ -269,8 +269,9 @@ usage: sigil-config <cmd> [args...]   author rules/sources, manage accounts
                     KEY names
   rule add <name> --source <s> [--command <c>] [--subcommand <s>]
                     [--argv-contains <str>...] [--flag <f>...] [--flag-eq <f>=<v>...]
-                    [--risk <r>] [--timeout <sec>]   a match -> gate + inject
-                    rule; also: rule list|remove
+                    [--leasable [--lease-max <secs>]] [--timeout <sec>]
+                    a match -> gate + inject rule (default run-once; --leasable
+                    allows a session lease up to the cap). also: rule list|remove
   list              summarize sources and rules (--json = the whole config)
   export            print the whole config as JSON (for the desktop to load)
   import            replace the whole config from JSON on stdin
@@ -2983,15 +2984,38 @@ fn cmd_config_rule(args: &[String], json: bool) -> i32 {
     }
 }
 
-/// Parse the risk flag, defaulting to routine. `Err` on an unknown value.
-fn risk_flag(args: &[String]) -> Result<sigil_proto::RiskLevel, i32> {
-    match flag_value(args, "--risk") {
-        Some(r) => crate::config::parse_risk(r).ok_or_else(|| {
-            eprintln!("sigil: unknown risk '{r}'; use routine, elevated, or critical");
-            2
-        }),
-        None => Ok(sigil_proto::RiskLevel::Routine),
+/// Default lease cap when `--leasable` is given without `--lease-max`: 15 minutes.
+const DEFAULT_LEASE_MAX_SECS: u32 = 15 * 60;
+
+/// Parse the lease-policy flags. The default is run-once (no lease ever granted);
+/// `--leasable` makes the rule leasable with a cap set by `--lease-max <secs>`
+/// (defaulting to [`DEFAULT_LEASE_MAX_SECS`]). `Err` on a malformed cap or a
+/// `--lease-max` without `--leasable`.
+fn lease_flag(args: &[String]) -> Result<sigil_proto::LeasePolicy, i32> {
+    let leasable = has_flag(args, "--leasable");
+    let max = flag_value(args, "--lease-max");
+    if !leasable {
+        if max.is_some() {
+            eprintln!(
+                "sigil: --lease-max is only meaningful with --leasable (default is run-once)"
+            );
+            return Err(2);
+        }
+        return Ok(sigil_proto::LeasePolicy::RunOnce);
     }
+    let max_secs = match max {
+        Some(s) => match s.parse::<u32>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                eprintln!(
+                    "sigil: --lease-max expects a positive whole number of seconds, got '{s}'"
+                );
+                return Err(2);
+            }
+        },
+        None => DEFAULT_LEASE_MAX_SECS,
+    };
+    Ok(sigil_proto::LeasePolicy::Leasable { max_secs })
 }
 
 /// Build a [`Match`](crate::config::Match) from the rule-matcher flags.
@@ -3022,16 +3046,14 @@ fn build_match(args: &[String]) -> Result<crate::config::Match, i32> {
 fn config_rule_add(args: &[String], json: bool) -> i32 {
     let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
         eprintln!(
-            "usage: sigil-config rule add <name> --source <src> [--command <c>] [--subcommand <s>] \
-             [--argv-contains <str> ...] [--flag <f> ...] [--flag-eq <f>=<v> ...] \
-             [--risk routine|elevated|critical] [--timeout <sec>]"
+            "usage: sigil-config rule add <name> [--source <src> | --allow] [--command <c>] \
+             [--subcommand <s>] [--argv-contains <str> ...] [--flag <f> ...] [--flag-eq <f>=<v> ...] \
+             [--leasable [--lease-max <secs>]] [--timeout <sec>]\n  \
+             --allow makes a passthrough rule (no approval, no injection); the default gates."
         );
         return 2;
     };
-    let Some(source) = flag_value(args, "--source").map(str::to_string) else {
-        eprintln!("sigil: --source <name> is required (the source this rule injects from)");
-        return 2;
-    };
+    let allow = has_flag(args, "--allow");
     let match_ = match build_match(args) {
         Ok(m) => m,
         Err(code) => return code,
@@ -3045,19 +3067,50 @@ fn config_rule_add(args: &[String], json: bool) -> i32 {
         );
         return 2;
     }
-    let risk = match risk_flag(args) {
-        Ok(r) => r,
-        Err(code) => return code,
-    };
-    let timeout_sec = match flag_value(args, "--timeout") {
-        Some(t) => match t.parse::<u32>() {
-            Ok(n) => Some(n),
-            Err(_) => {
-                eprintln!("sigil: --timeout expects a whole number of seconds, got '{t}'");
+
+    // An allow rule is a pure passthrough: it names no source, carries no lease,
+    // and has no approval to time out. Reject the gate-only flags rather than
+    // silently ignore them, so the intent is unambiguous.
+    let action = if allow {
+        for gate_flag in ["--source", "--leasable", "--lease-max", "--timeout"] {
+            if has_flag(args, gate_flag) || flag_value(args, gate_flag).is_some() {
+                eprintln!("sigil: {gate_flag} is not valid with --allow (allow is a passthrough)");
                 return 2;
             }
-        },
-        None => None,
+        }
+        crate::config::Action {
+            mode: crate::config::RuleMode::Allow,
+            source: String::new(),
+            lease: sigil_proto::LeasePolicy::RunOnce,
+            timeout_sec: None,
+        }
+    } else {
+        let Some(source) = flag_value(args, "--source").map(str::to_string) else {
+            eprintln!(
+                "sigil: --source <name> is required (the source this rule injects from), or pass --allow for a passthrough"
+            );
+            return 2;
+        };
+        let lease = match lease_flag(args) {
+            Ok(l) => l,
+            Err(code) => return code,
+        };
+        let timeout_sec = match flag_value(args, "--timeout") {
+            Some(t) => match t.parse::<u32>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    eprintln!("sigil: --timeout expects a whole number of seconds, got '{t}'");
+                    return 2;
+                }
+            },
+            None => None,
+        };
+        crate::config::Action {
+            mode: crate::config::RuleMode::Gate,
+            source,
+            lease,
+            timeout_sec,
+        }
     };
 
     let mut cfg = match load_config() {
@@ -3067,11 +3120,7 @@ fn config_rule_add(args: &[String], json: bool) -> i32 {
     let rule = crate::config::Rule {
         name: name.clone(),
         match_,
-        action: crate::config::Action {
-            source,
-            risk,
-            timeout_sec,
-        },
+        action,
     };
     if let Err(e) = cfg.add_rule(rule) {
         eprintln!("sigil: {e}");
@@ -3113,15 +3162,21 @@ fn config_rule_list(json: bool) -> i32 {
     println!("{}", s.cobalt("rules"));
     println!();
     for r in &cfg.rules {
+        // An allow rule is a passthrough (no source, no lease); a gate rule shows
+        // its target source and lease policy.
+        let (target, policy) = if r.action.mode.is_allow() {
+            ("-> allow (passthrough)".to_string(), "allow".to_string())
+        } else {
+            (
+                format!("-> {}", r.action.source),
+                crate::config::lease_str(r.action.lease),
+            )
+        };
         println!(
             "  {}  {}  {}",
             pad(&r.name, 16),
-            pad(&format!("-> {}", r.action.source), 18),
-            s.dim(&format!(
-                "{} \u{b7} {}",
-                crate::config::risk_str(r.action.risk),
-                describe_match(&r.match_)
-            ))
+            pad(&target, 22),
+            s.dim(&format!("{} \u{b7} {}", policy, describe_match(&r.match_)))
         );
     }
     0
@@ -3278,7 +3333,7 @@ fn config_add(args: &[String], json: bool) -> i32 {
     let s = Style::stdout();
     let Some(cmd) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
         eprintln!(
-            "usage: sigil-config add <cmd> --provider <id> [--source <path>] [--account <label>] [--risk routine|elevated|critical]"
+            "usage: sigil-config add <cmd> --provider <id> [--source <path>] [--account <label>] [--leasable [--lease-max <secs>]]"
         );
         return 2;
     };
@@ -3295,8 +3350,8 @@ fn config_add(args: &[String], json: bool) -> i32 {
         .or_else(|| flag_value(args, "--path"))
         .map(str::to_string);
     let account = flag_value(args, "--account").map(str::to_string);
-    let risk = match risk_flag(args) {
-        Ok(r) => r,
+    let lease = match lease_flag(args) {
+        Ok(l) => l,
         Err(code) => return code,
     };
     if provider == crate::provider::EnvFileProvider::ID && path.is_none() {
@@ -3326,8 +3381,9 @@ fn config_add(args: &[String], json: bool) -> i32 {
             ..crate::config::Match::default()
         },
         action: crate::config::Action {
+            mode: crate::config::RuleMode::Gate,
             source: cmd.clone(),
-            risk,
+            lease,
             timeout_sec: None,
         },
     };
@@ -3348,9 +3404,9 @@ fn config_add(args: &[String], json: bool) -> i32 {
         println!("  {}    {}", s.dim("source"), s.dim(p));
     }
     println!(
-        "  {}      {}",
-        s.dim("risk"),
-        s.dim(crate::config::risk_str(risk))
+        "  {}     {}",
+        s.dim("lease"),
+        s.dim(&crate::config::lease_str(lease))
     );
     println!(
         "  {}",

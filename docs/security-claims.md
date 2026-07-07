@@ -119,6 +119,12 @@ Extended again at commit `747b3a4` (the P-256 Secure Enclave DEK wrap) — secti
 | Lockdown clears (zeroizes) every lease and refuses new requests | `daemon.rs::handle_conn` (`Lockdown`), `lease.rs::LeaseStore::clear`, `fulfill` (lockdown check first) | `lease.rs::lockdown_clears_all_leases`, `daemon.rs::lockdown_refuses_new_requests` |
 | Daemon restart / ctrl-c zeroizes leases | `daemon.rs::serve` (`core.leases.clear()` on ctrl-c) + RAM-only storage | **UNPROVEN** by test (process-exit path); RAM-only + `clear()` reviewed by inspection |
 | A revoke drops matching leases | `lease.rs::LeaseStore::revoke` | `lease.rs::revoke_by_grant_prefix` |
+| A **run-once** rule never leases, even if the approver returns a lease | `daemon.rs::fulfill` (`action.lease.clamp_secs(...)` gates both grant sites; `LeasePolicy::RunOnce.clamp_secs` → `None`), `request.rs::LeasePolicy` | `daemon.rs::run_once_rule_never_leases_even_when_a_lease_is_returned`, `request.rs::lease_policy_defaults_to_run_once_and_clamps` |
+| A **leasable** rule clamps any lease to the per-rule cap (no over-lease) | `daemon.rs::fulfill` (`clamp_secs` = `min(requested, cap)`) | `daemon.rs::leasable_rule_clamps_an_over_cap_lease_to_the_rule_max`, `request.rs::lease_policy_defaults_to_run_once_and_clamps` |
+| The lease policy the approver consents to rides inside the sealed/signed envelope | `request.rs::ApprovalRequest.lease_policy` (default `RunOnce` on absence), carried by `remote.rs::build_request` | `request.rs::request_serializes_camel_case_and_stays_provider_agnostic` (asserts `leasePolicy`), `remote.rs::build_request_is_provider_blind` |
+| An **allow** (passthrough) rule is a deliberate, user-authored ungating scoped strictly to its match | `config.rs::RuleMode::Allow`, `Config::resolve` (returns `Resolution::Allow` only on a matching allow rule), `add_rule` (rejects an empty match in both modes, and an allow rule that names a source or is leasable) | `config.rs::allow_rule_resolves_to_passthrough_and_layers_above_a_gate`, `add_rule_rejects_an_allow_with_a_source_or_lease_and_a_gate_without` |
+| An allow rule bypasses the gate for its match ONLY; an unmatched command still refuses (fails closed) | `daemon.rs::fulfill` (`Resolution::Allow` -> `provider::run_passthrough`, no approval/injection/lease; `None` -> `fail_closed`), first-match-in-order is the only precedence | `daemon.rs::allow_rule_runs_the_command_directly_without_gating`, `config.rs::allow_rule_resolves_to_passthrough_and_layers_above_a_gate` (unmatched still `None`) |
+| Mode defaults to gate: a config missing/dropping `mode` gates, never allows | `config.rs::RuleMode` (`#[default] Gate`, `#[serde(default)]`) | `config.rs::action_defaults_to_run_once_when_lease_field_absent` (same absent-field config resolves as a gate) |
 
 ## 9. The relay is powerless (invariant #3)
 
@@ -587,6 +593,86 @@ Net: the sealing, zeroization, fail-closed decoding, no-lease, and
 zero-knowledge-of-values properties all hold as claimed. The one substantive
 finding (P2-1) is a readout/injection reconciliation gap that should get an
 inject-time key-set check; the other two are hygiene. No P0/P1.
+
+---
+
+## 20. The persistent push-registration listener (idle ToDaemon reader)
+
+*Implementer note (behavior + residuals only; the verdict is the independent
+security-reviewer's).*
+
+**Problem it fixes.** The phone deposits its APNs push token as a sealed
+`PushRegister` on the `ToDaemon` channel the moment it arms
+(`apps/phone/.../controller.ts`), not only alongside an approval. The relay holds
+a deposit for `TTL_MS` (180s) and then drops it. Previously the daemon read
+`ToDaemon` **only** at the start of an approval `round_trip` (`drain_pending` +
+the response wait), so unless a gated command fired within 180s of arming, the
+token expired unseen: `record_registration` never ran, `~/.sigil/push.json` was
+never written, and every later deposit carried no `PushHint`, so the relay rang
+no doorbell. The background doorbell simply never worked.
+
+**What was added.** `RemoteApprover::run_registration_listener` (spawned once by
+`daemon.rs::serve`, phone factor only) owns the idle `ToDaemon` reads: while the
+daemon is paired and no approval is running it long-polls `ToDaemon`, records any
+`PushRegister` to the disk-backed `PushStore` (0600, survives restart via
+`PushStore::load`), and drops everything else. The arm-time token is therefore
+captured the instant it lands. No phone change, no relay change, no new message
+type; the phone still deposits exactly as before.
+
+**Exclusion (the correctness-critical part).** The relay hands a fresh deposit to
+exactly one waiter, so if the listener and an in-flight `round_trip` both held a
+`ToDaemon` GET the approval's own `ApprovalResponse` could be delivered to the
+listener and dropped as unmatched, spuriously denying a legitimate approval. That
+is made impossible by a single `Mutex` (`RemoteApprover::channel`) that **both**
+paths acquire around every `ToDaemon` read:
+
+- `round_trip` takes the lock **before** it deposits the request and holds it for
+  the entire deposit-and-wait. Because the deposit happens only under the lock,
+  the phone cannot answer while any listener read is outstanding, so a response
+  can only ever come back to the waiting `round_trip`.
+- The listener takes the lock only for one short poll at a time (default 2s),
+  then releases it, so an approval that wants the channel waits at most one poll
+  (on a transport that honours the recv timeout) to acquire it.
+- An `approval_active` `AtomicBool` (RAII-set for the round trip's lifetime) is a
+  pure latency/fairness hint: the listener reads it and *yields* (sleeps rather
+  than parking on the lock) while an approval runs, so it keeps observing the
+  shutdown flag instead of blocking behind a multi-minute approval. Exclusion
+  never depends on this flag; drop it and correctness is unchanged, only a
+  wasted listener beat.
+
+At most one outstanding `ToDaemon` GET exists at any instant. A side effect of
+the same lock: two concurrent approvals with different grant keys now serialise
+on the channel instead of both polling `ToDaemon` (which, pre-change, could let
+one wait consume the other's response); this is a strict safety improvement for a
+single-user daemon but does mean a second distinct approval waits behind the
+first.
+
+**Verify/replay semantics are identical on both paths.** The listener classifies
+every envelope through the same `classify` over the same single `ReplayGuard` the
+approval path uses, so the phone's one monotonic outbound counter is enforced
+across responses and registrations together exactly as before. The listener
+grants nothing and never touches a DEK or `Z_F`; a `PushRegister` only writes
+`{token, platform}`. A token is not a credential (§9 / the `push_store` module
+docs): it unlocks nothing and the doorbell payload is a static string.
+
+**Residuals for the reviewer to weigh:**
+
+- *Latency, not correctness.* On the network relay a single listener poll can
+  block for the relay's own ~25s long-poll hold regardless of the short recv
+  timeout, because a held GET is bounded server-side, not by the client timeout.
+  So an approval that fires while the listener is mid-poll can wait up to one hold
+  (~25s) to take the channel before it deposits the request. The response can
+  never be stolen (the phone cannot answer until we deposit, which is under the
+  lock), so this is added worst-case latency only. Shutdown can likewise take up
+  to one hold for the listener thread to observe the flag; the join is bounded by
+  that and the process is exiting regardless.
+- *No relay spam.* The listener holds exactly one `ToDaemon` connection and only
+  while idle; during an approval it yields entirely. This respects the standing
+  "NO SPAMMING, ONLY APNS wakeups" rule and adds no polling beyond the single
+  idle long-poll the relay already expects.
+- The relay stays powerless and anonymous: the token rides only as an opaque
+  `PushHint` on a deposit, the daemon signs no push, and `push.json` stays 0600
+  under `~/.sigil`. None of that changed.
 
 ---
 

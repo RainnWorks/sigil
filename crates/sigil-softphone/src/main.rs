@@ -32,8 +32,8 @@ use sigil_proto::envelope::Envelope;
 use sigil_proto::identity::DeviceIdentity;
 use sigil_proto::pairing::{DaemonPairing, Dek};
 use sigil_proto::{
-    now_ms, ApprovalRequest, Direction, LocalRelay, Provenance, RequestKind, RiskLevel, SecretRef,
-    Transport,
+    now_ms, ApprovalRequest, Direction, LeasePolicy, LocalRelay, Provenance, RequestKind,
+    SecretRef, Transport,
 };
 use sigil_softphone::{Pairing, Policy};
 
@@ -195,7 +195,8 @@ fn cmd_demo(args: &[String]) -> anyhow::Result<()> {
             machine: "demo-mac".into(),
             requested_at: now,
         },
-        risk: RiskLevel::Routine,
+        // The demo request is leasable so the `--policy lease` path is coherent.
+        lease_policy: LeasePolicy::Leasable { max_secs: 15 * 60 },
         reason: None,
         threshold: None,
         expires_at: now + 90_000,

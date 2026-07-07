@@ -36,7 +36,7 @@ use crate::approve::{
     ApprovalContext, ApprovalGate, Approver, Decision, DevMode, LocalApprover, NullApprover,
     PendingRegistry,
 };
-use crate::config::{self, Config};
+use crate::config::Config;
 use crate::factor::{self, Factor};
 use crate::keystore::{self, Keystore};
 use crate::lease::{self, LeaseStore, ProcessTable, SysProcessTable};
@@ -48,7 +48,7 @@ use crate::secrets::{self, AccountStore};
 use crate::service;
 use crate::sshagent::{self, ServedIdentity, SignRequest, SshBackend, SshSigner};
 
-use sigil_proto::{RiskLevel, SshChallenge};
+use sigil_proto::{LeasePolicy, SshChallenge};
 
 use sigil_proto::identity::DeviceIdentity;
 use sigil_proto::{mailbox_id, PeerIdentity};
@@ -75,7 +75,7 @@ pub struct Core {
     /// the seam is generic and each provider owns its own tool discovery.
     providers: ProviderRegistry,
     /// The generic rule/source config: an ordered rule list matched against each
-    /// invocation, resolving to a provider + source + risk. Loaded at arm time.
+    /// invocation, resolving to a provider + source + lease policy. Loaded at arm time.
     /// The core holds no concept of `op`; op-ness lives in user-authored rules.
     config: Config,
     lease_ttl: Duration,
@@ -138,13 +138,18 @@ fn load_remote_pairing(ks: &Arc<dyn Keystore>) -> Option<RemotePairingConfig> {
 /// enables the dev switch and the control socket; [`Factor::NoFactor`] denies
 /// every request; the real factors are the phone (sealed remote approval) and
 /// the hardware biometric.
+///
+/// Returns the gate plus, for the phone factor only, a live handle to the
+/// [`RemoteApprover`] so the caller can run its background registration listener
+/// (which owns the idle ToDaemon reads that capture the phone's arm-time push
+/// token). The other factors have no relay channel and hand back `None`.
 fn build_gate(
     factor: Factor,
     remote: Option<RemotePairingConfig>,
     keystore: &Arc<dyn Keystore>,
     pending: &Arc<PendingRegistry>,
-) -> anyhow::Result<ApprovalGate> {
-    let approver: Box<dyn Approver> = match factor {
+) -> anyhow::Result<(ApprovalGate, Option<Arc<RemoteApprover>>)> {
+    let (approver, listener): (Box<dyn Approver>, Option<Arc<RemoteApprover>>) = match factor {
         Factor::Phone => {
             let cfg = remote.expect("phone factor implies a pairing config");
             let relay = DaemonRelay::new(&cfg.relay_url, cfg.mailbox())
@@ -155,23 +160,34 @@ fn build_gate(
             // no Apple secret and signs no push. Best-effort: with no token the
             // phone simply polls.
             let push_store = Arc::new(crate::push_store::PushStore::load());
-            Box::new(
+            // Hold the approver in an Arc: the gate takes one clone as its
+            // `Box<dyn Approver>` and `serve` keeps another to run the idle
+            // registration listener. Both share the one ToDaemon channel lock, so
+            // the listener never races an approval's response.
+            let approver = Arc::new(
                 RemoteApprover::new(Arc::new(relay), cfg.daemon_identity, cfg.phone)
                     .with_push(push_store),
-            )
+            );
+            (Box::new(approver.clone()), Some(approver))
         }
         // The biometric unwrap is the only gate; an unresolved decision fails
         // closed (no control socket, no dev switch).
-        Factor::Biometric => Box::new(LocalApprover::new(keystore.clone(), pending.clone())),
-        // The one place the forgeable dev paths are wired.
-        Factor::DevInsecure => Box::new(
-            LocalApprover::new(keystore.clone(), pending.clone())
-                .with_dev(DevMode::from_env())
-                .with_control_socket(true),
+        Factor::Biometric => (
+            Box::new(LocalApprover::new(keystore.clone(), pending.clone())),
+            None,
         ),
-        Factor::NoFactor => Box::new(NullApprover),
+        // The one place the forgeable dev paths are wired.
+        Factor::DevInsecure => (
+            Box::new(
+                LocalApprover::new(keystore.clone(), pending.clone())
+                    .with_dev(DevMode::from_env())
+                    .with_control_socket(true),
+            ),
+            None,
+        ),
+        Factor::NoFactor => (Box::new(NullApprover), None),
     };
-    Ok(ApprovalGate::new(approver))
+    Ok((ApprovalGate::new(approver), listener))
 }
 
 impl Core {
@@ -179,7 +195,7 @@ impl Core {
     /// (a paired phone, then a hardware biometric) and `dev_insecure`. With no
     /// real factor and no `--dev-insecure`, the factor is [`Factor::NoFactor`]
     /// and every gated request fails closed.
-    pub fn for_host(dev_insecure: bool) -> anyhow::Result<Self> {
+    pub fn for_host(dev_insecure: bool) -> anyhow::Result<(Self, Option<Arc<RemoteApprover>>)> {
         let keystore = keystore::for_host();
         let accounts = AccountStore::load().context("loading account store")?;
         // The v2 threshold accounts (if any). A missing/unreadable store is
@@ -200,7 +216,7 @@ impl Core {
             biometric: keystore.is_biometric(),
         };
         let factor = factor::resolve(&inputs);
-        let gate = build_gate(factor, remote, &keystore, &pending)?;
+        let (gate, remote_listener) = build_gate(factor, remote, &keystore, &pending)?;
 
         // Load the served SSH identities from ~/.sigil/ssh-keys.json and build a
         // signer per source (op-fetch + file-based). A bad config is logged and
@@ -224,7 +240,7 @@ impl Core {
             }
         };
 
-        Ok(Self {
+        let core = Self {
             keystore,
             accounts: Mutex::new(accounts),
             threshold: Mutex::new(threshold),
@@ -243,7 +259,8 @@ impl Core {
                     .map(|s| s.retention_days)
                     .unwrap_or(30),
             ),
-        })
+        };
+        Ok((core, remote_listener))
     }
 
     /// The full status report, the daemon's answer to `Frame::Status`. It is the
@@ -403,8 +420,8 @@ impl SshBackend for Core {
             command: vec!["ssh-sign".to_string(), req.id.label.clone()],
             secret_refs: Vec::new(),
             kind: sigil_proto::RequestKind::SshSignature,
-            // A signature is an authentication event: elevated by default.
-            risk: RiskLevel::Elevated,
+            // Every signature is gated afresh (no lease short-circuit in v1).
+            lease: LeasePolicy::RunOnce,
             ssh: Some(challenge),
             // SSH keys are v1-only for now (op-fetch / file signers).
             threshold: None,
@@ -499,15 +516,19 @@ impl Drop for ConnPermit {
 /// `args` are the `sigil daemon` arguments (e.g. `--dev-insecure`).
 pub fn run(args: &[String]) -> anyhow::Result<()> {
     let dev_insecure = factor::dev_insecure_requested(args);
-    let core = Arc::new(Core::for_host(dev_insecure)?);
+    let (core, remote_listener) = Core::for_host(dev_insecure)?;
+    let core = Arc::new(core);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
         .build()
         .context("building tokio runtime")?;
-    rt.block_on(serve(core))
+    rt.block_on(serve(core, remote_listener))
 }
 
-async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
+async fn serve(
+    core: Arc<Core>,
+    remote_listener: Option<Arc<RemoteApprover>>,
+) -> anyhow::Result<()> {
     // Roll the launchd append-mode logs if they have grown large, before we add
     // to them. Best-effort: never blocks arming.
     service::rotate_logs(service::LOG_ROTATE_BYTES);
@@ -568,11 +589,27 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
     // one cap bounds both.
     let conns = ConnGate::new();
 
+    // The background registration listener (phone factor only). It owns the idle
+    // ToDaemon reads so the phone's arm-time push token is captured the instant it
+    // lands, instead of expiring in the relay before the next approval looks. It
+    // runs on its own thread (its recv is a blocking long-poll) and stops when the
+    // shutdown flag is set. Correctness against a concurrent approval is enforced
+    // inside the approver via a shared channel lock, not here.
+    let listener_shutdown = Arc::new(AtomicBool::new(false));
+    let listener_handle = remote_listener.map(|approver| {
+        let stop = listener_shutdown.clone();
+        std::thread::Builder::new()
+            .name("sigil-push-listener".into())
+            .spawn(move || approver.run_registration_listener(&stop))
+            .expect("spawning the push registration listener")
+    });
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("sigil daemon: shutting down (leases zeroized)");
                 core.leases.clear();
+                listener_shutdown.store(true, Ordering::SeqCst);
                 break;
             }
             accepted = listener.accept() => {
@@ -624,6 +661,13 @@ async fn serve(core: Arc<Core>) -> anyhow::Result<()> {
                 });
             }
         }
+    }
+
+    // Let the registration listener observe the shutdown flag and exit. It may be
+    // mid-poll (up to one relay long-poll hold), so this join is best-effort and
+    // bounded by that; the process is exiting regardless.
+    if let Some(handle) = listener_handle {
+        let _ = handle.join();
     }
 
     let _ = fs::remove_file(&sock);
@@ -805,7 +849,8 @@ fn leases_json(core: &Core) -> Vec<crate::json::LeaseJson> {
 }
 
 /// The parked requests as the `pending --json` array. Enumerates the local
-/// control-socket queue; `risk`/`reason`/`coalesced` are the honest defaults for
+/// control-socket queue; the lease policy is carried through from the matched
+/// rule (via the context), while `reason`/`coalesced` are the honest defaults for
 /// that path (see JSON.md).
 fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
     core.pending
@@ -837,7 +882,8 @@ fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
                     machine: crate::json::hostname(),
                     requested_ms: s.queued_at_ms,
                 },
-                risk: config::risk_str(ctx.risk).to_string(),
+                leasable: ctx.lease.is_leasable(),
+                max_lease_secs: ctx.lease.max_secs(),
                 reason: None,
                 expires_ms: s.queued_at_ms + s.timeout_ms,
                 timeout_ms: s.timeout_ms,
@@ -894,14 +940,46 @@ fn fulfill(
     // Evaluate the rules against this whole invocation. An invocation that no
     // rule matches is refused (never run ungated) with a pointer to `sigil
     // config`; the core holds no built-in rule for any command, `op` included.
-    let Some(action) = core.config.resolve(argv) else {
-        return fail_closed(
-            stderr,
-            &format!(
-                "sigil: '{cmd}' is not configured (no rule matches); Sigil will not run it ungated.\n  \
-                 configure it: sigil-config add {cmd} --provider <id>\n"
-            ),
-        );
+    let action = match core.config.resolve(argv) {
+        None => {
+            return fail_closed(
+                stderr,
+                &format!(
+                    "sigil: '{cmd}' is not configured (no rule matches); Sigil will not run it ungated.\n  \
+                     configure it: sigil-config add {cmd} --provider <id>\n"
+                ),
+            );
+        }
+        // An explicit ALLOW rule: a passthrough the user deliberately authored,
+        // scoped strictly to this rule's match. Run the real command directly,
+        // ungated and uninjected. This is distinct from the UNMATCHED case above,
+        // which still fails closed: allow is the user's choice, not a default.
+        Some(crate::config::Resolution::Allow { rule }) => {
+            let caller = lease::walk_ancestry(core.proc_table.as_ref(), peer.unwrap_or(-1));
+            let label = argv.join(" ");
+            core.record_audit(
+                &uuid::Uuid::now_v7().to_string(),
+                sigil_proto::RequestKind::SecretRead,
+                label.trim(),
+                "",
+                &caller.provenance(),
+                cwd,
+                "allowed",
+                &format!("allow:{rule}"),
+            );
+            return crate::provider::run_passthrough(crate::provider::ProviderRun {
+                command: argv,
+                cwd,
+                credential: None,
+                source: "",
+                stdin,
+                stdout,
+                stderr,
+                proxy_depth: child_depth,
+                env: None,
+            });
+        }
+        Some(crate::config::Resolution::Gate(action)) => action,
     };
     let Some(provider) = core.providers.get(&action.provider) else {
         return fail_closed(
@@ -1059,12 +1137,23 @@ fn fulfill(
         command: argv.to_vec(),
         secret_refs: provider.describe(argv, &view),
         kind: provider.kind(argv),
-        risk: action.risk,
+        lease: action.lease,
         ssh: None,
         threshold,
     };
     let outcome = core.gate.decide(gk, &ctx);
     let decision = outcome.decision;
+    // Enforce the rule's lease policy as the SOLE authority on leasing: a
+    // run-once rule yields no lease even if the approver returned one, and a
+    // leasable rule is clamped to its per-rule cap. Computed once here so every
+    // grant site below honors it (defense in depth: the phone should only offer a
+    // lease when allowed, but the daemon never trusts that and re-checks).
+    let lease_secs = decision.lease_ttl().and_then(|ttl| {
+        action
+            .lease
+            .clamp_secs(ttl.as_secs().min(u32::MAX as u64) as u32)
+    });
+    let lease_ttl = lease_secs.map(|s| Duration::from_secs(u64::from(s)));
     if !decision.is_grant() {
         core.record_audit(
             &ctx.id,
@@ -1118,7 +1207,7 @@ fn fulfill(
             Err(e) => return fail_closed(stderr, &format!("sigil token decrypt failed: {e}\n")),
         };
         drop(m); // the Mac share is held only for the one combine
-        if let Some(ttl) = decision.lease_ttl() {
+        if let Some(ttl) = lease_ttl {
             core.leases
                 .grant(gk, &account_label, &scope, token.clone(), ttl);
         }
@@ -1141,7 +1230,7 @@ fn fulfill(
             Err(e) => return fail_closed(stderr, &format!("sigil token decrypt failed: {e}\n")),
         };
         drop(dek);
-        if let Some(ttl) = decision.lease_ttl() {
+        if let Some(ttl) = lease_ttl {
             core.leases
                 .grant(gk, &account_label, &scope, token.clone(), ttl);
         }
@@ -1305,7 +1394,7 @@ mod tests {
     /// tests used to get for free before the rule engine replaced the built-in
     /// default. op-ness now lives entirely in this user-authored rule.
     fn op_config() -> Config {
-        use crate::config::{Action, Match, Rule, Source};
+        use crate::config::{Action, Match, Rule, RuleMode, Source};
         let mut cfg = Config::default();
         cfg.add_source(Source {
             name: "op".into(),
@@ -1322,8 +1411,11 @@ mod tests {
                 ..Match::default()
             },
             action: Action {
+                // Leasable so the lease-machinery tests can exercise a grant; the
+                // per-rule run-once/clamp enforcement has its own focused tests.
+                mode: RuleMode::Gate,
                 source: "op".into(),
-                risk: RiskLevel::Routine,
+                lease: LeasePolicy::Leasable { max_secs: 900 },
                 timeout_sec: None,
             },
         })
@@ -1331,11 +1423,19 @@ mod tests {
         cfg
     }
 
+    /// Like [`op_config`] but with an explicit lease policy, for the tests that
+    /// assert the daemon honors run-once vs. leasable at grant time.
+    fn op_config_with_lease(lease: LeasePolicy) -> Config {
+        let mut cfg = op_config();
+        cfg.rules[0].action.lease = lease;
+        cfg
+    }
+
     /// A config gating `<command>` to the `env-file` provider at `path` (the
     /// direct-injection shape). Used by the env-file daemon tests in place of the
     /// old per-command store.
     fn env_file_config(command: &str, path: &str) -> Config {
-        use crate::config::{Action, Match, Rule, Source};
+        use crate::config::{Action, Match, Rule, RuleMode, Source};
         let mut cfg = Config::default();
         cfg.add_source(Source {
             name: command.into(),
@@ -1352,8 +1452,9 @@ mod tests {
                 ..Match::default()
             },
             action: Action {
+                mode: RuleMode::Gate,
                 source: command.into(),
-                risk: RiskLevel::Routine,
+                lease: LeasePolicy::RunOnce,
                 timeout_sec: None,
             },
         })
@@ -1366,7 +1467,7 @@ mod tests {
     /// (`Legacy`). It stands in for the old argv `--vault` routing so the
     /// v1/v2 coexistence test still drives each token down its own path.
     fn coexist_config() -> Config {
-        use crate::config::{Action, Match, Rule, Source};
+        use crate::config::{Action, Match, Rule, RuleMode, Source};
         let mut cfg = Config::default();
         for (name, account, marker) in [
             ("v2", "Engineering", "Engineering"),
@@ -1388,8 +1489,9 @@ mod tests {
                     ..Match::default()
                 },
                 action: Action {
+                    mode: RuleMode::Gate,
                     source: name.into(),
-                    risk: RiskLevel::Routine,
+                    lease: LeasePolicy::RunOnce,
                     timeout_sec: None,
                 },
             })
@@ -1407,6 +1509,19 @@ mod tests {
         secret: &str,
         dev: DevMode,
         timeout: Duration,
+    ) -> (Arc<Core>, Arc<PendingRegistry>) {
+        test_core_with_config(dir, token, secret, dev, timeout, op_config())
+    }
+
+    /// [`test_core`] but with an explicit config, so the lease-policy tests can
+    /// gate the same `op` command under run-once or a specific cap.
+    fn test_core_with_config(
+        dir: &Path,
+        token: &str,
+        secret: &str,
+        dev: DevMode,
+        timeout: Duration,
+        config: Config,
     ) -> (Arc<Core>, Arc<PendingRegistry>) {
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::with_dek());
         let dek = keystore.unwrap_dek("seed").unwrap();
@@ -1435,7 +1550,7 @@ mod tests {
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
             ))]),
-            config: op_config(),
+            config,
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
             ssh_signers: Vec::new(),
@@ -1782,6 +1897,115 @@ mod tests {
     }
 
     #[test]
+    fn run_once_rule_never_leases_even_when_a_lease_is_returned() {
+        // A run-once rule must not install a lease even if the approver returns
+        // one (DevMode::Lease here stands in for a phone/compromised approver that
+        // asks for a session). The secret is still delivered, but nothing is held,
+        // so the very next identical request is gated afresh.
+        let dir = tmpdir("runonce");
+        let (core, _) = test_core_with_config(
+            &dir,
+            "tok-abc",
+            "secret-A",
+            DevMode::Lease(Duration::from_secs(60)),
+            Duration::from_millis(50),
+            op_config_with_lease(LeasePolicy::RunOnce),
+        );
+        let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
+        let (r1, w1) = pipe();
+        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(read_all(r1), "secret-A");
+        assert_eq!(
+            core.leases.active(),
+            0,
+            "a run-once rule must refuse a lease the approver tried to install"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn leasable_rule_clamps_an_over_cap_lease_to_the_rule_max() {
+        // The approver asks for a 60s session but the rule caps leases at 5s; the
+        // lease is granted (leasable) yet its remaining time never exceeds the cap.
+        let dir = tmpdir("clamp");
+        let (core, _) = test_core_with_config(
+            &dir,
+            "tok-abc",
+            "secret-A",
+            DevMode::Lease(Duration::from_secs(60)),
+            Duration::from_millis(50),
+            op_config_with_lease(LeasePolicy::Leasable { max_secs: 5 }),
+        );
+        let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
+        let (r1, w1) = pipe();
+        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(read_all(r1), "secret-A");
+        assert_eq!(core.leases.active(), 1, "a leasable rule grants the lease");
+        let leases = core.leases.list();
+        assert_eq!(leases.len(), 1);
+        assert!(
+            leases[0].remaining <= Duration::from_secs(5),
+            "the 60s request must be clamped down to the rule's 5s cap, got {:?}",
+            leases[0].remaining
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn allow_rule_runs_the_command_directly_without_gating() {
+        // An allow rule is a passthrough: even with NO approver (DevMode::Off,
+        // which would deny a gate rule), a matched command runs directly, injects
+        // nothing, creates no pending approval, and grants no lease. Uses `true`
+        // (present on every unix) so the passthrough's real-binary resolution has
+        // something to exec; the exit code is what proves it actually ran.
+        use crate::config::{Action, Match, Rule, RuleMode};
+        let dir = tmpdir("allow");
+        let mut cfg = Config::default();
+        cfg.add_rule(Rule {
+            name: "allow-true".into(),
+            match_: Match {
+                command: Some("true".into()),
+                ..Match::default()
+            },
+            action: Action {
+                mode: RuleMode::Allow,
+                source: String::new(),
+                lease: LeasePolicy::RunOnce,
+                timeout_sec: None,
+            },
+        })
+        .unwrap();
+        let (core, pending) = test_core_with_config(
+            &dir,
+            "tok",
+            "secret",
+            DevMode::Off,
+            Duration::from_millis(50),
+            cfg,
+        );
+        let (read_end, write_end) = pipe();
+        let code = fulfill(
+            &core,
+            &["true".to_string()],
+            "",
+            None,
+            0,
+            None,
+            Some(write_end),
+            None,
+        );
+        assert_eq!(code, 0, "allow passthrough runs the real `true`, exit 0");
+        assert_eq!(read_all(read_end), "", "`true` emits nothing");
+        assert_eq!(core.leases.active(), 0, "an allow rule never leases");
+        assert_eq!(
+            pending.snapshot().len(),
+            0,
+            "an allow rule creates no pending approval (never gates)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn denied_request_fails_closed_and_delivers_no_secret() {
         let dir = tmpdir("deny");
         // dev Off + no local resolver + short timeout -> Deny.
@@ -1947,7 +2171,7 @@ mod tests {
     /// with the given KEY names. The sealed values live in the account store (not
     /// here), keyed by the same name.
     fn env_inline_config(command: &str, keys: &[&str]) -> Config {
-        use crate::config::{Action, Match, Rule, Source};
+        use crate::config::{Action, Match, Rule, RuleMode, Source};
         let mut cfg = Config::default();
         cfg.add_source(Source {
             name: command.into(),
@@ -1964,8 +2188,9 @@ mod tests {
                 ..Match::default()
             },
             action: Action {
+                mode: RuleMode::Gate,
                 source: command.into(),
-                risk: RiskLevel::Routine,
+                lease: LeasePolicy::RunOnce,
                 timeout_sec: None,
             },
         })
@@ -3346,7 +3571,7 @@ mod tests {
             .unwrap();
         drop(dek);
         let pending = Arc::new(PendingRegistry::new());
-        let gate = build_gate(factor, None, &keystore, &pending).unwrap();
+        let (gate, _listener) = build_gate(factor, None, &keystore, &pending).unwrap();
         Arc::new(Core {
             keystore,
             accounts: Mutex::new(accounts),
@@ -3471,8 +3696,12 @@ mod tests {
             Factor::Phone
         );
         // And the gate builds the phone approver from the config.
-        let gate = build_gate(Factor::Phone, Some(cfg), &ks, &pending).unwrap();
+        let (gate, listener) = build_gate(Factor::Phone, Some(cfg), &ks, &pending).unwrap();
         let _ = gate; // constructed without a DEK at rest: inert.
+        assert!(
+            listener.is_some(),
+            "the phone factor hands back a listener handle for the registration reader"
+        );
         assert!(!ks.has_dek());
     }
 

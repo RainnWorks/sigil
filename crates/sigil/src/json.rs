@@ -16,8 +16,9 @@
 //! `apps/mac/Sigil/Model/DaemonClient.swift` field-for-field. `PROTOCOL.md`
 //! (socket) and `JSON.md` (CLI mutations) are the human indices; keep them in
 //! sync with this file. Enum-like fields are plain `String` so the exact wire
-//! spelling is explicit here; [`request_kind_str`] and [`risk_str`] map the
-//! proto enums to the strings the Swift `RawValue` initializers expect.
+//! spelling is explicit here; [`request_kind_str`] maps the proto enum to the
+//! strings the Swift `RawValue` initializers expect. The lease policy is carried
+//! flat as `leasable` + `max_lease_secs` for the Swift approve sheet.
 
 use serde::{Deserialize, Serialize};
 
@@ -175,9 +176,14 @@ pub struct PendingJson {
     pub secrets: Vec<SecretRefJson>,
     pub ssh: Option<SshJson>,
     pub provenance: ProvJson,
-    /// `routine` | `elevated` | `critical`. Always `routine`: the local
-    /// control-socket path does no risk scoring (gap).
-    pub risk: String,
+    /// Whether this request's matched rule permits a session lease. `false` =>
+    /// run-once: a local approver must not offer "approve for N minutes", and the
+    /// daemon refuses a lease even if one is requested.
+    pub leasable: bool,
+    /// The per-rule lease cap in seconds when [`leasable`](Self::leasable); `None`
+    /// (omitted) for run-once. A local approver clamps any offered window to this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lease_secs: Option<u32>,
     pub reason: Option<String>,
     pub expires_ms: u64,
     pub timeout_ms: u64,
@@ -234,16 +240,6 @@ pub fn request_kind_str(kind: sigil_proto::RequestKind) -> &'static str {
         SshSignature => "ssh_signature",
         Resume => "resume",
         LockdownClear => "lockdown_clear",
-    }
-}
-
-/// The lowercase wire spelling of a [`RiskLevel`](sigil_proto::RiskLevel).
-pub fn risk_str(risk: sigil_proto::RiskLevel) -> &'static str {
-    use sigil_proto::RiskLevel::*;
-    match risk {
-        Routine => "routine",
-        Elevated => "elevated",
-        Critical => "critical",
     }
 }
 

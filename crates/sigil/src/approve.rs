@@ -129,9 +129,11 @@ pub struct ApprovalContext {
     pub secret_refs: Vec<sigil_proto::SecretRef>,
     /// The display hint the provider assigned (how the approver should render).
     pub kind: sigil_proto::RequestKind,
-    /// The risk policy for this request (from the command config, or a provider
-    /// default). Scales the approve friction on the phone; deny is always one tap.
-    pub risk: sigil_proto::RiskLevel,
+    /// The rule's lease policy (from the matched rule, or a control-path default).
+    /// Governs whether this approval may also open an auto-approve window; the
+    /// phone offers "approve for N minutes" only when it is leasable. One tap
+    /// approves regardless; deny is always one tap.
+    pub lease: sigil_proto::LeasePolicy,
     /// Present for an `ssh_signature` request: the key label, derived
     /// destination, and data-to-sign fingerprint the approver renders. `None`
     /// for secret reads and control requests.
@@ -524,7 +526,7 @@ mod tests {
             command: vec!["op".into(), "read".into()],
             secret_refs: Vec::new(),
             kind: sigil_proto::RequestKind::SecretRead,
-            risk: sigil_proto::RiskLevel::Routine,
+            lease: sigil_proto::LeasePolicy::RunOnce,
             ssh: None,
             threshold: None,
         }

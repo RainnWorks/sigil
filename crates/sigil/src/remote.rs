@@ -18,8 +18,32 @@
 //! mis-correlated response, or an "approve" that carries no DEK — fails closed
 //! to a `Deny` outcome. Only a well-formed, authenticated approve carrying a DEK
 //! releases a secret.
+//!
+//! ## The idle registration listener
+//!
+//! The phone deposits its push token as a [`PushRegister`] on the ToDaemon
+//! channel *the moment it arms*, not only alongside an approval. The relay holds
+//! a deposit for a short TTL and then drops it, so unless a gated command happens
+//! to fire within that window the token is gone before [`round_trip`] ever looks.
+//! To catch the arm-time registration the daemon runs a persistent
+//! [`run_registration_listener`](RemoteApprover::run_registration_listener): while
+//! idle it owns the ToDaemon reads, records any [`PushRegister`] to the push
+//! store, and drops anything else.
+//!
+//! The listener and an in-flight [`round_trip`] must never both hold a ToDaemon
+//! read at once: the relay hands a fresh deposit to exactly one waiter, so a
+//! concurrent listener could swallow the approval's own [`ApprovalResponse`] and
+//! spuriously deny it. Exclusion is a single [`Mutex`] (`channel`) that BOTH paths
+//! acquire around every ToDaemon read: `round_trip` holds it for its whole
+//! deposit-and-wait, and the listener takes it only for one short poll at a time.
+//! An `approval_active` flag is a fast-path hint so the listener yields (sleeps
+//! rather than parking on the lock) while an approval runs, keeping shutdown
+//! responsive; correctness rests on the mutex alone, never the flag. At most one
+//! outstanding ToDaemon read exists at any instant.
+//!
+//! [`round_trip`]: RemoteApprover::round_trip
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,6 +62,23 @@ use crate::push_store::PushStore;
 
 /// Default wait for a phone decision before failing closed.
 pub const DEFAULT_REMOTE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long one idle-listener poll of the ToDaemon channel waits before it loops
+/// to re-check the shutdown/approval flags. Short (not the relay's ~25s hold) so
+/// that on a transport which honours the timeout (the in-process relay and the
+/// tests) an approval that wants the channel waits at most one poll for the
+/// listener to release the lock. On the network relay a single GET may hold for
+/// the relay's own long-poll regardless (see the module note and residuals).
+const LISTEN_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The beat the listener sleeps when it yields the channel to an active approval
+/// (or loses the race for the lock) before re-checking. Keeps the loop from
+/// busy-spinning while staying responsive to a shutdown signal.
+const LISTEN_YIELD: Duration = Duration::from_millis(50);
+
+/// Backoff after a transport error in the listener, so a persistently failing
+/// poll settles instead of spinning.
+const LISTEN_ERROR_BACKOFF: Duration = Duration::from_millis(500);
 
 /// An approver backed by a paired phone reachable over a [`Transport`].
 pub struct RemoteApprover {
@@ -60,6 +101,23 @@ pub struct RemoteApprover {
     /// on the ToDaemon channel and is recorded here; the token is forwarded to the
     /// relay per deposit so the relay (not the daemon) rings the doorbell.
     push_store: Arc<PushStore>,
+    /// The single-owner lock over ToDaemon reads. Both an approval [`round_trip`]
+    /// (which holds it for the whole deposit-and-wait) and the idle registration
+    /// listener (which takes it for one short poll at a time) acquire it, so at
+    /// most one ToDaemon read is ever outstanding and the listener can never
+    /// swallow an approval's response. This is the correctness guarantee; the
+    /// [`approval_active`](Self::approval_active) flag is only a latency hint.
+    ///
+    /// [`round_trip`]: Self::round_trip
+    channel: Mutex<()>,
+    /// Set for the duration of an approval [`round_trip`](Self::round_trip). A
+    /// pure fast-path hint: the listener reads it to yield the channel (sleep
+    /// rather than park on `channel`) while an approval runs, which keeps the
+    /// listener free to observe the shutdown flag instead of blocking behind a
+    /// multi-minute approval. Exclusion never depends on it.
+    approval_active: AtomicBool,
+    /// How long one idle listener poll waits; a field only so tests can shrink it.
+    listen_poll: Duration,
 }
 
 impl RemoteApprover {
@@ -86,6 +144,9 @@ impl RemoteApprover {
             // softphone/local test loop runs with this no-op and never touches the
             // filesystem.
             push_store: Arc::new(PushStore::ephemeral()),
+            channel: Mutex::new(()),
+            approval_active: AtomicBool::new(false),
+            listen_poll: LISTEN_POLL_INTERVAL,
         }
     }
 
@@ -132,7 +193,7 @@ impl RemoteApprover {
                 machine: self.machine.clone(),
                 requested_at: now,
             },
-            risk: ctx.risk,
+            lease_policy: ctx.lease,
             reason: None,
             // A v2 account carries its threshold challenge to the phone; a v1
             // account leaves this absent and takes the DEK path.
@@ -152,6 +213,19 @@ impl RemoteApprover {
     /// be mistaken for a failed response, which would deny a legitimate approval.
     fn round_trip(&self, ctx: &ApprovalContext) -> Option<ApprovalOutcome> {
         let req = self.build_request(ctx);
+
+        // Take exclusive ownership of the ToDaemon channel for the entire round
+        // trip. The flag is raised FIRST (so the idle listener stops taking new
+        // polls while we wait for the lock), then we block on the lock until the
+        // listener's current poll, if any, releases it. Only after we hold the
+        // lock do we deposit the request; the phone therefore cannot answer while
+        // any listener poll is outstanding, so the response can only come back to
+        // us. Both guards are RAII: a panic or early return still clears the flag
+        // and frees the channel. Concurrent approvals with different grant keys
+        // serialise here too, which is what keeps "one outstanding ToDaemon read"
+        // true and stops two waits stealing each other's responses.
+        let _active = ApprovalActiveGuard::raise(&self.approval_active);
+        let _channel = self.channel.lock().expect("remote channel poisoned");
 
         // Drain any registration the phone sent while we were idle, so the deposit
         // below carries the freshest token. Non-blocking.
@@ -289,6 +363,115 @@ impl RemoteApprover {
             platform: reg.platform,
         })
     }
+
+    /// Own the idle ToDaemon reads for the life of the daemon so an arm-time
+    /// [`PushRegister`] is captured the instant it lands and persisted to the push
+    /// store, rather than expiring in the relay before the next approval looks.
+    ///
+    /// Runs until `shutdown` is set. Each iteration either yields (an approval is
+    /// active, or the channel lock is momentarily held) or takes the channel lock
+    /// for exactly one short poll. A [`PushRegister`] is recorded; a stale
+    /// response with no approval in flight, or an envelope that will not open, is
+    /// dropped. Verify/replay semantics are identical to the approval path because
+    /// both go through [`classify`](Self::classify) over the one shared
+    /// [`ReplayGuard`]. The listener never grants anything and never touches a DEK.
+    ///
+    /// The mutual exclusion is the `channel` mutex, held around the poll: while an
+    /// approval `round_trip` holds it, the listener parks on the flag instead of
+    /// the lock (so it keeps checking `shutdown`), and after `round_trip` deposits
+    /// no listener read can be outstanding. See the module note for the one
+    /// residual: on the network relay a single poll may block for the relay's own
+    /// long-poll hold, so an approval firing mid-poll can wait that long to take
+    /// the channel; correctness is unaffected because the phone cannot answer
+    /// until we deposit, which happens only once we hold the lock.
+    pub fn run_registration_listener(&self, shutdown: &AtomicBool) {
+        while !shutdown.load(Ordering::Acquire) {
+            // An approval owns the channel: yield without parking on the lock, so
+            // we keep observing `shutdown` instead of blocking behind a possibly
+            // multi-minute approval.
+            if self.approval_active.load(Ordering::Acquire) {
+                std::thread::sleep(LISTEN_YIELD);
+                continue;
+            }
+            // Take the channel only if it is free right now; never queue behind an
+            // approval that is about to raise the flag.
+            let channel = match self.channel.try_lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    std::thread::sleep(LISTEN_YIELD);
+                    continue;
+                }
+            };
+            // Close the race where an approval raised the flag between our check
+            // and the lock: if it is active now, release the lock unused and yield
+            // so the approval acquires it and no listener read is ever outstanding
+            // while a response could arrive.
+            if self.approval_active.load(Ordering::Acquire) {
+                drop(channel);
+                std::thread::sleep(LISTEN_YIELD);
+                continue;
+            }
+            match self
+                .transport
+                .recv(self.pairing_id, Direction::ToDaemon, self.listen_poll)
+            {
+                Ok(Some(env)) => match self.classify(env) {
+                    Some(ToDaemonMessage::Push(pr)) => self.record_registration(&pr),
+                    // A response with no approval in flight is stale (a prior wait
+                    // timed out and moved on); an undecodable envelope failed verify
+                    // or replay. Either way: drop it and keep listening.
+                    Some(ToDaemonMessage::Response(_)) | None => {}
+                },
+                // The poll held for its interval with nothing to read: loop.
+                Ok(None) => {}
+                // A transport fault (the network relay only errors on an exhausted
+                // retry budget or a poisoned buffer): back off so a persistent
+                // failure does not spin, then retry. Release the lock first.
+                Err(_) => {
+                    drop(channel);
+                    std::thread::sleep(LISTEN_ERROR_BACKOFF);
+                }
+            }
+        }
+    }
+
+    /// Shrink the idle-listener poll interval so a test needn't wait the full
+    /// [`LISTEN_POLL_INTERVAL`] for a poll to cycle.
+    #[cfg(test)]
+    fn with_listen_poll(mut self, interval: Duration) -> Self {
+        self.listen_poll = interval;
+        self
+    }
+}
+
+/// RAII guard that flags an approval as active for its lifetime, clearing the
+/// flag on drop so a panic or early return in [`RemoteApprover::round_trip`] still
+/// resets it. The flag is only a listener latency hint (see the field docs);
+/// exclusion is the `channel` mutex, so a lost race here is never a correctness
+/// problem, only a wasted listener beat.
+struct ApprovalActiveGuard<'a>(&'a AtomicBool);
+
+impl<'a> ApprovalActiveGuard<'a> {
+    fn raise(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::Release);
+        Self(flag)
+    }
+}
+
+impl Drop for ApprovalActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Lets the daemon share one [`RemoteApprover`] between the approval gate (which
+/// needs a `Box<dyn Approver>`) and the background registration listener (which
+/// needs a live handle) by holding it in an [`Arc`] and cloning. The forwarding
+/// dereferences to the inner approver rather than recursing.
+impl Approver for Arc<RemoteApprover> {
+    fn decide(&self, ctx: &ApprovalContext) -> ApprovalOutcome {
+        (**self).decide(ctx)
+    }
 }
 
 impl Approver for RemoteApprover {
@@ -310,7 +493,7 @@ fn hostname() -> String {
 mod tests {
     use super::*;
     use crate::approve::ApprovalContext;
-    use sigil_proto::{RequestKind, RiskLevel, SecretRef};
+    use sigil_proto::{LeasePolicy, RequestKind, SecretRef};
 
     #[test]
     fn build_request_is_provider_blind() {
@@ -340,7 +523,7 @@ mod tests {
                 label: ".env".into(),
             }],
             kind: RequestKind::SecretRead,
-            risk: RiskLevel::Elevated,
+            lease: LeasePolicy::Leasable { max_secs: 900 },
             ssh: None,
             threshold: None,
         };
@@ -348,9 +531,9 @@ mod tests {
         assert_eq!(req.request_id, "req-1");
         assert_eq!(req.kind, RequestKind::SecretRead);
         assert_eq!(
-            req.risk,
-            RiskLevel::Elevated,
-            "risk is threaded from the context"
+            req.lease_policy,
+            LeasePolicy::Leasable { max_secs: 900 },
+            "lease policy is threaded from the context"
         );
         assert_eq!(req.command, ctx.command);
         assert_eq!(req.secrets, ctx.secret_refs);
@@ -379,7 +562,7 @@ mod tests {
             command: vec!["op".into(), "read".into()],
             secret_refs: vec![],
             kind: RequestKind::SecretRead,
-            risk: RiskLevel::Routine,
+            lease: LeasePolicy::RunOnce,
             ssh: None,
             threshold: None,
         }
@@ -474,5 +657,114 @@ mod tests {
             store.get(mailbox).expect("registration drained").token,
             "beadfeed"
         );
+    }
+
+    /// The fix: a PushRegister the phone deposits while the daemon is idle (NO
+    /// approval in flight, and no round trip about to run) is caught by the
+    /// background listener and lands in the push store on its own. This is the
+    /// arm-time path that used to be lost when the relay dropped the deposit
+    /// before any command fired.
+    #[test]
+    fn the_idle_listener_captures_an_arm_time_registration() {
+        let relay = LocalRelay::new();
+        let daemon = DeviceIdentity::generate();
+        let phone = DeviceIdentity::generate();
+        let mailbox = mailbox_id(&daemon.peer_identity(), &phone.peer_identity());
+
+        let store = Arc::new(PushStore::ephemeral());
+        let approver = Arc::new(
+            RemoteApprover::new(
+                Arc::new(relay.clone()),
+                clone_id(&daemon),
+                phone.peer_identity(),
+            )
+            .with_push(store.clone())
+            .with_listen_poll(Duration::from_millis(20)),
+        );
+
+        // Start the listener; nothing is armed yet.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let listener = {
+            let approver = approver.clone();
+            let shutdown = shutdown.clone();
+            std::thread::spawn(move || approver.run_registration_listener(&shutdown))
+        };
+
+        // The phone arms: it deposits its push token with no approval outstanding.
+        let pr = PushRegister::new("d00dfeed", "apns");
+        let pr_env =
+            Envelope::seal(&pr, mailbox, 1, &phone.signing, &daemon.peer_identity()).unwrap();
+        relay.send(mailbox, Direction::ToDaemon, &pr_env).unwrap();
+
+        // The listener records it without any round trip ever running.
+        let mut tries = 0;
+        let reg = loop {
+            if let Some(reg) = store.get(mailbox) {
+                break reg;
+            }
+            tries += 1;
+            assert!(tries < 200, "the listener never captured the registration");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(reg.token, "d00dfeed");
+        assert_eq!(reg.platform, "apns");
+
+        shutdown.store(true, Ordering::SeqCst);
+        listener.join().unwrap();
+    }
+
+    /// The correctness constraint: with the background listener running, a
+    /// concurrent approval must still receive its OWN response. The listener must
+    /// not swallow the ApprovalResponse off the shared ToDaemon channel (which
+    /// would deny a legitimate approval). Exclusion is the `channel` mutex.
+    #[test]
+    fn the_listener_never_steals_a_concurrent_approvals_response() {
+        let relay = LocalRelay::new();
+        let daemon = DeviceIdentity::generate();
+        let phone = DeviceIdentity::generate();
+        let phone_pub = phone.peer_identity();
+        let mailbox = mailbox_id(&daemon.peer_identity(), &phone_pub);
+
+        let store = Arc::new(PushStore::ephemeral());
+        let approver = Arc::new(
+            RemoteApprover::new(Arc::new(relay.clone()), clone_id(&daemon), phone_pub)
+                .with_push(store.clone())
+                .with_timeout(Duration::from_secs(2))
+                .with_listen_poll(Duration::from_millis(20)),
+        );
+
+        // The listener runs for the whole test, contending for the same channel.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let listener = {
+            let approver = approver.clone();
+            let shutdown = shutdown.clone();
+            std::thread::spawn(move || approver.run_registration_listener(&shutdown))
+        };
+
+        // The phone side: wait for the request, then approve it (counter 1).
+        let phone_thread = {
+            let relay = relay.clone();
+            let daemon_pub = daemon.peer_identity();
+            std::thread::spawn(move || {
+                let _req = relay
+                    .recv(mailbox, Direction::ToPhone, Duration::from_secs(2))
+                    .unwrap()
+                    .expect("the daemon sent a request");
+                let resp = ApprovalResponse::approve("req-live", &Dek::from_bytes([5u8; 32]), 1);
+                let env = Envelope::seal(&resp, mailbox, 1, &phone.signing, &daemon_pub).unwrap();
+                relay.send(mailbox, Direction::ToDaemon, &env).unwrap();
+            })
+        };
+
+        let outcome = approver.decide(&secret_ctx("req-live"));
+        phone_thread.join().unwrap();
+        shutdown.store(true, Ordering::SeqCst);
+        listener.join().unwrap();
+
+        assert!(
+            outcome.decision.is_grant(),
+            "the approval must succeed; the listener must not have stolen its response"
+        );
+        assert!(outcome.dek.is_some(), "the delivered DEK reaches the gate");
     }
 }
