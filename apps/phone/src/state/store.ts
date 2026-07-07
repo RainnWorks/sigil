@@ -6,7 +6,7 @@
  */
 import { useSyncExternalStore } from "react";
 
-import { type ApprovalRequest, type Decision } from "@/src/protocol";
+import { type ApprovalRequest, type Decision, type ResolutionStatus } from "@/src/protocol";
 import { secretRefLabel } from "@/src/lib/format";
 import {
   type AppState,
@@ -104,6 +104,31 @@ class Store {
     this.remove(requestId);
   }
 
+  /**
+   * #36 multi-device ring-all / first-wins: another paired device resolved this
+   * request, or the daemon expired / withdrew it, so this phone dismisses its copy.
+   * Records a neutral outcome to history and drops the request from the active
+   * queue, exactly as {@link decide} and {@link markExpired} do.
+   *
+   * Zero-knowledge: the phone never learns which device resolved it, nor whether it
+   * was an approve or a deny, so the recorded outcome is deliberately neutral
+   * (`"superseded"`, or `"expired"` for an expiry), never approved/denied. A no-op
+   * for an unknown or already-terminal request, so a duplicate or late broadcast
+   * (or one for a request this device never saw) changes nothing.
+   */
+  dismissResolved(requestId: string, status: ResolutionStatus): void {
+    const p = this.find(requestId);
+    if (!p || p.state === "approved" || p.state === "denied" || p.state === "expired") return;
+    if (status === "expired") {
+      this.record(p, "expired");
+    } else {
+      this.transition(requestId, "superseded");
+      const note = status === "withdrawn" ? "withdrawn" : "resolved on another device";
+      this.record(p, "superseded", note);
+    }
+    this.remove(requestId);
+  }
+
   lockdown(): void {
     // Deny everything pending, refuse everything new. Denied requests are recorded
     // and cleared from the queue, so lockdown leaves nothing dangling.
@@ -161,7 +186,11 @@ class Store {
     });
   }
 
-  private record(p: PendingRequest, decision: Decision | "expired", note?: string): void {
+  private record(
+    p: PendingRequest,
+    decision: Decision | "expired" | "superseded",
+    note?: string,
+  ): void {
     const r = p.request;
     const label =
       r.secrets.length > 0

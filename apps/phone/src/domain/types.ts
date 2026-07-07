@@ -33,8 +33,13 @@ export interface HistoryEntry {
   origin: string;
   process: string;
   cwd: string;
-  decision: Decision | "expired";
-  /** Empty for approvals; the reason line for denials. */
+  /**
+   * The recorded outcome. `"superseded"` is the zero-knowledge #36 case: another
+   * paired device resolved a ring-all request (or the daemon withdrew it), so this
+   * phone dismissed its copy without learning whether it was an approve or a deny.
+   */
+  decision: Decision | "expired" | "superseded";
+  /** Empty for approvals; the reason line for denials or a dismissal note. */
   note?: string;
   at: number;
   /** How it was decided: "phone", "rule", "local". */

@@ -63,7 +63,8 @@ use sigil_proto::identity::DeviceIdentity;
 use sigil_proto::ReplayGuard;
 use sigil_proto::{
     mailbox_id, now_ms, ApprovalRequest, ApprovalResponse, Decision as ProtoDecision, Direction,
-    PeerIdentity, Provenance, PushHint, PushRegister, ToDaemonMessage, Transport,
+    PeerIdentity, Provenance, PushHint, PushRegister, ResolutionBroadcast, ResolutionStatus,
+    ToDaemonMessage, Transport,
 };
 
 use crate::approve::{ApprovalContext, ApprovalOutcome, Approver, Decision, PendingRegistry};
@@ -445,6 +446,41 @@ impl RemoteApprover {
     fn record_registration(&self, pr: &PushRegister) {
         self.push_store
             .register(self.pairing_id, &pr.token, &pr.platform, now_ms());
+    }
+
+    /// Seal a zero-knowledge [`ResolutionBroadcast`] to THIS device's phone and
+    /// deposit it `ToPhone`, so a device that did not resolve a ring-all request
+    /// dismisses its pending copy instead of lingering until its own timeout (#36
+    /// multi-device). This is the daemon half of the resolution broadcast; the ring
+    /// coordinator (see `docs/design/multi-device.md`) calls it on every device
+    /// EXCEPT the one that resolved.
+    ///
+    /// **Additive to the reviewed approval path.** It shares the daemon->phone
+    /// [`counter`](Self::counter) and seal, exactly like a request deposit, but
+    /// registers no waiter and touches no [`ReplayGuard`], DEK, or `Z_F`. It carries
+    /// only `request_id` + `status`, releases nothing, and gates nothing; the worst a
+    /// (cryptographically impossible) forged one could do is hide a prompt, which
+    /// only ever withholds a release. Best-effort: a seal or transport error is
+    /// swallowed because the phone's own request timeout still expires the sheet, so
+    /// a lost broadcast degrades to the single-device behavior, never to a release.
+    pub fn broadcast_resolution(&self, request_id: &str, status: ResolutionStatus) {
+        let msg = ResolutionBroadcast::new(request_id, status);
+        let counter = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let Ok(env) = Envelope::seal(
+            &msg,
+            self.pairing_id,
+            counter,
+            &self.identity.signing,
+            &self.phone,
+        ) else {
+            return;
+        };
+        // Forward the push hint so the device wakes to dismiss promptly; the phone
+        // opens the envelope, finds a resolution, and clears the sheet. Content-free
+        // doorbell, exactly as a request deposit.
+        let _ = self
+            .transport
+            .deposit_to_phone(self.pairing_id, &env, self.push_hint());
     }
 
     /// The push doorbell hint to forward to the relay for this pairing: the phone's
@@ -831,6 +867,50 @@ mod tests {
             Some(&[2u8; 32]),
             "req-B got its own DEK"
         );
+    }
+
+    /// The daemon half of the #36 resolution broadcast: `broadcast_resolution`
+    /// seals a zero-knowledge `ResolutionBroadcast` to the pinned phone and deposits
+    /// it ToPhone, where the phone opens it (verifying signature + replay) and its
+    /// demux classifies it as a `Resolution`, never a request or a decision. It
+    /// carries only the request id and status, and rides the same monotonic
+    /// daemon->phone counter as a request, so it passes the phone's replay guard once
+    /// and cannot be replayed.
+    #[test]
+    fn broadcast_resolution_deposits_a_sealed_dismissal_the_phone_can_open() {
+        use sigil_proto::{ReplayGuard, ToPhoneMessage};
+
+        let relay = LocalRelay::new();
+        let daemon = DeviceIdentity::generate();
+        let phone = DeviceIdentity::generate();
+        let phone_pub = phone.peer_identity();
+        let mailbox = mailbox_id(&daemon.peer_identity(), &phone_pub);
+        let approver = RemoteApprover::new(Arc::new(relay.clone()), clone_id(&daemon), phone_pub);
+
+        approver.broadcast_resolution("req-RING", ResolutionStatus::Settled);
+
+        // The phone reads its ToPhone mailbox and opens the sealed broadcast.
+        let env = relay
+            .recv(mailbox, Direction::ToPhone, Duration::from_millis(50))
+            .unwrap()
+            .expect("a resolution was deposited toward the phone");
+        let mut guard = ReplayGuard::new();
+        let value: serde_json::Value = env
+            .open(&daemon.peer_identity(), &phone.agreement, &mut guard)
+            .expect("the phone opens the daemon-signed broadcast");
+        match ToPhoneMessage::from_value(value).expect("classifies") {
+            ToPhoneMessage::Resolution(rb) => {
+                assert_eq!(rb.request_id, "req-RING");
+                assert_eq!(rb.status, ResolutionStatus::Settled);
+            }
+            ToPhoneMessage::Request(_) => panic!("a broadcast must classify as a Resolution"),
+        }
+
+        // A replay of the exact bytes is rejected by the phone's guard: a relay
+        // cannot re-dismiss (or suppress a later prompt) by resending it.
+        assert!(env
+            .open::<serde_json::Value>(&daemon.peer_identity(), &phone.agreement, &mut guard)
+            .is_err());
     }
 
     /// A delivery receipt advances the in-flight entry's `delivered_at_ms` and is
