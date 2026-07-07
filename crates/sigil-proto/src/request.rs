@@ -252,16 +252,18 @@ pub enum Decision {
     Denied,
 }
 
-/// An "approve for this session" grant the daemon may install as a lease.
+/// An "approve for this session" grant: the auto-approve WINDOW the approver
+/// chose, and nothing more.
 ///
-/// The daemon derives and trusts its *own* grant key from the kernel-verified
-/// caller; `grant_key` here is echoed for the phone's display only and is not
-/// trusted by the daemon when it installs the lease. `ttl_ms` is the requested
-/// session length.
+/// The zero-knowledge phone picks only a window; it cannot compute the grant key
+/// (a hash of the daemon-verified caller identity the phone never sees). The
+/// DAEMON is the sole lease authority: given this window it clamps to the rule's
+/// [`LeasePolicy`] (run-once refuses any lease; leasable caps at `max_secs`) and
+/// mints/binds the grant itself. Nothing here is trusted as a key; `ttl_ms` is the
+/// requested session length, always subject to the daemon's clamp.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallLease {
-    pub grant_key: String,
     pub ttl_ms: u64,
 }
 
@@ -434,12 +436,52 @@ impl PushRegister {
     }
 }
 
+/// A phone -> daemon delivery receipt (task #41): the phone seals this the instant
+/// it opens and verifies an inbound [`ApprovalRequest`], so the daemon can advance
+/// the requester's readout from "Sent" to "Delivered".
+///
+/// **Wire contract (locked, shared with `apps/phone`).** Serializes with a
+/// `"type":"delivered"` discriminator so the daemon's demux tells it apart from an
+/// (untagged) [`ApprovalResponse`] and a [`PushRegister`] on the same ToDaemon
+/// channel; `request_id` (wire: `requestId`) names the request it acknowledges.
+///
+/// It rides the established session box exactly like a [`PushRegister`], with the
+/// same monotonic outbound counter, so it passes through the one shared
+/// [`ReplayGuard`](crate::ReplayGuard) like every other inbound message. It is NOT
+/// a decision and releases nothing: it carries no DEK, partial, or lease. A
+/// duplicate, late, or unknown receipt is dropped and NEVER changes a gating
+/// decision, only the requester's display.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryReceipt {
+    /// The wire discriminator. Always [`DeliveryReceipt::TYPE`] on a conforming
+    /// message; validated by [`ToDaemonMessage::from_value`] before dispatch.
+    #[serde(rename = "type")]
+    pub message_type: String,
+    /// The request this acknowledges receipt of; correlates to a pending request.
+    pub request_id: String,
+}
+
+impl DeliveryReceipt {
+    /// The locked `type` discriminator value.
+    pub const TYPE: &'static str = "delivered";
+
+    /// Build a receipt for `request_id`, stamping the discriminator.
+    pub fn new(request_id: impl Into<String>) -> Self {
+        Self {
+            message_type: Self::TYPE.to_string(),
+            request_id: request_id.into(),
+        }
+    }
+}
+
 /// A phone -> daemon message on an established session's `ToDaemon` channel.
 ///
-/// Two shapes share this channel: the (untagged, legacy) [`ApprovalResponse`] and
-/// the tagged [`PushRegister`]. This is the single place the daemon decides which
-/// one an opened payload is. The discriminator is the `type` field:
-/// `"pushRegister"` selects [`PushRegister`]; anything else (in practice, its
+/// Three shapes share this channel: the (untagged, legacy) [`ApprovalResponse`],
+/// the tagged [`PushRegister`], and the tagged [`DeliveryReceipt`]. This is the
+/// single place the daemon decides which one an opened payload is. The
+/// discriminator is the `type` field: `"pushRegister"` selects [`PushRegister`],
+/// `"delivered"` selects [`DeliveryReceipt`]; anything else (in practice, its
 /// absence) is an [`ApprovalResponse`]. A hand-rolled peek is used deliberately
 /// instead of a `#[serde(untagged)]` enum so [`ApprovalResponse`]'s wire shape
 /// stays byte-for-byte unchanged (the v2 pairing transcript must not shift).
@@ -449,24 +491,24 @@ pub enum ToDaemonMessage {
     Response(ApprovalResponse),
     /// A push-token (re)registration.
     Push(PushRegister),
+    /// A receipt acknowledging the phone opened a request. Display only: it never
+    /// releases a secret and never gates a decision.
+    Delivered(DeliveryReceipt),
 }
 
 impl ToDaemonMessage {
     /// Classify an already-decrypted payload [`serde_json::Value`] (the plaintext
     /// an [`Envelope`](crate::Envelope) opened to). Fails closed: a value that is
-    /// neither a valid registration nor a valid response is an error the caller
+    /// none of a valid registration, receipt, or response is an error the caller
     /// drops. Opening at the [`Value`](serde_json::Value) layer keeps the single
     /// envelope decrypt/verify/replay pass and lets the tag select the concrete
     /// type without a second parse of the ciphertext.
     pub fn from_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
-        let is_push = value
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|t| t == PushRegister::TYPE);
-        if is_push {
-            Ok(Self::Push(serde_json::from_value(value)?))
-        } else {
-            Ok(Self::Response(serde_json::from_value(value)?))
+        let tag = value.get("type").and_then(serde_json::Value::as_str);
+        match tag {
+            Some(PushRegister::TYPE) => Ok(Self::Push(serde_json::from_value(value)?)),
+            Some(DeliveryReceipt::TYPE) => Ok(Self::Delivered(serde_json::from_value(value)?)),
+            _ => Ok(Self::Response(serde_json::from_value(value)?)),
         }
     }
 }
@@ -573,10 +615,8 @@ mod tests {
     #[test]
     fn response_round_trips_through_json() {
         let dek = Dek::from_bytes([3u8; 32]);
-        let resp = ApprovalResponse::approve("r", &dek, 9).with_lease(InstallLease {
-            grant_key: "abcd".into(),
-            ttl_ms: 900_000,
-        });
+        let resp =
+            ApprovalResponse::approve("r", &dek, 9).with_lease(InstallLease { ttl_ms: 900_000 });
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"wrappedDek\""));
         assert!(json.contains("\"ttlMs\":900000"));
@@ -697,6 +737,47 @@ mod tests {
         // A payload tagged as a push but missing the required fields is an error
         // the caller drops, never a half-built registration.
         let bogus = serde_json::json!({ "type": "pushRegister" });
+        assert!(ToDaemonMessage::from_value(bogus).is_err());
+    }
+
+    #[test]
+    fn delivery_receipt_serializes_the_locked_wire_contract() {
+        // Matches apps/phone's `{ type: "delivered", requestId }`.
+        let dr = DeliveryReceipt::new("req-7");
+        let json = serde_json::to_string(&dr).unwrap();
+        assert!(json.contains("\"type\":\"delivered\""));
+        assert!(json.contains("\"requestId\":\"req-7\""));
+        let back: DeliveryReceipt = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, dr);
+    }
+
+    #[test]
+    fn to_daemon_message_classifies_a_delivery_receipt() {
+        // A `"delivered"`-tagged payload is a Delivered receipt, never mistaken for
+        // an ApprovalResponse (which carries no `type`).
+        let dr = DeliveryReceipt::new("req-42");
+        let val = serde_json::to_value(&dr).unwrap();
+        assert_eq!(
+            ToDaemonMessage::from_value(val).unwrap(),
+            ToDaemonMessage::Delivered(dr)
+        );
+
+        // An ApprovalResponse (no `type`) still classifies as a Response, so the
+        // receipt tag can never shadow a real decision.
+        let dek = Dek::from_bytes([4u8; 32]);
+        let resp = ApprovalResponse::approve("req-42", &dek, 1);
+        let resp_val = serde_json::to_value(&resp).unwrap();
+        assert!(matches!(
+            ToDaemonMessage::from_value(resp_val).unwrap(),
+            ToDaemonMessage::Response(_)
+        ));
+    }
+
+    #[test]
+    fn delivery_receipt_missing_request_id_fails_closed() {
+        // A receipt tag with no request id is an error the caller drops, never a
+        // half-built receipt that could touch delivery state.
+        let bogus = serde_json::json!({ "type": "delivered" });
         assert!(ToDaemonMessage::from_value(bogus).is_err());
     }
 

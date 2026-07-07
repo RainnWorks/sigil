@@ -66,8 +66,39 @@ use sigil_proto::{
     PeerIdentity, Provenance, PushHint, PushRegister, ToDaemonMessage, Transport,
 };
 
-use crate::approve::{ApprovalContext, ApprovalOutcome, Approver, Decision};
+use crate::approve::{ApprovalContext, ApprovalOutcome, Approver, Decision, PendingRegistry};
 use crate::push_store::PushStore;
+
+/// One in-flight remote approval, held in the [`RemoteApprover::waiters`] map. It
+/// pairs the channel its `round_trip` blocks on with a read-only snapshot of the
+/// sealed request (so the daemon can enumerate remote pendings for the Mac's
+/// `pending` surface) and the delivery-receipt state.
+struct Inflight {
+    /// The sender the owner loop hands the phone's [`ApprovalResponse`] to.
+    tx: Sender<ApprovalResponse>,
+    /// A plaintext snapshot of the request, for the `pending` enumeration only. It
+    /// carries no secret value (an [`ApprovalRequest`] never does).
+    request: ApprovalRequest,
+    /// When this request was deposited, unix ms (the countdown's zero point).
+    queued_at_ms: u64,
+    /// When the phone's delivery receipt landed, unix ms; `None` until then.
+    /// Display/telemetry only: it NEVER gates a decision, only the requester's
+    /// Sent -> Delivered readout.
+    delivered_at_ms: Option<u64>,
+}
+
+/// A read-only view of one in-flight remote approval, for the daemon's `pending`
+/// surface. Mirrors [`crate::approve::PendingSnapshot`] but adds the delivery
+/// state the phone reports over the relay.
+#[derive(Clone)]
+pub struct RemotePending {
+    /// The sealed request, snapshotted (names and provenance only, never a secret).
+    pub request: ApprovalRequest,
+    /// When the request was deposited, unix ms.
+    pub queued_at_ms: u64,
+    /// When the phone acknowledged receipt, unix ms; `None` if not yet (or never).
+    pub delivered_at_ms: Option<u64>,
+}
 
 /// Default wait for a phone decision before failing closed.
 pub const DEFAULT_REMOTE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -106,15 +137,22 @@ pub struct RemoteApprover {
     /// on the ToDaemon channel and is recorded here; the token is forwarded to the
     /// relay per deposit so the relay (not the daemon) rings the doorbell.
     push_store: Arc<PushStore>,
-    /// In-flight approval waiters, keyed by `request_id`. [`round_trip`] inserts a
-    /// [`Sender`] here before it deposits its request and blocks on the paired
+    /// In-flight approval waiters, keyed by `request_id`. [`round_trip`] inserts an
+    /// [`Inflight`] here before it deposits its request and blocks on the paired
     /// receiver; the owner loop, the sole ToDaemon reader, looks up the matching
-    /// waiter for each [`ApprovalResponse`] and hands it over. A response with no
-    /// entry is stale and dropped. This map is what lets one reader serve any
-    /// number of concurrent approvals without a lock.
+    /// entry for each [`ApprovalResponse`] and hands the response to its `tx`. A
+    /// response with no entry is stale and dropped. This map is what lets one reader
+    /// serve any number of concurrent approvals without a lock. It doubles as the
+    /// remote `pending` enumeration (each entry snapshots its request) and holds the
+    /// per-request delivery-receipt state.
     ///
     /// [`round_trip`]: Self::round_trip
-    waiters: Mutex<HashMap<String, Sender<ApprovalResponse>>>,
+    waiters: Mutex<HashMap<String, Inflight>>,
+    /// The shared local pending registry, when wired (phone factor). Not read here;
+    /// its version counter is bumped whenever the in-flight/delivery set changes so a
+    /// `subscribe_pending` client re-emits promptly (Sent -> Delivered is reactive,
+    /// not only on the 30s keepalive). `None` in the softphone/test loop.
+    pending: Option<Arc<PendingRegistry>>,
     /// How long one owner-loop poll waits; a field only so tests can shrink it.
     listen_poll: Duration,
 }
@@ -144,8 +182,18 @@ impl RemoteApprover {
             // filesystem.
             push_store: Arc::new(PushStore::ephemeral()),
             waiters: Mutex::new(HashMap::new()),
+            pending: None,
             listen_poll: OWNER_POLL_INTERVAL,
         }
+    }
+
+    /// Wire the shared local pending registry so a change to the remote in-flight
+    /// or delivery set bumps its version and wakes any `subscribe_pending` client.
+    /// The production `build_gate` passes the same registry the control handler
+    /// enumerates, so the Mac sees remote pendings advance Sent -> Delivered live.
+    pub fn with_pending(mut self, pending: Arc<PendingRegistry>) -> Self {
+        self.pending = Some(pending);
+        self
     }
 
     /// Attach the persistent push registration store. The production `build_gate`
@@ -217,7 +265,7 @@ impl RemoteApprover {
         // response to us the instant it arrives. Registering before the deposit
         // closes the only race (a response landing before a waiter exists) because
         // the phone cannot answer a request it has not yet received.
-        let rx = self.register_waiter(&req.request_id);
+        let rx = self.register_waiter(&req);
         // From here every return path must drop the waiter, so wrap the body.
         let outcome = self.deposit_and_wait(&req, rx);
         self.remove_waiter(&req.request_id);
@@ -260,22 +308,89 @@ impl RemoteApprover {
     }
 
     /// Register an approval waiter and return the receiver [`round_trip`] blocks
-    /// on. The owner loop finds the paired sender by `request_id`.
-    fn register_waiter(&self, request_id: &str) -> Receiver<ApprovalResponse> {
+    /// on. The owner loop finds the paired sender by `request_id`. The entry also
+    /// snapshots the request so the daemon can enumerate remote pendings, and starts
+    /// with no delivery receipt (`delivered_at_ms: None`).
+    fn register_waiter(&self, req: &ApprovalRequest) -> Receiver<ApprovalResponse> {
         let (tx, rx) = std::sync::mpsc::channel();
         self.waiters
             .lock()
             .expect("remote waiters poisoned")
-            .insert(request_id.to_string(), tx);
+            .insert(
+                req.request_id.clone(),
+                Inflight {
+                    tx,
+                    request: req.clone(),
+                    queued_at_ms: now_ms(),
+                    delivered_at_ms: None,
+                },
+            );
+        // A new in-flight request changed the pending set: wake subscribers.
+        self.notify_pending();
         rx
     }
 
     /// Drop the waiter for `request_id` (on resolve, timeout, or error).
     fn remove_waiter(&self, request_id: &str) {
-        self.waiters
+        let removed = self
+            .waiters
             .lock()
             .expect("remote waiters poisoned")
-            .remove(request_id);
+            .remove(request_id)
+            .is_some();
+        if removed {
+            // The request left the in-flight set: wake subscribers.
+            self.notify_pending();
+        }
+    }
+
+    /// Record the phone's delivery receipt for `request_id`. Idempotent and fail
+    /// closed for the display: an unknown, late, or duplicate receipt is a no-op
+    /// (unknown/late => no entry; duplicate => `delivered_at_ms` already set), and
+    /// it can only ever set a boolean/timestamp for the requester's readout, never
+    /// touch a decision, DEK, or lease. Bumps the pending version on the first
+    /// receipt so `subscribe_pending` advances Sent -> Delivered promptly.
+    fn mark_delivered(&self, request_id: &str, at_ms: u64) {
+        let changed = {
+            let mut waiters = self.waiters.lock().expect("remote waiters poisoned");
+            match waiters.get_mut(request_id) {
+                Some(entry) if entry.delivered_at_ms.is_none() => {
+                    entry.delivered_at_ms = Some(at_ms);
+                    true
+                }
+                // Duplicate (already delivered) or unknown/late (no entry): drop it.
+                _ => false,
+            }
+        };
+        if changed {
+            self.notify_pending();
+        }
+    }
+
+    /// A read-only snapshot of every in-flight remote approval, for the daemon's
+    /// `pending` enumeration. Newest-first, matching the local registry's ordering.
+    pub fn pending_snapshot(&self) -> Vec<RemotePending> {
+        let mut out: Vec<RemotePending> = self
+            .waiters
+            .lock()
+            .expect("remote waiters poisoned")
+            .values()
+            .map(|w| RemotePending {
+                request: w.request.clone(),
+                queued_at_ms: w.queued_at_ms,
+                delivered_at_ms: w.delivered_at_ms,
+            })
+            .collect();
+        out.sort_by_key(|s| std::cmp::Reverse(s.queued_at_ms));
+        out
+    }
+
+    /// Bump the shared pending registry's version, if wired, so a subscriber
+    /// re-emits. A no-op in the softphone/test loop (no registry).
+    fn notify_pending(&self) {
+        if let Some(pending) = &self.pending {
+            pending.notify_change();
+        }
     }
 
     /// Verify, replay-check, decrypt, and classify one inbound envelope. Returns
@@ -387,6 +502,13 @@ impl RemoteApprover {
         match self.classify(env) {
             Some(ToDaemonMessage::Push(pr)) => self.record_registration(&pr),
             Some(ToDaemonMessage::Response(resp)) => self.route_response(resp),
+            // A delivery receipt only advances the requester's display; it never
+            // touches the waiter channel, so it can never be mistaken for a
+            // decision. An unknown/late/duplicate receipt is dropped inside
+            // `mark_delivered`.
+            Some(ToDaemonMessage::Delivered(receipt)) => {
+                self.mark_delivered(&receipt.request_id, now_ms())
+            }
             // Failed verify/replay/decode: fail closed by dropping it.
             None => {}
         }
@@ -399,8 +521,8 @@ impl RemoteApprover {
     /// no-op.
     fn route_response(&self, resp: ApprovalResponse) {
         let waiters = self.waiters.lock().expect("remote waiters poisoned");
-        if let Some(tx) = waiters.get(&resp.request_id) {
-            let _ = tx.send(resp);
+        if let Some(entry) = waiters.get(&resp.request_id) {
+            let _ = entry.tx.send(resp);
         }
     }
 
@@ -709,5 +831,106 @@ mod tests {
             Some(&[2u8; 32]),
             "req-B got its own DEK"
         );
+    }
+
+    /// A delivery receipt advances the in-flight entry's `delivered_at_ms` and is
+    /// visible on `pending_snapshot`, is idempotent (a duplicate does not move the
+    /// timestamp), drops an unknown/late receipt silently, and NEVER resolves the
+    /// approval (the waiter channel stays empty). This is the display-only,
+    /// fail-closed contract the Mac's Sent -> Delivered readout relies on.
+    #[test]
+    fn a_delivery_receipt_marks_delivered_without_resolving_the_approval() {
+        let transport = Arc::new(LocalRelay::new());
+        let daemon = DeviceIdentity::generate();
+        let phone = DeviceIdentity::generate().peer_identity();
+        let approver = RemoteApprover::new(transport, daemon, phone);
+
+        let req = approver.build_request(&secret_ctx("req-D"));
+        // Register an in-flight waiter as `round_trip` would, before any receipt.
+        let rx = approver.register_waiter(&req);
+        assert_eq!(approver.pending_snapshot().len(), 1);
+        assert!(
+            approver.pending_snapshot()[0].delivered_at_ms.is_none(),
+            "a fresh request is not yet delivered"
+        );
+
+        // The receipt lands: the entry flips to delivered at this instant.
+        approver.mark_delivered("req-D", 111);
+        let snap = approver.pending_snapshot();
+        assert_eq!(snap[0].delivered_at_ms, Some(111));
+
+        // Idempotent: a duplicate receipt does not move the timestamp.
+        approver.mark_delivered("req-D", 222);
+        assert_eq!(approver.pending_snapshot()[0].delivered_at_ms, Some(111));
+
+        // Unknown/late receipt: a no-op, no panic, no new entry.
+        approver.mark_delivered("req-unknown", 333);
+        assert_eq!(approver.pending_snapshot().len(), 1);
+
+        // The receipt NEVER resolves the approval: the waiter channel is still
+        // empty, so the gate keeps waiting for a real sealed decision.
+        assert!(
+            matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "a delivery receipt must not deliver a decision to the waiter"
+        );
+
+        // Once the round trip completes, the entry (and its delivery state) is gone.
+        approver.remove_waiter("req-D");
+        assert!(approver.pending_snapshot().is_empty());
+    }
+
+    /// The owner loop, reading the real ToDaemon channel, routes a sealed delivery
+    /// receipt to the delivery state through the SAME replay guard as every other
+    /// inbound message, and does so without disturbing the concurrent approval it is
+    /// also demultiplexing. A replayed receipt is rejected by the guard (its request
+    /// id is single-use), so it cannot re-touch state.
+    #[test]
+    fn the_owner_routes_a_sealed_delivery_receipt_over_the_channel() {
+        use sigil_proto::DeliveryReceipt;
+
+        let relay = LocalRelay::new();
+        let daemon = DeviceIdentity::generate();
+        let phone = DeviceIdentity::generate();
+        let phone_pub = phone.peer_identity();
+        let mailbox = mailbox_id(&daemon.peer_identity(), &phone_pub);
+
+        let approver = Arc::new(
+            RemoteApprover::new(Arc::new(relay.clone()), clone_id(&daemon), phone_pub)
+                .with_timeout(Duration::from_secs(2))
+                .with_listen_poll(Duration::from_millis(20)),
+        );
+        let (shutdown, owner) = spawn_owner(approver.clone());
+
+        // The phone: wait for the request, seal a delivery receipt (counter 1), then
+        // approve (counter 2). Both ride the one monotonic ToDaemon counter/guard.
+        let phone_thread = {
+            let relay = relay.clone();
+            let daemon_pub = daemon.peer_identity();
+            std::thread::spawn(move || {
+                relay
+                    .recv(mailbox, Direction::ToPhone, Duration::from_secs(2))
+                    .unwrap()
+                    .expect("the daemon sent a request");
+                let receipt = DeliveryReceipt::new("req-live");
+                let env =
+                    Envelope::seal(&receipt, mailbox, 1, &phone.signing, &daemon_pub).unwrap();
+                relay.send(mailbox, Direction::ToDaemon, &env).unwrap();
+                // Give the owner a moment to process the receipt before approving.
+                std::thread::sleep(Duration::from_millis(60));
+                let resp = ApprovalResponse::approve("req-live", &Dek::from_bytes([8u8; 32]), 1);
+                let env = Envelope::seal(&resp, mailbox, 2, &phone.signing, &daemon_pub).unwrap();
+                relay.send(mailbox, Direction::ToDaemon, &env).unwrap();
+            })
+        };
+
+        let outcome = approver.decide(&secret_ctx("req-live"));
+        phone_thread.join().unwrap();
+        shutdown.store(true, Ordering::SeqCst);
+        owner.join().unwrap();
+
+        // The approval still succeeded with its own DEK: the receipt did not steal
+        // or short-circuit the decision.
+        assert!(outcome.decision.is_grant());
+        assert_eq!(outcome.dek.as_deref(), Some(&[8u8; 32]));
     }
 }

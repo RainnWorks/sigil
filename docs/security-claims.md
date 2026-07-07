@@ -1296,3 +1296,85 @@ task #53 for real-edge verification plus client-side resend. Recommend two
 documentation tightenings (both non-blocking): (1) mark residual B as not
 reachable by today's single-flight clients rather than an open peer of residual
 A; (2) note that slot-steal presupposes knowledge of the unguessable mailbox id.
+
+## 21. The delivery receipt (task #41) + lease-window wire alignment
+
+*Implementer note (behavior + residuals only; the verdict is the independent
+security-reviewer's). This closes the daemon side of three phone-opened gaps.*
+
+**A. Delivery receipt, a fourth-kind display-only inbound.** The phone seals a
+`{ type: "delivered", requestId }` to the `ToDaemon` slot the instant it opens and
+verifies an inbound request (`apps/phone/.../session.ts`). Daemon side:
+
+- `sigil-proto` gains `DeliveryReceipt { message_type:"delivered", request_id }`
+  and a `ToDaemonMessage::Delivered` variant. `ToDaemonMessage::from_value`
+  classifies by the `type` tag: `"pushRegister"` -> `Push`, `"delivered"` ->
+  `Delivered`, anything else (in practice its absence) -> `Response`. A `"delivered"`
+  tag with no `request_id` fails the parse and the caller drops it (fail closed).
+  An `ApprovalResponse` carries no `type`, so a receipt tag can never shadow a real
+  decision, and a receipt carries no DEK/partial/lease, so it can never *be* one.
+- The single `run_todaemon_owner` reader routes `Delivered` through the SAME one
+  `classify`/`ReplayGuard` pass as every other inbound envelope, then calls
+  `RemoteApprover::mark_delivered(request_id, now)`. It NEVER touches the waiter
+  channel (`route_response`), so a receipt cannot deliver, forge, or short-circuit a
+  decision. `mark_delivered` sets `delivered_at_ms` on the matching in-flight entry
+  only if unset; an unknown/late (no entry) or duplicate (already set) receipt is a
+  silent no-op. A replayed receipt is additionally rejected by the `ReplayGuard`
+  (single-use request id), proven in `hostile_relay.rs::
+  delivery_receipt_rides_the_sealed_signed_replay_protected_envelope`.
+- **The receipt is display-only and NEVER changes gating.** It cannot move a
+  decision, DEK, lease, or timeout; it only sets a boolean/timestamp the requester
+  UI reads. A lost receipt leaves `delivered=false` ("couldn't confirm") while the
+  approve/deny path resolves the request exactly as before.
+
+**Surface (the DTO the Mac reads).** In-flight remote requests are now enumerated
+onto the existing `pending` surface. `RemoteApprover`'s waiter map entry carries a
+plaintext snapshot of its request (names/provenance only, never a secret) plus the
+delivery state; `daemon.rs::pending_json` appends these under the phone factor.
+`json::PendingJson` gains `delivered: bool` and `delivered_at_ms: Option<u64>`
+(camel-free snake wire: `delivered`, `delivered_at_ms`). A `subscribe_pending`
+client re-emits promptly because the approver bumps the shared `PendingRegistry`
+version on request arrival, receipt, and completion (`PendingRegistry::
+notify_change`, which resolves nothing and touches no waiter). Tests:
+`remote.rs::a_delivery_receipt_marks_delivered_without_resolving_the_approval`,
+`remote.rs::the_owner_routes_a_sealed_delivery_receipt_over_the_channel`,
+`request.rs::to_daemon_message_classifies_a_delivery_receipt`.
+
+**B. Lease response is a window, not a key (daemon is sole lease authority).**
+`ApprovalResponse.lease` (proto `InstallLease`) dropped its `grant_key` field; it
+is now `{ ttl_ms }` only, matching the phone's `lease?: { ttlMs } | null`. The
+zero-knowledge phone picks only a window; nothing daemon-side ever trusted a
+phone-supplied grant key (`remote.rs::outcome_for` reads only `lease.ttl_ms` and
+maps it to `Decision::Lease(ttl)`; the daemon's own `lease::grant_key` over the
+kernel-verified caller mints/binds the grant, and `LeasePolicy::clamp_secs`
+enforces run-once => no lease / leasable => `min(requested, max_secs)`). This only
+removed a field the daemon never read.
+
+**C. `lease_policy` populated; `risk` already retired from the wire.**
+`remote.rs::build_request` sets `ApprovalRequest.lease_policy` from the resolved
+rule's policy (via `ApprovalContext.lease`), so the phone's "keep approved for N"
+offer appears for leasable rules (`build_request_is_provider_blind` asserts it).
+The proto `ApprovalRequest` already carries NO `risk` field (a prior change retired
+the risk tier in favour of mode/lease); the only remaining `risk` in `crates/` is
+`config.rs`'s deliberate read-and-drop of the legacy on-disk config key during
+migration (not the wire), so nothing dead needed removing daemon-side.
+
+**Residuals for the reviewer to weigh:**
+
+- *Delivery state is best-effort and unauthenticated as to liveness.* A receipt is
+  authenticated (sealed + signed + replay-guarded), so a hostile relay cannot forge
+  a "delivered" the phone did not send; but its ABSENCE proves nothing (offline
+  phone, lost deposit in the relay's TTL, dropped ack). The UI must treat
+  `delivered=false` as "couldn't confirm", never as "not seen", and it MUST NOT gate
+  on it. The generous display bound lives in the Mac UI, not the gate.
+- *Remote pendings now appear in `pending`.* This is display enumeration only:
+  `pending_json` reads a snapshot; the local control-socket `approve`/`deny` path
+  (`core.pending.resolve`) still targets the LOCAL `PendingRegistry` and finds no
+  entry for a remote `request_id`, so it cannot resolve a phone-gated request. The
+  snapshot copies the (already non-secret) `ApprovalRequest`; no DEK/partial is ever
+  in it.
+
+**Phone follow-up (not in this change, for the phone-app owner):**
+`apps/phone/src/protocol/requests.ts` still carries a residual `risk: RiskLevel`
+on `ApprovalRequest` (and the `RiskLevel` type). It is now dead on the wire (the
+daemon never sends it); drop both there to match.

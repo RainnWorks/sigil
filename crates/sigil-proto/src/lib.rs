@@ -27,9 +27,9 @@ pub use pairing::{
 };
 pub use replay::{ReplayError, ReplayGuard};
 pub use request::{
-    ApprovalRequest, ApprovalResponse, BlockDirective, Decision, InstallLease, LeasePolicy,
-    Provenance, PushRegister, RequestKind, SecretRef, SshChallenge, ThresholdChallenge,
-    ThresholdPartial, ToDaemonMessage,
+    ApprovalRequest, ApprovalResponse, BlockDirective, Decision, DeliveryReceipt, InstallLease,
+    LeasePolicy, Provenance, PushRegister, RequestKind, SecretRef, SshChallenge,
+    ThresholdChallenge, ThresholdPartial, ToDaemonMessage,
 };
 pub use se_ecies::{unwrap_dek_p256, wrap_dek_p256, SeEciesError};
 pub use threshold::{
