@@ -8,14 +8,19 @@
 # This script installs NO secrets and contains NONE. It expects the operator to
 # have already placed these three files on the box (each chmod 600), see
 # README.md step (c):
-#   /etc/sigil/apns.p8     the Rainnworks APNs signing key (.p8 PEM)
-#   /etc/sigil/origin.crt  the Cloudflare Origin Certificate for relay.rainn.works
+#   /etc/sigil/apns.p8     the APNs signing key (.p8 PEM)
+#   /etc/sigil/origin.crt  the Cloudflare Origin Certificate for your relay host
 #   /etc/sigil/origin.key  the matching private key
 #
 # It expects the relay binary to be reachable at ./sigil-relay (next to this
 # script) OR at the path in $RELAY_BIN. Build it per README.md "Build the relay
 # binary" (build-musl.sh), scp it onto the box, then run this script from the
 # same directory.
+#
+# Required env var:
+#   RELAY_HOST  your relay's public hostname, e.g. relay.example.com. It is
+#               substituted into the Caddyfile so Caddy serves that vhost. There
+#               is no committed default.
 #
 # Re-running is safe: it overwrites the unit/env/Caddyfile from the copies in
 # this directory and restarts the services.
@@ -24,6 +29,13 @@ set -euo pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "ERROR: run as root: sudo ./setup.sh" >&2
+  exit 1
+fi
+
+RELAY_HOST="${RELAY_HOST:-}"
+if [ -z "$RELAY_HOST" ]; then
+  echo "ERROR: set RELAY_HOST to your relay hostname, e.g.:" >&2
+  echo "  sudo RELAY_HOST=relay.example.com ./setup.sh" >&2
   exit 1
 fi
 
@@ -92,10 +104,11 @@ else
   apt-get install -y caddy
 fi
 
-# ---- 7. Caddyfile ----
-echo "installing /etc/caddy/Caddyfile ..."
+# ---- 7. Caddyfile (with RELAY_HOST substituted for the __RELAY_HOST__ token) ----
+echo "installing /etc/caddy/Caddyfile for host '$RELAY_HOST' ..."
 install -d -m 0755 /etc/caddy
-install -m 0644 -o root -g root "$HERE/Caddyfile" /etc/caddy/Caddyfile
+sed "s/__RELAY_HOST__/${RELAY_HOST}/g" "$HERE/Caddyfile" > /etc/caddy/Caddyfile
+chmod 0644 /etc/caddy/Caddyfile
 # Caddy runs as the 'caddy' user; let it read the origin cert + key.
 if id caddy >/dev/null 2>&1; then
   chgrp caddy "$ETC_DIR" "$ETC_DIR/origin.crt" "$ETC_DIR/origin.key" 2>/dev/null || true
@@ -114,7 +127,7 @@ echo "== setup complete =="
 systemctl --no-pager --lines=0 status sigil-relay.service || true
 echo
 echo "Verify from your workstation:"
-echo "  curl https://relay.rainn.works/health"
-echo "  curl https://relay.rainn.works/version"
+echo "  curl https://${RELAY_HOST}/health"
+echo "  curl https://${RELAY_HOST}/version"
 echo "Local (on the box) origin check, bypassing Caddy:"
 echo "  curl http://127.0.0.1:8080/health"

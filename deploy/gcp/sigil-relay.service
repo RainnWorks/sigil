@@ -10,7 +10,6 @@
 
 [Unit]
 Description=Sigil blind relay (native)
-Documentation=https://github.com/rainnworks/sigil
 After=network-online.target
 Wants=network-online.target
 

@@ -1,14 +1,21 @@
 # Sigil relay on a GCP e2-micro, fronted by Cloudflare
 
-Turnkey scaffolding to host the native Rust relay (`crates/sigil-relay`) on a
-Google Cloud `e2-micro` Always Free VM, with Cloudflare in front of
-`relay.rainn.works`.
+Turnkey, reusable scaffolding to self-host the native Rust relay
+(`crates/sigil-relay`) on a Google Cloud `e2-micro` Always Free VM, with
+Cloudflare in front of your relay hostname. Bring your own project id, domain,
+and APNs key; every deployment-specific value below is an environment variable or
+a placeholder.
 
 This is **additive**. It does not remove the TypeScript relay and does not touch
-the live Cloudflare Worker deploy. The Worker at `relay.rainn.works` keeps
-serving until a human confirms the Rust relay is live and healthy. The removal of
-the TS relay and the CI cutover are a separate, later step, described under
-"After cutover" at the end.
+the live Cloudflare Worker deploy. The managed Worker keeps serving until a human
+confirms the Rust relay is live and healthy. The removal of the TS relay and the
+CI cutover are a separate, later step, described under "After cutover" at the end.
+
+Throughout, substitute your own values for the placeholders:
+
+- `your-project-id` - your GCP project id
+- `you@example.com` - the Google account you provision under
+- `relay.example.com` - your relay's public hostname (the `RELAY_HOST` var)
 
 ## Architecture
 
@@ -23,7 +30,7 @@ the TS relay and the CI cutover are a separate, later step, described under
     Caddy :443  -- terminates TLS with a Cloudflare Origin Certificate
         |
         v  plain HTTP
-    sigil-relay :8080  (systemd, KNOCK_MODE=direct, Rainnworks APNs key)
+    sigil-relay :8080  (systemd, KNOCK_MODE=direct, your APNs key)
 ```
 
 The origin IP is never directly reachable: the GCP firewall admits `:443` only
@@ -35,11 +42,13 @@ relay.
 
 Provided by you (never in this repo):
 
-- The GCP **project id** `sigil-relay` (pass as `PROJECT`, see isolation below).
-- The **APNs signing key** `.p8` (Rainnworks, key id `5PCK76SDBA`, team
-  `53W966FBFP`). Placed on the box as `/etc/sigil/apns.p8`, mode `600`.
-- The **Cloudflare Origin Certificate** and its private key for
-  `relay.rainn.works`. Placed on the box as `/etc/sigil/origin.crt` and
+- The GCP **project id** (`PROJECT`, required, no committed default).
+- The relay **hostname** (`RELAY_HOST`, e.g. `relay.example.com`).
+- The **APNs signing key** `.p8` matching the identity compiled into the binary
+  you deploy (topic/team/key id live in `crates/sigil-relay/src/push.rs`, not in
+  config). Placed on the box as `/etc/sigil/apns.p8`, mode `600`.
+- The **Cloudflare Origin Certificate** and its private key for your relay
+  hostname. Placed on the box as `/etc/sigil/origin.crt` and
   `/etc/sigil/origin.key`, mode `600`.
 
 Scripted here:
@@ -49,34 +58,33 @@ Scripted here:
 - `setup.sh` installs the binary, the systemd unit, the env file, Caddy, and the
   Caddyfile on the box, then starts everything.
 
-## gcloud isolation (do this first)
+## gcloud isolation (recommended)
 
-This machine's default `~/.config/gcloud` belongs to a different org (Rowm).
-Keep the Sigil work in a separate gcloud config so the operator's default
+If this machine's default `~/.config/gcloud` belongs to a different Google
+account or org, keep this work in a separate gcloud config so your default
 account and project are never disturbed:
 
 ```sh
-export CLOUDSDK_CONFIG="$HOME/.config/gcloud-rainnworks"
-gcloud auth login                    # sign in as thomas@rainn.works
-gcloud config set project sigil-relay
+export CLOUDSDK_CONFIG="$HOME/.config/gcloud-sigil"
+gcloud auth login                    # sign in as you@example.com
+gcloud config set project your-project-id
 ```
 
 A convenient permanent alias for the isolated CLI:
 
 ```sh
-alias rwgcloud='CLOUDSDK_CONFIG="$HOME/.config/gcloud-rainnworks" gcloud'
+alias sgcloud='CLOUDSDK_CONFIG="$HOME/.config/gcloud-sigil" gcloud'
 ```
 
 Everything below assumes `CLOUDSDK_CONFIG` points at the isolated config for the
 duration of the session. `provision.sh` inherits it and warns if it is unset; set
-`EXPECTED_ACCOUNT=thomas@rainn.works` to have it hard-refuse to run under the
-wrong login.
+`EXPECTED_ACCOUNT=you@example.com` to have it hard-refuse to run under the wrong
+login.
 
 ## Prerequisites
 
-- The `sigil-relay` project must have **billing enabled**. The e2-micro is
-  Always Free, but a billing account must be attached for the free tier to
-  apply.
+- The GCP project must have **billing enabled**. The e2-micro is Always Free, but
+  a billing account must be attached for the free tier to apply.
 - **Always Free is ONE `e2-micro` per billing account**, and only in
   `us-west1`, `us-central1`, or `us-east1`. A second free instance, or one in
   any other region, is billed. The default zone here (`us-central1-a`) is
@@ -89,8 +97,8 @@ wrong login.
 ### (a) Provision the VM and firewall
 
 ```sh
-export CLOUDSDK_CONFIG="$HOME/.config/gcloud-rainnworks"
-PROJECT=sigil-relay EXPECTED_ACCOUNT=thomas@rainn.works ./provision.sh
+export CLOUDSDK_CONFIG="$HOME/.config/gcloud-sigil"
+PROJECT=your-project-id EXPECTED_ACCOUNT=you@example.com ./provision.sh
 ```
 
 Optional overrides: `ZONE` (default `us-central1-a`), `INSTANCE` (default
@@ -102,10 +110,10 @@ resources are reused, not recreated.
 
 ### (b) Cloudflare
 
-1. **Origin Certificate.** In the Cloudflare dashboard for `rainn.works`:
-   SSL/TLS > Origin Server > Create Certificate. Generate a certificate for
-   `relay.rainn.works` (the default 15-year validity is fine; it is trusted only
-   by Cloudflare's edge, which is all we need). Save the certificate PEM and the
+1. **Origin Certificate.** In the Cloudflare dashboard for your zone:
+   SSL/TLS > Origin Server > Create Certificate. Generate a certificate for your
+   relay hostname (the default 15-year validity is fine; it is trusted only by
+   Cloudflare's edge, which is all we need). Save the certificate PEM and the
    private key; these become `origin.crt` and `origin.key` on the box.
 2. **SSL mode.** SSL/TLS > Overview > set the mode to **Full (strict)**. This
    makes Cloudflare validate the origin cert, which the Origin Certificate
@@ -123,7 +131,7 @@ resources are reused, not recreated.
 gcloud compute ssh sigil-relay --zone=us-central1-a   # uses CLOUDSDK_CONFIG
 # on the box:
 sudo install -d -m 0700 /etc/sigil
-sudo install -m 0600 /dev/stdin /etc/sigil/apns.p8    < AuthKey_5PCK76SDBA.p8
+sudo install -m 0600 /dev/stdin /etc/sigil/apns.p8    < AuthKey.p8
 sudo install -m 0600 /dev/stdin /etc/sigil/origin.crt < origin.crt
 sudo install -m 0600 /dev/stdin /etc/sigil/origin.key < origin.key
 ```
@@ -140,25 +148,27 @@ build modes):
 ./build-musl.sh --docker     # easiest on macOS; ~2 MB static binary
 ```
 
-Copy it and this directory onto the box, then run setup as root:
+Copy it and this directory onto the box, then run setup as root with your
+`RELAY_HOST`:
 
 ```sh
 gcloud compute scp ./sigil-relay sigil-relay:~/ --zone=us-central1-a
 gcloud compute scp --recurse . sigil-relay:~/gcp --zone=us-central1-a
 gcloud compute ssh sigil-relay --zone=us-central1-a
 # on the box:
-cd ~/gcp && sudo RELAY_BIN=~/sigil-relay ./setup.sh
+cd ~/gcp && sudo RELAY_HOST=relay.example.com RELAY_BIN=~/sigil-relay ./setup.sh
 ```
 
 `setup.sh` creates the `sigil` user, installs `/usr/local/bin/sigil-relay`, the
 systemd unit, `/etc/sigil/relay.env` (from `relay.env.example`, `KNOCK_MODE=direct`),
-Caddy, and the Caddyfile, then enables and starts `sigil-relay` and `caddy`.
+Caddy, and the Caddyfile (with `RELAY_HOST` substituted for its `__RELAY_HOST__`
+token), then enables and starts `sigil-relay` and `caddy`.
 
 ### (e) Verify
 
 ```sh
-curl https://relay.rainn.works/health     # {"ok":true,"service":"sigil-relay"}
-curl https://relay.rainn.works/version    # {"version":"...","git_commit":"..."}
+curl https://relay.example.com/health     # {"ok":true,"service":"sigil-relay"}
+curl https://relay.example.com/version    # {"version":"...","git_commit":"..."}
 ```
 
 On the box, the origin directly (bypassing Cloudflare and Caddy):
@@ -171,11 +181,10 @@ curl http://127.0.0.1:8080/health
 
 Relay endpoints are configured per pairing (the daemon and phone each store the
 relay base URL), so there is no global flag to flip. Point one test pairing's
-relay at `https://relay.rainn.works` (once DNS is cut over, existing pairings
-already resolve here), trigger a gated command, and confirm the phone receives
-the push doorbell and the approval round-trips. Because `KNOCK_MODE=direct` and
-the Rainnworks `.p8` is installed, the relay signs and sends the APNs wake
-itself.
+relay at `https://relay.example.com`, trigger a gated command, and confirm the
+phone receives the push doorbell and the approval round-trips. Because
+`KNOCK_MODE=direct` and the `.p8` is installed, the relay signs and sends the
+APNs wake itself.
 
 ## About the bind address
 
@@ -202,10 +211,9 @@ intentionally not done here because this task does not touch `crates/`.
 
 ## After cutover (NOT done now; do only after a human confirms the Rust relay is live)
 
-Once `https://relay.rainn.works/health` is served by the GCP box, a real
-approval has round-tripped through it, and it has been stable long enough to
-trust, retire the TypeScript relay and retarget CI. None of this is done by this
-scaffolding.
+Once your relay hostname's `/health` is served by the GCP box, a real approval
+has round-tripped through it, and it has been stable long enough to trust, retire
+the TypeScript relay and retarget CI. None of this is done by this scaffolding.
 
 1. **Retarget CI.** In `.github/workflows/release.yml`, the `relay-deploy` job
    currently runs `wrangler deploy` from `relay/`. Replace it with a step that
@@ -225,8 +233,8 @@ scaffolding.
      long as the native relay is built. Keep `relay/shared/` similarly only if
      something still imports it; otherwise remove.
 3. **Docs.** Update `docs/design/rust-relay.md` and `relay/README.md` to state
-   that the native relay is now the managed default at `relay.rainn.works`, and
-   remove the "Worker remains the managed default" framing.
-4. **Cloudflare.** Delete the Worker/route for `relay.rainn.works` and the
+   that the native relay is now the managed default, and remove the "Worker
+   remains the managed default" framing.
+4. **Cloudflare.** Delete the Worker/route for your relay hostname and the
    `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` GitHub secrets if the Worker
    is fully decommissioned.

@@ -12,25 +12,24 @@
 #   - gcloud CLI, authenticated (`gcloud auth login`) with rights on the project
 #   - curl (used to fetch Cloudflare's published IP ranges live)
 #
-# gcloud ISOLATION (important): this machine's default ~/.config/gcloud belongs
-# to a DIFFERENT org (Rowm). Run everything sigil under an isolated gcloud config
-# so the operator's default account/project is never touched:
+# gcloud ISOLATION (recommended): if this machine's default ~/.config/gcloud
+# belongs to a DIFFERENT Google account or org, run everything under an isolated
+# gcloud config so your default account/project is never touched:
 #
-#   export CLOUDSDK_CONFIG="$HOME/.config/gcloud-rainnworks"
-#   gcloud auth login                       # as thomas@rainn.works
-#   gcloud config set project sigil-relay
-#   CLOUDSDK_CONFIG="$HOME/.config/gcloud-rainnworks" ./provision.sh
+#   export CLOUDSDK_CONFIG="$HOME/.config/gcloud-sigil"
+#   gcloud auth login                       # as you@example.com
+#   gcloud config set project your-project-id
+#   CLOUDSDK_CONFIG="$HOME/.config/gcloud-sigil" ./provision.sh
 #
 # provision.sh inherits whatever CLOUDSDK_CONFIG is exported; it does not set it.
 # Set EXPECTED_ACCOUNT to have it refuse to run under the wrong login (fail safe).
 #
 # Usage:
-#   PROJECT=sigil-relay ./provision.sh
-#   PROJECT=sigil-relay ZONE=us-central1-a INSTANCE=sigil-relay OPERATOR_IP=203.0.113.7 ./provision.sh
+#   PROJECT=your-project-id ./provision.sh
+#   PROJECT=your-project-id ZONE=us-central1-a INSTANCE=sigil-relay OPERATOR_IP=203.0.113.7 ./provision.sh
 #
 # Env vars:
-#   PROJECT      (required) the Rainnworks GCP project id. No default is
-#                committed on purpose.
+#   PROJECT      (required) your GCP project id. No default is committed.
 #   ZONE         (default us-central1-a) MUST be in a free-tier region.
 #   INSTANCE     (default sigil-relay) the VM name.
 #   OPERATOR_IP  (optional) the single IP allowed to SSH (tcp:22). If unset the
@@ -50,7 +49,7 @@ ZONE="${ZONE:-us-central1-a}"
 INSTANCE="${INSTANCE:-sigil-relay}"
 OPERATOR_IP="${OPERATOR_IP:-}"
 # Optional guard: if set, refuse to run unless the active gcloud account matches
-# (protects against provisioning under the operator's default Rowm login).
+# (protects against provisioning under the wrong default login).
 EXPECTED_ACCOUNT="${EXPECTED_ACCOUNT:-}"
 
 # Derived. The static address and firewall rules are named off the instance so a
@@ -70,8 +69,8 @@ IMAGE_FAMILY="debian-12"
 IMAGE_PROJECT="debian-cloud"
 
 if [ -z "$PROJECT" ]; then
-  echo "ERROR: set PROJECT to the Rainnworks GCP project id, e.g.:" >&2
-  echo "  PROJECT=my-rainnworks-proj ./provision.sh" >&2
+  echo "ERROR: set PROJECT to your GCP project id, e.g.:" >&2
+  echo "  PROJECT=your-project-id ./provision.sh" >&2
   exit 1
 fi
 
@@ -90,8 +89,8 @@ GC="gcloud --project=$PROJECT"
 # ---- gcloud isolation guard ----
 if [ -z "${CLOUDSDK_CONFIG:-}" ]; then
   echo "WARNING: CLOUDSDK_CONFIG is not set. You may be using this machine's" >&2
-  echo "         DEFAULT gcloud config (a different org). Strongly recommended:" >&2
-  echo "           export CLOUDSDK_CONFIG=\"\$HOME/.config/gcloud-rainnworks\"" >&2
+  echo "         DEFAULT gcloud config. If that is a different account, isolate:" >&2
+  echo "           export CLOUDSDK_CONFIG=\"\$HOME/.config/gcloud-sigil\"" >&2
   echo "         and authenticate inside it before running this script." >&2
 fi
 ACTIVE_ACCOUNT="$(gcloud config get-value account 2>/dev/null || true)"
@@ -213,19 +212,19 @@ cat <<EOF
 == Done. External IP: $STATIC_IP ==
 
 Cloudflare follow-up (see README.md step (b)):
-  1. Create an Origin Certificate for relay.rainn.works (SSL/TLS > Origin Server
+  1. Create an Origin Certificate for relay.example.com (SSL/TLS > Origin Server
      > Create Certificate). Save the cert and private key; you will place them on
      the box as /etc/sigil/origin.crt and /etc/sigil/origin.key.
   2. Set SSL/TLS mode to Full (strict).
-  3. Add a PROXIED (orange cloud) DNS record for relay.rainn.works:
+  3. Add a PROXIED (orange cloud) DNS record for relay.example.com:
        A     relay   $STATIC_IP     (proxied)
      If you gave the VM an external IPv6, add a proxied AAAA too. The orange
      cloud is what makes Cloudflare the only thing that ever touches the origin.
 
 On-box follow-up (see README.md steps (c)-(d)):
   gcloud --project=$PROJECT compute ssh $INSTANCE --zone=$ZONE
-  # copy AuthKey.p8 + origin.crt + origin.key into /etc/sigil (chmod 600), then:
-  sudo ./setup.sh
+  # copy the .p8 + origin.crt + origin.key into /etc/sigil (chmod 600), then:
+  sudo RELAY_HOST=relay.example.com ./setup.sh
 
 Firewall summary:
   tcp:443  <- Cloudflare ranges only ($FW_CF_V4, $FW_CF_V6)
