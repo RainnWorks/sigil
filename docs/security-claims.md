@@ -1700,3 +1700,179 @@ an opaque `Envelope` never parsed for secret material), relay powerless/anonymou
 layer is the sole trust boundary), fail-closed everywhere (verify gate, drop/
 truncation, timeout, unknown tag), and zero em-dash / zero emoji in user-facing
 strings all hold across these diffs.
+
+## Independent review verdict: native Rust blind relay `crates/sigil-relay` (merged `feat/config-rule-engine` @ `4b771f2`)
+
+**Written by the security-reviewer, which did NOT author `crates/sigil-relay`**
+(rust-core / relay, `4b771f2`); per the review-integrity rule this is an
+independent verdict, not a self-certification. Scope: the from-scratch
+tokio/hyper reimplementation of the blind relay SERVER (the clients
+`crates/sigil-relay-client` and `apps/phone/src/transport/relay-http.ts` are
+unchanged), reviewed against the TS originals it replaces (`relay/shared/
+protocol.ts`, `relay/shared/push.ts`, `relay/src/index.ts`) and against what the
+real clients send/expect. Gate run at `4b771f2`: `cargo test -p sigil-relay` =
+**23 passed** (18 integration + 5 push, plus 8 protocol unit tests in the lib
+build), `cargo clippy -p sigil-relay --all-targets -- -D warnings` = **clean**,
+`cargo fmt -p sigil-relay --check` = **clean**.
+
+**Overall: GREEN with one P2 availability-only hardening note. No P0/P1. No
+confidentiality or integrity finding; every failure path fails closed (a lost or
+denied delivery, never a wrong/duplicate delivery, a cross-mailbox/cross-direction
+leak, or an ungated release).**
+
+### Per-item verdict
+
+| # | Property | Verdict |
+|---|----------|---------|
+| 1 | Powerlessness / anonymity / zero persistence | **GREEN** |
+| 2 | Wire-compat exact (routes, methods, statuses, byte shapes, constants) | **GREEN** |
+| 3 | offer-then-drain wake (#53 v5.2): newest-wins, drop-oldest, no lock across await | **GREEN** |
+| 4 | APNs ES256 JWT signing + fail-safe caching, key never logged | **GREEN** |
+| 5 | Knock modes + `POST /knock`: opaque-only, stores nothing, no amplifier/SSRF | **GREEN** |
+| 6 | Rate limiting under a hostile peer; disjoint per-direction waiter lists | **GREEN** (see P2) |
+| 7 | Fail-closed, no panic-DoS on malformed input, zero em-dash/emoji user-facing | **GREEN** |
+
+**1. Powerlessness / anonymity / zero persistence: GREEN.** No code path reads,
+parses, hashes, or branches on envelope contents. `parse_to_phone` / `parse_env`
+(`server.rs`) extract only `env` (moved as an opaque `String`) plus the doorbell
+`pushToken`/`platform`; `enqueue`/`drain`/`wake` (`protocol.rs`) move the String
+verbatim. State is a single in-memory `HashMap<mailbox_id, Arc<Mutex<Mailbox>>>`
+(`server.rs::AppState`); grep confirms no `std::fs` write, no DB, no `ctx.storage`
+analogue anywhere. A restart drops all mailboxes, exactly as the short TTL would.
+Routing is by the URL mailbox id (shape-checked by `valid_id`), never by envelope
+content.
+
+**2. Wire-compat exact: GREEN.** Verified field-by-field against `relay/src/
+index.ts` and both real clients (`http.rs::{deposit,poll_slot}` sends
+`{"env",..,"pushToken"?,"platform"?}` and reads `{"envelopes":[...]}`;
+`relay-http.ts` the same). Routes `GET /`, `GET /health`, `GET|POST /mailbox/{64-hex}/
+to-phone|to-daemon`; invalid id and unknown top-level path both 400 `bad_mailbox`;
+unknown verb / unsupported method rate-checks then 404 `not_found`, matching the
+TS order (rate-check precedes routing, exactly one increment per request).
+Statuses 200/400/413/429/507/404 map identically; `QueueFull -> 507
+INSUFFICIENT_STORAGE`, `TooLarge -> 413`. Response bytes are typed structs so
+serde emits byte-exact field order (`{"ok":true,"service":"sigil-relay"}`,
+`{"ok":true}`, `{"envelopes":[...]}`, `{"ok":false,"error":".."}`), asserted by
+`protocol.rs::response_bodies_match_the_ts_wire_bytes`. All constants match the TS
+(`TTL_MS 180000`, `MAX_QUEUE 32`, `MAX_ENVELOPE_BYTES 16384`, `LONG_POLL_MS 25000`,
+`MAX_WAITERS 8`, `RATE_MAX 60/60000`, `PUSH_MAX 5/60000`). `GET /version` and
+`POST /knock` are ADDITIVE endpoints absent from the TS variants; no shipping
+client depends on them for the message path, so they cannot break a live client.
+One deliberate, non-breaking hardening: a hard `MAX_BODY_BYTES` (`Limited`) read
+cap the TS delegated to the runtime/content-length; it converges for legitimate
+traffic (env <= 16 KiB + tiny wrapper < 20 KiB) and is only stricter on abuse.
+Retry-After is absent on 429 in both implementations; the client treats its
+absence as "back off" (`relay-http.ts::parseRetryAfter(null) -> null`), so no
+divergence.
+
+**3. offer-then-drain wake: GREEN.** `protocol.rs::wake` offers the still-queued
+blobs to the newest waiter (`waiters.pop()`) and drains (`list.clear()`) ONLY on a
+positive accept; a rejecting (settled/dead) waiter leaves every `Item` untouched
+(same `exp`, no TTL reset, no reorder) and the loop tries the next-newest, else
+leaves the queue for the next GET. The accept/reject signal is the oneshot
+`send().is_ok()` in `server.rs::poll`. `MAX_WAITERS` drop-oldest
+(`waiters.remove(0); oldest.offer(&[])`) only ever evicts within the same slot and
+resolves the evicted waiter empty against a provably-empty queue. No lock is held
+across an await: the mailbox `MutexGuard` lives only inside the synchronous `let rx
+= { .. }` block; the `tokio::select!` awaits with no guard held; the timeout branch
+re-locks. `WaiterGuard::drop` reaps the waiter on a mid-poll client disconnect. The
+same-tick loss window (a silent disconnect whose abort never fires, deposit landing
+in the gap before any reconnect) is the documented #53 orphan-gap residual: it
+fails CLOSED (one delivery lost, recovered by the sender's poll backstop + item
+TTL), never a wrong or duplicated delivery, never a cross-mailbox or cross-direction
+leak. The two directions are disjoint `Vec<Waiter>`s, so a flood on one slot cannot
+evict or steal the paired party's waiter on the other. Ported adversarial unit
+tests (`residual_newest_silently_dead_...`, `hardened_newest_settled_dead_...`,
+`newest_wins_delivers_to_the_live_reconnect`, and the HTTP-level
+`deposit_survives_disconnect_then_reconnect`) all pass.
+
+**4. APNs ES256 JWT signing + caching: GREEN.** `push.rs::bearer` signs
+`base64url(header).base64url(claims)` with p256 `SigningKey` (RustCrypto,
+RFC6979-deterministic) and emits `sig.to_bytes()` = raw 64-byte `r||s`, exactly
+JWS ES256; header `{"alg":"ES256","kid":"5PCK76SDBA"}`, claims
+`{"iss":"53W966FBFP","iat":<now/1000>}`. `tests/push.rs::rings_a_real_es256_jwt_...`
+mints against a throwaway key and cryptographically verifies the signature,
+header, claims, topic (`works.rainn.sigil`), and fixed doorbell body. The key is
+resolved from `APNS_KEY_P8` / `APNS_KEY_P8_PATH` (`lib.rs::resolve_apns_key`) and
+is never logged: every `eprintln!` carries a decode-error Display (no key bytes),
+a status, or a token-free message; the token goes only into the `/3/device/{token}`
+URL, never a log line. The JWT cache (`JWT_CACHE: Mutex<Option<Cached>>`) fails
+safe: a poisoned lock on the read path returns an error that `ring_apns` logs and
+swallows (no push, poll backstop); the write path skips caching but still returns
+the fresh JWT, so it degrades to re-signing, never blocks delivery and never
+serves a stale/wrong token. Every push failure is best-effort: `ring_apns` and
+`send_push_direct` return `()` and are `tokio::spawn`ed detached from the deposit
+response, so a push outcome can never block or alter message delivery (the 200 is
+already returned).
+
+**5. Knock modes + `POST /knock`: GREEN.** `direct` signs+sends locally; `upstream`
+forwards `{opaque_token, mailbox_hash, platform}` only (`push.rs::forward_knock`),
+never any `env`/message content; `off` and a `direct`-with-no-key both no-op and
+fall through to the client poll (fail-open doorbell, correctness intact).
+`/knock` accepts only `opaque_token` + `mailbox_hash` (`valid_id`-checked) +
+`platform`, rate-limits on the tight per-mailbox `push_ok` (5/min), stores
+nothing, and returns `{"ok":true}`. No SSRF/amplifier: `KNOCK_UPSTREAM` is an
+operator-set env var (never attacker-supplied at request time), so the forward
+target is fixed; a hostile peer can at most trigger one rate-limited forward per
+knock. The upstream-trust note is documented honestly in `push.rs` (an upstream
+knock relay learns only the opaque token and that *some* mailbox has traffic; it
+cannot read, forge, or attribute).
+
+**6. Rate limiting under a hostile peer: GREEN (one P2 note below).** Fixed-window
+`rate_ok` / `push_ok` are per-mailbox, in-memory, non-load-bearing (clients verify
+everything); the classic 2x fixed-window boundary burst is documented and
+harmless. Waiter lists are disjoint per direction, so a flood is self-DoS and
+cannot evict/steal the other party's waiter. Addressing any mailbox at all
+presupposes the 256-bit mailbox id (BLAKE2b of both pinned keys, carried only
+inside TLS); an outsider who does learn one and races the phone's poll still
+cannot read or forge the sealed+signed envelope, and the intended party recovers
+via replay/backstop, so a stolen delivery is a denial, never a leak.
+
+**7. Fail-closed / no panic-DoS / no em-dash-emoji: GREEN.** Every parser is
+`Option`-returning with no indexing panic: `valid_id` (len+byte range), the
+serde `as_object`/`as_str` chains in `parse_env`/`parse_to_phone`/`knock`,
+`content_length` (parse-error -> None), `read_body` (`Limited` cap -> None ->
+413), `now_ms` (`unwrap_or(0)`). Response construction never panics
+(`serde_json::to_vec(..).unwrap_or_else(|_| b"{}")`; `.expect` only on a static
+status+header). A poisoned mailbox lock recovers the guard rather than panicking
+mid-request (`server.rs::lock`). Fuzzing the inputs mentally (bad/short/long
+mailbox id, oversized/short/empty/non-JSON body, missing `env`, weird verb,
+unsupported method, non-numeric content-length) yields only the correct 400/404/
+413 status, never a crash. User-facing strings hold invariant #6: all error codes
+are ASCII snake_case, `relay/landing.html` has zero non-ASCII bytes, the
+`/version` body is ASCII. (Informational, not a violation: one em-dash exists at
+`push.rs:188`, but it is inside a `///` doc comment, i.e. source, not a
+user-facing string; flagged only because the repo runs an aggressive em-dash
+sweep and may want it changed for consistency.)
+
+### P2 (availability-only hardening) - unbounded mailbox-map growth under a distinct-id flood
+
+`server.rs::AppState::get_box` inserts a new `Arc<Mutex<Mailbox>>` for ANY
+shape-valid 64-hex id, and shape-validity requires no secret (any 64 hex chars
+pass `valid_id`). An unauthenticated remote peer can therefore mint arbitrarily
+many distinct mailbox entries by hitting `/mailbox/<random-64-hex>/to-daemon`
+(a deposit leaves a TTL-lived `Item`) or `/knock` (creates the entry just to hold
+the push counter); the per-mailbox rate limiter does not bound the number of
+DISTINCT mailboxes, and the idle-sweep only reaps every `TTL_MS` (180 s), so the
+map can grow to ~180 s of request volume before reclamation. Held long-poll GETs
+similarly accumulate open connections (25 s each). This is availability-only: it
+touches no secret, causes no wrong/duplicate/cross-mailbox delivery, and OOM/fd
+exhaustion fails CLOSED (a dead relay denies, never releases). It also mirrors an
+architectural property of the TS variant, where Cloudflare's per-name Durable
+Object model + edge DDoS protection mask it; the native single-process binary,
+sold as "safe to run wide open," concentrates it in one heap with no such
+backstop. Recommend (not blocking): a global cap on live mailboxes and/or
+concurrent held connections that refuses NEW mailbox creation past the cap (fail
+closed) while leaving established pairings' existing entries untouched, plus the
+usual reverse-proxy connection/rate limits in the deploy guide. Severity P2:
+worth closing before a wide public deploy, but no invariant is violated and no
+change is required to land the crate.
+
+### Cross-cutting invariants, GREEN
+
+Relay powerless/anonymous (opaque envelopes, key-hash mailboxes, opaque push
+token, no key-distribution role), zero persistence (in-memory only, gone on
+restart), everything fails closed (denial never release; a push failure is
+best-effort and detached), and zero em-dash / zero emoji in every user-facing
+string (errors, landing, version) all hold for this crate.
+
