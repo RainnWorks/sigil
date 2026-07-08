@@ -102,7 +102,7 @@ biometric, not this build box, not a VM, not the Simulator):
 
 ```sh
 # SE keygen + biometric-gated decrypt exercised by the app's Security self-test:
-#   Latch.app > menubar > (debug) "Run SE self-test"   [DEBUG builds only]
+#   Sigil.app > menubar > (debug) "Run SE self-test"   [DEBUG builds only]
 # or headless:
 swift apps/mac/Tools/se-selftest.swift     # prints the P-256 pubkey + round-trips ECIES
 ```

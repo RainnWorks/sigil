@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<!--
-	  The app is not sandboxed: it shells out to the `latch` CLI and talks to the
+	  The app is not sandboxed: it shells out to the `sigil` CLI and talks to the
 	  daemon's unix socket, both outside a sandbox container. This matches the
 	  posture of a personal admin tool that drives a local daemon; it is not a
 	  Mac App Store product.
@@ -17,7 +17,7 @@
 	-->
 	<key>keychain-access-groups</key>
 	<array>
-		<string>$(AppIdentifierPrefix)co.rowm.latch</string>
+		<string>$(AppIdentifierPrefix)$(SIGIL_MAC_BUNDLE_ID)</string>
 	</array>
 </dict>
 </plist>
