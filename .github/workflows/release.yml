@@ -163,38 +163,109 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------
-  # Relay: Cloudflare Worker deploy. Needs CLOUDFLARE_API_TOKEN.
+  # Relay: static x86_64-unknown-linux-musl binary of the native Rust relay
+  # (crates/sigil-relay). No secrets needed - always runs, and its artifact
+  # is both attached to the GitHub Release and consumed by relay-deploy-gcp.
   # ---------------------------------------------------------------------
-  relay-deploy:
-    name: relay (wrangler deploy)
+  relay-build:
+    name: relay (musl binary)
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: relay
     env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      # ring (via rustls) needs a musl C toolchain to cross-compile; musl-tools
+      # provides musl-gcc. Point both the linker and ring's build cc at it.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CC_x86_64_unknown_linux_musl: musl-gcc
     steps:
-      - name: skip if secrets are not configured yet
-        if: ${{ env.CLOUDFLARE_API_TOKEN == '' }}
-        run: |
-          echo "::warning::CLOUDFLARE_API_TOKEN not set - skipping the Worker deploy. See docs/RELEASE.md and relay/DEPLOY.md."
-          exit 0
       - uses: actions/checkout@v4
-        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
-      - uses: actions/setup-node@v4
-        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          node-version: 22
-      - run: npm ci
-        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
-      - name: wrangler deploy
-        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
-        run: npx wrangler deploy
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: build static relay binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p sigil-relay
+      - name: stage artifact
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/sigil-relay \
+            dist/sigil-relay-x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay-musl
+          path: dist/*
+          if-no-files-found: error
 
   # ---------------------------------------------------------------------
-  # Relay: Docker image -> GHCR. Only needs the built-in GITHUB_TOKEN
-  # (packages: write, granted above), so this always runs on a tag.
+  # Relay: deploy the musl binary to the self-hosted GCP box (see
+  # deploy/gcp/). Gated on the deploy secrets: with any of them missing this
+  # logs a warning and no-ops (still reports success), so it is inert until
+  # the secrets exist and never fails a run. RELAY_DEPLOY_HOST is the public
+  # relay hostname, reachable over https for the healthcheck and over ssh
+  # (:22) for the copy; RELAY_DEPLOY_USER/RELAY_DEPLOY_SSH_KEY authenticate
+  # the copy. No real host, user, or key value lives in this file.
+  # ---------------------------------------------------------------------
+  relay-deploy-gcp:
+    name: relay (deploy to gcp)
+    needs: relay-build
+    runs-on: ubuntu-latest
+    env:
+      RELAY_DEPLOY_SSH_KEY: ${{ secrets.RELAY_DEPLOY_SSH_KEY }}
+      RELAY_DEPLOY_HOST: ${{ secrets.RELAY_DEPLOY_HOST }}
+      RELAY_DEPLOY_USER: ${{ secrets.RELAY_DEPLOY_USER }}
+    steps:
+      - name: skip if secrets are not configured yet
+        if: ${{ env.RELAY_DEPLOY_SSH_KEY == '' || env.RELAY_DEPLOY_HOST == '' || env.RELAY_DEPLOY_USER == '' }}
+        run: |
+          echo "::warning::RELAY_DEPLOY_* not fully set - skipping the GCP relay deploy. See deploy/gcp/README.md."
+          exit 0
+      - uses: actions/download-artifact@v4
+        if: ${{ env.RELAY_DEPLOY_SSH_KEY != '' && env.RELAY_DEPLOY_HOST != '' && env.RELAY_DEPLOY_USER != '' }}
+        with:
+          name: relay-musl
+          path: dist
+      - name: configure ssh
+        if: ${{ env.RELAY_DEPLOY_SSH_KEY != '' && env.RELAY_DEPLOY_HOST != '' && env.RELAY_DEPLOY_USER != '' }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$RELAY_DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$RELAY_DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+      - name: copy binary, install, restart
+        if: ${{ env.RELAY_DEPLOY_SSH_KEY != '' && env.RELAY_DEPLOY_HOST != '' && env.RELAY_DEPLOY_USER != '' }}
+        run: |
+          bin=dist/sigil-relay-x86_64-unknown-linux-musl
+          chmod +x "$bin"
+          scp -i ~/.ssh/deploy_key "$bin" \
+            "$RELAY_DEPLOY_USER@$RELAY_DEPLOY_HOST:/tmp/sigil-relay.new"
+          ssh -i ~/.ssh/deploy_key "$RELAY_DEPLOY_USER@$RELAY_DEPLOY_HOST" \
+            'sudo install -m 0755 /tmp/sigil-relay.new /usr/local/bin/sigil-relay \
+             && rm -f /tmp/sigil-relay.new \
+             && sudo systemctl restart sigil-relay'
+      - name: healthcheck
+        if: ${{ env.RELAY_DEPLOY_SSH_KEY != '' && env.RELAY_DEPLOY_HOST != '' && env.RELAY_DEPLOY_USER != '' }}
+        run: |
+          ok=
+          for _ in $(seq 1 10); do
+            if curl -fsS "https://$RELAY_DEPLOY_HOST/health" | grep -q '"ok":true'; then
+              ok=1
+              break
+            fi
+            sleep 3
+          done
+          if [ -z "$ok" ]; then
+            echo "::error::relay /health did not report healthy after restart"
+            exit 1
+          fi
+          echo "relay /health ok; version:"
+          curl -fsS "https://$RELAY_DEPLOY_HOST/version"
+
+  # ---------------------------------------------------------------------
+  # Relay: Docker image of the native Rust relay -> GHCR. Builds
+  # crates/sigil-relay/Dockerfile (static musl binary in scratch); context is
+  # the repo root so relay/landing.html is available to include_str!. Only
+  # needs the built-in GITHUB_TOKEN (packages: write, granted above), so this
+  # always runs on a tag.
   # ---------------------------------------------------------------------
   relay-docker:
     name: relay (docker -> ghcr)
@@ -211,7 +282,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@v6
         with:
-          context: relay
+          context: .
+          file: crates/sigil-relay/Dockerfile
           push: true
           tags: |
             ghcr.io/${{ steps.owner.outputs.lower }}/sigil-relay:${{ github.ref_name }}
@@ -219,14 +291,15 @@ jobs:
 
   # ---------------------------------------------------------------------
   # Publish the GitHub Release once whatever above ran settles. `ios`, `mac`,
-  # and `relay-deploy` report *success* even when their secret is missing
+  # and `relay-deploy-gcp` report *success* even when their secret is missing
   # (they early-exit a step with a warning rather than failing the job - see
   # each job's first step), so `needs` is satisfied either way; `!cancelled()`
-  # just makes sure a genuine failure elsewhere still stops the release.
+  # just makes sure a genuine failure elsewhere still stops the release. The
+  # static relay binary from relay-build is attached alongside the CLI assets.
   # ---------------------------------------------------------------------
   github-release:
     name: github release
-    needs: [cli-release-assets, ios, mac, relay-deploy, relay-docker]
+    needs: [cli-release-assets, ios, mac, relay-build, relay-deploy-gcp, relay-docker]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
@@ -238,6 +311,11 @@ jobs:
         continue-on-error: true # absent when the mac job was skipped
         with:
           name: mac-dmg
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        continue-on-error: true # the static relay binary
+        with:
+          name: relay-musl
           path: release-assets
       - uses: softprops/action-gh-release@v2
         with:
