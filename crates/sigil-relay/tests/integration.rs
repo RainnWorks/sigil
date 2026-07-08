@@ -18,6 +18,7 @@ fn test_config() -> Config {
         knock_mode: KnockMode::Off,
         knock_upstream: None,
         apns_key: None,
+        apns_identity: sigil_relay::push::ApnsIdentity::default(),
         apns_host: "http://127.0.0.1:0".to_string(),
         long_poll_ms: LONG_POLL_MS,
     }

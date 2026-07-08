@@ -33,9 +33,54 @@ use p256::pkcs8::DecodePrivateKey;
 use tokio::sync::OnceCell;
 
 pub const APNS_HOST: &str = "https://api.push.apple.com";
-const APNS_TOPIC: &str = "works.rainn.sigil";
-const APNS_TEAM_ID: &str = "53W966FBFP";
-const APNS_KEY_ID: &str = "5PCK76SDBA";
+
+/// The official Rainnworks APNs identity. Each field is used byte-for-byte when
+/// its env override is unset, so the published build is unchanged.
+pub const DEFAULT_APNS_TOPIC: &str = "works.rainn.sigil";
+pub const DEFAULT_APNS_TEAM_ID: &str = "53W966FBFP";
+pub const DEFAULT_APNS_KEY_ID: &str = "5PCK76SDBA";
+
+/// The APNs identity that addresses the push and signs the provider JWT: the
+/// topic (app bundle id), the Apple team id (`iss`), and the auth-key id
+/// (`kid`). The official build uses the pinned defaults above; a self-hoster
+/// overrides each via the matching env var without recompiling. This is the
+/// relay counterpart to the phone's build-config self-host work.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ApnsIdentity {
+    pub topic: String,
+    pub team_id: String,
+    pub key_id: String,
+}
+
+impl Default for ApnsIdentity {
+    fn default() -> Self {
+        Self {
+            topic: DEFAULT_APNS_TOPIC.to_string(),
+            team_id: DEFAULT_APNS_TEAM_ID.to_string(),
+            key_id: DEFAULT_APNS_KEY_ID.to_string(),
+        }
+    }
+}
+
+impl ApnsIdentity {
+    /// Resolve from the process environment: `APNS_TOPIC` / `APNS_TEAM_ID` /
+    /// `APNS_KEY_ID`, each falling back to its pinned default when unset or
+    /// empty. A build with none of these set is byte-identical to the previous
+    /// compiled-in constants.
+    pub fn from_env() -> Self {
+        fn var_or(key: &str, default: &str) -> String {
+            match std::env::var(key) {
+                Ok(v) if !v.is_empty() => v,
+                _ => default.to_string(),
+            }
+        }
+        Self {
+            topic: var_or("APNS_TOPIC", DEFAULT_APNS_TOPIC),
+            team_id: var_or("APNS_TEAM_ID", DEFAULT_APNS_TEAM_ID),
+            key_id: var_or("APNS_KEY_ID", DEFAULT_APNS_KEY_ID),
+        }
+    }
+}
 
 /// Refresh the JWT before Apple's ~60 minute cap; ~50 minutes is the sweet spot.
 const JWT_REFRESH_MS: u64 = 50 * 60 * 1000;
@@ -70,10 +115,12 @@ async fn client() -> &'static reqwest::Client {
 }
 
 /// A cached provider JWT, so a repeated ring within the refresh window neither
-/// re-parses the PEM nor re-signs. Keyed loosely by the PEM string; if it
-/// changes, the cache just misses and re-signs.
+/// re-parses the PEM nor re-signs. Keyed loosely by the PEM string and the
+/// identity (`kid`/`iss` ride inside the token); if either changes, the cache
+/// just misses and re-signs.
 struct Cached {
     pem: String,
+    id: ApnsIdentity,
     bearer: String,
     minted_at: u64,
 }
@@ -98,21 +145,22 @@ fn signing_key_from_pem(pem: &str) -> Result<SigningKey, String> {
 /// Mint (ES256, header `{alg,kid}`, claims `{iss,iat}`) or reuse a cached
 /// provider JWT. The ECDSA signature is the raw 64-byte `r||s` that JWS ES256
 /// requires, so no re-encoding is needed.
-fn bearer(pem: &str, now_ms: u64) -> Result<String, String> {
+fn bearer(pem: &str, id: &ApnsIdentity, now_ms: u64) -> Result<String, String> {
     {
         let guard = JWT_CACHE
             .lock()
             .map_err(|_| "jwt cache poisoned".to_string())?;
         if let Some(c) = guard.as_ref() {
-            if c.pem == pem && now_ms.saturating_sub(c.minted_at) < JWT_REFRESH_MS {
+            if c.pem == pem && &c.id == id && now_ms.saturating_sub(c.minted_at) < JWT_REFRESH_MS {
                 return Ok(c.bearer.clone());
             }
         }
     }
     let key = signing_key_from_pem(pem)?;
-    let header = URL_SAFE_NO_PAD.encode(format!(r#"{{"alg":"ES256","kid":"{APNS_KEY_ID}"}}"#));
+    let header = URL_SAFE_NO_PAD.encode(format!(r#"{{"alg":"ES256","kid":"{}"}}"#, id.key_id));
     let claims = URL_SAFE_NO_PAD.encode(format!(
-        r#"{{"iss":"{APNS_TEAM_ID}","iat":{}}}"#,
+        r#"{{"iss":"{}","iat":{}}}"#,
+        id.team_id,
         now_ms / 1000
     ));
     let signing_input = format!("{header}.{claims}");
@@ -121,6 +169,7 @@ fn bearer(pem: &str, now_ms: u64) -> Result<String, String> {
     if let Ok(mut guard) = JWT_CACHE.lock() {
         *guard = Some(Cached {
             pem: pem.to_string(),
+            id: id.clone(),
             bearer: jwt.clone(),
             minted_at: now_ms,
         });
@@ -131,8 +180,8 @@ fn bearer(pem: &str, now_ms: u64) -> Result<String, String> {
 /// Ring the APNs doorbell for one device token (lowercase hex). Never returns an
 /// error to the caller: every failure is logged and swallowed. `host` is
 /// overridable so tests can point this at a local stub.
-pub async fn ring_apns(token: &str, key_pem: &str, now_ms: u64, host: &str) {
-    let jwt = match bearer(key_pem, now_ms) {
+pub async fn ring_apns(token: &str, key_pem: &str, id: &ApnsIdentity, now_ms: u64, host: &str) {
+    let jwt = match bearer(key_pem, id, now_ms) {
         Ok(j) => j,
         Err(e) => {
             eprintln!("push: minting the APNs JWT failed, relying on the poll backstop: {e}");
@@ -144,7 +193,7 @@ pub async fn ring_apns(token: &str, key_pem: &str, now_ms: u64, host: &str) {
         .await
         .post(&url)
         .header("authorization", format!("bearer {jwt}"))
-        .header("apns-topic", APNS_TOPIC)
+        .header("apns-topic", &id.topic)
         .header("apns-push-type", "alert")
         .header("apns-priority", "10")
         .header("content-type", "application/json")
@@ -169,6 +218,7 @@ pub async fn send_push_direct(
     token: String,
     platform: Option<String>,
     key_pem: Option<String>,
+    identity: ApnsIdentity,
     host: String,
     now_ms: u64,
 ) {
@@ -180,7 +230,7 @@ pub async fn send_push_direct(
         eprintln!("push: no APNs signing key configured, relying on the poll backstop");
         return;
     };
-    ring_apns(&token, &pem, now_ms, &host).await;
+    ring_apns(&token, &pem, &identity, now_ms, &host).await;
 }
 
 /// Upstream-mode dispatch: forward an opaque knock to a configured upstream

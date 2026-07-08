@@ -1,10 +1,11 @@
 # systemd unit for the native Sigil relay (sigil-relay).
 #
 # The relay serves PLAIN HTTP only, by design (TLS is Caddy's job, in front).
-# It listens on port 8080 (set PORT=8080 in the env file). NOTE: the current
-# binary binds 0.0.0.0:PORT, not 127.0.0.1; it is kept off the internet by the
-# GCP firewall never opening :8080 (only :443 from Cloudflare and :22 from the
-# operator). See README.md "About the bind address" for the loopback follow-up.
+# It binds BIND_ADDR:PORT from the env file; this deployment sets
+# BIND_ADDR=127.0.0.1 and PORT=8080, so it listens on loopback only and Caddy
+# reaches it there. It is also kept off the internet by the GCP firewall never
+# opening :8080 (only :443 from Cloudflare and :22 from the operator). See
+# README.md "About the bind address".
 #
 # Install: /etc/systemd/system/sigil-relay.service (setup.sh does this).
 

@@ -36,6 +36,10 @@ pub struct Config {
     pub knock_mode: KnockMode,
     pub knock_upstream: Option<String>,
     pub apns_key: Option<String>,
+    /// The APNs identity (topic/team/key id) the direct doorbell signs and
+    /// addresses with. Defaults to the pinned official values; overridable via
+    /// env for self-hosters.
+    pub apns_identity: push::ApnsIdentity,
     /// Overridable so tests can point the doorbell at a local stub.
     pub apns_host: String,
     /// Overridable so tests can shrink the long-poll window; production uses
@@ -382,7 +386,10 @@ fn dispatch_doorbell(state: &Arc<AppState>, id: &str, token: String, platform: O
         KnockMode::Direct => {
             let key = cfg.apns_key.clone();
             let host = cfg.apns_host.clone();
-            tokio::spawn(push::send_push_direct(token, platform, key, host, now));
+            let identity = cfg.apns_identity.clone();
+            tokio::spawn(push::send_push_direct(
+                token, platform, key, identity, host, now,
+            ));
         }
         KnockMode::Upstream => {
             if let Some(up) = cfg.knock_upstream.clone() {
@@ -445,10 +452,12 @@ async fn knock(state: &Arc<AppState>, req: Request<Incoming>) -> Response<Full<B
         KnockMode::Direct => {
             let key = state.config.apns_key.clone();
             let host = state.config.apns_host.clone();
+            let identity = state.config.apns_identity.clone();
             tokio::spawn(push::send_push_direct(
                 token.to_string(),
                 platform,
                 key,
+                identity,
                 host,
                 now,
             ));

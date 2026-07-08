@@ -20,7 +20,7 @@ use p256::pkcs8::EncodePrivateKey;
 use p256::SecretKey;
 use tokio::net::TcpListener;
 
-use sigil_relay::push::send_push_direct;
+use sigil_relay::push::{send_push_direct, ApnsIdentity};
 
 #[derive(Clone, Default)]
 struct Captured {
@@ -115,6 +115,7 @@ async fn rings_a_real_es256_jwt_with_the_pinned_identity() {
         "deadbeef".into(),
         Some("apns".into()),
         Some(pem),
+        ApnsIdentity::default(),
         host,
         1_700_000_000_000,
     )
@@ -165,7 +166,15 @@ async fn a_rejection_from_apple_is_swallowed() {
     let (pem, _) = test_key();
     let (host, _cap) = spawn_stub(400).await;
     // Must simply return, never panic or error.
-    send_push_direct("deadbeef".into(), Some("apns".into()), Some(pem), host, 1).await;
+    send_push_direct(
+        "deadbeef".into(),
+        Some("apns".into()),
+        Some(pem),
+        ApnsIdentity::default(),
+        host,
+        1,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -175,6 +184,7 @@ async fn fcm_is_a_stub_no_network_call() {
         "deadbeef".into(),
         Some("fcm".into()),
         Some("irrelevant".into()),
+        ApnsIdentity::default(),
         host,
         1,
     )
@@ -186,7 +196,15 @@ async fn fcm_is_a_stub_no_network_call() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_key_no_network_call() {
     let (host, cap) = spawn_stub(200).await;
-    send_push_direct("deadbeef".into(), Some("apns".into()), None, host, 1).await;
+    send_push_direct(
+        "deadbeef".into(),
+        Some("apns".into()),
+        None,
+        ApnsIdentity::default(),
+        host,
+        1,
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!cap.lock().unwrap().hit);
 }
@@ -195,6 +213,91 @@ async fn no_key_no_network_call() {
 async fn undefined_platform_defaults_to_apns() {
     let (pem, _) = test_key();
     let (host, cap) = spawn_stub(200).await;
-    send_push_direct("deadbeef".into(), None, Some(pem), host, 1).await;
+    send_push_direct(
+        "deadbeef".into(),
+        None,
+        Some(pem),
+        ApnsIdentity::default(),
+        host,
+        1,
+    )
+    .await;
     assert!(cap.lock().unwrap().hit);
+}
+
+/// The default identity (no env override) is byte-for-byte the pinned official
+/// values, so a build with no APNS_* env set is unchanged from the compiled-in
+/// constants that preceded this parameterization.
+#[test]
+fn default_identity_is_the_pinned_official_values() {
+    let id = ApnsIdentity::default();
+    assert_eq!(id.topic, "works.rainn.sigil");
+    assert_eq!(id.team_id, "53W966FBFP");
+    assert_eq!(id.key_id, "5PCK76SDBA");
+}
+
+/// A self-hoster's overridden identity flows all the way into the wire push: the
+/// `apns-topic` header, and the JWT's `kid` (header) and `iss` (claims).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overridden_identity_rides_the_wire() {
+    let (pem, _) = test_key();
+    let (host, cap) = spawn_stub(200).await;
+    let id = ApnsIdentity {
+        topic: "com.example.self".into(),
+        team_id: "TEAM123456".into(),
+        key_id: "KEYID98765".into(),
+    };
+    send_push_direct(
+        "deadbeef".into(),
+        Some("apns".into()),
+        Some(pem),
+        id,
+        host,
+        1_700_000_000_001,
+    )
+    .await;
+    let c = cap.lock().unwrap().clone();
+    assert!(c.hit);
+    assert_eq!(c.topic, "com.example.self");
+    let jwt = c.authorization.strip_prefix("bearer ").expect("bearer");
+    let parts: Vec<&str> = jwt.split('.').collect();
+    let header: serde_json::Value = serde_json::from_slice(&b64url(parts[0])).unwrap();
+    assert_eq!(
+        header.get("kid").and_then(|v| v.as_str()),
+        Some("KEYID98765")
+    );
+    let claims: serde_json::Value = serde_json::from_slice(&b64url(parts[1])).unwrap();
+    assert_eq!(
+        claims.get("iss").and_then(|v| v.as_str()),
+        Some("TEAM123456")
+    );
+}
+
+/// `ApnsIdentity::from_env` reads the three vars, each falling back to its
+/// pinned default when unset. This test owns these vars (no other test touches
+/// them) and restores the environment before returning.
+#[test]
+fn from_env_overrides_and_defaults() {
+    // Unset: every field is the pinned default.
+    std::env::remove_var("APNS_TOPIC");
+    std::env::remove_var("APNS_TEAM_ID");
+    std::env::remove_var("APNS_KEY_ID");
+    assert_eq!(ApnsIdentity::from_env(), ApnsIdentity::default());
+
+    // Set: each field is taken from its var.
+    std::env::set_var("APNS_TOPIC", "com.acme.relay");
+    std::env::set_var("APNS_TEAM_ID", "ACME000000");
+    std::env::set_var("APNS_KEY_ID", "ACMEKEY999");
+    let id = ApnsIdentity::from_env();
+    assert_eq!(id.topic, "com.acme.relay");
+    assert_eq!(id.team_id, "ACME000000");
+    assert_eq!(id.key_id, "ACMEKEY999");
+
+    // An empty value falls back to the default, not the empty string.
+    std::env::set_var("APNS_TOPIC", "");
+    assert_eq!(ApnsIdentity::from_env().topic, "works.rainn.sigil");
+
+    std::env::remove_var("APNS_TOPIC");
+    std::env::remove_var("APNS_TEAM_ID");
+    std::env::remove_var("APNS_KEY_ID");
 }

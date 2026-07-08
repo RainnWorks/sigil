@@ -351,11 +351,20 @@ For a non-root image instead of `scratch`, swap the final stage to
 | Var | Meaning | Default |
 |-----|---------|---------|
 | `PORT` | Listen port | `8787` |
+| `BIND_ADDR` | Listen interface (set `127.0.0.1` behind a local proxy); bad value falls back to the default with a warning | `0.0.0.0` |
 | `KNOCK_MODE` | `direct` / `upstream` / `off` | inferred (see above) |
-| `KNOCK_UPSTREAM` | Upstream relay base URL for `upstream` mode | — |
-| `APNS_KEY_P8` | The `.p8` PEM text directly (shows in `docker inspect`; avoid on shared hosts) | — |
-| `APNS_KEY_P8_PATH` | Path to the `.p8` file (a read-only mount; preferred) | — |
+| `KNOCK_UPSTREAM` | Upstream relay base URL for `upstream` mode | - |
+| `APNS_KEY_P8` | The `.p8` PEM text directly (shows in `docker inspect`; avoid on shared hosts) | - |
+| `APNS_KEY_P8_PATH` | Path to the `.p8` file (a read-only mount; preferred) | - |
+| `APNS_TOPIC` | Push topic / app bundle id (JWT audience) | `works.rainn.sigil` |
+| `APNS_TEAM_ID` | Apple team id (JWT `iss`) | `53W966FBFP` |
+| `APNS_KEY_ID` | APNs auth-key id (JWT `kid`) | `5PCK76SDBA` |
 | `LONG_POLL_MS` | Long-poll hold window (tests shrink it; leave unset in prod) | `25000` |
+
+The three `APNS_*` identity vars default to the official Rainnworks values, so a
+build with none of them set signs and addresses the doorbell byte-identically to
+before they were env-configurable. A self-hoster with their own Apple app sets
+all three to match their `.p8`.
 
 **TLS:** the relay serves plain HTTP only, deliberately, to keep it tiny and keep
 certificate management out of its trust surface. Put a reverse proxy (Caddy,

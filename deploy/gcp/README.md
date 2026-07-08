@@ -44,9 +44,11 @@ Provided by you (never in this repo):
 
 - The GCP **project id** (`PROJECT`, required, no committed default).
 - The relay **hostname** (`RELAY_HOST`, e.g. `relay.example.com`).
-- The **APNs signing key** `.p8` matching the identity compiled into the binary
-  you deploy (topic/team/key id live in `crates/sigil-relay/src/push.rs`, not in
-  config). Placed on the box as `/etc/sigil/apns.p8`, mode `600`.
+- The **APNs signing key** `.p8`. Its identity (topic/team/key id) defaults to
+  the official Rainnworks values but is env-configurable via `APNS_TOPIC` /
+  `APNS_TEAM_ID` / `APNS_KEY_ID` in `relay.env` (see `relay.env.example`), so a
+  self-hoster can point at their own Apple app without recompiling. Placed on the
+  box as `/etc/sigil/apns.p8`, mode `600`.
 - The **Cloudflare Origin Certificate** and its private key for your relay
   hostname. Placed on the box as `/etc/sigil/origin.crt` and
   `/etc/sigil/origin.key`, mode `600`.
@@ -188,13 +190,14 @@ APNs wake itself.
 
 ## About the bind address
 
-The relay binary currently binds `0.0.0.0:PORT` (it reads only `PORT`, not a
-bind address; see `crates/sigil-relay/src/main.rs`). We keep the relay off the
-internet with the **GCP firewall**, which never opens `:8080` (only `:443` from
-Cloudflare and `:22` from the operator). Caddy reaches it over loopback at
-`127.0.0.1:8080`. If you want defense-in-depth loopback binding, that is a small
-follow-up in the crate (add a `BIND_ADDR` env, default `127.0.0.1`); it is
-intentionally not done here because this task does not touch `crates/`.
+The relay binds `BIND_ADDR:PORT`, where `BIND_ADDR` defaults to `0.0.0.0` (all
+interfaces) when unset; see `crates/sigil-relay/src/main.rs`. This deployment
+sets `BIND_ADDR=127.0.0.1` in `relay.env` so the relay listens on loopback only
+and Caddy reaches it at `127.0.0.1:8080`. That is defense-in-depth: the **GCP
+firewall** already keeps the relay off the internet by never opening `:8080`
+(only `:443` from Cloudflare and `:22` from the operator), and the loopback bind
+means `:8080` is unreachable off the box even if that firewall were
+misconfigured. An unparsable `BIND_ADDR` falls back to `0.0.0.0` with a warning.
 
 ## Files
 
