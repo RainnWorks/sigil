@@ -206,7 +206,11 @@ export async function submitPairingResponse(): Promise<void> {
       // daemon's fixed key id so per-request challenges resolve `f`.
       c.seSharePub = await generateShareKey(PHONE_SE_KEY_ID);
       c.seKeyId = PHONE_SE_KEY_ID;
-    } catch {
+    } catch (e) {
+      // The Secure Enclave is present but minting F failed: degrade to a v1
+      // pairing rather than block. Unexpected on capable hardware, so log it.
+      // eslint-disable-next-line no-console
+      console.warn(`[pairing] SE share mint failed, falling back to v1: ${e instanceof Error ? e.message : String(e)}`);
       c.seSharePub = undefined;
       c.seKeyId = undefined;
     }
