@@ -12,7 +12,7 @@ Specialized profiles live in `.claude/agents/`. Route work accordingly:
 - **rust-core**: anything under `crates/` (daemon, proto, shim, ssh-agent, CLI)
 - **mac-app**: `apps/mac` (SwiftUI configurator, menubar, Touch ID/SE)
 - **phone-app**: `apps/phone` (Expo approver, keystore crypto, push)
-- **relay**: `relay/` (blind mailbox Worker + Bun variant)
+- **relay**: `crates/sigil-relay` (native Rust blind mailbox; serves `relay/landing.html`), deployed per `deploy/gcp/`
 - **security-reviewer**: run on EVERY change touching crypto, keys, envelope,
   shim, leases, pairing, or relay. Adversarial; owns the hostile-relay suite.
 - **design-reviewer**: run on every user-facing change (screens, CLI output,
