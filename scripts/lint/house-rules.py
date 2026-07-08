@@ -36,7 +36,7 @@ TARGETS = [
     ("apps/phone/components", "**/*.tsx", "c"),
     ("apps/phone/src", "**/*.ts", "c"),
     ("apps/phone/src", "**/*.tsx", "c"),
-    ("apps/mac/Latch", "**/*.swift", "c"),
+    ("apps/mac/Sigil", "**/*.swift", "c"),
     ("crates/latch/src", "**/*.rs", "c"),
     ("crates/proto/src", "**/*.rs", "c"),
     ("crates/relay-client/src", "**/*.rs", "c"),

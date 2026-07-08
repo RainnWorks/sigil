@@ -1122,7 +1122,7 @@ correctly fixes and that must be committed.
   (`.cargo/.../security-framework-2.11.1/src/access_control.rs:51`-`76`). Every
   Swift counterpart pins `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`
   (`apps/mac/Tools/se-selftest.swift:29`,
-  `apps/mac/Latch/Security/SecureEnclaveApprover.swift:52`,
+  `apps/mac/Sigil/Security/SecureEnclaveApprover.swift:52`,
   `apps/phone/.../SigilSeModule.swift:95`) and `apps/mac/RESEARCH.md:70`
   specifies exactly that class. Consequence is **fail-closed, not
   fail-open**: on hardware this most likely makes `SecKeyCreateRandomKey`

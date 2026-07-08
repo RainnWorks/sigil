@@ -74,7 +74,7 @@ jobs:
       # any Apple credentials.
       - run: |
           cd apps/mac
-          xcodebuild -project Latch.xcodeproj -scheme Latch -configuration Debug \
+          xcodebuild -project Sigil.xcodeproj -scheme Sigil -configuration Debug \
             -destination 'platform=macOS' build CODE_SIGNING_ALLOWED=NO
 
   ios-debug-build:

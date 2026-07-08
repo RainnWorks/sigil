@@ -159,7 +159,7 @@ jobs:
         if: ${{ env.MAC_ASC_API_KEY_P8 != '' }}
         with:
           name: mac-dmg
-          path: build/mac/Latch.dmg
+          path: build/mac/Sigil.dmg
           if-no-files-found: error
 
   # ---------------------------------------------------------------------
