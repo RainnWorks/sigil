@@ -77,6 +77,7 @@ pub fn config_from_env() -> Config {
         knock_mode,
         knock_upstream,
         apns_key,
+        apns_identity: push::ApnsIdentity::from_env(),
         apns_host: push::APNS_HOST.to_string(),
         long_poll_ms,
     }
