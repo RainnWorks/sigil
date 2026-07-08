@@ -2061,3 +2061,144 @@ reaches the header/claims.
 are GREEN and ship-clear; the two residuals above are fail-closed availability
 limits, not release paths.**
 
+## Independent review verdict: #51 direct-transport core (`dc51b408`, merged @ `1ea1776`)
+
+Reviewer did NOT implement this change. Scope: the OPTIONAL, OFF-BY-DEFAULT
+direct (LAN/DDNS) transport that carries the same sealed envelopes and skips the
+relay, integrated with the reviewed #36 multi-device per-device owner model.
+Files: `crates/sigil/src/remote.rs` (`verify_and_promote`, `route`,
+`deposit_and_wait` + `deposit_and_wait_cancellable` demote paths,
+`demote_and_redeposit`, `direct_primary_live`, `direct_service_hint`),
+`crates/sigil/src/daemon.rs` (`build_gate` per-device `direct_endpoint` wiring,
+`DirectAcceptor`, `run_direct_acceptor` spawn in `serve`),
+`crates/sigil/src/pairing_store.rs` (`direct_endpoint` field, default-off
+round-trip), `crates/sigil-direct/src/{tcp,fallback,discovery}.rs`,
+`docs/design/direct-transport.md`.
+
+Gate: `cargo test --workspace` = 456 passed / 0 failed (sigil-direct 18,
+hostile_relay 18, pairing_mitm 26, all others green); `cargo clippy --workspace
+--all-targets -- -D warnings` clean; `cargo fmt --check` clean.
+
+### Per item
+
+**1. Byte-identical when OFF (the load-bearing claim): GREEN.** `direct` is
+`None` by default (`remote.rs:235`); `with_direct` is called only when a device
+carries a `direct_endpoint` (`daemon.rs:272-275`), which is `None` on every fresh
+pairing, on v1 migration, and on any pairing that omits the additive field
+(`pairing_store.rs:178,199,236`). `direct_primary_live()` (`remote.rs:370`) is
+`self.direct.as_ref().is_some_and(|d| d.has_primary())`, so it is `false` whenever
+`direct` is `None`. In `deposit_and_wait` the `!direct_primary_live()` branch
+(`remote.rs:408-413`) is the reviewed single `recv_timeout(self.timeout)`, and in
+`deposit_and_wait_cancellable` `demote_at` is `None` (`remote.rs:475-477`), so the
+loop is the reviewed ring wait with no demote arm. `seal_and_deposit` is unchanged
+and `self.transport` is the bare relay when direct is off. N==1 (bare
+`RemoteApprover`) and N>=2 (`RingApprover` over unchanged approvers) both stay on
+the reviewed path. No behavior change to the relay path when direct is disabled.
+
+**2. verify_and_promote: GREEN.** Reads exactly ONE envelope off the RAW `link`
+via `discovery::verify_link` -> `link.recv` (the `DirectLink`, never the owner's
+`FallbackTransport`), and opens it through `self.classify`, which locks the ONE
+shared `ReplayGuard` and `env.open(&self.phone, &self.identity.agreement, guard)`
+(`remote.rs:600-607,794-805`). An imposter link that seals with any non-pinned key
+fails signature verification in `open` -> predicate `false` -> `NotPinnedPeer` ->
+never installed (`remote.rs:817`); proven by `verify_and_promote_rejects_an_imposter`.
+On success it installs the primary FIRST (`install_primary`), THEN routes the
+already-opened opener via `route` WITHOUT a second `classify` (`remote.rs:807-813`),
+so the shared counter is consumed exactly once and a second open (which would be a
+correct counter-replay reject) never happens. No SECOND ToDaemon reader is created:
+the verify read is on the raw link and strictly sequenced before install, after
+which the single owner loop is the sole reader of the installed transport; the
+acceptor never reads a channel. No `ReplayGuard` and no `FallbackTransport` is
+shared across devices (`build_gate` constructs one approver, one guard, one
+selector, one listener per `cfg`; `remote.rs:963-971`). A rogue LAN/TCP peer thus
+cannot inject/forge/replay a request or response: it can only send bytes that fail
+`open` and are dropped.
+
+**3. Demote-on-silence: GREEN.** `demote_and_redeposit` (`remote.rs:382-387`) calls
+`clear_primary()` (owner reverts to the relay on its next poll; the re-deposit
+rides the relay because a primary-less `FallbackTransport` IS the relay) then
+`seal_and_deposit` which reseals under a FRESH counter (`fetch_add`,
+`remote.rs:351`). Exactly one outcome resolves: the owner routes any response by
+`request_id` to the single waiter `tx`; `round_trip` takes the FIRST via one
+`recv_timeout` and then `remove_waiter`s, so a late/duplicate response (whether the
+black-holed direct copy arrives late, or the phone answered both copies) finds no
+waiter and is dropped (`route_response`, `remote.rs:857-862`), and `outcome_for`
+runs once. A replayed/stale direct response after demote is also rejected by the
+shared guard (its counter was already consumed) even if read. Fail-safe: the
+approval is NEVER failed by a tampered/black-holed direct attempt: on silence it
+re-deposits over the relay (which the LAN attacker cannot block) and spends the
+remaining budget waiting, completing there; a re-deposit error is swallowed
+(`let _ =`) leaving the original wait to time out -> deny (fail closed). Proven by
+`demote_on_silence_completes_over_the_relay`. The fresh counter is what lets the
+phone's inbound guard accept the relay copy after a black-holed direct copy.
+
+**4. Acceptor / rung-2 bound port: GREEN.** `run_direct_acceptor` no-ops when
+`direct` is `None` (`remote.rs:830`), so spawning it per device is safe; it only
+polls `accept_nonblocking` honoring the shutdown flag and hands each raw link to
+`verify_and_promote`, never reading any ToDaemon channel. Daemon-at-rest inertness
+holds with a port open: the listener carries no secret and grants nothing; a
+connect-then-silent or garbage connection is read once by `verify_link`, times out
+at `DIRECT_VERIFY_TIMEOUT` (5s) or fails `open`, is dropped, and its `Arc<DirectLink>`
+falls out of scope -> `Drop` -> `shutdown(Both)`, so no fd/thread leak and no wedge
+of the owner (a separate thread) or of approvals (the relay serves throughout). The
+frame layer fails closed on over-cap length (`MAX_FRAME_BYTES` 64 KiB), unknown
+direction byte, truncation, or EOF (`tcp.rs:315-357`). Bytes that never open as the
+pinned peer can never promote.
+
+**5. Downgrade safety: GREEN (with residual R-#51-1 below).** Discovery is
+untrusted (`ServiceRecord`/`hint` only choose which host to dial; `direct_service_hint`
+is a salted BLAKE2b-64 of the daemon PUBLIC identity, not the mailbox id, and grants
+nothing). Only `verify_and_promote` (envelope-pinned) installs a primary. An active
+LAN MITM cannot forge or read (every rung carries the same sealed/signed envelope
+opened against pinned keys + shared guard); the worst it achieves by relaying the
+phone's genuine opener to get promoted then black-holing is a bounded denial that
+demote-on-silence turns into an ~8s relay retry for every request that deposits over
+the (now-primary) direct link.
+
+### Cross-cutting re-confirmation
+
+Inert at rest GREEN (no DEK/token added; direct carries only sealed envelopes).
+Secret bytes never in daemon memory GREEN (the DEK/`Z_F` path in `outcome_for` and
+the op-stdout->client-fd splice are untouched; direct changes only which bytes carry
+the opaque envelope). Relay powerless/anonymous GREEN (this work is about NOT using
+the relay, never weakening it; no key-distribution role added). Approve
+hardware-gated GREEN (unchanged phone SE key use; deny/dismiss require nothing).
+Everything fails closed GREEN (`NotPinnedPeer`/timeout/link-error never install; a
+bind failure logs and degrades to relay-only rather than refusing to arm,
+`daemon.rs:252-257`; all-timeout denies). N==1 and multi-device both correct.
+
+### Residual (honest limit, fail-closed, gates a fully-confident ENABLE)
+
+- **R-#51-1 (promotion racing an in-flight relay request -> one full-timeout
+  denial).** The demote-on-silence protection is scheduled only for a request whose
+  deposit went out a LIVE direct primary (`direct_primary_live()` sampled once, just
+  after deposit, `remote.rs:408`/`475`). A request deposited over the relay (no
+  primary yet) takes the plain `recv_timeout(self.timeout)` with NO demote arm. If a
+  primary is then installed mid-flight (the phone dials in / is discovered, or an
+  active LAN MITM times its promotion), the single owner loop, on its next poll,
+  reads the newly-installed direct primary instead of the relay, so the relay-
+  delivered response to that in-flight request is starved and the request times out
+  at `DEFAULT_REMOTE_TIMEOUT` (120s) -> DENY. This is fail-closed (never a forged
+  approval, leaked secret, or false release) and self-limiting (subsequent requests
+  deposit over the primary and regain the 8s demote bound), but it means the design
+  doc's "an active MITM costs at most one 8s demote, never a full-timeout denial"
+  claim is imprecise: a promotion that races an already-in-flight relay approval
+  costs THAT request a full-timeout denial. Severity: LOW (availability only, worst
+  case one long deny per promotion event; an attacker who can drive it gains nothing
+  beyond the already-acknowledged denial ceiling). Recommended close before enabling
+  on a hostile LAN: crisper owner revert (close/interrupt the parked relay poll on
+  install, symmetric to `clear_primary` on demote) or track the depositing rung per
+  request and demote a relay-deposited request whose owner has switched rungs. The
+  mitigation is straightforward; it is not required for the OFF-by-default ship.
+
+**Verdict recorded by the independent security-reviewer (did not implement
+`dc51b408`). The #51 direct-transport core is GREEN on all five flagged items and
+on every cross-cutting invariant, with one fail-closed availability residual
+(R-#51-1). It is SAFE TO SHIP as merged, because it is OFF by default and
+byte-identical to the reviewed relay path when off. It is SAFE TO ENABLE on a
+trusted LAN / owned endpoint today (the only attacker outcome is a bounded, fail-
+closed denial). Before enabling in an actively-hostile-LAN posture, close R-#51-1
+(or run `DepositPolicy::Mirror`, which removes the in-flight-starvation window
+entirely at the cost of always also using the relay) so a promotion cannot cost an
+in-flight relay approval a full-timeout denial.**
+
