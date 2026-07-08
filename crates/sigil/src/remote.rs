@@ -58,6 +58,8 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
+use sigil_direct::discovery::{self, VerifyError};
+use sigil_direct::{DirectLink, DirectListener, FallbackTransport};
 use sigil_proto::envelope::Envelope;
 use sigil_proto::identity::DeviceIdentity;
 use sigil_proto::ReplayGuard;
@@ -122,6 +124,28 @@ const OWNER_ERROR_BACKOFF: Duration = Duration::from_millis(500);
 /// threads). Small enough to feel instant, large enough not to spin.
 const RING_CANCEL_TICK: Duration = Duration::from_millis(100);
 
+/// How long a deposited request may go unanswered over a live DIRECT primary
+/// before [`round_trip`](RemoteApprover::round_trip) demotes to the relay and
+/// re-deposits (see [`demote_and_redeposit`](RemoteApprover::demote_and_redeposit)).
+/// A short fraction of [`DEFAULT_REMOTE_TIMEOUT`]: long enough that a healthy
+/// direct link answers first (so the relay is genuinely skipped), short enough
+/// that an active LAN MITM black-holing an accepted deposit costs one brief retry
+/// rather than a full-timeout denial. Only ever consulted when a direct primary
+/// is installed; with direct OFF the wait is the reviewed single `recv_timeout`.
+const DIRECT_DEMOTE_AFTER: Duration = Duration::from_secs(8);
+
+/// How long [`verify_and_promote`](RemoteApprover::verify_and_promote) waits for
+/// the first envelope on a freshly dialled/accepted direct link before failing
+/// closed (never installing it). A direct-connecting phone sends its opener at
+/// once; this only bounds a connect-then-silent host (honest or hostile).
+const DIRECT_VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a rung-2 direct acceptor parks between non-blocking `accept` polls
+/// while it waits for a phone to dial. Small enough to pick up a dial promptly,
+/// large enough not to spin; the relay serves throughout, so this never gates an
+/// approval.
+const DIRECT_ACCEPT_POLL: Duration = Duration::from_millis(200);
+
 /// An approver backed by a paired phone reachable over a [`Transport`].
 pub struct RemoteApprover {
     transport: Arc<dyn Transport>,
@@ -162,6 +186,23 @@ pub struct RemoteApprover {
     pending: Option<Arc<PendingRegistry>>,
     /// How long one owner-loop poll waits; a field only so tests can shrink it.
     listen_poll: Duration,
+    /// The direct-transport selector for THIS device, when direct is enabled for
+    /// it (#51). `Some` iff [`transport`](Self::transport) is that same
+    /// [`FallbackTransport`], so [`verify_and_promote`](Self::verify_and_promote)
+    /// can install a verified direct primary on it and
+    /// [`demote_and_redeposit`](Self::demote_and_redeposit) can retire one.
+    /// `None` is the default and means relay-only: every direct code path below is
+    /// gated on `self.direct.is_some()`, so with direct OFF the approver is
+    /// byte-identical to the reviewed relay-only path (single- and multi-device).
+    /// A direct link is a pipe, never a trust boundary: only the same sealed
+    /// envelopes ride it, opened against the same pinned key + shared guard.
+    direct: Option<Arc<FallbackTransport>>,
+    /// The unanswered-over-direct window before demoting to the relay; a field
+    /// only so tests can shrink it. Unused when [`direct`](Self::direct) is `None`.
+    demote_after: Duration,
+    /// The verification read window in [`verify_and_promote`](Self::verify_and_promote);
+    /// a field only so tests can shrink it.
+    verify_timeout: Duration,
 }
 
 impl RemoteApprover {
@@ -191,7 +232,24 @@ impl RemoteApprover {
             waiters: Mutex::new(HashMap::new()),
             pending: None,
             listen_poll: OWNER_POLL_INTERVAL,
+            direct: None,
+            demote_after: DIRECT_DEMOTE_AFTER,
+            verify_timeout: DIRECT_VERIFY_TIMEOUT,
         }
+    }
+
+    /// Enable the direct-transport ladder for this device (#51), OFF by default.
+    ///
+    /// `fallback` MUST be the very same [`FallbackTransport`] this approver was
+    /// constructed over (i.e. `RemoteApprover::new(fallback.clone(), ..)`), so that
+    /// [`transport`](Self::transport) (which the owner loop and `round_trip` use)
+    /// and the recorded [`direct`](Self::direct) selector are one object: a primary
+    /// installed here is what the owner then reads and a request then rides. The
+    /// caller wires this only when a device has a `direct_endpoint`; without it the
+    /// approver keeps its bare relay transport and every direct path stays inert.
+    pub fn with_direct(mut self, fallback: Arc<FallbackTransport>) -> Self {
+        self.direct = Some(fallback);
+        self
     }
 
     /// Wire the shared local pending registry so a change to the remote in-flight
@@ -279,14 +337,17 @@ impl RemoteApprover {
         outcome
     }
 
-    /// Seal, deposit, and block for the owner-delivered response. Split from
-    /// [`round_trip`] so the waiter cleanup there covers every exit uniformly.
-    fn deposit_and_wait(
-        &self,
-        req: &ApprovalRequest,
-        rx: Receiver<ApprovalResponse>,
-    ) -> Option<ApprovalOutcome> {
-        // Seal the request for the phone.
+    /// Seal `req` under a fresh monotonic counter and deposit it toward the phone
+    /// over the active transport, forwarding the phone's push token (if any) so the
+    /// RELAY rings a content-free doorbell. The token wakes the phone to fetch the
+    /// request; it is best-effort and never gates correctness (the phone's poll
+    /// backstop delivers regardless), and a direct link ignores it (the phone is
+    /// awake on the live connection). The daemon signs no push. `None` on a seal or
+    /// deposit error, so every caller fails closed. Used for the initial deposit
+    /// and for the demote re-deposit (which reseals under a NEW counter, so the
+    /// phone's replay guard accepts the relay copy even if it also saw a
+    /// black-holed direct copy).
+    fn seal_and_deposit(&self, req: &ApprovalRequest) -> Option<()> {
         let counter = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         let env = Envelope::seal(
             req,
@@ -296,19 +357,74 @@ impl RemoteApprover {
             &self.phone,
         )
         .ok()?;
-
-        // Deposit it to the relay, forwarding the phone's push token (if any) so
-        // the RELAY rings a content-free doorbell. The token wakes the phone to
-        // fetch the request; it is best-effort and never gates correctness (the
-        // phone's poll backstop delivers regardless). The daemon signs no push.
         self.transport
             .deposit_to_phone(self.pairing_id, &env, self.push_hint())
             .ok()?;
+        Some(())
+    }
 
-        // Block for the owner loop to hand us the correlating response, or fail
-        // closed. `recv_timeout` returns `Err` on timeout (and on a dropped sender,
-        // e.g. the owner stopped) -> deny, unchanged from the old timeout path.
-        match rx.recv_timeout(self.timeout) {
+    /// Whether a verified DIRECT primary is installed on this device's selector
+    /// right now. `false` when direct is disabled (`self.direct` is `None`) or
+    /// enabled-but-relay-serving, i.e. exactly the states in which the wait below
+    /// is the reviewed single-`recv_timeout` path.
+    fn direct_primary_live(&self) -> bool {
+        self.direct.as_ref().is_some_and(|d| d.has_primary())
+    }
+
+    /// Retire the direct primary and re-deposit `req` over the relay once
+    /// (demote-on-silence, #51). The `clear_primary` makes the owner loop revert to
+    /// reading the relay on its next poll and makes this re-deposit ride the relay
+    /// (a [`FallbackTransport`] with no primary IS the relay). This is what turns
+    /// the active-LAN-MITM residual (a promoted-then-black-holed link) from a
+    /// full-timeout denial into a short relay retry: the LAN attacker cannot block
+    /// the relay. A no-op re-deposit failure just leaves the original wait to time
+    /// out and fail closed. Only ever called with `self.direct` = `Some`.
+    fn demote_and_redeposit(&self, req: &ApprovalRequest) {
+        if let Some(direct) = self.direct.as_ref() {
+            direct.clear_primary();
+        }
+        let _ = self.seal_and_deposit(req);
+    }
+
+    /// Seal, deposit, and block for the owner-delivered response. Split from
+    /// [`round_trip`] so the waiter cleanup there covers every exit uniformly.
+    ///
+    /// With direct OFF (or enabled but relay-serving) this is byte-identical to the
+    /// reviewed path: one `recv_timeout(self.timeout)`, fail-closed on timeout or a
+    /// dropped owner. With a direct primary live, it adds demote-on-silence: wait a
+    /// short window on the direct link, and if nothing arrives, retire the primary
+    /// and re-deposit over the relay, then spend the rest of the budget waiting for
+    /// the relay-delivered response. Either way exactly one correlated response (or
+    /// a fail-closed `None`) is returned.
+    fn deposit_and_wait(
+        &self,
+        req: &ApprovalRequest,
+        rx: Receiver<ApprovalResponse>,
+    ) -> Option<ApprovalOutcome> {
+        self.seal_and_deposit(req)?;
+
+        // Reviewed single-device path, byte-identical, whenever no direct primary
+        // is carrying this request (direct disabled, or enabled but relay-serving).
+        if !self.direct_primary_live() {
+            return match rx.recv_timeout(self.timeout) {
+                Ok(resp) => self.outcome_for(req, resp),
+                Err(_) => None,
+            };
+        }
+
+        // A direct primary carried the deposit: give it a short window, then demote
+        // to the relay on silence. The total wait budget is still `self.timeout`.
+        let deadline = Instant::now() + self.timeout;
+        let window = self.demote_after.min(self.timeout);
+        match rx.recv_timeout(window) {
+            Ok(resp) => return self.outcome_for(req, resp),
+            // The owner dropped the sender (shutdown): fail closed.
+            Err(RecvTimeoutError::Disconnected) => return None,
+            // Silence over the direct link: demote and retry once over the relay.
+            Err(RecvTimeoutError::Timeout) => self.demote_and_redeposit(req),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
             Ok(resp) => self.outcome_for(req, resp),
             Err(_) => None,
         }
@@ -350,20 +466,15 @@ impl RemoteApprover {
         rx: Receiver<ApprovalResponse>,
         cancel: &CancelToken,
     ) -> Option<ApprovalOutcome> {
-        let counter = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let env = Envelope::seal(
-            req,
-            self.pairing_id,
-            counter,
-            &self.identity.signing,
-            &self.phone,
-        )
-        .ok()?;
-        self.transport
-            .deposit_to_phone(self.pairing_id, &env, self.push_hint())
-            .ok()?;
+        self.seal_and_deposit(req)?;
 
         let deadline = Instant::now() + self.timeout;
+        // Demote schedule: a one-shot instant, present only when a direct primary
+        // is actually carrying this request. `None` (direct off, or relay-serving)
+        // leaves the loop byte-identical to the reviewed ring wait.
+        let mut demote_at = self
+            .direct_primary_live()
+            .then(|| Instant::now() + self.demote_after.min(self.timeout));
         loop {
             // A winner elsewhere: stop waiting and remove our waiter (via the
             // caller). No decision -> fail closed, same as a timeout.
@@ -374,10 +485,21 @@ impl RemoteApprover {
             if now >= deadline {
                 return None;
             }
-            let wait = RING_CANCEL_TICK.min(deadline - now);
+            // Demote-on-silence: past the short window with no response, retire the
+            // direct primary and re-deposit over the relay once, then keep waiting.
+            if let Some(at) = demote_at {
+                if now >= at {
+                    self.demote_and_redeposit(req);
+                    demote_at = None;
+                }
+            }
+            let mut wait = RING_CANCEL_TICK.min(deadline - now);
+            if let Some(at) = demote_at {
+                wait = wait.min(at.saturating_duration_since(now));
+            }
             match rx.recv_timeout(wait) {
                 Ok(resp) => return self.outcome_for(req, resp),
-                // Tick elapsed with nothing: re-check cancel and deadline.
+                // Tick elapsed with nothing: re-check cancel, deadline, and demote.
                 Err(RecvTimeoutError::Timeout) => continue,
                 // The owner dropped the sender (shutdown): fail closed.
                 Err(RecvTimeoutError::Disconnected) => return None,
@@ -612,18 +734,118 @@ impl RemoteApprover {
     /// Classify one owned ToDaemon envelope and route it: registrations to the
     /// push store, responses to their waiter, everything else dropped.
     fn dispatch(&self, env: Envelope) {
-        match self.classify(env) {
-            Some(ToDaemonMessage::Push(pr)) => self.record_registration(&pr),
-            Some(ToDaemonMessage::Response(resp)) => self.route_response(resp),
+        // A failed verify/replay/decode classifies as `None`: fail closed by
+        // dropping it (nothing to route).
+        if let Some(msg) = self.classify(env) {
+            self.route(msg);
+        }
+    }
+
+    /// Route one already-classified ToDaemon message. Split from [`dispatch`] so
+    /// [`verify_and_promote`](Self::verify_and_promote) can route the verifying
+    /// envelope it already opened WITHOUT a second [`classify`] (which the shared
+    /// replay guard would correctly reject as a replay of the same counter).
+    fn route(&self, msg: ToDaemonMessage) {
+        match msg {
+            ToDaemonMessage::Push(pr) => self.record_registration(&pr),
+            ToDaemonMessage::Response(resp) => self.route_response(resp),
             // A delivery receipt only advances the requester's display; it never
             // touches the waiter channel, so it can never be mistaken for a
             // decision. An unknown/late/duplicate receipt is dropped inside
             // `mark_delivered`.
-            Some(ToDaemonMessage::Delivered(receipt)) => {
+            ToDaemonMessage::Delivered(receipt) => {
                 self.mark_delivered(&receipt.request_id, now_ms())
             }
-            // Failed verify/replay/decode: fail closed by dropping it.
-            None => {}
+        }
+    }
+
+    /// Verify a freshly dialled/accepted direct [`DirectLink`] is THIS device's
+    /// pinned phone and, if so, promote it to the [`FallbackTransport`] primary and
+    /// route its first envelope. Returns whether the link was promoted (#51).
+    ///
+    /// This is the ONLY place a direct link becomes a trusted primary, and it slots
+    /// into the per-device owner model without adding a second channel reader:
+    ///
+    /// * It reads exactly one envelope off the RAW `link` (not the owner's
+    ///   transport), through the approver's OWN pinned key + agreement key + the
+    ///   SAME shared [`ReplayGuard`] (via [`classify`](Self::classify)). So there is
+    ///   still exactly one guard, honoring the phone's single monotonic outbound
+    ///   counter across both the relay and this link; a host that dialled in but
+    ///   does not hold the phone's key cannot produce an envelope that opens, and is
+    ///   never installed (fail closed on `NotPinnedPeer`, timeout, or link error).
+    /// * On success it installs the link as the primary FIRST, so the owner loop's
+    ///   next `recv` (the sole reader of the installed transport) reads the link,
+    ///   THEN routes the verifying message. The one verifying envelope is consumed
+    ///   here and routed via [`route`](Self::route) without re-opening; every later
+    ///   frame on the link is read only by the owner. Thus the single-reader
+    ///   invariant holds: the acceptor never reads the installed transport, and the
+    ///   verify read is a one-shot handoff sequenced strictly before install.
+    ///
+    /// A no-op returning `false` when direct is disabled (`self.direct` is `None`),
+    /// so an acceptor wired by mistake could still never promote anything.
+    pub fn verify_and_promote(&self, link: Arc<DirectLink>) -> bool {
+        let Some(direct) = self.direct.clone() else {
+            return false;
+        };
+        // Open + replay-check + classify the opener exactly once, through the
+        // shared guard, and stash the result to route after install. The predicate
+        // returns true iff the envelope opened as our pinned peer.
+        let mut opener: Option<ToDaemonMessage> = None;
+        let verified = discovery::verify_link(
+            link.as_ref(),
+            Direction::ToDaemon,
+            self.verify_timeout,
+            |env| match self.classify(env.clone()) {
+                Some(msg) => {
+                    opener = Some(msg);
+                    true
+                }
+                None => false,
+            },
+        );
+        match verified {
+            Ok(_) => {
+                // Install BEFORE routing so the owner's next recv reads the link.
+                direct.install_primary(link);
+                if let Some(msg) = opener {
+                    self.route(msg);
+                }
+                true
+            }
+            // Not the pinned peer, a timeout, or a link error: fail closed, never
+            // install. The relay path is untouched.
+            Err(VerifyError::NotPinnedPeer | VerifyError::Timeout | VerifyError::Link(_)) => false,
+        }
+    }
+
+    /// Run a rung-2 direct acceptor for this device until `shutdown` is set: poll
+    /// `listener` for a phone dial and hand each accepted link to
+    /// [`verify_and_promote`](Self::verify_and_promote). The listener is put in
+    /// non-blocking mode so the poll can observe `shutdown` promptly; the relay
+    /// serves throughout, so nothing here ever gates or delays an approval. An
+    /// accept error is logged and backed off, never fatal (the daemon keeps serving
+    /// from the relay). A no-op that returns immediately if direct is disabled, so
+    /// this can be spawned unconditionally.
+    pub fn run_direct_acceptor(&self, listener: &DirectListener, shutdown: &AtomicBool) {
+        if self.direct.is_none() {
+            return;
+        }
+        if listener.set_nonblocking(true).is_err() {
+            return; // cannot poll safely: decline to accept, relay still serves
+        }
+        while !shutdown.load(Ordering::Acquire) {
+            match listener.accept_nonblocking() {
+                Ok(Some(link)) => {
+                    // Verify + promote (or drop). A rogue LAN host that dials and
+                    // sends bytes that do not open as the pinned peer is rejected
+                    // here and never installed.
+                    self.verify_and_promote(link);
+                }
+                // No dial pending: nap and re-check shutdown.
+                Ok(None) => std::thread::sleep(DIRECT_ACCEPT_POLL),
+                // Transient accept fault: back off, keep serving from the relay.
+                Err(_) => std::thread::sleep(OWNER_ERROR_BACKOFF),
+            }
         }
     }
 
@@ -646,6 +868,45 @@ impl RemoteApprover {
         self.listen_poll = interval;
         self
     }
+
+    /// Shrink the demote-on-silence window so a test does not wait the full
+    /// [`DIRECT_DEMOTE_AFTER`].
+    #[cfg(test)]
+    pub(crate) fn with_demote_after(mut self, after: Duration) -> Self {
+        self.demote_after = after;
+        self
+    }
+
+    /// Shrink the verification read window so a test does not wait the full
+    /// [`DIRECT_VERIFY_TIMEOUT`].
+    #[cfg(test)]
+    pub(crate) fn with_verify_timeout(mut self, timeout: Duration) -> Self {
+        self.verify_timeout = timeout;
+        self
+    }
+}
+
+/// The non-secret mDNS `hint` a rung-1 advertisement carries for THIS daemon
+/// identity (#51). It is a salted, truncated hash of the daemon's PUBLIC identity
+/// (Ed25519 verifying key + X25519 agreement key), which the paired phone -- which
+/// pins that identity -- recomputes to pick the right host among several on the
+/// LAN before dialling. It grants nothing and is never trusted: a wrong hint only
+/// wastes a dial that then fails [`RemoteApprover::verify_and_promote`] and falls
+/// back to the relay. It is deliberately NOT the mailbox id (broadcasting that
+/// would advertise the pairing's routing address on the LAN).
+///
+/// Kept here, not in `sigil-direct`, because the discovery crate holds no identity
+/// or crypto types by design; the daemon (which has the pinned key + `blake2`)
+/// computes the hint and hands it to a [`sigil_direct::discovery::ServiceRecord`].
+pub fn direct_service_hint(daemon: &PeerIdentity) -> String {
+    use blake2::digest::consts::U8;
+    use blake2::{Blake2b, Digest};
+    let mut hasher = Blake2b::<U8>::new();
+    hasher.update(b"sigil.direct.hint.v1");
+    hasher.update(daemon.verifying);
+    hasher.update(daemon.agreement);
+    let out = hasher.finalize();
+    out.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Lets the daemon share one [`RemoteApprover`] between the approval gate (which
@@ -1467,5 +1728,334 @@ mod tests {
         for o in owners {
             o.join().unwrap();
         }
+    }
+
+    // --- #51 direct transport: promote / demote / acceptor -----------------------
+
+    use sigil_proto::{PushRegister, Transport, TransportError};
+
+    /// Build a phone-factor approver with direct transport ENABLED over an
+    /// in-process relay, plus the shared `FallbackTransport` (the promote/demote
+    /// seam) and its push store. The approver's `transport` and its `direct` field
+    /// are the SAME FallbackTransport, exactly as `build_gate` wires it.
+    fn direct_approver(
+        daemon: &DeviceIdentity,
+        phone_pub: PeerIdentity,
+    ) -> (
+        Arc<RemoteApprover>,
+        Arc<FallbackTransport>,
+        LocalRelay,
+        Arc<PushStore>,
+    ) {
+        let relay = LocalRelay::new();
+        let fb = Arc::new(FallbackTransport::new(Arc::new(relay.clone())));
+        let store = Arc::new(PushStore::ephemeral());
+        let approver = Arc::new(
+            RemoteApprover::new(fb.clone(), clone_id(daemon), phone_pub)
+                .with_push(store.clone())
+                .with_timeout(Duration::from_secs(2))
+                .with_listen_poll(Duration::from_millis(20))
+                .with_verify_timeout(Duration::from_millis(500))
+                .with_direct(fb.clone()),
+        );
+        (approver, fb, relay, store)
+    }
+
+    /// A connected loopback pair of direct links (daemon `server`, phone `client`).
+    fn direct_pair() -> (Arc<DirectLink>, Arc<DirectLink>) {
+        let listener = DirectListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let dialer =
+            std::thread::spawn(move || DirectLink::connect(&addr.to_string()).expect("connect"));
+        let server = listener.accept().expect("accept");
+        let client = dialer.join().expect("dialer");
+        (server, client)
+    }
+
+    /// Seal the phone's direct-link opener (a real `PushRegister`), which
+    /// `verify_and_promote` reads as the proof of the pinned peer.
+    fn phone_opener(
+        phone: &DeviceIdentity,
+        daemon_pub: &PeerIdentity,
+        mailbox: [u8; 32],
+    ) -> Envelope {
+        let pr = PushRegister::new("direct-token", "apns");
+        Envelope::seal(&pr, mailbox, 1, &phone.signing, daemon_pub).expect("seal opener")
+    }
+
+    /// The gate: `verify_and_promote` installs the direct link as the primary ONLY
+    /// after an envelope opens as the pinned phone, and routes that first envelope
+    /// (here a PushRegister -> the push store) without a second open.
+    #[test]
+    fn verify_and_promote_installs_a_primary_for_the_pinned_phone() {
+        let daemon = DeviceIdentity::generate();
+        let phone = DeviceIdentity::generate();
+        let (approver, fb, _relay, store) = direct_approver(&daemon, phone.peer_identity());
+        let mailbox = approver.mailbox();
+
+        let (server, client) = direct_pair();
+        client
+            .send(
+                mailbox,
+                Direction::ToDaemon,
+                &phone_opener(&phone, &daemon.peer_identity(), mailbox),
+            )
+            .expect("phone sends its opener");
+
+        assert!(
+            approver.verify_and_promote(server),
+            "an opener that opens as the pinned phone promotes the link"
+        );
+        assert!(
+            fb.has_primary(),
+            "the verified link is installed as the primary"
+        );
+        assert_eq!(
+            store.get(mailbox).expect("opener routed").token,
+            "direct-token",
+            "the verifying PushRegister was routed, not re-opened"
+        );
+    }
+
+    /// Fail closed: an opener sealed by some OTHER key (a rogue LAN host that
+    /// dialled in) does not open as the pinned phone, so the link is never
+    /// installed and the relay path is untouched.
+    #[test]
+    fn verify_and_promote_rejects_an_imposter() {
+        let daemon = DeviceIdentity::generate();
+        let phone = DeviceIdentity::generate();
+        let (approver, fb, _relay, _store) = direct_approver(&daemon, phone.peer_identity());
+        let mailbox = approver.mailbox();
+
+        let (server, client) = direct_pair();
+        // An imposter seals with its OWN key, not the pinned phone's.
+        let imposter = DeviceIdentity::generate();
+        client
+            .send(
+                mailbox,
+                Direction::ToDaemon,
+                &phone_opener(&imposter, &daemon.peer_identity(), mailbox),
+            )
+            .expect("imposter sends bytes");
+
+        assert!(
+            !approver.verify_and_promote(server),
+            "an imposter's envelope must not promote the link"
+        );
+        assert!(!fb.has_primary(), "no primary is installed for an imposter");
+    }
+
+    /// With direct DISABLED (no `with_direct`), `verify_and_promote` is a no-op that
+    /// returns false, so an acceptor wired by mistake can never install a primary.
+    #[test]
+    fn verify_and_promote_is_a_noop_when_direct_is_disabled() {
+        let daemon = DeviceIdentity::generate();
+        let phone = DeviceIdentity::generate();
+        // A plain relay-only approver: no `with_direct`.
+        let approver = Arc::new(RemoteApprover::new(
+            Arc::new(LocalRelay::new()),
+            clone_id(&daemon),
+            phone.peer_identity(),
+        ));
+        let mailbox = approver.mailbox();
+        let (server, client) = direct_pair();
+        client
+            .send(
+                mailbox,
+                Direction::ToDaemon,
+                &phone_opener(&phone, &daemon.peer_identity(), mailbox),
+            )
+            .expect("send");
+        assert!(!approver.verify_and_promote(server));
+    }
+
+    /// End to end: once a link is promoted, the owner reads it and a full approval
+    /// rides the DIRECT link (never the relay). Proves the promoted primary is what
+    /// both the owner's recv and the request deposit use.
+    #[test]
+    fn a_promoted_direct_link_carries_a_full_approval() {
+        let daemon = DeviceIdentity::generate();
+        let phone = DeviceIdentity::generate();
+        let daemon_pub = daemon.peer_identity();
+        let (approver, fb, relay, _store) = direct_approver(&daemon, phone.peer_identity());
+        let mailbox = approver.mailbox();
+
+        let (server, client) = direct_pair();
+        client
+            .send(
+                mailbox,
+                Direction::ToDaemon,
+                &phone_opener(&phone, &daemon_pub, mailbox),
+            )
+            .expect("opener");
+        assert!(approver.verify_and_promote(server));
+
+        let (shutdown, owner) = spawn_owner(approver.clone());
+
+        // The phone answers over the DIRECT link: read the request ToPhone, seal an
+        // approve ToDaemon (counter 2, after the counter-1 opener).
+        let phone_thread = {
+            let client = client.clone();
+            std::thread::spawn(move || {
+                client
+                    .recv(mailbox, Direction::ToPhone, Duration::from_secs(2))
+                    .unwrap()
+                    .expect("the request arrived on the direct link");
+                let resp = ApprovalResponse::approve("req-DL", &Dek::from_bytes([7u8; 32]), 2);
+                let env = Envelope::seal(&resp, mailbox, 2, &phone.signing, &daemon_pub).unwrap();
+                client.send(mailbox, Direction::ToDaemon, &env).unwrap();
+            })
+        };
+
+        let outcome = approver.decide(&secret_ctx("req-DL"));
+        phone_thread.join().unwrap();
+        shutdown.store(true, Ordering::SeqCst);
+        owner.join().unwrap();
+
+        assert!(
+            outcome.decision.is_grant(),
+            "the approval rode the direct link"
+        );
+        assert_eq!(outcome.dek.as_deref(), Some(&[7u8; 32]));
+        // The relay never carried the request: it was genuinely skipped.
+        assert_eq!(relay.depth(mailbox, Direction::ToPhone), 0);
+        assert!(fb.has_primary(), "a healthy link stays promoted");
+    }
+
+    /// A transport that accepts deposits but never delivers a response: the shape of
+    /// an active LAN MITM that got promoted then black-holes traffic. Its `recv`
+    /// naps and returns empty so an owner polling it does not spin.
+    #[derive(Default)]
+    struct BlackHole;
+    impl Transport for BlackHole {
+        fn send(&self, _m: [u8; 32], _d: Direction, _e: &Envelope) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn recv(
+            &self,
+            _m: [u8; 32],
+            _d: Direction,
+            timeout: Duration,
+        ) -> Result<Option<Envelope>, TransportError> {
+            std::thread::sleep(timeout.min(Duration::from_millis(30)));
+            Ok(None)
+        }
+    }
+
+    /// Demote-on-silence: a request deposited over a black-holed direct primary is
+    /// not answered within the short window, so `round_trip` retires the primary and
+    /// re-deposits over the relay, where the phone answers. The approval SUCCEEDS via
+    /// the relay rather than timing out: the residual becomes a short retry.
+    #[test]
+    fn demote_on_silence_completes_over_the_relay() {
+        let daemon = DeviceIdentity::generate();
+        let phone = DeviceIdentity::generate();
+        let daemon_pub = daemon.peer_identity();
+        let (_approver, fb, relay, _store) = direct_approver(&daemon, phone.peer_identity());
+        // Shrink the demote window so the test does not wait the default.
+        let approver = Arc::new(
+            RemoteApprover::new(fb.clone(), clone_id(&daemon), phone.peer_identity())
+                .with_timeout(Duration::from_secs(2))
+                .with_listen_poll(Duration::from_millis(20))
+                .with_demote_after(Duration::from_millis(60))
+                .with_direct(fb.clone()),
+        );
+        let mailbox = approver.mailbox();
+        // Install a black-holed direct primary directly (as verify_and_promote
+        // would), bypassing the TCP handshake.
+        fb.install_primary(Arc::new(BlackHole));
+
+        let (shutdown, owner) = spawn_owner(approver.clone());
+
+        // The phone waits for the RELAY re-deposit (only arrives after demote), then
+        // approves over the relay.
+        let phone_thread = {
+            let relay = relay.clone();
+            std::thread::spawn(move || {
+                relay
+                    .recv(mailbox, Direction::ToPhone, Duration::from_secs(2))
+                    .unwrap()
+                    .expect("the demote re-deposit reached the relay");
+                let resp = ApprovalResponse::approve("req-DEMOTE", &Dek::from_bytes([3u8; 32]), 1);
+                let env = Envelope::seal(&resp, mailbox, 1, &phone.signing, &daemon_pub).unwrap();
+                relay.send(mailbox, Direction::ToDaemon, &env).unwrap();
+            })
+        };
+
+        let outcome = approver.decide(&secret_ctx("req-DEMOTE"));
+        phone_thread.join().unwrap();
+        shutdown.store(true, Ordering::SeqCst);
+        owner.join().unwrap();
+
+        assert!(
+            outcome.decision.is_grant(),
+            "a black-holed direct link demotes and completes over the relay"
+        );
+        assert_eq!(outcome.dek.as_deref(), Some(&[3u8; 32]));
+        assert!(
+            !fb.has_primary(),
+            "the silent primary was retired on demote"
+        );
+    }
+
+    /// The rung-2 acceptor loop, over real loopback TCP: a phone dials the bound
+    /// listener and sends its opener; the acceptor verifies + promotes it, so the
+    /// FallbackTransport gains a primary and the opener is recorded. Exercises
+    /// `run_direct_acceptor` + `accept_nonblocking` + `verify_and_promote` together.
+    #[test]
+    fn the_acceptor_loop_promotes_a_dialled_phone() {
+        let daemon = DeviceIdentity::generate();
+        let phone = DeviceIdentity::generate();
+        let daemon_pub = daemon.peer_identity();
+        let (approver, fb, _relay, store) = direct_approver(&daemon, phone.peer_identity());
+        let mailbox = approver.mailbox();
+
+        let listener = DirectListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let acceptor = {
+            let approver = approver.clone();
+            let shutdown = shutdown.clone();
+            std::thread::spawn(move || approver.run_direct_acceptor(&listener, &shutdown))
+        };
+
+        // The phone dials and sends its opener.
+        let client = DirectLink::connect(&addr).expect("phone dials");
+        client
+            .send(
+                mailbox,
+                Direction::ToDaemon,
+                &phone_opener(&phone, &daemon_pub, mailbox),
+            )
+            .expect("phone sends opener");
+
+        // The acceptor promotes within a few poll cycles.
+        let mut tries = 0;
+        while !fb.has_primary() {
+            tries += 1;
+            assert!(tries < 200, "the acceptor never promoted the dialled phone");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            store.get(mailbox).expect("opener routed").token,
+            "direct-token"
+        );
+
+        shutdown.store(true, Ordering::SeqCst);
+        acceptor.join().unwrap();
+        drop(client);
+    }
+
+    /// The mDNS hint is deterministic for one identity and differs across
+    /// identities, and it is NOT the mailbox id (never advertises the routing
+    /// address). It grants nothing; a wrong hint only wastes a dial.
+    #[test]
+    fn direct_service_hint_is_stable_and_identity_specific() {
+        let a = DeviceIdentity::generate().peer_identity();
+        let b = DeviceIdentity::generate().peer_identity();
+        assert_eq!(direct_service_hint(&a), direct_service_hint(&a));
+        assert_ne!(direct_service_hint(&a), direct_service_hint(&b));
+        assert!(!direct_service_hint(&a).is_empty());
     }
 }

@@ -1386,6 +1386,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sigil-direct",
  "sigil-proto",
  "sigil-relay-client",
  "sigil-softphone",

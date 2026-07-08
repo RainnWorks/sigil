@@ -169,6 +169,14 @@ struct PersistedDevice {
     /// The phone's v2 threshold share `F`, present only for a v2 pairing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     phone_share: Option<PersistedPhoneShare>,
+    /// The rung-2 owned endpoint (`host:port`) the daemon binds for a direct link
+    /// to this device (#51). Absent/omitted means direct transport is OFF for this
+    /// device (the default), so the field is additive and an existing pairing
+    /// round-trips unchanged. It is a NON-secret routing address, safe in the
+    /// plaintext 0600 file, and never a trust boundary: an inbound direct byte is
+    /// dropped unless it opens as the pinned phone (`verify_and_promote`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    direct_endpoint: Option<String>,
 }
 
 impl PersistedDevice {
@@ -186,6 +194,9 @@ impl PersistedDevice {
                 f_x963: B64.encode(&s.f_x963),
                 ecdh_algo: s.ecdh_algo,
             }),
+            // A fresh pairing does not enable direct transport; it stays OFF until
+            // the user configures an endpoint (kept additive and default-off).
+            direct_endpoint: None,
         }
     }
 }
@@ -221,6 +232,8 @@ impl PersistedContainer {
                 paired_at: v1.paired_at,
                 sas_words: v1.sas_words,
                 phone_share: v1.phone_share,
+                // A v1 file predates direct transport: OFF on migration.
+                direct_endpoint: None,
             }],
         }
     }
@@ -369,6 +382,7 @@ fn device_to_config(
         daemon_identity,
         phone: d.phone,
         phone_share,
+        direct_endpoint: d.direct_endpoint.clone(),
     })
 }
 

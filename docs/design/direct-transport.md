@@ -1,8 +1,26 @@
 # Direct transport: ladder rungs 1 (LAN/Bonjour) and 2 (owned endpoint / DDNS)
 
-Status: partial implementation + design (2026-07-07, task #51). Implementer
-notes and residuals for an independent security review; the review verdict lives
-in `docs/security-claims.md`, written by the reviewer, not here.
+Status: DEFERRED CORE landed + remaining design (2026-07-09, task #51).
+Implementer notes and residuals for an independent security review; the review
+verdict lives in `docs/security-claims.md`, written by the reviewer, not here.
+
+What changed on 2026-07-09 (this pass): the daemon-side deferred pieces landed,
+integrated with the reviewed #36 multi-device owner model, still OFF by default:
+
+- `RemoteApprover::verify_and_promote(link)` -- the per-device promotion gate.
+- Demote-on-silence in the approval wait (`deposit_and_wait` and its ring-all
+  cancellable twin), turning the section-4 MITM residual into a short relay retry.
+- `RemoteApprover::run_direct_acceptor(listener, shutdown)` -- the rung-2 acceptor
+  loop, plus `DirectListener::set_nonblocking` / `accept_nonblocking`.
+- Daemon wiring: a per-device `direct_endpoint` (`RemotePairingConfig` +
+  `pairing.json`), the `FallbackTransport` build in `build_gate`, and one acceptor
+  thread per direct-enabled device in `serve`. All additive and default-off.
+- `remote::direct_service_hint(daemon_pub)` -- the non-secret mDNS hint helper.
+
+Still deferred (needs live networking / a native module that cannot be exercised
+here): the concrete `mdns-sd` Bonjour backend and the phone native-TCP rung. See
+"Deferred" below; the design is unchanged and now sits behind a landed, tested
+daemon seam.
 
 Today every daemon<->phone approval rides the blind relay (rung 3). When the two
 can reach each other directly -- same LAN via Bonjour/mDNS (rung 1), or a
@@ -147,9 +165,10 @@ be able to forge or read one.
      and retries the request over the relay, so the damage is one short retry,
      not a full timeout, and repeated MITM attempts keep falling back to the
      relay (which the LAN attacker cannot block).
-   Because demote-on-silence lives in the reviewed approval loop, the crate ships
-   with direct transport **OFF by default**, and enabling it is a security-review
-   decision.
+   Demote-on-silence is now **built** (2026-07-09), in the reviewed approval loop:
+   see "Daemon integration (landed)" below. Direct transport still ships **OFF by
+   default** (`direct_endpoint` unset on every device), so enabling it remains a
+   security-review decision.
 
 ## The relay <-> direct handoff (protocol invariant)
 
@@ -180,62 +199,117 @@ daemon's listener) that never blocks an approval, because the relay is always
 available underneath. Backoff on reconnect attempts is the phone/daemon
 integration's job; the crate imposes none.
 
+## Daemon integration (landed)
+
+The clean seam that was designed here is now built, integrated with the reviewed
+#36 multi-device owner model, and OFF by default. The care was all in
+**promotion**, which needs the daemon's private agreement key and the shared
+replay guard -- both owned by `RemoteApprover`, whose owner loop is the *sole*
+reader of that device's `ToDaemon` channel. A naive acceptor that read one
+envelope to verify would become a second reader of that channel, violating the
+single-reader invariant and desynchronising the replay counter.
+
+How it preserves the per-device owner model:
+
+- **`RemoteApprover::verify_and_promote(link)`** reads exactly one envelope off the
+  **raw** `link` (never the owner's transport), through the approver's OWN pinned
+  key + agreement key + the SAME shared `ReplayGuard` (via `classify`). So there
+  is still exactly one guard, honoring the phone's single monotonic outbound
+  counter across BOTH the relay and the link. On success it installs the link as
+  the `FallbackTransport` primary FIRST (so the owner's next `recv` reads the
+  link), THEN routes that one verifying envelope via a new `route` helper WITHOUT
+  a second open (a second open would be correctly rejected as a counter replay).
+  The verify read is a one-shot handoff sequenced strictly before install, so the
+  owner never races it: before install the owner reads the relay; after install
+  the owner is the sole reader of the link. Fail-closed on `NotPinnedPeer`,
+  timeout, or link error -- a rogue LAN dialer is dropped, never installed.
+- **The acceptor never reads the channel.** `run_direct_acceptor` only polls the
+  rung-2 `DirectListener` (`accept_nonblocking`, honoring the shutdown flag) and
+  hands each raw link to `verify_and_promote`. It is a no-op when direct is
+  disabled, so it is safe to spawn per device.
+- **Per-device isolation is untouched.** Each device's approver has its own
+  `direct` selector, its own `ReplayGuard`, its own pinned phone, its own owner
+  loop, and (if enabled) its own bound listener + acceptor thread. Nothing is
+  shared across devices; a `RingApprover` still composes N unchanged approvers.
+- **Demote-on-silence** is a bounded retry in `deposit_and_wait` (and its
+  ring-all cancellable twin `deposit_and_wait_cancellable`): after a deposit that
+  actually went out a live direct primary, if no response arrives within a short
+  window (`DIRECT_DEMOTE_AFTER`, 8s), `demote_and_redeposit` retires the primary
+  (`clear_primary`, so the owner reverts to the relay on its next poll) and
+  re-seals the request under a FRESH counter and re-deposits over the relay
+  (which a LAN attacker cannot block). The re-seal is what lets the phone's replay
+  guard accept the relay copy even if it already saw the black-holed direct copy.
+  The remaining timeout budget is then spent waiting for the relay-delivered
+  response, so the section-4 MITM residual becomes a short retry that COMPLETES
+  over the relay, not a full-timeout denial. **Byte-identical when direct is off:**
+  `deposit_and_wait` takes the reviewed single `recv_timeout(self.timeout)` path
+  whenever no direct primary is carrying the request (`self.direct` is `None`, or
+  enabled-but-relay-serving), and the ring loop's demote branch is gated on the
+  same, so N==1 and N>=2 relay-only behavior is unchanged.
+
+**N==1 revert timing.** After `clear_primary`, an owner already parked in the old
+primary's `recv` reverts to the relay only on its next poll (bounded by the direct
+link's poll return, or immediately if the link dropped). With the 8s demote window
+and the 120s approval timeout this is comfortably fail-closed and still completes
+via the relay; a crisper revert (closing the demoted link to unblock the owner at
+once) is a possible future refinement, not required for correctness.
+
+Config (additive, default-off), landed: `direct_endpoint: Option<String>` (the
+rung-2 `host:port` the daemon binds) on `RemotePairingConfig` and the
+`pairing.json` device row (`#[serde(default, skip_serializing_if)]`, so existing
+pairings round-trip unchanged and load with direct OFF). A future `direct_lan:
+bool` toggle gates rung-1 advertise/discover once the Bonjour backend lands; the
+acceptor/promotion machinery it will feed is already in place. No `NewPairing` /
+`save` / `add_device` signature changed: a user opts a device in by setting
+`direct_endpoint` (hand-edit today, a config verb later), keeping the pairing flow
+untouched.
+
+Tested (all headless, over loopback TCP + in-memory relay): promotion for the
+pinned peer, rejection of an imposter opener, no-op when direct is disabled, a
+full approval riding a promoted direct link (relay depth stays 0), demote-on-
+silence completing over the relay against a black-holed primary, and the acceptor
+loop promoting a dialled phone end to end. See `crates/sigil/src/remote.rs` tests.
+
 ## Deferred, with the design to implement it
 
-These are deferred because they need either live networking / a native module
-that cannot be exercised in the current environment, or a change inside the
-reviewed daemon owner loop that must not be half-built.
+These remain deferred because they need live networking / a native module that
+cannot be exercised in the current environment. Each now sits behind the landed,
+tested daemon seam above, so a wrong or hostile input from either is bounded by
+`verify_and_promote` (drop + relay fallback), not by trusting the network.
 
-### Daemon integration (acceptor + owner-loop handoff)
+### Rung 2 status
 
-The clean seam exists: build the daemon's approver on a `FallbackTransport`
-instead of a bare `DaemonRelay` (both are `Arc<dyn Transport>`; the owner loop is
-unchanged). The care is in **promotion**, which needs the daemon's private
-agreement key and the shared replay guard -- both owned by `RemoteApprover`, whose
-owner loop is the *sole* reader of the `ToDaemon` channel. A naive acceptor that
-reads one envelope to verify would become a second reader of that channel,
-violating the single-reader invariant and desynchronising the replay counter.
-
-Plan: give `RemoteApprover` a small, additive `verify_and_promote(link)` entry
-that (a) performs the `verify_link` read using the approver's own key + guard, so
-there is still exactly one guard and one reader, and (b) on success both installs
-the link as the `FallbackTransport` primary and dispatches that first envelope
-through the normal `dispatch` path (it is a real `PushRegister`/response). The
-acceptor thread (rung 2: `DirectListener::bind(endpoint)`; rung 1: dial a
-verified discovery hit) only hands raw links to that entry; it never reads the
-channel itself. Demote-on-silence is a bounded retry added to `round_trip`:
-after a direct deposit, if no response arrives within a short fraction of the
-timeout, retire the primary and re-deposit over the relay once. This is the piece
-that turns the residual in section 4 into a short retry; it touches the reviewed
-loop and so is left for a reviewed change rather than bundled here.
-
-Config (additive, default-off) to add when this lands: `direct_endpoint:
-Option<String>` (rung 2 `host:port` the daemon binds) and `direct_lan: bool`
-(rung 1 advertise/discover toggle) on `Settings` and `RemotePairingConfig`, both
-defaulting to off so existing configs and the default relay path are unchanged.
+Rung 2 (owned-endpoint / DDNS) is **landed**: `DirectListener::bind(direct_endpoint)`
++ `run_direct_acceptor` + `verify_and_promote`. The only out-of-scope piece is an
+optional DDNS updater (the user may run any existing DDNS client). Unauthenticated
+bytes hitting the bound port drop at `verify_link`; see the residuals.
 
 ### Rung 1 concrete mDNS/Bonjour backend
 
 A thin adapter implementing `discovery::Discovery` over `mdns-sd` (pure-Rust, no
 Avahi/Bonjour daemon dependency), advertising `_sigil._tcp` with the daemon's
-`DirectListener` port and a `hint` TXT record. The hint is a salted, truncated
-hash of the daemon's public identity (e.g. first 8 bytes of
-`BLAKE2b(domain-sep || daemon_pub)`), which the phone -- which pins that key --
-recomputes to filter candidates before dialling. Deferred because it cannot be
-exercised without a live multicast network; it is a small, well-understood
-adapter over the landed, tested seam, and it produces only *hints* (a wrong hint
-merely fails `verify_link` and falls back to the relay), so its blast radius is
-bounded by the verification gate.
+`DirectListener` port and a `hint` TXT record.
 
-### Rung 2 DDNS / owned endpoint
+The hint is **already landed** as `remote::direct_service_hint(daemon_pub)`:
+`hex(BLAKE2b-64("sigil.direct.hint.v1" || verifying || agreement))`, a salted,
+truncated hash of the daemon's PUBLIC identity, which the phone -- which pins that
+key -- recomputes to filter candidates before dialling. It lives in `sigil` (not
+`sigil-direct`) because the discovery crate holds no identity/crypto types by
+design; the daemon computes the hint and hands it to a `ServiceRecord`. It is not
+the mailbox id (broadcasting that would advertise the pairing's routing address).
 
-Rung 2 is `DirectListener::bind` on a configured port plus the user's own DDNS
-name / static IP / forwarded port; the phone dials `ServiceRecord`-shaped
-`host:port` and runs the same `verify_link`. The only additional piece is an
-optional DDNS updater (out of scope here; the user may run any existing DDNS
-client). Unauthenticated bytes hitting the port drop at `verify_link`, so an
-exposed port is not a new trust surface, only a new (envelope-gated) attack
-surface the reviewer should weigh; hence default-off.
+The `mdns-sd` **crate dependency is deliberately not added**: this environment is
+offline and `mdns-sd` is not in the cargo cache, so adding it (even as an optional
+dep) would break `cargo test --workspace` at dependency resolution. When wired on
+a networked machine, add `mdns-sd` to `sigil-direct` behind an off-by-default
+`mdns` feature and implement `Discovery::advertise` (register a `ServiceInfo` with
+the port + hint TXT) and `browse` (a bounded `ServiceDaemon` browse draining the
+receiver into `ServiceRecord`s). It cannot be exercised without a live multicast
+network, and it produces only *hints* (a wrong hint merely fails `verify_link` and
+falls back to the relay), so its blast radius is bounded by the verification gate.
+The daemon side that consumes a discovered/verified rung-1 record reuses the same
+`verify_and_promote` the rung-2 acceptor uses (dial the record's `endpoint()`,
+`verify_link`, promote), so no new trust path is introduced.
 
 ### Phone native TCP direct rung
 
@@ -248,19 +322,30 @@ landed and tested.
 
 ## Residuals for the security reviewer
 
-- **Active LAN MITM one-timeout denial** under `PreferDirect` without
-  demote-on-silence (section 4). Denial only, fail-closed; closed by `Mirror` or
-  by the deferred demote-on-silence. Direct transport ships OFF by default for
-  exactly this reason.
-- **Rung-2 inbound port** is a new (envelope-gated) attack surface. Every byte is
-  dropped unless it is an envelope that opens as the pinned peer, but a reviewer
-  should confirm the daemon-at-rest inertness and fail-closed posture hold with a
-  bound listener before rung 2 is enabled.
-- **`verify_link` uses the caller's predicate.** The gate's soundness depends on
-  the daemon wiring the predicate to the real `Envelope::open` with the shared
-  guard (not a throwaway guard). The deferred `verify_and_promote` entry is where
-  that wiring must be reviewed; the crate cannot enforce it because it holds no
-  identity types by design.
+- **Active LAN MITM residual, now a short retry (section 4).** With
+  demote-on-silence built, a promoted-then-black-holed direct link no longer
+  causes a full-timeout denial: after `DIRECT_DEMOTE_AFTER` (8s) the primary is
+  retired and the request is re-deposited over the relay, which the LAN attacker
+  cannot block, and the approval completes there. The reviewer should confirm the
+  demote path (`demote_and_redeposit`: `clear_primary` + fresh-counter re-seal +
+  relay deposit; owner reverts on its next poll) and the "byte-identical when
+  direct is off" claim in `deposit_and_wait` / `deposit_and_wait_cancellable`.
+  Direct still ships OFF by default (`direct_endpoint` unset).
+- **Rung-2 inbound port** is a new (envelope-gated) attack surface, now bindable
+  when `direct_endpoint` is set. Every byte is dropped unless it is an envelope
+  that opens as the pinned peer (`verify_and_promote` -> `verify_link` -> the real
+  `classify`/`Envelope::open`); an unverified dialer gets a link that is read once
+  and dropped, never installed. The reviewer should confirm daemon-at-rest
+  inertness and the fail-closed posture with a bound listener before enabling it.
+- **`verify_and_promote` wires the real open.** The `verify_link` predicate is
+  wired to the approver's own `classify` (pinned peer key + daemon agreement key +
+  the SHARED `ReplayGuard`), not a throwaway guard, and the opener is routed
+  without a second open. This is the wiring the earlier draft flagged as needing
+  review; it is in `crates/sigil/src/remote.rs::verify_and_promote`. The
+  single-reader invariant is preserved because the verify read is on the raw link
+  and sequenced strictly before the primary is installed (after which the owner is
+  the sole reader). Confirm no second reader of any device's `ToDaemon` channel and
+  no guard sharing across devices.
 - **Metadata.** A direct link reveals to a LAN observer that two hosts talk, and
   the mDNS advertisement reveals a Sigil daemon is present (via `_sigil._tcp` +
   a non-identifying hint). No pairing routing address or key is exposed. This is
