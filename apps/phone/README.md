@@ -86,8 +86,12 @@ implementation; it is a no-op until the file exists, then a hard CI gate.
   `expo-local-authentication`; binding the wrapping key to the enclave with
   `.biometryCurrentSet` semantics needs a small native module or
   `expo-secure-store` with `requireAuthentication`, confirmed on device.
-- **Entitlements**: camera and Face ID usage strings are set in `app.json`;
-  `remote-notification` background mode is declared for the doorbell.
+- **Entitlements**: camera and Face ID usage strings, the `aps-environment`
+  entitlement, and the Apple/Android ids are set in `app.config.js` (a dynamic
+  Expo config that reads `SIGIL_*` env vars, defaulting to the Rainnworks
+  values). A self-hoster rebuilds with their own identity by setting those vars;
+  see `docs/design/self-host-build.md`. `remote-notification` background mode is
+  declared for the doorbell.
 
 ## Stubbed for later
 
