@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sigil-proto", "crates/sigil", "crates/sigil-softphone", "crates/sigil-relay-client", "crates/sigil-direct"]
+members = ["crates/sigil-proto", "crates/sigil", "crates/sigil-softphone", "crates/sigil-relay-client", "crates/sigil-direct", "crates/sigil-relay"]
 
 [workspace.package]
 version = "0.1.0"

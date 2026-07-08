@@ -1,0 +1,9 @@
+# Keep the crates/sigil-relay Docker build context (repo root) small and fast.
+target/
+**/target/
+.git/
+**/node_modules/
+apps/phone/ios/
+apps/phone/android/
+apps/mac/
+*.log
