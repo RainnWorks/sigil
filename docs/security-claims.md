@@ -1876,3 +1876,188 @@ restart), everything fails closed (denial never release; a push failure is
 best-effort and detached), and zero em-dash / zero emoji in every user-facing
 string (errors, landing, version) all hold for this crate.
 
+---
+
+## Independent review verdict: #36 multi-device core + #64 APNs identity env-sourcing (`3a18d17`, `ed5c4b6`, merged @ `afadede`)
+
+*Written by the independent security-reviewer, who did NOT implement any of this
+change (review-integrity rule). The implementer's record is
+`docs/design/multi-device.md`; its residual list was treated as a set of claims
+to break, not to trust.*
+
+**Gate:** `cargo test --workspace` PASS (sigil-core 243, hostile_relay 18,
+pairing_mitm 26, sigil-relay 12, relay integration 18, relay push 8,
+relay-client 13, softphone 3, sigil-proto 18, plus the crates that report per
+binary; 0 failed, 7 ignored). `cargo clippy --workspace --all-targets -D
+warnings` PASS (0 warnings). `cargo fmt --check` PASS (clean).
+
+**Overall verdict: GREEN. No P0/P1/P2 findings.** The multi-device approval core
+is a genuine composition over N unchanged, previously-reviewed `RemoteApprover`s,
+not a rewrite; every reviewed single-device guarantee is preserved by
+construction, and the one new concurrency (loser cancellation + first-wins
+commit) is correct: exactly one outcome reaches the gate per `decide`, and every
+failure path denies. Two honest residuals are recorded below (both already known,
+neither a release path). Held to the hostile bar.
+
+### Primary scope (#36), per item
+
+**1. N == 1 byte-identical: GREEN.** `build_gate` (`daemon.rs:241`) constructs a
+bare `Arc<RemoteApprover>` for `devices.len() == 1` and only wraps a
+`RingApprover` for N >= 2, so the common case never enters the ring coordinator.
+The reviewed `RemoteApprover::round_trip` / `deposit_and_wait` /
+`recv_timeout(self.timeout)` shape (`remote.rs:268-315`) is untouched by this
+change; `round_trip_cancellable` is a *separate* method (option A per the design)
+so no cancel check leaks into the single-device wait. `RingApprover::decide`
+(`remote.rs:746`) also short-circuits N == 1 to `self.devices[0].decide(ctx)`, and
+`pairing_store::load` returns `devices[0]` alone. Confirmed no behavior change for
+one device.
+
+**2. Cancellation correctness / exactly one outcome: GREEN.** The race is
+serialized by `winner: Mutex<Option<(usize, ApprovalOutcome)>>` (`remote.rs:757`):
+the first thread whose `round_trip_cancellable` returns `Some` finds the slot
+empty, commits, and fires `cancel.cancel()`; any later thread that also returned
+`Some` finds `w.is_some()` and drops its outcome (`remote.rs:770-778`). So even
+when two phones both approve in the same tick, EXACTLY ONE outcome is returned to
+the gate; the loser's `ApprovalOutcome` (DEK/`Z_F`) is dropped and zeroized,
+never consumed, so there is no double-release and no two devices both releasing a
+DEK. A dropped `ApprovalOutcome` releases nothing: the token decrypt/splice
+happens only on the single value `decide` returns (`daemon.rs:535`, `1460`,
+`1488`). A cancelled loser returns `None` within one `RING_CANCEL_TICK` (100 ms)
+and `round_trip_cancellable` then calls `remove_waiter` (`remote.rs:337`), so a
+late response for that device finds no waiter and is dropped by `route_response`
+(`remote.rs:635`); the remove-vs-route ordering is itself serialized by the
+`waiters` mutex, and in the losing branch the channel is never read, so a
+late-but-real response can reach neither the gate nor a second commit. All threads
+run in a `thread::scope` that JOINS before the winner slot is read
+(`remote.rs:763-784`), so no loser outlives `decide`. All-timeout / all-`None`
+leaves the slot `None` and returns `Decision::Deny` (`remote.rs:799`); the N == 0
+guard also denies (`remote.rs:743`). Fail-closed confirmed. Proven by
+`ring_first_wins_delivers_the_winners_dek_and_dismisses_losers`,
+`ring_first_deny_wins_and_dismisses_losers`, `ring_all_timeout_denies`,
+`ring_of_one_matches_the_single_device_path`.
+
+**3. Broadcast-after-commit: GREEN.** The `Settled` broadcast loop runs only in
+the `Some((idx, outcome))` arm, AFTER the scope has joined every device thread and
+the winner slot is final (`remote.rs:783-795`); it can never race a still-running
+approve. It is sent to every device EXCEPT the winner. `broadcast_resolution`
+(`remote.rs:543`) seals a `ResolutionBroadcast` carrying only `request_id` +
+`status` (no key material, no which-device, no approve/deny), rides the
+daemon->phone monotonic counter and the pinned seal, registers no waiter, and
+touches no `ReplayGuard`/DEK/`Z_F`. A forged/lost/replayed broadcast can only hide
+or dismiss a prompt (withhold a release), never cause one; the phone verifies
+signature + replay and a replay is rejected (proven by
+`broadcast_resolution_deposits_a_sealed_dismissal_the_phone_can_open` and the
+hostile-relay proof
+`resolution_broadcast_rides_the_sealed_signed_replay_protected_envelope`). A seal
+or transport error is swallowed and degrades to that phone's own timeout, never to
+a release.
+
+**4. Per-device replay isolation: GREEN.** `RingApprover` holds only
+`Vec<Arc<RemoteApprover>>` and adds NO shared guard. Each `RemoteApprover` owns
+its own `Mutex<ReplayGuard>` (`remote.rs:140`), its own monotonic `counter`, its
+own pinned `phone` key, and its own `waiters` map. Devices have distinct mailboxes
+(`mailbox_id(daemon_pub_i, phone_pub_i)`, distinct per pairing;
+`add_device_is_additive_and_per_device_isolated` asserts `all[0].mailbox() !=
+all[1].mailbox()`). A response sealed by phone B fails signature verification
+inside device A's `classify`/`Envelope::open` against A's pinned phone key and is
+dropped, so device A can never resolve device B's request nor pass B's replay
+counter. Each device keeps its own single ToDaemon owner (`serve` spawns one per
+device, `daemon.rs:694-704`), the sole reader of that mailbox.
+
+**5. Storage migration windows: GREEN.** `add_device` (`pairing_store.rs:423`)
+runs the #48 `gate_presence` FIRST (deny-closed, nothing written on decline;
+proven by `add_device_gates_on_biometric_and_writes_nothing_on_decline`), then
+seals the identity blob, then rewrites the container file: blob-then-file, so a
+crash between leaves an ORPHAN blob (inert, referenced by no device row), never an
+armed device without a pinned phone. `remove_device` (`pairing_store.rs:519`)
+rewrites the file (row gone) BEFORE deleting the blob: file-then-blob, so a crash
+leaves an orphan blob, never a dangling row pointing at a deleted identity. A pin
+without an identity cannot arm: `device_to_config` fails LOUD
+(`MissingIdentity`/`CorruptIdentity`) rather than arming without the keystore half
+(`config_present_but_identity_missing_is_a_loud_error`). The v1->v2 migration
+(`read_container` -> `from_v1`) is a pure in-memory read transform that keeps the
+primary's `primary` sentinel + legacy keystore label and NEVER touches the
+keystore; reads never rewrite (idempotent, crash-safe), and the rewrite defers to
+the next mutating call (`a_v1_file_migrates_on_read`). The #48 gate also fires on
+`save`. Confirmed no window with an armed-without-pin device or a pin without
+identity.
+
+**6. load_all fail-closed: GREEN.** `load_all` (`pairing_store.rs:469`) maps
+`device_to_config` over every device and `.collect()`s into `Result<Vec, _>`,
+which short-circuits on the FIRST error, so one half-broken device makes the whole
+load fail. `load_remote_pairing` turns that error into an empty vector
+(`daemon.rs:180`), which sets `phone_paired = false` (`daemon.rs:290`) and drops
+the factor to Biometric or NoFactor: the daemon never arms a SUBSET of devices,
+and the phone factor is disabled entirely rather than arming past a broken row.
+That is the safe (fail-closed) direction. N tokens under N mailboxes is the
+single-device push posture multiplied: the relay learns it can wake N devices for
+N unlinkable mailbox hashes and nothing more (`PushStore` is keyed by mailbox; no
+`daemon_pub` ever reaches the relay). Recorded as residual R-#36-2 below (a single
+corrupt row disables all phone approval, an availability tradeoff, never a
+release).
+
+**Cross-cutting (re-verified for the ring): GREEN.** Daemon inert at rest (no DEK
+persisted; the v2 container holds only public pins in a 0600 file; the private
+identity stays in the keystore; `config_file_is_0600_and_holds_no_dek`). Secret
+bytes never enter daemon memory (the decrypt/splice path is untouched; the ring
+returns the same `ApprovalOutcome` the single-device path does). Relay powerless
+(per-device mailbox is another opaque key-hash mailbox; the broadcast is opaque
+and single-use). Approve requires the phone's hardware-gated key use (unchanged;
+deny and dismiss require nothing). Everything fails closed (all-timeout deny,
+half-broken-load deny, non-primary v2 deny).
+
+### Secondary scope (#64), per item
+
+**(a) Default build byte-identical: GREEN.** `ApnsIdentity::from_env`
+(`push.rs:70`) reads `APNS_TOPIC` / `APNS_TEAM_ID` / `APNS_KEY_ID`, each falling
+back to the pinned `DEFAULT_APNS_*` (`works.rainn.sigil` / `53W966FBFP` /
+`5PCK76SDBA`) when unset OR empty, so `kid`/`iss`/`topic` are unchanged with the
+env unset. Proven by `default-equals-pinned` and the `from_env` override/default
+tests (relay push suite, 8 pass).
+
+**(b) Self-hoster identity grants no new power: GREEN.** The identity only
+addresses the APNs topic and signs the operator's own provider JWT with the
+operator's own `.p8` key; it never enters the opaque-envelope / key-hash-mailbox
+path (which carries no identity), so it can only sign that operator's own pushes.
+The doorbell body is fixed and content-free.
+
+**(c) No identity/secret logged: GREEN.** Only error branches `eprintln!` (JWT
+mint failure, APNs rejection status/text, transport error); the `.p8` PEM, the
+minted bearer, and the device token are never logged. Topic/team/key-id are not
+secrets.
+
+**(d) Stale bearer not reusable across a changed kid/iss: GREEN.** The JWT cache
+hit requires `c.pem == pem && &c.id == id` AND freshness (`push.rs:154`), so any
+change to `key_id`/`team_id`/`topic` (or the PEM) misses the cache and re-signs a
+fresh token with the new `kid`/`iss`. A token minted under one identity can never
+be served for another. `overridden-identity-rides-the-wire` proves the override
+reaches the header/claims.
+
+### Residuals (honest limits, neither a release path)
+
+- **R-#36-1 (v2 threshold under multi-device, known/deferred).** A v2 account is
+  armed against the PRIMARY device's Secure-Enclave share `F` only. In a ring, a
+  non-primary phone's v2 approve returns a partial for the right `account_id` but
+  the wrong `F`, which the coordinator treats as a real decision that can WIN the
+  race; the downstream combine then reconstructs a wrong DEK and AES-256-GCM
+  authentication fails (`secrets::decrypt_token` -> `SecretsError::Aead`), so the
+  request DENIES. This is fail-closed (no partial release, no plaintext), but it
+  is an availability quirk: a non-primary phone answering a v2 request first can
+  cause a spurious deny of a request the primary would have approved. Must stay
+  surfaced in `sigil doctor` (design doc §"v2 threshold under multi-device"), not
+  silent. No release path; acceptable to land, worth closing with per-device `E_i`
+  wraps before v2 multi-device is advertised.
+- **R-#36-2 (one broken device disables all phone approval).** Because `load_all`
+  fails loud on the first bad row, a single corrupt/unreadable device row (corrupt
+  file, missing/rotated keystore identity, off-curve `F`) drops the WHOLE phone
+  factor to Biometric/NoFactor. This is the intended fail-closed direction (never
+  arm a subset), but it means local corruption of one row is a denial-of-service
+  on all phone approval. An attacker who can corrupt a pairing row already has the
+  local file/keystore access that is game-over for this threat model, so this is
+  availability-only; noted for honesty, not blocking.
+
+**Verdict recorded by the independent security-reviewer (did not implement
+`3a18d17` / `ed5c4b6`). #36 multi-device core and #64 APNs identity env-sourcing
+are GREEN and ship-clear; the two residuals above are fail-closed availability
+limits, not release paths.**
+
