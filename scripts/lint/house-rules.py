@@ -41,9 +41,7 @@ TARGETS = [
     ("crates/proto/src", "**/*.rs", "c"),
     ("crates/relay-client/src", "**/*.rs", "c"),
     ("crates/softphone/src", "**/*.rs", "c"),
-    ("relay/src", "**/*.ts", "c"),
-    ("relay/bun", "**/*.ts", "c"),
-    ("relay/shared", "**/*.ts", "c"),
+    ("relay", "landing.html", "html"),
     ("site", "*.html", "html"),
     ("docs/design", "sigil-design-brief.html", "html"),
 ]
