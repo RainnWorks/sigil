@@ -1,0 +1,55 @@
+# systemd unit for the native Sigil relay (sigil-relay).
+#
+# The relay serves PLAIN HTTP only, by design (TLS is Caddy's job, in front).
+# It listens on port 8080 (set PORT=8080 in the env file). NOTE: the current
+# binary binds 0.0.0.0:PORT, not 127.0.0.1; it is kept off the internet by the
+# GCP firewall never opening :8080 (only :443 from Cloudflare and :22 from the
+# operator). See README.md "About the bind address" for the loopback follow-up.
+#
+# Install: /etc/systemd/system/sigil-relay.service (setup.sh does this).
+
+[Unit]
+Description=Sigil blind relay (native)
+Documentation=https://github.com/rainnworks/sigil
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sigil
+Group=sigil
+EnvironmentFile=/etc/sigil/relay.env
+ExecStart=/usr/local/bin/sigil-relay
+Restart=always
+RestartSec=2
+
+# The relay writes nothing to disk, holds one small in-memory map, and only
+# needs to read its .p8 under /etc/sigil. Lock everything else down.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+# The relay never writes anywhere. No ReadWritePaths are needed: ProtectSystem=
+# strict leaves the whole filesystem read-only, which is exactly right here.
+
+# Keep the footprint tight; the relay's whole point is to be near-free.
+MemoryMax=128M
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target
