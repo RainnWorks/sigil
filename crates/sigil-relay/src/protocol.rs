@@ -46,6 +46,15 @@ pub const LONG_POLL_MS: u64 = 25_000;
 /// likeliest orphaned) rather than resolving a live one early. This is the
 /// explicit memory bound; the rate limiter is only a coarse backstop.
 pub const MAX_WAITERS: usize = 8;
+/// Global cap on the number of distinct live mailboxes the process will hold at
+/// once. A mailbox id is a 256-bit capability, so a shape-valid id costs nothing
+/// to mint; without this bound an unauthenticated flood of distinct ids grows
+/// the map (and its held connections) until the 180s sweep reclaims them. At the
+/// cap the relay refuses to CREATE a new mailbox (503) but never touches ones
+/// already established, so real pairings keep working while a flood fails closed.
+/// Generous enough that normal use never reaches it; a wide public deploy should
+/// also sit behind a reverse proxy with its own connection/rate limits.
+pub const MAX_MAILBOXES: usize = 100_000;
 /// Per-mailbox ordinary deposits/drains allowed per [`RATE_WINDOW_MS`]. Held
 /// only in the mailbox's in-memory record; never persisted. Non-load-bearing.
 pub const RATE_MAX: u32 = 60;

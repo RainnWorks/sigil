@@ -69,11 +69,24 @@ impl AppState {
         &self.config
     }
 
-    fn get_box(&self, id: &str) -> Arc<Mutex<Mailbox>> {
+    /// Fetch an existing mailbox, or create one if the global cap allows.
+    /// Returns `None` only when the id is new AND the process is already holding
+    /// [`p::MAX_MAILBOXES`] distinct mailboxes: an established pairing (its id is
+    /// already in the map) is never refused, so a flood of fresh ids fails closed
+    /// without evicting real traffic. See [`p::MAX_MAILBOXES`].
+    fn get_box(&self, id: &str) -> Option<Arc<Mutex<Mailbox>>> {
         let mut map = lock(&self.boxes);
-        map.entry(id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(Mailbox::new())))
-            .clone()
+        if let Some(mb) = map.get(id) {
+            return Some(mb.clone());
+        }
+        if map.len() >= p::MAX_MAILBOXES {
+            return None;
+        }
+        Some(
+            map.entry(id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(Mailbox::new())))
+                .clone(),
+        )
     }
 
     /// Periodic sweep: evict expired items and drop mailboxes that are both
@@ -164,7 +177,9 @@ async fn mailbox(
     method: hyper::Method,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
-    let mb = state.get_box(id);
+    let Some(mb) = state.get_box(id) else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "at_capacity");
+    };
     let slot = match verb {
         "to-phone" => Some(Slot::ToPhone),
         "to-daemon" => Some(Slot::ToDaemon),
@@ -416,7 +431,9 @@ async fn knock(state: &Arc<AppState>, req: Request<Incoming>) -> Response<Full<B
 
     // Rate-limit the knock on the same tight per-mailbox push budget.
     {
-        let mb = state.get_box(mailbox_hash);
+        let Some(mb) = state.get_box(mailbox_hash) else {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "at_capacity");
+        };
         let mut g = lock(&mb);
         if !p::push_ok(&mut g, p::now_ms()) {
             return err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");

@@ -185,7 +185,7 @@ pub async fn send_push_direct(
 
 /// Upstream-mode dispatch: forward an opaque knock to a configured upstream
 /// relay's `/knock`. Best-effort, fail-open; carries only the opaque token, the
-/// mailbox hash, and the platform tag — never any message content.
+/// mailbox hash, and the platform tag, never any message content.
 pub async fn forward_knock(
     upstream: String,
     token: String,
