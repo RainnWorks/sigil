@@ -110,12 +110,14 @@ pub struct Core {
     leases: LeaseStore,
     gate: ApprovalGate,
     pending: Arc<PendingRegistry>,
-    /// The remote approver, when the phone is the factor. Held so the control
-    /// handler can enumerate in-flight remote requests (and their delivery-receipt
-    /// state) onto the `pending` surface the Mac reads. `None` for the local
-    /// factors, which enumerate the [`pending`](Self::pending) registry alone. This
-    /// is the SAME approver the ToDaemon owner loop drives; it is read-only here.
-    remote: Option<Arc<RemoteApprover>>,
+    /// The remote approvers, one per paired phone (#36 multi-device), when the
+    /// phone is the factor. Held so the control handler can enumerate in-flight
+    /// remote requests (and their delivery-receipt state) across all devices onto
+    /// the `pending` surface the Mac reads. Empty for the local factors, which
+    /// enumerate the [`pending`](Self::pending) registry alone. These are the SAME
+    /// approvers the ToDaemon owner loops drive; read-only here. A single-device
+    /// daemon holds exactly one, behaving as before.
+    remote: Vec<Arc<RemoteApprover>>,
     lockdown: AtomicBool,
     proc_table: Box<dyn ProcessTable + Send + Sync>,
     /// The provider registry: a command's config names a provider by id, and the
@@ -174,12 +176,12 @@ impl RemotePairingConfig {
 /// daemon still arms and fails closed rather than refusing to start; the fault
 /// surfaces in `sigil doctor`. See [`crate::pairing_store`] for the on-disk
 /// format and why it stays inert at rest.
-fn load_remote_pairing(ks: &Arc<dyn Keystore>) -> Option<RemotePairingConfig> {
-    match crate::pairing_store::load(ks.as_ref()) {
-        Ok(cfg) => cfg,
+fn load_remote_pairing(ks: &Arc<dyn Keystore>) -> Vec<RemotePairingConfig> {
+    match crate::pairing_store::load_all(ks.as_ref()) {
+        Ok(cfgs) => cfgs,
         Err(e) => {
             eprintln!("sigil daemon: ignoring an unreadable pairing config: {e}");
-            None
+            Vec::new()
         }
     }
 }
@@ -189,47 +191,65 @@ fn load_remote_pairing(ks: &Arc<dyn Keystore>) -> Option<RemotePairingConfig> {
 /// every request; the real factors are the phone (sealed remote approval) and
 /// the hardware biometric.
 ///
-/// Returns the gate plus, for the phone factor only, a live handle to the
-/// [`RemoteApprover`] so the caller can run its ToDaemon owner loop (the sole
-/// reader of the ToDaemon channel, which captures the phone's arm-time push token
-/// and routes approval responses to their waiters). The other factors have no
-/// relay channel and hand back `None`.
+/// Returns the gate plus, for the phone factor, the live [`RemoteApprover`]
+/// handles (one per paired phone) so the caller can run each device's ToDaemon
+/// owner loop (the sole reader of that device's channel, which captures its
+/// arm-time push token and routes its approval responses to their waiters). The
+/// other factors have no relay channel and hand back an empty vector.
+///
+/// **N == 1 is byte-identical.** With exactly one paired device the gate is a
+/// bare [`RemoteApprover`], exactly as the reviewed single-device path. A
+/// [`RingApprover`] is built ONLY for N >= 2, so the common case never touches the
+/// ring coordinator (#36 multi-device).
 fn build_gate(
     factor: Factor,
-    remote: Option<RemotePairingConfig>,
+    remote: Vec<RemotePairingConfig>,
     keystore: &Arc<dyn Keystore>,
     pending: &Arc<PendingRegistry>,
-) -> anyhow::Result<(ApprovalGate, Option<Arc<RemoteApprover>>)> {
-    let (approver, listener): (Box<dyn Approver>, Option<Arc<RemoteApprover>>) = match factor {
+) -> anyhow::Result<(ApprovalGate, Vec<Arc<RemoteApprover>>)> {
+    let (approver, listeners): (Box<dyn Approver>, Vec<Arc<RemoteApprover>>) = match factor {
         Factor::Phone => {
-            let cfg = remote.expect("phone factor implies a pairing config");
-            let relay = DaemonRelay::new(&cfg.relay_url, cfg.mailbox())
-                .map_err(|e| anyhow::anyhow!("reaching relay {}: {e}", cfg.relay_url))?;
-            // The disk-backed push registration store (survives restarts). The
-            // phone's token, when registered, is forwarded to the relay on each
-            // deposit so the RELAY rings a content-free doorbell; the daemon holds
-            // no Apple secret and signs no push. Best-effort: with no token the
-            // phone simply polls.
-            let push_store = Arc::new(crate::push_store::PushStore::load());
-            // Hold the approver in an Arc: the gate takes one clone as its
-            // `Box<dyn Approver>` and `serve` keeps another to run the ToDaemon
-            // owner loop. They share the waiter map, so the owner (the sole reader)
-            // routes each response to the approval waiting for it.
-            let approver = Arc::new(
-                RemoteApprover::new(Arc::new(relay), cfg.daemon_identity, cfg.phone)
-                    .with_push(push_store)
-                    // Share the pending registry so a remote request's arrival,
-                    // delivery receipt, or completion bumps the version a
-                    // `subscribe_pending` client waits on (Sent -> Delivered live).
-                    .with_pending(pending.clone()),
+            assert!(
+                !remote.is_empty(),
+                "phone factor implies at least one pairing config"
             );
-            (Box::new(approver.clone()), Some(approver))
+            // The disk-backed push registration store, shared across devices: it is
+            // keyed by mailbox, so N devices register N tokens under N mailboxes and
+            // coexist without collision. Survives restarts.
+            let push_store = Arc::new(crate::push_store::PushStore::load());
+            // Build one unchanged single-device approver per paired phone.
+            let mut devices: Vec<Arc<RemoteApprover>> = Vec::with_capacity(remote.len());
+            for cfg in remote {
+                let relay = DaemonRelay::new(&cfg.relay_url, cfg.mailbox())
+                    .map_err(|e| anyhow::anyhow!("reaching relay {}: {e}", cfg.relay_url))?;
+                // Hold each approver in an Arc: the gate drives it (bare, or via the
+                // ring) and `serve` keeps a clone to run its ToDaemon owner loop.
+                // They share the waiter map, so the owner (the sole reader) routes
+                // each response to the approval waiting for it.
+                let approver = Arc::new(
+                    RemoteApprover::new(Arc::new(relay), cfg.daemon_identity, cfg.phone)
+                        .with_push(push_store.clone())
+                        // Share the pending registry so a remote request's arrival,
+                        // delivery receipt, or completion bumps the version a
+                        // `subscribe_pending` client waits on (Sent -> Delivered).
+                        .with_pending(pending.clone()),
+                );
+                devices.push(approver);
+            }
+            // N == 1: the gate is the bare approver (reviewed path, unchanged).
+            // N >= 2: compose the ring-all / first-wins coordinator over them.
+            let gate_approver: Box<dyn Approver> = if devices.len() == 1 {
+                Box::new(devices[0].clone())
+            } else {
+                Box::new(crate::remote::RingApprover::new(devices.clone()))
+            };
+            (gate_approver, devices)
         }
         // The biometric unwrap is the only gate; an unresolved decision fails
         // closed (no control socket, no dev switch).
         Factor::Biometric => (
             Box::new(LocalApprover::new(keystore.clone(), pending.clone())),
-            None,
+            Vec::new(),
         ),
         // The one place the forgeable dev paths are wired.
         Factor::DevInsecure => (
@@ -238,11 +258,11 @@ fn build_gate(
                     .with_dev(DevMode::from_env())
                     .with_control_socket(true),
             ),
-            None,
+            Vec::new(),
         ),
-        Factor::NoFactor => (Box::new(NullApprover), None),
+        Factor::NoFactor => (Box::new(NullApprover), Vec::new()),
     };
-    Ok((ApprovalGate::new(approver), listener))
+    Ok((ApprovalGate::new(approver), listeners))
 }
 
 impl Core {
@@ -250,7 +270,7 @@ impl Core {
     /// (a paired phone, then a hardware biometric) and `dev_insecure`. With no
     /// real factor and no `--dev-insecure`, the factor is [`Factor::NoFactor`]
     /// and every gated request fails closed.
-    pub fn for_host(dev_insecure: bool) -> anyhow::Result<(Self, Option<Arc<RemoteApprover>>)> {
+    pub fn for_host(dev_insecure: bool) -> anyhow::Result<(Self, Vec<Arc<RemoteApprover>>)> {
         let keystore = keystore::for_host();
         let accounts = AccountStore::load().context("loading account store")?;
         // The v2 threshold accounts (if any). A missing/unreadable store is
@@ -267,11 +287,11 @@ impl Core {
         let remote = load_remote_pairing(&keystore);
         let inputs = factor::ArmInputs {
             dev_insecure,
-            phone_paired: remote.is_some(),
+            phone_paired: !remote.is_empty(),
             biometric: keystore.is_biometric(),
         };
         let factor = factor::resolve(&inputs);
-        let (gate, remote_listener) = build_gate(factor, remote, &keystore, &pending)?;
+        let (gate, remote_listeners) = build_gate(factor, remote, &keystore, &pending)?;
 
         // Load the served SSH identities from ~/.sigil/ssh-keys.json and build a
         // signer per source (op-fetch + file-based). A bad config is logged and
@@ -302,7 +322,7 @@ impl Core {
             leases: LeaseStore::new(),
             gate,
             pending,
-            remote: remote_listener.clone(),
+            remote: remote_listeners.clone(),
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(SysProcessTable),
             providers: ProviderRegistry::with_defaults(),
@@ -316,7 +336,7 @@ impl Core {
                     .unwrap_or(30),
             ),
         };
-        Ok((core, remote_listener))
+        Ok((core, remote_listeners))
     }
 
     /// The full status report, the daemon's answer to `Frame::Status`. It is the
@@ -590,19 +610,16 @@ impl Drop for ConnPermit {
 /// `args` are the `sigil daemon` arguments (e.g. `--dev-insecure`).
 pub fn run(args: &[String]) -> anyhow::Result<()> {
     let dev_insecure = factor::dev_insecure_requested(args);
-    let (core, remote_listener) = Core::for_host(dev_insecure)?;
+    let (core, remote_listeners) = Core::for_host(dev_insecure)?;
     let core = Arc::new(core);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
         .build()
         .context("building tokio runtime")?;
-    rt.block_on(serve(core, remote_listener))
+    rt.block_on(serve(core, remote_listeners))
 }
 
-async fn serve(
-    core: Arc<Core>,
-    remote_listener: Option<Arc<RemoteApprover>>,
-) -> anyhow::Result<()> {
+async fn serve(core: Arc<Core>, remote_listeners: Vec<Arc<RemoteApprover>>) -> anyhow::Result<()> {
     // Roll the launchd append-mode logs if they have grown large, before we add
     // to them. Best-effort: never blocks arming.
     service::rotate_logs(service::LOG_ROTATE_BYTES);
@@ -663,22 +680,28 @@ async fn serve(
     // one cap bounds both.
     let conns = ConnGate::new();
 
-    // The single ToDaemon owner (phone factor only). It is the sole reader of the
-    // ToDaemon channel: it captures the phone's arm-time push token the instant it
-    // lands (instead of letting it expire in the relay before the next approval
-    // looks) and routes each approval response to its waiting round trip. It runs
-    // on its own thread (its recv is a blocking long-poll) and stops when the
-    // shutdown flag is set. Because it is the only reader, no two readers can steal
-    // each other's messages, and an approval piggybacks the poll it is already
-    // holding, so there is no lock and no latency coupling to the relay's hold.
+    // One ToDaemon owner PER paired device (#36 multi-device). Each is the sole
+    // reader of ITS device's ToDaemon channel: it captures that phone's arm-time
+    // push token the instant it lands (instead of letting it expire in the relay
+    // before the next approval looks) and routes that device's approval responses
+    // to their waiting round trips. Each runs on its own thread (its recv is a
+    // blocking long-poll) and stops when the shared shutdown flag is set. Because
+    // each device has exactly one reader, no two readers can steal each other's
+    // messages, and an approval piggybacks the poll it is already holding, so there
+    // is no lock and no latency coupling to the relay's hold. A single-device
+    // daemon spawns exactly one, as before.
     let listener_shutdown = Arc::new(AtomicBool::new(false));
-    let listener_handle = remote_listener.map(|approver| {
-        let stop = listener_shutdown.clone();
-        std::thread::Builder::new()
-            .name("sigil-todaemon-owner".into())
-            .spawn(move || approver.run_todaemon_owner(&stop))
-            .expect("spawning the ToDaemon owner")
-    });
+    let listener_handles: Vec<std::thread::JoinHandle<()>> = remote_listeners
+        .into_iter()
+        .enumerate()
+        .map(|(i, approver)| {
+            let stop = listener_shutdown.clone();
+            std::thread::Builder::new()
+                .name(format!("sigil-todaemon-owner-{i}"))
+                .spawn(move || approver.run_todaemon_owner(&stop))
+                .expect("spawning the ToDaemon owner")
+        })
+        .collect();
 
     // The config hot-reloader (#59): picks up `sigil-config` edits without a
     // restart. Shares the shutdown flag so it stops with the daemon.
@@ -743,10 +766,10 @@ async fn serve(
         }
     }
 
-    // Let the ToDaemon owner observe the shutdown flag and exit. It may be mid-poll
-    // (up to one relay long-poll hold), so this join is best-effort and bounded by
-    // that; the process is exiting regardless.
-    if let Some(handle) = listener_handle {
+    // Let each device's ToDaemon owner observe the shutdown flag and exit. Each may
+    // be mid-poll (up to one relay long-poll hold), so these joins are best-effort
+    // and bounded by that; the process is exiting regardless.
+    for handle in listener_handles {
         let _ = handle.join();
     }
     // The watcher wakes at most one poll interval after the flag is set.
@@ -1041,14 +1064,32 @@ fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
         })
         .collect();
 
-    // Remote (phone-factor) in-flight set, if any, carrying delivery state.
-    if let Some(remote) = &core.remote {
-        rows.extend(
-            remote
-                .pending_snapshot()
-                .into_iter()
-                .map(remote_pending_json),
-        );
+    // Remote (phone-factor) in-flight set across all paired devices, carrying
+    // delivery state. A ring-all request is outstanding on EVERY device at once, so
+    // it appears once per device; de-duplicate by `request_id` for the Mac's
+    // surface, keeping the earliest `queued_at_ms` and any observed
+    // `delivered_at_ms` (a delivery receipt from any device advances the readout).
+    if !core.remote.is_empty() {
+        let mut by_id: std::collections::HashMap<String, crate::remote::RemotePending> =
+            std::collections::HashMap::new();
+        for remote in &core.remote {
+            for snap in remote.pending_snapshot() {
+                by_id
+                    .entry(snap.request.request_id.clone())
+                    .and_modify(|existing| {
+                        if snap.queued_at_ms < existing.queued_at_ms {
+                            existing.queued_at_ms = snap.queued_at_ms;
+                        }
+                        if existing.delivered_at_ms.is_none() {
+                            existing.delivered_at_ms = snap.delivered_at_ms;
+                        }
+                    })
+                    .or_insert(snap);
+            }
+        }
+        let mut deduped: Vec<crate::remote::RemotePending> = by_id.into_values().collect();
+        deduped.sort_by_key(|s| std::cmp::Reverse(s.queued_at_ms));
+        rows.extend(deduped.into_iter().map(remote_pending_json));
     }
     rows
 }
@@ -1742,7 +1783,7 @@ mod tests {
             .with_control_socket(true)
             .with_timeout(timeout);
         let core = Core {
-            remote: None,
+            remote: Vec::new(),
             keystore,
             accounts: Mutex::new(accounts),
             threshold: Mutex::new(Default::default()),
@@ -1872,7 +1913,7 @@ mod tests {
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Core {
-            remote: None,
+            remote: Vec::new(),
             keystore,
             accounts: Mutex::new(accounts),
             threshold: Mutex::new(Default::default()),
@@ -2324,7 +2365,7 @@ mod tests {
             .with_control_socket(true);
         let config = env_file_config("faketool", env_path.to_str().unwrap());
         let core = Arc::new(Core {
-            remote: None,
+            remote: Vec::new(),
             keystore,
             accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
@@ -2443,7 +2484,7 @@ mod tests {
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Arc::new(Core {
-            remote: None,
+            remote: Vec::new(),
             keystore,
             accounts: Mutex::new(accounts),
             threshold: Mutex::new(Default::default()),
@@ -2500,7 +2541,7 @@ mod tests {
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Arc::new(Core {
-            remote: None,
+            remote: Vec::new(),
             keystore,
             accounts: Mutex::new(AccountStore::default()), // no sealed blob
             threshold: Mutex::new(Default::default()),
@@ -2572,7 +2613,7 @@ mod tests {
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Arc::new(Core {
-            remote: None,
+            remote: Vec::new(),
             keystore,
             accounts: Mutex::new(accounts),
             threshold: Mutex::new(Default::default()),
@@ -2645,7 +2686,7 @@ mod tests {
             .with_control_socket(true);
         let config = env_file_config("faketool", env_path.to_str().unwrap());
         let core = Arc::new(Core {
-            remote: None,
+            remote: Vec::new(),
             keystore,
             accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
@@ -2727,7 +2768,7 @@ mod tests {
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Arc::new(Core {
-            remote: None,
+            remote: Vec::new(),
             keystore,
             accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
@@ -2816,7 +2857,7 @@ mod tests {
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Core {
-            remote: None,
+            remote: Vec::new(),
             keystore,
             accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
@@ -3027,7 +3068,7 @@ mod tests {
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver.clone())),
-            remote: Some(approver.clone()),
+            remote: vec![approver.clone()],
             pending,
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
@@ -3271,7 +3312,7 @@ mod tests {
             threshold: Mutex::new(store),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver.clone())),
-            remote: Some(approver.clone()),
+            remote: vec![approver.clone()],
             pending: Arc::new(PendingRegistry::new()),
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
@@ -3483,7 +3524,7 @@ mod tests {
             threshold: Mutex::new(tstore),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver.clone())),
-            remote: Some(approver.clone()),
+            remote: vec![approver.clone()],
             pending: Arc::new(PendingRegistry::new()),
             lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
@@ -3560,13 +3601,13 @@ mod tests {
     // --- the FULL cross-process loop over the REAL relay -------------------
     //
     // Same milestone as `remote_softphone_approval_delivers_secret_over_the_socket`,
-    // but the envelopes traverse the real blind relay (the Bun server) over plain
+    // but the envelopes traverse the real blind relay (the native sigil-relay) over plain
     // HTTP instead of the in-process LocalRelay: the daemon deposits/drains its
     // mailbox slots (`DaemonRelay`) and the softphone deposits/drains the mirror
     // (`PhoneRelay`). Pairing is done in-process (out-of-band by design); only
     // the post-pairing approval round trip is carried by the relay.
 
-    /// A spawned Bun relay process, killed on drop.
+    /// A spawned native relay process, killed on drop.
     struct RelayServer(std::process::Child);
     impl Drop for RelayServer {
         fn drop(&mut self) {
@@ -3584,36 +3625,34 @@ mod tests {
             .port()
     }
 
-    /// Locate the `bun` binary: `$BUN_PATH`, then `PATH`, then `~/.bun/bin/bun`.
-    fn which_bun() -> Option<PathBuf> {
-        if let Some(p) = std::env::var_os("BUN_PATH") {
-            return Some(PathBuf::from(p));
+    /// Locate the native `sigil-relay` binary (the TS Bun relay was retired). In
+    /// order: `$SIGIL_RELAY_BIN`, then the workspace `target/{debug,release}`
+    /// under `$CARGO_TARGET_DIR` or `../../target` relative to this crate. Returns
+    /// `None` when it has not been built, so the caller soft-skips with a hint to
+    /// `cargo build -p sigil-relay`.
+    fn which_native_relay() -> Option<PathBuf> {
+        if let Some(p) = std::env::var_os("SIGIL_RELAY_BIN") {
+            let p = PathBuf::from(p);
+            return p.is_file().then_some(p);
         }
-        if let Some(path) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&path) {
-                let cand = dir.join("bun");
-                if cand.is_file() {
-                    return Some(cand);
-                }
+        let target_root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"));
+        for profile in ["debug", "release"] {
+            let cand = target_root.join(profile).join("sigil-relay");
+            if cand.is_file() {
+                return Some(cand);
             }
         }
-        let home = std::env::var_os("HOME")?;
-        let cand = Path::new(&home).join(".bun/bin/bun");
-        cand.is_file().then_some(cand)
+        None
     }
 
-    /// Spawn the Bun relay on a specific loopback `port` and wait for it to
-    /// accept connections. Returns `None` if `bun` or the server script is
-    /// missing, or the port never came up.
-    fn bun_relay_on(port: u16) -> Option<RelayServer> {
-        let bun = which_bun()?;
-        let server = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../relay/bun/server.ts");
-        if !server.exists() {
-            return None;
-        }
-        let child = std::process::Command::new(bun)
-            .arg("run")
-            .arg(&server)
+    /// Spawn the native `sigil-relay` on a specific loopback `port` and wait for
+    /// it to accept connections. Returns `None` if the binary is missing or the
+    /// port never came up.
+    fn native_relay_on(port: u16) -> Option<RelayServer> {
+        let bin = which_native_relay()?;
+        let child = std::process::Command::new(bin)
             .env("PORT", port.to_string())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -3630,28 +3669,29 @@ mod tests {
     }
 
     /// Resolve a relay base URL for the e2e test. Prefers `$SIGIL_TEST_RELAY_URL`
-    /// (an already-running relay); otherwise spawns the Bun relay if `bun` is
-    /// available. Returns `None` to soft-skip when no relay can be obtained.
+    /// (an already-running relay); otherwise spawns the native `sigil-relay` if it
+    /// has been built. Returns `None` to soft-skip when no relay can be obtained.
     fn obtain_relay() -> Option<(String, Option<RelayServer>)> {
         if let Ok(url) = std::env::var("SIGIL_TEST_RELAY_URL") {
             return Some((url, None));
         }
         let port = free_port();
-        let guard = bun_relay_on(port)?;
+        let guard = native_relay_on(port)?;
         Some((format!("http://127.0.0.1:{port}"), Some(guard)))
     }
 
     #[test]
     #[cfg_attr(
         not(feature = "real-relay"),
-        ignore = "spawns an external bun relay; run: cargo test -p sigil --features real-relay -- --test-threads=1"
+        ignore = "spawns the native sigil-relay; build it first (cargo build -p sigil-relay), then: cargo test -p sigil --features real-relay -- --test-threads=1"
     )]
     fn remote_approval_over_the_real_relay_delivers_the_secret() {
         let Some((base, _server)) = obtain_relay() else {
             eprintln!(
                 "SKIPPED remote_approval_over_the_real_relay_delivers_the_secret: no relay. \
-                 Install bun, or start one and set SIGIL_TEST_RELAY_URL, e.g.\n  \
-                 PORT=8787 bun run relay/bun/server.ts   (then SIGIL_TEST_RELAY_URL=http://127.0.0.1:8787)"
+                 Build the native relay (cargo build -p sigil-relay), or start one and set \
+                 SIGIL_TEST_RELAY_URL, e.g.\n  \
+                 PORT=8787 target/debug/sigil-relay   (then SIGIL_TEST_RELAY_URL=http://127.0.0.1:8787)"
             );
             return;
         };
@@ -3753,7 +3793,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "real-relay"),
-        ignore = "spawns an external bun relay; run: cargo test -p sigil --features real-relay -- --test-threads=1"
+        ignore = "spawns the native sigil-relay; build it first (cargo build -p sigil-relay), then: cargo test -p sigil --features real-relay -- --test-threads=1"
     )]
     fn daemon_relay_resumes_after_the_relay_is_bounced() {
         // Relay restart tolerance: build the daemon client, drop the relay out
@@ -3767,8 +3807,8 @@ mod tests {
             return;
         }
         let port = free_port();
-        let Some(server1) = bun_relay_on(port) else {
-            eprintln!("SKIPPED daemon_relay_resumes_after_the_relay_is_bounced: bun not available");
+        let Some(server1) = native_relay_on(port) else {
+            eprintln!("SKIPPED daemon_relay_resumes_after_the_relay_is_bounced: native sigil-relay not built (cargo build -p sigil-relay)");
             return;
         };
         let base = format!("http://127.0.0.1:{port}");
@@ -3785,7 +3825,7 @@ mod tests {
         // Bounce the relay: drop the old process, start a fresh one on the port.
         drop(server1);
         std::thread::sleep(Duration::from_millis(200));
-        let _server2 = bun_relay_on(port).expect("relay restart on the same port");
+        let _server2 = native_relay_on(port).expect("relay restart on the same port");
 
         // Generous timeout to absorb reconnect backoff.
         let (core, approver) = remote_core(
@@ -3841,9 +3881,9 @@ mod tests {
             .unwrap();
         drop(dek);
         let pending = Arc::new(PendingRegistry::new());
-        let (gate, _listener) = build_gate(factor, None, &keystore, &pending).unwrap();
+        let (gate, _listeners) = build_gate(factor, Vec::new(), &keystore, &pending).unwrap();
         Arc::new(Core {
-            remote: None,
+            remote: Vec::new(),
             keystore,
             accounts: Mutex::new(accounts),
             threshold: Mutex::new(Default::default()),
@@ -4070,11 +4110,12 @@ mod tests {
             Factor::Phone
         );
         // And the gate builds the phone approver from the config.
-        let (gate, listener) = build_gate(Factor::Phone, Some(cfg), &ks, &pending).unwrap();
+        let (gate, listeners) = build_gate(Factor::Phone, vec![cfg], &ks, &pending).unwrap();
         let _ = gate; // constructed without a DEK at rest: inert.
-        assert!(
-            listener.is_some(),
-            "the phone factor hands back a listener handle for the registration reader"
+        assert_eq!(
+            listeners.len(),
+            1,
+            "the single-device phone factor hands back exactly one listener handle"
         );
         assert!(!ks.has_dek());
     }
@@ -4115,7 +4156,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "real-relay"),
-        ignore = "spawns an external bun relay; run: cargo test -p sigil --features real-relay -- --test-threads=1"
+        ignore = "spawns the native sigil-relay; build it first (cargo build -p sigil-relay), then: cargo test -p sigil --features real-relay -- --test-threads=1"
     )]
     fn reloaded_pairing_serves_a_secret_over_the_real_relay() {
         // The end-to-end proof of the critical path: persist a pairing, reload
@@ -4126,7 +4167,7 @@ mod tests {
         let Some((base, _server)) = obtain_relay() else {
             eprintln!(
                 "SKIPPED reloaded_pairing_serves_a_secret_over_the_real_relay: no relay. \
-                 Install bun, or set SIGIL_TEST_RELAY_URL."
+                 Build the native relay (cargo build -p sigil-relay), or set SIGIL_TEST_RELAY_URL."
             );
             return;
         };
@@ -4223,7 +4264,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "real-relay"),
-        ignore = "spawns an external bun relay; run: cargo test -p sigil --features real-relay -- --test-threads=1"
+        ignore = "spawns the native sigil-relay; build it first (cargo build -p sigil-relay), then: cargo test -p sigil --features real-relay -- --test-threads=1"
     )]
     fn sigil_pair_completes_the_ceremony_over_the_real_relay() {
         // Drive the real `sigil pair` ceremony end to end over the blind relay:
@@ -4234,7 +4275,7 @@ mod tests {
         let Some((base, _server)) = obtain_relay() else {
             eprintln!(
                 "SKIPPED sigil_pair_completes_the_ceremony_over_the_real_relay: no relay. \
-                 Install bun, or set SIGIL_TEST_RELAY_URL."
+                 Build the native relay (cargo build -p sigil-relay), or set SIGIL_TEST_RELAY_URL."
             );
             return;
         };
@@ -4349,7 +4390,7 @@ mod tests {
             .with_control_socket(true);
         let config = env_file_config("faketool", env_path.to_str().unwrap());
         let core = Arc::new(Core {
-            remote: None,
+            remote: Vec::new(),
             keystore,
             accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
@@ -4427,7 +4468,7 @@ mod tests {
             .with_control_socket(true)
             .with_timeout(Duration::from_millis(50));
         let core = Core {
-            remote: None,
+            remote: Vec::new(),
             keystore,
             accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),

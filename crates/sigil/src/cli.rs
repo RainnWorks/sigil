@@ -215,10 +215,13 @@ usage: sigil <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
                     paired phone or a hardware biometric it fails closed;
                     --dev-insecure enables local self-approval for dev only.
   doctor            diagnose shim drift, factor, relay, socket, and op
-  pair --relay <url> [--qr-png <path>]   pair a phone over the relay (renders a
-                    QR; --qr-png also writes the pairing code as a scannable PNG)
+  pair --relay <url> [--name <label>] [--qr-png <path>]   pair a phone over the
+                    relay (renders a QR; --qr-png also writes the pairing code as
+                    a scannable PNG). Additive: adds a device without dropping
+                    the ones already paired
   pair list         list paired devices
-  unpair            forget the paired phone
+  pair remove <id>  forget one paired device by id (from pair list)
+  unpair            forget every paired phone
   qr <data>         render <data> as a QR in the terminal; --stdin reads it from
                     stdin, --png <path> also writes a PNG, --out svg emits SVG,
                     --scale <n> sets pixels per module (PNG/SVG, default 8)
@@ -1112,8 +1115,10 @@ fn check(s: &Style, ok: bool, label: &str, hint: &str) -> bool {
 }
 
 fn cmd_pair(args: &[String], json: bool) -> i32 {
-    if args.first().map(String::as_str) == Some("list") {
-        return pair_list(json);
+    match args.first().map(String::as_str) {
+        Some("list") => return pair_list(json),
+        Some("remove") => return pair_remove(&args[1..], json),
+        _ => {}
     }
     if json {
         return run_pairing_json(args);
@@ -1217,50 +1222,143 @@ fn qr_positional(args: &[String]) -> Option<String> {
     None
 }
 
-/// `sigil pair list`: show the persisted pairing. The device name is not
-/// captured by the ceremony, so the JSON form reports a fixed `iPhone` (gap).
+/// `sigil pair list`: show every persisted device (#36 multi-device). The JSON
+/// form carries the full `devices` array plus a `paired` primary for a
+/// single-device decoder (back-compat).
 fn pair_list(json: bool) -> i32 {
     let s = Style::stdout();
+    let devices = match crate::pairing_store::list_devices() {
+        Ok(d) => d,
+        Err(e) => {
+            if json {
+                return emit_local_control(&ControlResult::line(
+                    false,
+                    format!("reading pairing: {e}"),
+                ));
+            }
+            eprintln!("sigil: reading pairing: {e}");
+            return 1;
+        }
+    };
+
     if json {
-        let paired = crate::pairing_store::summary()
-            .ok()
-            .flatten()
-            .map(|p| json::PairedJson {
-                name: "iPhone".into(),
-                sas_words: p.sas_words,
-                relay_url: p.relay_url,
-                paired_ms: p.paired_at,
-            });
-        println!("{}", json::to_pretty(&json::PairListJson { paired }));
+        let devices_json: Vec<json::PairedDeviceJson> = devices
+            .iter()
+            .map(|d| json::PairedDeviceJson {
+                device_id: d.device_id.clone(),
+                label: device_label(&d.label),
+                name: device_label(&d.label),
+                sas_words: d.sas_words.clone(),
+                relay_url: d.relay_url.clone(),
+                paired_ms: d.paired_at,
+            })
+            .collect();
+        let paired = devices.first().map(|d| json::PairedJson {
+            name: device_label(&d.label),
+            sas_words: d.sas_words.clone(),
+            relay_url: d.relay_url.clone(),
+            paired_ms: d.paired_at,
+        });
+        println!(
+            "{}",
+            json::to_pretty(&json::PairListJson {
+                paired,
+                devices: devices_json,
+            })
+        );
         return 0;
     }
-    match crate::pairing_store::summary() {
-        Ok(Some(p)) => {
-            println!("{}", s.cobalt("paired devices"));
-            println!();
-            let words = if p.sas_words.is_empty() {
-                s.dim("(no SAS on record)")
-            } else {
-                s.cobalt(&p.sas_words.join(&s.faint(" \u{00b7} ")))
-            };
-            println!("  {}  {}", s.dim("phone"), words);
-            println!("  {}  {}", s.dim("relay"), s.dim(&p.relay_url));
-            println!(
-                "  {}  {}",
-                s.dim("since"),
-                s.dim(&format_unix_ms(p.paired_at))
-            );
+
+    if devices.is_empty() {
+        println!(
+            "  {}",
+            s.dim("no paired phone; run: sigil pair --relay <url>")
+        );
+        return 0;
+    }
+
+    let count = devices.len();
+    let heading = if count == 1 {
+        "paired devices".to_string()
+    } else {
+        format!("paired devices ({count})")
+    };
+    println!("{}", s.cobalt(&heading));
+    for d in &devices {
+        println!();
+        let words = if d.sas_words.is_empty() {
+            s.dim("(no SAS on record)")
+        } else {
+            s.cobalt(&d.sas_words.join(&s.faint(" \u{00b7} ")))
+        };
+        println!("  {}  {}", s.dim("device"), s.dim(&device_label(&d.label)));
+        println!("  {}  {}", s.dim("id    "), s.faint(&d.device_id));
+        println!("  {}  {}", s.dim("sas   "), words);
+        println!("  {}  {}", s.dim("relay "), s.dim(&d.relay_url));
+        println!(
+            "  {}  {}",
+            s.dim("since "),
+            s.dim(&format_unix_ms(d.paired_at))
+        );
+    }
+    0
+}
+
+/// A device's display label, falling back to a constant when the ceremony
+/// captured no name (the pairing wire does not carry a device name yet).
+fn device_label(label: &str) -> String {
+    if label.is_empty() {
+        "iPhone".to_string()
+    } else {
+        label.to_string()
+    }
+}
+
+/// `sigil pair remove <deviceId>`: forget ONE paired device without dropping the
+/// others (#36). Bare `sigil unpair` still removes all.
+fn pair_remove(args: &[String], json: bool) -> i32 {
+    let s = Style::stdout();
+    let Some(device_id) = args.iter().find(|a| !a.starts_with('-')).cloned() else {
+        if json {
+            return emit_local_control(&ControlResult::line(
+                false,
+                "usage: sigil pair remove <deviceId>",
+            ));
+        }
+        eprintln!("usage: sigil pair remove <deviceId>");
+        return 2;
+    };
+    let ks = keystore::for_host();
+    match crate::pairing_store::remove_device(ks.as_ref(), &device_id) {
+        Ok(true) => {
+            if json {
+                return emit_local_control(&ControlResult::line(
+                    true,
+                    format!("removed device {device_id}"),
+                ));
+            }
+            println!("{} removed device {device_id}", s.ok("\u{2713}"));
+            println!("  {}", s.faint("restart to apply: sigil restart"));
             0
         }
-        Ok(None) => {
-            println!(
-                "  {}",
-                s.dim("no paired phone; run: sigil pair --relay <url>")
-            );
+        Ok(false) => {
+            if json {
+                return emit_local_control(&ControlResult::line(
+                    true,
+                    format!("no device with id {device_id}"),
+                ));
+            }
+            println!("  {}", s.dim(&format!("no device with id {device_id}")));
             0
         }
         Err(e) => {
-            eprintln!("sigil: reading pairing: {e}");
+            if json {
+                return emit_local_control(&ControlResult::line(
+                    false,
+                    format!("remove failed: {e}"),
+                ));
+            }
+            eprintln!("sigil: pair remove failed: {e}");
             1
         }
     }
@@ -1293,13 +1391,22 @@ fn run_pairing(args: &[String]) -> i32 {
     // --qr-png also writes the pairing payload as a scannable PNG, so a remote
     // operator can be handed an image of the pairing code (not just terminal art).
     let qr_png = flag_value(args, "--qr-png").map(str::to_string);
+    // --name <label> names the added device for `sigil pair list` / removal.
+    let device_name = flag_value(args, "--name")
+        .map(str::to_string)
+        .unwrap_or_else(|| "iPhone".to_string());
 
-    if crate::pairing_store::exists() {
+    // Pairing is ADDITIVE (#36 multi-device): a new device is added alongside any
+    // already paired, not replacing them. Bare `sigil unpair` still removes all.
+    let existing = crate::pairing_store::list_devices()
+        .map(|d| d.len())
+        .unwrap_or(0);
+    if existing > 0 {
         println!(
             "  {}",
-            s.brass(
-                "a phone is already paired; re-pairing will replace it (sigil unpair to remove)"
-            )
+            s.dim(&format!(
+                "{existing} device(s) already paired; this adds another (sigil pair remove <id> to drop one)"
+            ))
         );
     }
 
@@ -1389,16 +1496,21 @@ fn run_pairing(args: &[String]) -> i32 {
         }
     };
 
-    if let Err(e) = crate::pairing_store::save(ks.as_ref(), &new_pairing) {
-        eprintln!(
-            "{} pairing succeeded but could not be saved: {e}",
-            s.deny("\u{2717}")
-        );
-        return 1;
-    }
+    let device_id = match crate::pairing_store::add_device(ks.as_ref(), &new_pairing, &device_name)
+    {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!(
+                "{} pairing succeeded but could not be saved: {e}",
+                s.deny("\u{2717}")
+            );
+            return 1;
+        }
+    };
 
     println!();
     println!("{} phone paired and saved", s.ok("\u{2713}"));
+    println!("  {}", s.faint(&format!("device id {device_id}")));
     println!(
         "  {}",
         s.dim("the daemon now gates every request on your phone")
@@ -1500,16 +1612,25 @@ fn run_pairing_json(args: &[String]) -> i32 {
             let sas: Vec<String> = np.sas_words.to_vec();
             let relay_url = np.relay_url.clone();
             let paired_ms = np.paired_at;
-            if let Err(e) = crate::pairing_store::save(ks.as_ref(), &np) {
-                emit_ndjson(&serde_json::json!({
-                    "event": "failed",
-                    "reason": format!("paired but could not save: {e}")
-                }));
-                return 1;
-            }
+            // Additive (#36): add alongside any already-paired device. The label
+            // comes from --name, defaulting to "iPhone".
+            let device_name = flag_value(args, "--name")
+                .map(str::to_string)
+                .unwrap_or_else(|| "iPhone".to_string());
+            let device_id = match crate::pairing_store::add_device(ks.as_ref(), &np, &device_name) {
+                Ok(id) => id,
+                Err(e) => {
+                    emit_ndjson(&serde_json::json!({
+                        "event": "failed",
+                        "reason": format!("paired but could not save: {e}")
+                    }));
+                    return 1;
+                }
+            };
             emit_ndjson(&serde_json::json!({
                 "event": "paired",
-                "name": "iPhone",
+                "name": device_name,
+                "device_id": device_id,
                 "sas_words": sas,
                 "relay_url": relay_url,
                 "paired_ms": paired_ms

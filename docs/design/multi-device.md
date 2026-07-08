@@ -83,6 +83,41 @@ The result is the complete resolution-broadcast wire, end to end, minus the ring
 coordinator that decides WHEN to call `broadcast_resolution`. That coordinator,
 and the multi-pairing storage that feeds it, are specified below and deferred.
 
+## Update: the deferred core landed (#36 follow-up)
+
+The two pieces specified as deferred below are now IMPLEMENTED, in Rust, exactly
+per this design. The design sections are retained as the as-built record; the
+only deltas from the spec are noted inline. Summary of what landed:
+
+- **Multi-pairing storage** (`crates/sigil/src/pairing_store.rs`): the v2
+  container (`{version:2, devices:[...]}`), v1 -> v2 read migration (primary keeps
+  the `primary` sentinel id + legacy keystore label, so migration never touches
+  the keystore), per-device identity labels, and `add_device` / `load` (primary) /
+  `load_all` / `list_devices` / `remove_device` / `remove` (all). The #48
+  biometric gate fires on every `add_device` and `save`, deny-closed before any
+  write. `sigil pair` is now additive (`--name <label>`), plus `sigil pair list`
+  (all devices) and `sigil pair remove <deviceId>`; bare `sigil unpair` removes
+  all.
+- **Ring-all / first-wins coordinator** (`crates/sigil/src/remote.rs`): the
+  `RingApprover` composition over N unchanged `RemoteApprover`s, option (A)
+  `round_trip_cancellable` (single-device `round_trip` untouched), scoped-thread
+  ring-all deposit, first-real-decision-wins via a `Mutex<Option<(idx, outcome)>>`
+  (exactly one outcome per `decide`), a shared `CancelToken` that stops the losers
+  within one 100ms tick, `Settled` broadcast to the losers AFTER the winner is
+  committed, and all-timeout -> deny (fail closed). Wired into `build_gate` /
+  `serve` / `Core`: `build_gate` returns `Vec<Arc<RemoteApprover>>`, `serve` spawns
+  one ToDaemon owner per device, and `pending` de-dups by `request_id`. **N == 1 is
+  byte-identical**: `build_gate` uses a bare `RemoteApprover` for one device and
+  builds a `RingApprover` only for N >= 2.
+
+Delta from the spec: the loser-dismissal broadcast is only wired for the
+first-wins path (`Settled`); the daemon-side `Withdrawn`-on-lockdown/restart
+broadcast is NOT wired (the single-device path does not broadcast on lockdown
+either, so this is no regression) and remains available via
+`broadcast_resolution` for a later change. The v2 threshold-under-multi-device
+gap (below) is unchanged: a non-primary phone still cannot open a v2 token and
+fails closed.
+
 ## Deferred, with design: the daemon ring-all / first-wins core
 
 ### Composition, not rewrite
