@@ -36,7 +36,7 @@ struct SocketDaemonClient: DaemonClient {
     /// its own short-lived connection, as the protocol's one-reply-then-close
     /// verbs expect).
     private static let ioQueue = DispatchQueue(
-        label: "co.rowm.sigil.socket", qos: .userInitiated, attributes: .concurrent)
+        label: "works.rainn.sigil.mac.socket", qos: .userInitiated, attributes: .concurrent)
 
     init(socketPath: String? = nil, cli: CLIDaemonClient = CLIDaemonClient()) {
         self.socketPath = socketPath ?? SocketDaemonClient.defaultSocketPath()

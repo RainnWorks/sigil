@@ -1,4 +1,4 @@
-# Latch — Mac configurator + menubar
+# Sigil — Mac configurator + menubar
 
 Native SwiftUI. A single configurator window (source-list sidebar + detail) and
 a `MenuBarExtra` pulse. Agent app (no Dock icon); the menubar is always present,
@@ -12,8 +12,8 @@ Secure Enclave / MenuBarExtra decisions.
 
 ```sh
 cd apps/mac
-xcodegen generate                       # regenerate Latch.xcodeproj from project.yml
-xcodebuild -project Latch.xcodeproj -scheme Latch -configuration Debug \
+xcodegen generate                       # regenerate Sigil.xcodeproj from project.yml
+xcodebuild -project Sigil.xcodeproj -scheme Sigil -configuration Debug \
   -destination 'platform=macOS' build CODE_SIGNING_ALLOWED=NO
 ```
 
@@ -23,7 +23,7 @@ Warnings are errors; a green build has no Swift warnings.
 ## Run with fixtures (no daemon needed)
 
 ```sh
-SIGIL_MOCK=1 open Build/.../Latch.app
+SIGIL_MOCK=1 open Build/.../Sigil.app
 ```
 
 `SIGIL_MOCK=1` swaps in `MockDaemonClient` + `MockApprover`, so every screen and
@@ -34,7 +34,7 @@ without a running daemon. SwiftUI previews use the mock directly (each view has 
 ## Structure
 
 ```
-Latch/
+Sigil/
   App/            SigilApp (Window + MenuBarExtra + Settings scenes), Info.plist, entitlements
   Design/         Palette (oklch->sRGB), Typography (SF Pro/SF Mono), Glass, MenubarGlyph (4 shape states)
   Model/          Domain types, DaemonClient protocol, Mock + CLI impls, AppModel (observable store)

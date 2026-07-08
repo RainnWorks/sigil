@@ -4,7 +4,7 @@
 //  never load-bearing here; each state is a different silhouette:
 //
 //    idle     dotted diamond outline   (daemon down or unpaired)
-//    armed    solid diamond            (the latch; requests will route)
+//    armed    solid diamond            (the sigil set; requests will route)
 //    pending  solid diamond + badge    (a corner notch, a decision waiting)
 //    locked   barred diamond           (a slash; sealed until unsealed)
 //
@@ -37,7 +37,7 @@ enum MenubarGlyph {
     private static func draw(_ state: MenubarState, in rect: CGRect, ctx: CGContext) {
         let inset: CGFloat = 2.5
         let box = rect.insetBy(dx: inset, dy: inset)
-        // A diamond: the "latch" mark. Points at N/E/S/W.
+        // A diamond: the sigil mark. Points at N/E/S/W.
         let cx = box.midX, cy = box.midY
         let hw = box.width / 2, hh = box.height / 2
         let diamond = CGMutablePath()
@@ -59,12 +59,12 @@ enum MenubarGlyph {
             ctx.strokePath()
 
         case .armed:
-            // Solid: the latch is closed and listening.
+            // Solid: the sigil is set and listening.
             ctx.addPath(diamond)
             ctx.fillPath()
 
         case .pending:
-            // Solid latch with a badge notch cut into the top-right, then a
+            // Solid sigil with a badge notch cut into the top-right, then a
             // filled badge dot beside it: a decision waiting. Shape, not color.
             ctx.saveGState()
             ctx.addPath(diamond)

@@ -131,47 +131,59 @@ platform :ios do
 end
 
 # ---------------------------------------------------------------------------
-# macOS: Latch configurator (apps/mac)
+# macOS: Sigil configurator (apps/mac)
 # ---------------------------------------------------------------------------
 platform :mac do
-  desc "Generate, build, sign, and notarize the Latch macOS app; package a DMG"
+  desc "Generate, build, sign, and notarize the Sigil macOS app; package a DMG"
   desc ""
   desc "Requires (see docs/RELEASE.md):"
   desc "  MAC_ASC_KEY_ID, MAC_ASC_ISSUER_ID, MAC_ASC_API_KEY_P8  - ASC API key for notarization"
-  desc "  MAC_TEAM_ID                                            - Apple team id signing the app"
   desc ""
-  desc "MAC_* credentials are named separately from the iOS ASC_* ones because, until #35"
-  desc "(migrate the Mac identity Rowm LTD -> Rainnworks) lands, the two apps sign under"
-  desc "different Apple Developer teams. Once that migration ships, both can point at the"
-  desc "same key and this comment (and the duplicate secrets) should go away."
+  desc "Apple identity (mirrors apps/phone/app.config.js), both default to Rainnworks:"
+  desc "  SIGIL_MAC_TEAM_ID     - Apple team id signing the app (default 53W966FBFP)"
+  desc "  SIGIL_MAC_BUNDLE_ID   - app bundle id (default works.rainn.sigil.mac)"
+  desc ""
+  desc "As of #52 the Mac app is on the Rainnworks team (53W966FBFP), same as the iOS"
+  desc "app. The MAC_ASC_* notarization credentials are still named separately from the"
+  desc "iOS ASC_* ones only because notarization uses a Developer-ID API key distinct"
+  desc "from the App Store one; both now live under the same Rainnworks account."
   lane :release do
     ensure_env_vars(
-      env_vars: ["MAC_ASC_KEY_ID", "MAC_ASC_ISSUER_ID", "MAC_ASC_API_KEY_P8", "MAC_TEAM_ID"]
+      env_vars: ["MAC_ASC_KEY_ID", "MAC_ASC_ISSUER_ID", "MAC_ASC_API_KEY_P8"]
     )
+
+    team_id   = ENV["SIGIL_MAC_TEAM_ID"] || "53W966FBFP"
+    bundle_id = ENV["SIGIL_MAC_BUNDLE_ID"] || "works.rainn.sigil.mac"
 
     mac_dir = File.join(ROOT, "apps/mac")
     build_dir = File.join(ROOT, "build/mac")
     FileUtils.mkdir_p(build_dir)
 
-    # Latch.xcodeproj is generated (see apps/mac/project.yml's own header) -
+    # Sigil.xcodeproj is generated (see apps/mac/project.yml's own header) -
     # never hand-edited, never assumed fresh in CI.
     Dir.chdir(mac_dir) { sh("xcodegen generate") }
 
+    # project.yml indirects PRODUCT_BUNDLE_IDENTIFIER / DEVELOPMENT_TEAM through the
+    # SIGIL_MAC_* build settings (default Rainnworks); pass the resolved values so a
+    # self-hoster's env override reaches codesign, keychain group, and the profile.
     gym(
-      project: File.join(mac_dir, "Latch.xcodeproj"),
-      scheme: "Latch",
+      project: File.join(mac_dir, "Sigil.xcodeproj"),
+      scheme: "Sigil",
       configuration: "Release",
       export_method: "developer-id",
       output_directory: build_dir,
-      output_name: "Latch.app",
+      output_name: "Sigil.app",
       skip_package_ipa: true,
       clean: true,
-      xcargs: "-allowProvisioningUpdates DEVELOPMENT_TEAM=#{ENV['MAC_TEAM_ID']}"
+      xcargs: "-allowProvisioningUpdates " \
+              "SIGIL_MAC_TEAM_ID=#{team_id.shellescape} " \
+              "SIGIL_MAC_BUNDLE_ID=#{bundle_id.shellescape} " \
+              "DEVELOPMENT_TEAM=#{team_id.shellescape}"
     )
 
-    app_path = File.join(build_dir, "Latch.app")
-    zip_path = File.join(build_dir, "Latch.zip")
-    dmg_path = File.join(build_dir, "Latch.dmg")
+    app_path = File.join(build_dir, "Sigil.app")
+    zip_path = File.join(build_dir, "Sigil.zip")
+    dmg_path = File.join(build_dir, "Sigil.dmg")
 
     # notarytool wants a zip/dmg/pkg, not a raw .app bundle, for submission.
     sh("ditto -c -k --keepParent #{app_path.shellescape} #{zip_path.shellescape}")
@@ -201,7 +213,7 @@ platform :mac do
 
     # Package the stapled, notarized .app into the DMG that ships.
     sh(
-      "hdiutil create -volname Latch -srcfolder #{app_path.shellescape} " \
+      "hdiutil create -volname Sigil -srcfolder #{app_path.shellescape} " \
       "-ov -format UDZO #{dmg_path.shellescape}"
     )
 
