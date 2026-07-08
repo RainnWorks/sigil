@@ -52,9 +52,9 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
@@ -115,6 +115,12 @@ const OWNER_POLL_INTERVAL: Duration = Duration::from_secs(20);
 /// Backoff after a transport error in the owner loop, so a persistently failing
 /// poll settles instead of spinning.
 const OWNER_ERROR_BACKOFF: Duration = Duration::from_millis(500);
+
+/// How often a ring device's cancellable wait re-checks the shared cancel flag
+/// while blocking on its response channel. Bounds how promptly a losing device
+/// stops after a winner (and thus how fast [`RingApprover::decide`] joins its
+/// threads). Small enough to feel instant, large enough not to spin.
+const RING_CANCEL_TICK: Duration = Duration::from_millis(100);
 
 /// An approver backed by a paired phone reachable over a [`Transport`].
 pub struct RemoteApprover {
@@ -305,6 +311,77 @@ impl RemoteApprover {
         match rx.recv_timeout(self.timeout) {
             Ok(resp) => self.outcome_for(req, resp),
             Err(_) => None,
+        }
+    }
+
+    /// The ring-only round trip: identical to [`round_trip`](Self::round_trip),
+    /// but its wait ALSO stops early when the shared [`CancelToken`] fires, so a
+    /// losing device in a [`RingApprover`] does not sit out the full timeout after
+    /// another device has already won.
+    ///
+    /// This is a SEPARATE method from `round_trip` on purpose (option (A) in
+    /// `docs/design/multi-device.md`): the single-device path keeps its exact,
+    /// reviewed `recv_timeout(self.timeout)` shape with no cancel check, so N == 1
+    /// is byte-identical. The seal/deposit/waiter-cleanup are shared; only the wait
+    /// loop differs. Every exit still removes the waiter, and a cancel returns
+    /// `None` (no decision), which fails closed exactly like a timeout.
+    fn round_trip_cancellable(
+        &self,
+        ctx: &ApprovalContext,
+        cancel: &CancelToken,
+    ) -> Option<ApprovalOutcome> {
+        let req = self.build_request(ctx);
+        let rx = self.register_waiter(&req);
+        let outcome = self.deposit_and_wait_cancellable(&req, rx, cancel);
+        self.remove_waiter(&req.request_id);
+        outcome
+    }
+
+    /// Seal, deposit, and block for a response OR a cancel. The wait polls the
+    /// waiter channel on a short tick and re-checks the cancel flag between ticks,
+    /// so a cancelled loser returns within one tick (`RING_CANCEL_TICK`). A real
+    /// response resolves it exactly as the single-device path does; a cancel or a
+    /// full-timeout returns `None` (fail closed). Never routes another device's
+    /// response: the waiter map is per-device, so `rx` only ever carries THIS
+    /// device's correlated response.
+    fn deposit_and_wait_cancellable(
+        &self,
+        req: &ApprovalRequest,
+        rx: Receiver<ApprovalResponse>,
+        cancel: &CancelToken,
+    ) -> Option<ApprovalOutcome> {
+        let counter = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let env = Envelope::seal(
+            req,
+            self.pairing_id,
+            counter,
+            &self.identity.signing,
+            &self.phone,
+        )
+        .ok()?;
+        self.transport
+            .deposit_to_phone(self.pairing_id, &env, self.push_hint())
+            .ok()?;
+
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            // A winner elsewhere: stop waiting and remove our waiter (via the
+            // caller). No decision -> fail closed, same as a timeout.
+            if cancel.is_cancelled() {
+                return None;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let wait = RING_CANCEL_TICK.min(deadline - now);
+            match rx.recv_timeout(wait) {
+                Ok(resp) => return self.outcome_for(req, resp),
+                // Tick elapsed with nothing: re-check cancel and deadline.
+                Err(RecvTimeoutError::Timeout) => continue,
+                // The owner dropped the sender (shutdown): fail closed.
+                Err(RecvTimeoutError::Disconnected) => return None,
+            }
         }
     }
 
@@ -585,6 +662,142 @@ impl Approver for RemoteApprover {
     fn decide(&self, ctx: &ApprovalContext) -> ApprovalOutcome {
         self.round_trip(ctx)
             .unwrap_or_else(|| ApprovalOutcome::local(Decision::Deny))
+    }
+}
+
+/// A one-shot cancel signal the ring coordinator fires the instant a winning
+/// device is seen, so the N-1 losing devices stop waiting promptly instead of
+/// sitting out the full timeout. It is a plain shared boolean; the single-device
+/// [`RemoteApprover::round_trip`] never touches one, so that reviewed wait shape
+/// is unchanged. Only [`RemoteApprover::round_trip_cancellable`] observes it.
+#[derive(Clone, Default)]
+struct CancelToken {
+    flag: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    fn new() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Fire the signal: every device's cancellable wait returns `None` within one
+    /// tick. Idempotent.
+    fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+}
+
+/// The ring-all / first-wins coordinator over N paired phones (#36 multi-device).
+///
+/// It is a thin COMPOSITION over N unchanged [`RemoteApprover`]s (one per device),
+/// not a rewrite of the reviewed single-device core. Because each device is a full,
+/// untouched approver, every reviewed guarantee is preserved for free:
+///
+/// - **Per-device replay.** Each [`RemoteApprover`] owns its own [`ReplayGuard`],
+///   its own monotonic counter, and its own pinned phone key. No guard is ever
+///   shared across devices, so one device's phone counters never touch another's.
+/// - **No wrong-device response resolves.** A response is verified inside the
+///   approver whose pinned `phone` key sealed it; another device's response fails
+///   signature verification there and is dropped, never routed here.
+/// - **One reader per device slot.** Each device keeps its single ToDaemon owner
+///   loop ([`serve`](crate::daemon) spawns one per device), the sole reader of
+///   that device's mailbox.
+///
+/// [`decide`](Self::decide) rings every device, waits for the FIRST real decision
+/// (approve OR deny) to win, cancels the losers, dismisses them with a
+/// zero-knowledge [`ResolutionBroadcast`], and returns the winner's outcome. If
+/// every device times out, it denies (fail closed). Exactly one outcome reaches
+/// the gate per `decide`.
+pub struct RingApprover {
+    /// One approver per paired phone, each an UNCHANGED single-device
+    /// [`RemoteApprover`]. Held in `Arc`s so [`serve`](crate::daemon) can also run
+    /// each device's ToDaemon owner loop against the same instance.
+    devices: Vec<Arc<RemoteApprover>>,
+}
+
+impl RingApprover {
+    /// Compose a ring over `devices` (one per paired phone). The caller builds a
+    /// ring only for N >= 2; a single device is driven as a bare
+    /// [`RemoteApprover`] so N == 1 stays byte-identical to the reviewed path.
+    pub fn new(devices: Vec<Arc<RemoteApprover>>) -> Self {
+        Self { devices }
+    }
+
+    /// The composed devices, for the caller that also spawns their owner loops.
+    pub fn devices(&self) -> &[Arc<RemoteApprover>] {
+        &self.devices
+    }
+}
+
+impl Approver for RingApprover {
+    fn decide(&self, ctx: &ApprovalContext) -> ApprovalOutcome {
+        match self.devices.len() {
+            // No devices: fail closed. Should not happen (the caller builds a ring
+            // only for N >= 2), but deny defensively rather than release.
+            0 => return ApprovalOutcome::local(Decision::Deny),
+            // Exactly one device: drive it through the unchanged single-device
+            // path, so a degenerate one-element ring is still byte-identical.
+            1 => return self.devices[0].decide(ctx),
+            _ => {}
+        }
+
+        let cancel = CancelToken::new();
+        // The single committed outcome, plus the index of the device that won (so
+        // the OTHER devices get the dismissal). The mutex serializes the race: the
+        // first device to record a real decision wins and cancels the rest; a
+        // second device that also returned a decision finds the slot taken and
+        // DISCARDS its outcome, so exactly one outcome ever reaches the gate and
+        // there is no double release.
+        let winner: Mutex<Option<(usize, ApprovalOutcome)>> = Mutex::new(None);
+
+        // Scoped threads so each device's round trip can borrow `ctx`, `cancel`,
+        // and `winner`; the scope JOINS all N before returning, so no loser thread
+        // outlives `decide` (the `ctx: &` lifetime requires it) and every waiter is
+        // removed before we broadcast.
+        std::thread::scope(|scope| {
+            for (i, dev) in self.devices.iter().enumerate() {
+                let cancel = &cancel;
+                let winner = &winner;
+                scope.spawn(move || {
+                    // A real decision (approve or explicit deny). `None` is a
+                    // timeout / cancel / dead owner and contributes nothing.
+                    if let Some(outcome) = dev.round_trip_cancellable(ctx, cancel) {
+                        let mut w = winner.lock().expect("ring winner poisoned");
+                        if w.is_none() {
+                            *w = Some((i, outcome));
+                            // Wake the losers the instant the winner is committed.
+                            cancel.cancel();
+                        }
+                        // else: we lost the race; drop our outcome (no release).
+                    }
+                });
+            }
+        });
+
+        // All device threads have joined; the winner slot is final.
+        match winner.into_inner().expect("ring winner poisoned") {
+            Some((idx, outcome)) => {
+                // Dismiss every OTHER device with a zero-knowledge `Settled`
+                // broadcast, sent only AFTER the winner's outcome is committed
+                // (never racing a real approve). Best-effort: a lost broadcast
+                // degrades to that phone's own timeout, never to a release.
+                for (i, dev) in self.devices.iter().enumerate() {
+                    if i != idx {
+                        dev.broadcast_resolution(&ctx.id, ResolutionStatus::Settled);
+                    }
+                }
+                outcome
+            }
+            // Every device timed out (or died): deny. Fail closed, identical to the
+            // single-device timeout. No broadcast: each phone expires on its own.
+            None => ApprovalOutcome::local(Decision::Deny),
+        }
     }
 }
 
@@ -1012,5 +1225,247 @@ mod tests {
         // or short-circuit the decision.
         assert!(outcome.decision.is_grant());
         assert_eq!(outcome.dek.as_deref(), Some(&[8u8; 32]));
+    }
+
+    // --- #36 ring-all / first-wins coordinator --------------------------------
+
+    use sigil_proto::ToPhoneMessage;
+
+    /// One device in a test ring: its (unchanged) approver plus the phone-side
+    /// keys and mailbox a test uses to answer or to inspect a dismissal.
+    struct RingDevice {
+        approver: Arc<RemoteApprover>,
+        phone: DeviceIdentity,
+        daemon_pub: PeerIdentity,
+        mailbox: [u8; 32],
+    }
+
+    /// Build a ring of `n` independent devices over one shared `LocalRelay`. Each
+    /// device is a full, unchanged [`RemoteApprover`] with its OWN daemon identity,
+    /// pinned phone, and mailbox, matching the composition design.
+    fn build_ring(relay: &LocalRelay, n: usize, timeout: Duration) -> Vec<RingDevice> {
+        (0..n)
+            .map(|_| {
+                let daemon = DeviceIdentity::generate();
+                let phone = DeviceIdentity::generate();
+                let phone_pub = phone.peer_identity();
+                let daemon_pub = daemon.peer_identity();
+                let mailbox = mailbox_id(&daemon_pub, &phone_pub);
+                let approver = Arc::new(
+                    RemoteApprover::new(Arc::new(relay.clone()), daemon, phone_pub)
+                        .with_timeout(timeout)
+                        .with_listen_poll(Duration::from_millis(20)),
+                );
+                RingDevice {
+                    approver,
+                    phone,
+                    daemon_pub,
+                    mailbox,
+                }
+            })
+            .collect()
+    }
+
+    /// Spawn every device's ToDaemon owner loop; return the shared shutdown flag
+    /// and the join handles.
+    fn spawn_ring_owners(
+        devices: &[RingDevice],
+    ) -> (Arc<AtomicBool>, Vec<std::thread::JoinHandle<()>>) {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handles = devices
+            .iter()
+            .map(|d| {
+                let approver = d.approver.clone();
+                let stop = shutdown.clone();
+                std::thread::spawn(move || approver.run_todaemon_owner(&stop))
+            })
+            .collect();
+        (shutdown, handles)
+    }
+
+    /// Drain up to a few ToPhone deposits from a loser's mailbox and return the
+    /// first that classifies as a resolution dismissal, if any.
+    fn drain_resolution(dev: &RingDevice, relay: &LocalRelay) -> Option<ResolutionStatus> {
+        let mut guard = ReplayGuard::new();
+        for _ in 0..4 {
+            match relay.recv(dev.mailbox, Direction::ToPhone, Duration::from_millis(200)) {
+                Ok(Some(env)) => {
+                    if let Ok(value) = env.open::<serde_json::Value>(
+                        &dev.daemon_pub,
+                        &dev.phone.agreement,
+                        &mut guard,
+                    ) {
+                        if let Ok(ToPhoneMessage::Resolution(rb)) =
+                            ToPhoneMessage::from_value(value)
+                        {
+                            return Some(rb.status);
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        None
+    }
+
+    /// First-wins: with N devices ringing, the FIRST to approve delivers its DEK
+    /// to the gate; the other N-1 are cancelled and dismissed with a `Settled`
+    /// broadcast, and only the winner's DEK reaches the gate (distinct DEKs prove
+    /// no cross-device delivery).
+    #[test]
+    fn ring_first_wins_delivers_the_winners_dek_and_dismisses_losers() {
+        let relay = LocalRelay::new();
+        let devices = build_ring(&relay, 3, Duration::from_secs(5));
+        let (shutdown, owners) = spawn_ring_owners(&devices);
+
+        // Device index 1 is the winner: it answers its request with a distinct DEK.
+        let winner = 1usize;
+        let w = &devices[winner];
+        let phone = clone_id(&w.phone);
+        let daemon_pub = w.daemon_pub;
+        let mailbox = w.mailbox;
+        let relay_w = relay.clone();
+        let phone_thread = std::thread::spawn(move || {
+            let _req = relay_w
+                .recv(mailbox, Direction::ToPhone, Duration::from_secs(5))
+                .unwrap()
+                .expect("the winner received its request");
+            let resp = ApprovalResponse::approve("req-RING", &Dek::from_bytes([7u8; 32]), 1);
+            let env = Envelope::seal(&resp, mailbox, 1, &phone.signing, &daemon_pub).unwrap();
+            relay_w.send(mailbox, Direction::ToDaemon, &env).unwrap();
+        });
+
+        let ring = RingApprover::new(devices.iter().map(|d| d.approver.clone()).collect());
+        let outcome = ring.decide(&secret_ctx("req-RING"));
+
+        phone_thread.join().unwrap();
+
+        assert!(outcome.decision.is_grant(), "the winner's approve resolves");
+        assert_eq!(
+            outcome.dek.as_deref(),
+            Some(&[7u8; 32]),
+            "exactly the winner's DEK reaches the gate"
+        );
+
+        // The two losers each received a Settled dismissal (after consuming their
+        // own ring-all request deposit).
+        for (i, dev) in devices.iter().enumerate() {
+            if i == winner {
+                continue;
+            }
+            let status = drain_resolution(dev, &relay);
+            assert_eq!(
+                status,
+                Some(ResolutionStatus::Settled),
+                "loser {i} must be dismissed with Settled"
+            );
+        }
+
+        shutdown.store(true, Ordering::SeqCst);
+        for o in owners {
+            o.join().unwrap();
+        }
+    }
+
+    /// First-wins covers DENY too: the first device to explicitly deny resolves the
+    /// ring (deny wins), and the others are dismissed with `Settled`.
+    #[test]
+    fn ring_first_deny_wins_and_dismisses_losers() {
+        let relay = LocalRelay::new();
+        let devices = build_ring(&relay, 2, Duration::from_secs(5));
+        let (shutdown, owners) = spawn_ring_owners(&devices);
+
+        let denier = 0usize;
+        let d = &devices[denier];
+        let phone = clone_id(&d.phone);
+        let daemon_pub = d.daemon_pub;
+        let mailbox = d.mailbox;
+        let relay_d = relay.clone();
+        let phone_thread = std::thread::spawn(move || {
+            let _req = relay_d
+                .recv(mailbox, Direction::ToPhone, Duration::from_secs(5))
+                .unwrap()
+                .expect("the denier received its request");
+            let resp = ApprovalResponse::deny("req-DENY", 1);
+            let env = Envelope::seal(&resp, mailbox, 1, &phone.signing, &daemon_pub).unwrap();
+            relay_d.send(mailbox, Direction::ToDaemon, &env).unwrap();
+        });
+
+        let ring = RingApprover::new(devices.iter().map(|d| d.approver.clone()).collect());
+        let outcome = ring.decide(&secret_ctx("req-DENY"));
+        phone_thread.join().unwrap();
+
+        assert_eq!(outcome.decision, Decision::Deny, "the first deny wins");
+        assert!(outcome.dek.is_none(), "a deny carries no DEK");
+
+        // The other device is dismissed with Settled (not told it was a deny).
+        let status = drain_resolution(&devices[1], &relay);
+        assert_eq!(status, Some(ResolutionStatus::Settled));
+
+        shutdown.store(true, Ordering::SeqCst);
+        for o in owners {
+            o.join().unwrap();
+        }
+    }
+
+    /// All devices time out (no phone answers): the ring DENIES (fail closed),
+    /// exactly like a single-device timeout, and no outcome is fabricated.
+    #[test]
+    fn ring_all_timeout_denies() {
+        let relay = LocalRelay::new();
+        // Short timeout so the test's all-timeout path resolves quickly.
+        let devices = build_ring(&relay, 3, Duration::from_millis(300));
+        let (shutdown, owners) = spawn_ring_owners(&devices);
+
+        let ring = RingApprover::new(devices.iter().map(|d| d.approver.clone()).collect());
+        let outcome = ring.decide(&secret_ctx("req-TIMEOUT"));
+
+        assert_eq!(
+            outcome.decision,
+            Decision::Deny,
+            "an all-timeout ring must fail closed to deny"
+        );
+        assert!(outcome.dek.is_none());
+
+        shutdown.store(true, Ordering::SeqCst);
+        for o in owners {
+            o.join().unwrap();
+        }
+    }
+
+    /// A one-device ring is byte-identical to the bare single-device path: it
+    /// drives the unchanged `RemoteApprover::decide`, delivering that device's DEK.
+    #[test]
+    fn ring_of_one_matches_the_single_device_path() {
+        let relay = LocalRelay::new();
+        let devices = build_ring(&relay, 1, Duration::from_secs(5));
+        let (shutdown, owners) = spawn_ring_owners(&devices);
+
+        let d = &devices[0];
+        let phone = clone_id(&d.phone);
+        let daemon_pub = d.daemon_pub;
+        let mailbox = d.mailbox;
+        let relay_c = relay.clone();
+        let phone_thread = std::thread::spawn(move || {
+            let _req = relay_c
+                .recv(mailbox, Direction::ToPhone, Duration::from_secs(5))
+                .unwrap()
+                .expect("the sole device received its request");
+            let resp = ApprovalResponse::approve("req-ONE", &Dek::from_bytes([5u8; 32]), 1);
+            let env = Envelope::seal(&resp, mailbox, 1, &phone.signing, &daemon_pub).unwrap();
+            relay_c.send(mailbox, Direction::ToDaemon, &env).unwrap();
+        });
+
+        let ring = RingApprover::new(vec![devices[0].approver.clone()]);
+        let outcome = ring.decide(&secret_ctx("req-ONE"));
+        phone_thread.join().unwrap();
+
+        assert!(outcome.decision.is_grant());
+        assert_eq!(outcome.dek.as_deref(), Some(&[5u8; 32]));
+
+        shutdown.store(true, Ordering::SeqCst);
+        for o in owners {
+            o.join().unwrap();
+        }
     }
 }

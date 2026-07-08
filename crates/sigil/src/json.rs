@@ -212,9 +212,29 @@ pub struct PairedJson {
     pub paired_ms: u64,
 }
 
+/// One paired device in the multi-device list (#36). A superset of
+/// [`PairedJson`] carrying the stable `device_id` (the `sigil pair remove`
+/// handle) and the human `label`. Additive: the Swift decoder that only reads
+/// `paired` ignores the `devices` array until it is taught this shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairedDeviceJson {
+    pub device_id: String,
+    pub label: String,
+    pub name: String,
+    pub sas_words: Vec<String>,
+    pub relay_url: String,
+    pub paired_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairListJson {
+    /// The primary device, for a single-device decoder (back-compat). `None` when
+    /// nothing is paired.
     pub paired: Option<PairedJson>,
+    /// Every paired device (#36 multi-device). Additive and omitted when empty, so
+    /// an older decoder that reads only `paired` is unaffected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<PairedDeviceJson>,
 }
 
 // --- settings --------------------------------------------------------------

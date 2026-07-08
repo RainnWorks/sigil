@@ -1,12 +1,24 @@
-//! On-disk persistence of the daemon<->phone pairing that makes the phone the
+//! On-disk persistence of the daemon<->phone pairing(s) that make the phone the
 //! approving factor across daemon restarts.
+//!
+//! # Multi-device (#36)
+//!
+//! The file is a versioned container of N devices (`{version:2, devices:[...]}`),
+//! one row per paired phone. Each device is fully independent: its own daemon
+//! identity in the keystore (under a per-device label), its own pinned phone, its
+//! own mailbox, and its own DEK delivery, so the relay sees N unrelated mailbox
+//! hashes and cannot link them. A legacy v1 (flat, single-device) file is migrated
+//! to the container on read; its device keeps the `primary` sentinel id so its
+//! keystore identity stays under the legacy label and migration never touches the
+//! keystore. [`load`] returns the primary alone (byte-identical single-device
+//! behavior); [`load_all`] returns every device for the ring-all coordinator.
 //!
 //! # What is persisted, and why it stays inert at rest
 //!
-//! A paired daemon needs three things to run the phone factor: its own
-//! long-term identity (to sign requests and open responses), the phone's pinned
-//! **public** identity (to seal to and verify), and the relay URL. This module
-//! persists exactly those, split by sensitivity:
+//! A paired daemon needs three things to run the phone factor for each device: its
+//! own long-term identity (to sign requests and open responses), the phone's
+//! pinned **public** identity (to seal to and verify), and the relay URL. This
+//! module persists exactly those, split by sensitivity:
 //!
 //! * The daemon's **private identity** (Ed25519 signing seed + X25519 agreement
 //!   secret, 64 bytes) goes into the [`Keystore`] blob seam — the login Keychain
@@ -43,12 +55,40 @@ use crate::keystore::{Keystore, KeystoreError};
 use crate::paths;
 use crate::threshold::PhoneShare;
 
-/// Keystore blob label under which the daemon's own 64-byte private identity is
-/// sealed. Versioned so a future key-format change can migrate cleanly.
+/// Keystore blob label under which the PRIMARY device's 64-byte private identity
+/// is sealed. This is the historical single-device label; a v1 pairing (and the
+/// v1-migrated primary of a v2 container) keeps its identity here forever, so
+/// migration never has to touch the keystore. Each ADDITIONAL device (#36
+/// multi-device) seals its own identity under a per-device label derived from
+/// this stem plus its `deviceId` (see [`identity_label`]).
 const DAEMON_IDENTITY_LABEL: &str = "pairing.daemon-identity.v1";
 
-/// Current on-disk `pairing.json` schema version.
-const PAIRING_VERSION: u32 = 1;
+/// The v1 on-disk `pairing.json` schema: a single [`PersistedPairing`] object.
+/// Still read (and migrated on the fly) so an existing single-device pairing
+/// keeps working after the v2 container lands.
+const PAIRING_VERSION_V1: u32 = 1;
+
+/// The current on-disk `pairing.json` schema: a versioned container holding N
+/// devices (#36 multi-device). New writes always emit this.
+const PAIRING_VERSION_V2: u32 = 2;
+
+/// The stable `deviceId` sentinel for the primary device: the one a v1 file
+/// migrates into, or the one a single-device `save` writes. Its keystore label
+/// is the legacy [`DAEMON_IDENTITY_LABEL`] (not the per-device scheme), so a
+/// v1 -> v2 migration is a pure file rewrite that leaves the keystore untouched.
+const PRIMARY_DEVICE_ID: &str = "primary";
+
+/// The keystore blob label for a device's private daemon identity. The primary
+/// device (a v1-migrated or single-`save` pairing) stays on the legacy stem so
+/// migration never re-keys the keystore; every additional device gets its own
+/// `pairing.daemon-identity.v1.<deviceId>` label, fully independent.
+fn identity_label(device_id: &str) -> String {
+    if device_id == PRIMARY_DEVICE_ID {
+        DAEMON_IDENTITY_LABEL.to_string()
+    } else {
+        format!("{DAEMON_IDENTITY_LABEL}.{device_id}")
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PairingStoreError {
@@ -60,7 +100,7 @@ pub enum PairingStoreError {
     Json(#[from] serde_json::Error),
     #[error("keystore: {0}")]
     Keystore(#[from] KeystoreError),
-    #[error("unsupported pairing config version {0} (this build understands {PAIRING_VERSION})")]
+    #[error("unsupported pairing config version {0} (this build understands {PAIRING_VERSION_V1} and {PAIRING_VERSION_V2})")]
     Version(u32),
     #[error("the daemon identity is missing from the keystore; re-pair with `sigil pair`")]
     MissingIdentity,
@@ -85,11 +125,11 @@ struct PersistedPhoneShare {
     ecdh_algo: EcdhAlgo,
 }
 
-/// The public half of a persisted pairing: everything safe to keep in a
-/// plaintext 0600 file. The private daemon identity lives in the keystore, keyed
-/// by [`DAEMON_IDENTITY_LABEL`], never here.
+/// The v1 (single-device) on-disk shape: one flat pairing object. Only READ now,
+/// to migrate an existing single-device `pairing.json` into the v2 container on
+/// the fly (see [`read_container`]). New writes never emit this shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedPairing {
+struct PersistedPairingV1 {
     version: u32,
     /// The relay base URL the daemon attaches to for approvals.
     relay_url: String,
@@ -103,6 +143,99 @@ struct PersistedPairing {
     /// pairing omits it; `#[serde(default)]` keeps old configs loading unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     phone_share: Option<PersistedPhoneShare>,
+}
+
+/// One device's public row inside the v2 container. Everything safe to keep in a
+/// plaintext 0600 file; the device's private daemon identity lives in the
+/// keystore under [`identity_label`]`(device_id)`, never here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedDevice {
+    /// Stable id (uuidv7, or the [`PRIMARY_DEVICE_ID`] sentinel for the migrated
+    /// primary): names the keystore identity label and the removal handle.
+    device_id: String,
+    /// Human label for `sigil pair list` / removal. Defaults empty on an old
+    /// row that predates the field.
+    #[serde(default)]
+    label: String,
+    /// The relay base URL the daemon attaches to for this device's approvals.
+    relay_url: String,
+    /// The phone's pinned public identity (verify + seal targets).
+    phone: PeerIdentity,
+    /// When pairing completed, unix ms.
+    paired_at: u64,
+    /// The six SAS words this pairing confirmed, kept for display only.
+    sas_words: Vec<String>,
+    /// The phone's v2 threshold share `F`, present only for a v2 pairing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phone_share: Option<PersistedPhoneShare>,
+}
+
+impl PersistedDevice {
+    /// Build a persisted row from a completed pairing plus a stable id + label.
+    fn from_new(device_id: &str, label: &str, p: &NewPairing) -> Self {
+        Self {
+            device_id: device_id.to_string(),
+            label: label.to_string(),
+            relay_url: p.relay_url.clone(),
+            phone: p.phone,
+            paired_at: p.paired_at,
+            sas_words: p.sas_words.to_vec(),
+            phone_share: p.phone_share.as_ref().map(|s| PersistedPhoneShare {
+                se_key_id: s.se_key_id.clone(),
+                f_x963: B64.encode(&s.f_x963),
+                ecdh_algo: s.ecdh_algo,
+            }),
+        }
+    }
+}
+
+/// The v2 on-disk container: a versioned list of paired devices (#36
+/// multi-device). Order is arm/pairing order; `devices[0]` is the primary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedContainer {
+    version: u32,
+    devices: Vec<PersistedDevice>,
+}
+
+impl PersistedContainer {
+    /// An empty v2 container (no devices yet).
+    fn empty() -> Self {
+        Self {
+            version: PAIRING_VERSION_V2,
+            devices: Vec::new(),
+        }
+    }
+
+    /// Lift a v1 flat pairing into a one-device v2 container. The single device
+    /// takes the [`PRIMARY_DEVICE_ID`] sentinel, so its identity stays under the
+    /// legacy keystore label and nothing in the keystore has to move.
+    fn from_v1(v1: PersistedPairingV1) -> Self {
+        Self {
+            version: PAIRING_VERSION_V2,
+            devices: vec![PersistedDevice {
+                device_id: PRIMARY_DEVICE_ID.to_string(),
+                label: "iPhone".to_string(),
+                relay_url: v1.relay_url,
+                phone: v1.phone,
+                paired_at: v1.paired_at,
+                sas_words: v1.sas_words,
+                phone_share: v1.phone_share,
+            }],
+        }
+    }
+}
+
+/// A read-only public summary of one paired device, for `sigil pair list` and
+/// `sigil pair remove`. Public parts only (no keystore access).
+#[derive(Debug, Clone)]
+pub struct DeviceSummary {
+    pub device_id: String,
+    pub label: String,
+    pub relay_url: String,
+    pub phone: PeerIdentity,
+    pub paired_at: u64,
+    pub sas_words: Vec<String>,
 }
 
 /// The phone's v2 threshold share as handed to [`save`]: the id, the raw 65-byte
@@ -155,84 +288,71 @@ pub fn exists() -> bool {
 /// em-dash, no emoji (invariant #6).
 const PAIRING_PRESENCE_REASON: &str = "Authorize pairing this phone to Sigil";
 
-/// Persist a completed pairing: seal the daemon identity into the keystore, then
-/// write the public config file 0600.
+/// Read `pairing.json` and normalize it to the v2 container, migrating a v1
+/// (flat, single-device) file on the fly. `None` when no file is present.
 ///
-/// **Biometric gate (#48):** before anything is persisted, authorizing a new
-/// pairing on a hardware keystore requires a live Touch ID / Secure Enclave
-/// user-presence, independent of DEK delivery. This is deny-closed and is the
-/// first thing `save` does, so a declined or absent biometric refuses the pairing
-/// and NOTHING is written (no identity blob, no config file). Non-biometric dev
-/// keystores (`is_biometric() == false`, only reachable under `SIGIL_DEV_KEYSTORE`
-/// with its loud warning) skip the check so headless dev and tests still pair; the
-/// default real-hardware keystore requires it.
-pub fn save(ks: &dyn Keystore, p: &NewPairing) -> Result<(), PairingStoreError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    // 0. Gate on a live hardware biometric before persisting anything. A real
-    //    keystore performs a Secure Enclave user-presence check here; a decline
-    //    returns an error and the pairing is refused with nothing written.
-    if ks.is_biometric() {
-        ks.verify_presence(PAIRING_PRESENCE_REASON)?;
-    }
-
-    // 1. Seal the private daemon identity into the keystore blob seam. The bytes
-    //    are Zeroizing and are wiped when `secret` drops at the end of this call.
-    let secret = p.daemon_identity.to_secret_bytes();
-    ks.store_blob(DAEMON_IDENTITY_LABEL, &secret[..])?;
-
-    // 2. Write the public config 0600.
-    let persisted = PersistedPairing {
-        version: PAIRING_VERSION,
-        relay_url: p.relay_url.clone(),
-        phone: p.phone,
-        paired_at: p.paired_at,
-        sas_words: p.sas_words.to_vec(),
-        phone_share: p.phone_share.as_ref().map(|s| PersistedPhoneShare {
-            se_key_id: s.se_key_id.clone(),
-            f_x963: B64.encode(&s.f_x963),
-            ecdh_algo: s.ecdh_algo,
-        }),
-    };
-    let path = config_path()?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    let json = serde_json::to_vec_pretty(&persisted)?;
-    std::fs::write(&path, json)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-/// Load the persisted pairing into a [`RemotePairingConfig`] the daemon can arm
-/// the phone factor with, or `None` when no pairing is configured.
-///
-/// Reconstructs the daemon identity from the keystore and pins the phone from
-/// the config file. Returns an error (rather than `None`) when a config file is
-/// present but unreadable or its keystore identity is missing/corrupt, so a
-/// half-broken pairing surfaces loudly instead of silently failing closed.
-pub fn load(ks: &dyn Keystore) -> Result<Option<RemotePairingConfig>, PairingStoreError> {
-    let path = config_path()?;
-    let bytes = match std::fs::read(&path) {
+/// Migration is a pure in-memory read transform: a v1 object becomes a
+/// one-device container whose device keeps the [`PRIMARY_DEVICE_ID`] sentinel, so
+/// its keystore identity stays under the legacy label and nothing in the keystore
+/// moves. The rewrite to a v2 file on disk happens on the next mutating call
+/// (`add_device`/`remove_device`); reads never rewrite, so this is idempotent and
+/// crash-safe.
+fn read_container(path: &std::path::Path) -> Result<Option<PersistedContainer>, PairingStoreError> {
+    let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let persisted: PersistedPairing = serde_json::from_slice(&bytes)?;
-    if persisted.version != PAIRING_VERSION {
-        return Err(PairingStoreError::Version(persisted.version));
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32;
+    match version {
+        PAIRING_VERSION_V2 => Ok(Some(serde_json::from_value(value)?)),
+        PAIRING_VERSION_V1 => {
+            let v1: PersistedPairingV1 = serde_json::from_value(value)?;
+            Ok(Some(PersistedContainer::from_v1(v1)))
+        }
+        other => Err(PairingStoreError::Version(other)),
     }
+}
 
+/// Write a v2 container to `pairing.json`, 0600, creating `~/.sigil` (0700) if
+/// needed. The container never holds any private key material (only public
+/// pins), matching the inert-at-rest invariant.
+fn write_container(
+    path: &std::path::Path,
+    container: &PersistedContainer,
+) -> Result<(), PairingStoreError> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let json = serde_json::to_vec_pretty(container)?;
+    std::fs::write(path, json)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// Reconstruct one device's [`RemotePairingConfig`] from its persisted public row
+/// plus its private identity in the keystore. Fails loud (not `None`) when the
+/// keystore identity is missing/corrupt or the pinned v2 share is off-curve, so a
+/// half-broken device surfaces instead of silently arming without a pin.
+fn device_to_config(
+    ks: &dyn Keystore,
+    d: &PersistedDevice,
+) -> Result<RemotePairingConfig, PairingStoreError> {
     let blob = ks
-        .load_blob(DAEMON_IDENTITY_LABEL)?
+        .load_blob(&identity_label(&d.device_id))?
         .ok_or(PairingStoreError::MissingIdentity)?;
     let daemon_identity =
         DeviceIdentity::from_secret_bytes(&blob).ok_or(PairingStoreError::CorruptIdentity)?;
 
     // Validate and pin the phone's v2 threshold share F on-curve (R2). A v1
     // pairing has none, which is not an error (it takes the DEK path).
-    let phone_share = match &persisted.phone_share {
+    let phone_share = match &d.phone_share {
         Some(s) => {
             let f = B64
                 .decode(&s.f_x963)
@@ -244,42 +364,211 @@ pub fn load(ks: &dyn Keystore) -> Result<Option<RemotePairingConfig>, PairingSto
         None => None,
     };
 
-    Ok(Some(RemotePairingConfig {
-        relay_url: persisted.relay_url,
+    Ok(RemotePairingConfig {
+        relay_url: d.relay_url.clone(),
         daemon_identity,
-        phone: persisted.phone,
+        phone: d.phone,
         phone_share,
-    }))
+    })
 }
 
-/// The public summary of the persisted pairing, for display. `None` when no
-/// pairing is configured.
-pub fn summary() -> Result<Option<PairingSummary>, PairingStoreError> {
-    let path = config_path()?;
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+/// Run the #48 biometric gate before any pairing mutation. On a hardware keystore
+/// this is a live Secure-Enclave user-presence check; a decline returns an error
+/// and the caller writes nothing. Non-biometric dev keystores (only reachable
+/// under `SIGIL_DEV_KEYSTORE`) skip it so headless dev and tests still pair.
+fn gate_presence(ks: &dyn Keystore) -> Result<(), PairingStoreError> {
+    if ks.is_biometric() {
+        ks.verify_presence(PAIRING_PRESENCE_REASON)?;
+    }
+    Ok(())
+}
+
+/// Persist a completed pairing as the SOLE device, replacing any existing
+/// pairing. This is the single-device writer kept for source compatibility; the
+/// additive multi-device path is [`add_device`]. The written device takes the
+/// [`PRIMARY_DEVICE_ID`] sentinel (identity under the legacy label).
+///
+/// **Biometric gate (#48):** authorizing a new pairing on a hardware keystore
+/// requires a live Touch ID / Secure Enclave user-presence, run BEFORE anything
+/// is written, deny-closed: a declined or absent biometric refuses the pairing
+/// with NOTHING written (no identity blob, no config file).
+pub fn save(ks: &dyn Keystore, p: &NewPairing) -> Result<(), PairingStoreError> {
+    // 0. Gate on a live hardware biometric before persisting anything.
+    gate_presence(ks)?;
+
+    // 1. Seal the private daemon identity into the keystore blob seam. The bytes
+    //    are Zeroizing and are wiped when `secret` drops at the end of this call.
+    let secret = p.daemon_identity.to_secret_bytes();
+    ks.store_blob(DAEMON_IDENTITY_LABEL, &secret[..])?;
+
+    // 2. Write a fresh one-device v2 container 0600.
+    let container = PersistedContainer {
+        version: PAIRING_VERSION_V2,
+        devices: vec![PersistedDevice::from_new(PRIMARY_DEVICE_ID, "iPhone", p)],
     };
-    let persisted: PersistedPairing = serde_json::from_slice(&bytes)?;
-    Ok(Some(PairingSummary {
-        relay_url: persisted.relay_url,
-        phone: persisted.phone,
-        paired_at: persisted.paired_at,
-        sas_words: persisted.sas_words,
+    write_container(&config_path()?, &container)?;
+    Ok(())
+}
+
+/// Append a completed pairing as an ADDITIONAL device WITHOUT dropping the
+/// existing devices (#36 additive pairing). Returns the new `deviceId`.
+///
+/// Each device is fully independent: a fresh uuidv7 id, its own daemon identity
+/// sealed under a per-device keystore label, its own pinned phone, its own
+/// mailbox, and its own DEK delivery. The #48 biometric gate fires on EVERY add,
+/// deny-closed and BEFORE any write. Crash-order: the identity blob is sealed,
+/// then the container file is rewritten; a crash in between leaves an orphan
+/// identity blob (inert, unreferenced by any device row), never an armed device
+/// without a pinned phone.
+pub fn add_device(
+    ks: &dyn Keystore,
+    p: &NewPairing,
+    label: &str,
+) -> Result<String, PairingStoreError> {
+    // 0. #48 gate on EACH add, before any write.
+    gate_presence(ks)?;
+
+    // 1. A fresh, stable device id (uuidv7: time-ordered, collision-free).
+    let device_id = uuid::Uuid::now_v7().to_string();
+
+    // 2. Seal this device's private identity under its per-device label.
+    let secret = p.daemon_identity.to_secret_bytes();
+    ks.store_blob(&identity_label(&device_id), &secret[..])?;
+
+    // 3. Read (migrating v1) and append; a brand-new store starts empty.
+    let path = config_path()?;
+    let mut container = read_container(&path)?.unwrap_or_else(PersistedContainer::empty);
+    container.version = PAIRING_VERSION_V2;
+    container
+        .devices
+        .push(PersistedDevice::from_new(&device_id, label, p));
+    write_container(&path, &container)?;
+    Ok(device_id)
+}
+
+/// Load the PRIMARY device (`devices[0]`) into a [`RemotePairingConfig`], or
+/// `None` when no pairing is configured. Byte-identical to the historical
+/// single-device `load` for a one-device store, so an N == 1 daemon arms exactly
+/// as before. Fails loud when the primary's keystore identity is missing/corrupt.
+pub fn load(ks: &dyn Keystore) -> Result<Option<RemotePairingConfig>, PairingStoreError> {
+    let Some(container) = read_container(&config_path()?)? else {
+        return Ok(None);
+    };
+    match container.devices.first() {
+        Some(primary) => Ok(Some(device_to_config(ks, primary)?)),
+        None => Ok(None),
+    }
+}
+
+/// Load EVERY paired device into a [`RemotePairingConfig`], for the ring-all
+/// coordinator (#36). Order is arm order (`devices[0]` is the primary). A single
+/// device yields a one-element vector identical to [`load`], so the composition
+/// over N == 1 is byte-identical to today. Fails loud if ANY device is
+/// half-broken, so the daemon degrades to fail-closed rather than arming a subset
+/// silently.
+pub fn load_all(ks: &dyn Keystore) -> Result<Vec<RemotePairingConfig>, PairingStoreError> {
+    let Some(container) = read_container(&config_path()?)? else {
+        return Ok(Vec::new());
+    };
+    container
+        .devices
+        .iter()
+        .map(|d| device_to_config(ks, d))
+        .collect()
+}
+
+/// The public summary of the PRIMARY device, for display. `None` when no pairing
+/// is configured. Reads the public file alone (no keystore).
+pub fn summary() -> Result<Option<PairingSummary>, PairingStoreError> {
+    let Some(container) = read_container(&config_path()?)? else {
+        return Ok(None);
+    };
+    Ok(container.devices.first().map(|d| PairingSummary {
+        relay_url: d.relay_url.clone(),
+        phone: d.phone,
+        paired_at: d.paired_at,
+        sas_words: d.sas_words.clone(),
     }))
 }
 
-/// Remove the pairing: delete the keystore identity blob and the config file.
-/// Returns `true` if anything was removed. Idempotent.
-pub fn remove(ks: &dyn Keystore) -> Result<bool, PairingStoreError> {
-    let mut removed = false;
-    ks.delete_blob(DAEMON_IDENTITY_LABEL)?;
+/// A public summary of every paired device, for `sigil pair list` (#36). Reads
+/// the public file alone (no keystore). Empty when nothing is paired.
+pub fn list_devices() -> Result<Vec<DeviceSummary>, PairingStoreError> {
+    let Some(container) = read_container(&config_path()?)? else {
+        return Ok(Vec::new());
+    };
+    Ok(container
+        .devices
+        .into_iter()
+        .map(|d| DeviceSummary {
+            device_id: d.device_id,
+            label: d.label,
+            relay_url: d.relay_url,
+            phone: d.phone,
+            paired_at: d.paired_at,
+            sas_words: d.sas_words,
+        })
+        .collect())
+}
+
+/// Remove ONE device by id: drop its row and delete its keystore identity blob.
+/// Idempotent (`false` if no such device). Removing the last device returns to
+/// the fully unpaired state (the file is deleted). Crash-order: the container
+/// file is rewritten (device gone) BEFORE the blob is deleted, so a crash leaves
+/// an orphan blob (inert), never a dangling row pointing at a deleted identity.
+pub fn remove_device(ks: &dyn Keystore, device_id: &str) -> Result<bool, PairingStoreError> {
     let path = config_path()?;
+    let Some(mut container) = read_container(&path)? else {
+        return Ok(false);
+    };
+    let Some(idx) = container
+        .devices
+        .iter()
+        .position(|d| d.device_id == device_id)
+    else {
+        return Ok(false);
+    };
+    let removed = container.devices.remove(idx);
+    // Write the file first (row gone), then delete the identity blob.
+    if container.devices.is_empty() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    } else {
+        write_container(&path, &container)?;
+    }
+    ks.delete_blob(&identity_label(&removed.device_id))?;
+    Ok(true)
+}
+
+/// Remove the pairing entirely: delete every device's keystore identity blob and
+/// the config file. Returns `true` if a config file was removed. Idempotent.
+/// `sigil unpair` (remove all) maps here.
+pub fn remove(ks: &dyn Keystore) -> Result<bool, PairingStoreError> {
+    let path = config_path()?;
+    // Snapshot the device ids before deleting the file, so we know which
+    // per-device identity blobs to reap.
+    let container = read_container(&path)?;
+
+    let mut removed = false;
     match std::fs::remove_file(&path) {
         Ok(()) => removed = true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
+    }
+
+    // Delete every device's identity blob. Always sweep the legacy label too, so
+    // a store that predates the container (or a partial migration) is fully
+    // cleaned regardless of what the file said.
+    ks.delete_blob(DAEMON_IDENTITY_LABEL)?;
+    if let Some(container) = container {
+        for d in container.devices {
+            if d.device_id != PRIMARY_DEVICE_ID {
+                ks.delete_blob(&identity_label(&d.device_id))?;
+            }
+        }
     }
     Ok(removed)
 }
@@ -619,5 +908,162 @@ mod tests {
         assert!(ks.load_blob(DAEMON_IDENTITY_LABEL).unwrap().is_none());
         // A second remove is a no-op, not an error.
         assert!(!remove(&ks).unwrap());
+    }
+
+    /// The current writer emits a v2 container; a fresh `save` is v2 on disk.
+    #[test]
+    fn save_writes_a_v2_container() {
+        let _home = HomeGuard::new("v2-write");
+        let ks = MemoryKeystore::new();
+        let (_i, _p, np) = new_pairing();
+        save(&ks, &np).unwrap();
+        let raw = std::fs::read_to_string(config_path().unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v.get("version").and_then(|x| x.as_u64()), Some(2));
+        assert_eq!(
+            v.get("devices").and_then(|d| d.as_array()).unwrap().len(),
+            1
+        );
+    }
+
+    /// A legacy v1 flat file is migrated on read: `load` reconstructs the primary
+    /// device from the LEGACY keystore label (untouched by migration), and
+    /// `load_all` yields exactly that one device. This is the byte-compatible
+    /// upgrade path for an existing single-device pairing.
+    #[test]
+    fn a_v1_file_migrates_on_read() {
+        let _home = HomeGuard::new("v1-migrate");
+        let ks = MemoryKeystore::new();
+        let daemon = DeviceIdentity::generate();
+        let daemon_pub = daemon.peer_identity();
+        let phone = DeviceIdentity::generate().peer_identity();
+
+        // Hand-write a v1 flat file + the identity under the LEGACY label, exactly
+        // as the old `save` used to.
+        ks.store_blob(DAEMON_IDENTITY_LABEL, &daemon.to_secret_bytes()[..])
+            .unwrap();
+        let v1 = PersistedPairingV1 {
+            version: PAIRING_VERSION_V1,
+            relay_url: "https://relay.legacy".into(),
+            phone,
+            paired_at: 42,
+            sas_words: vec!["a".into(), "b".into()],
+            phone_share: None,
+        };
+        write_v1(&v1);
+
+        // load() reconstructs the primary from the legacy label.
+        let cfg = load(&ks).unwrap().expect("v1 migrates to a primary");
+        assert_eq!(cfg.relay_url, "https://relay.legacy");
+        assert_eq!(cfg.phone, phone);
+        assert_eq!(cfg.daemon_identity.peer_identity(), daemon_pub);
+
+        // load_all yields exactly one device, and list_devices names the primary.
+        assert_eq!(load_all(&ks).unwrap().len(), 1);
+        let devices = list_devices().unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].device_id, PRIMARY_DEVICE_ID);
+        assert_eq!(devices[0].relay_url, "https://relay.legacy");
+    }
+
+    /// Adding a device is ADDITIVE: the existing device is not dropped, the new
+    /// one gets its own uuidv7 id and its own per-device keystore label, and
+    /// `load_all` returns both with distinct daemon identities.
+    #[test]
+    fn add_device_is_additive_and_per_device_isolated() {
+        let _home = HomeGuard::new("add-additive");
+        let ks = MemoryKeystore::new();
+
+        let (_i, primary_pub, np1) = new_pairing();
+        save(&ks, &np1).unwrap();
+
+        let (_i2, second_pub, np2) = new_pairing();
+        let id2 = add_device(&ks, &np2, "iPad").unwrap();
+        assert_ne!(id2, PRIMARY_DEVICE_ID);
+
+        // Both devices load, in arm order, each with its OWN daemon identity.
+        let all = load_all(&ks).unwrap();
+        assert_eq!(all.len(), 2, "the primary was not dropped by the add");
+        assert_eq!(all[0].daemon_identity.peer_identity(), primary_pub);
+        assert_eq!(all[1].daemon_identity.peer_identity(), second_pub);
+        // Distinct mailboxes: the relay cannot link them.
+        assert_ne!(all[0].mailbox(), all[1].mailbox());
+
+        // The second device's identity is under its OWN per-device label, not the
+        // legacy one, so it is fully independent of the primary.
+        assert!(ks.load_blob(&identity_label(&id2)).unwrap().is_some());
+        let devices = list_devices().unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[1].label, "iPad");
+    }
+
+    /// `add_device` also works as the FIRST device on an empty store, and the
+    /// #48 biometric gate fires on the add (a decline writes nothing).
+    #[test]
+    fn add_device_gates_on_biometric_and_writes_nothing_on_decline() {
+        let _home = HomeGuard::new("add-gate");
+        let ks = ScriptedBiometric::new(false);
+        let (_i, _p, np) = new_pairing();
+        let err = add_device(&ks, &np, "iPhone").expect_err("a declined biometric refuses");
+        assert!(matches!(
+            err,
+            PairingStoreError::Keystore(KeystoreError::Declined)
+        ));
+        assert!(!exists(), "no file written on a declined biometric add");
+    }
+
+    /// Removing one device of several drops only that row + its identity blob,
+    /// leaving the others intact; removing the last device returns to unpaired.
+    #[test]
+    fn remove_device_drops_one_then_the_last() {
+        let _home = HomeGuard::new("remove-one");
+        let ks = MemoryKeystore::new();
+
+        let (_i, _p, np1) = new_pairing();
+        save(&ks, &np1).unwrap();
+        let (_i2, _p2, np2) = new_pairing();
+        let id2 = add_device(&ks, &np2, "iPad").unwrap();
+
+        // Remove the second: the primary stays, the second's blob is reaped.
+        assert!(remove_device(&ks, &id2).unwrap());
+        assert!(ks.load_blob(&identity_label(&id2)).unwrap().is_none());
+        assert_eq!(load_all(&ks).unwrap().len(), 1);
+        assert!(exists(), "the primary remains, so the file remains");
+
+        // An unknown id is idempotent-false.
+        assert!(!remove_device(&ks, "no-such-device").unwrap());
+
+        // Remove the last (primary): back to fully unpaired.
+        assert!(remove_device(&ks, PRIMARY_DEVICE_ID).unwrap());
+        assert!(!exists());
+        assert!(ks.load_blob(DAEMON_IDENTITY_LABEL).unwrap().is_none());
+        assert!(load(&ks).unwrap().is_none());
+    }
+
+    /// `remove` (unpair all) reaps EVERY device's identity blob, not just the
+    /// primary's, so no per-device identity is orphaned in the keystore.
+    #[test]
+    fn remove_all_reaps_every_device_identity() {
+        let _home = HomeGuard::new("remove-all");
+        let ks = MemoryKeystore::new();
+        let (_i, _p, np1) = new_pairing();
+        save(&ks, &np1).unwrap();
+        let (_i2, _p2, np2) = new_pairing();
+        let id2 = add_device(&ks, &np2, "iPad").unwrap();
+
+        assert!(remove(&ks).unwrap());
+        assert!(!exists());
+        assert!(ks.load_blob(DAEMON_IDENTITY_LABEL).unwrap().is_none());
+        assert!(ks.load_blob(&identity_label(&id2)).unwrap().is_none());
+    }
+
+    /// Hand-write a v1 flat `pairing.json`, as the pre-#36 `save` produced, for the
+    /// migration test.
+    fn write_v1(v1: &PersistedPairingV1) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = config_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec_pretty(v1).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 }
