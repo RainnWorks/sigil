@@ -38,6 +38,11 @@ interface Live {
   transport: PhoneRelay;
 }
 
+/** A short, secret-free error string for a diagnostic log line. */
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 let live: Live | null = null;
 
 export function isArmed(): boolean {
@@ -56,7 +61,8 @@ export async function armLiveSession(): Promise<boolean> {
   let sodium: Sodium;
   try {
     sodium = await loadSodium();
-  } catch {
+  } catch (e) {
+    console.warn(`[session] arm failed: libsodium did not load: ${errText(e)}`);
     return false;
   }
   const transport = new PhoneRelay({
@@ -130,7 +136,8 @@ export async function sendPushRegister(token: string): Promise<PushRegisterOutco
       platform: "apns",
     });
     return "sent";
-  } catch {
+  } catch (e) {
+    console.warn(`[session] push token deposit failed: ${errText(e)}`);
     return "error";
   }
 }
@@ -186,7 +193,11 @@ export async function liveApprove(
       ...(opts.lease ? { lease: opts.lease } : {}),
     });
     return "sent";
-  } catch {
+  } catch (e) {
+    // The approve was sealed but the dispatch threw (transport/seal fault). No
+    // secret leaks here: the DEK is a separate, zeroized-below buffer, and the
+    // error is a wire error, not key material.
+    console.warn(`[session] approve dispatch failed: ${errText(e)}`);
     return "error";
   } finally {
     dek.fill(0);
@@ -235,7 +246,8 @@ async function liveApproveThreshold(
       ...(opts.lease ? { lease: opts.lease } : {}),
     });
     return "sent";
-  } catch {
+  } catch (e) {
+    console.warn(`[session] threshold approve dispatch failed: ${errText(e)}`);
     return "error";
   }
 }
@@ -251,7 +263,8 @@ export async function liveDeny(request: ApprovalRequest): Promise<DenyOutcome> {
   try {
     await live.session.respond(request, "denied");
     return "sent";
-  } catch {
+  } catch (e) {
+    console.warn(`[session] deny dispatch failed: ${errText(e)}`);
     return "error";
   }
 }

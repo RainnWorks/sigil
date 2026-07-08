@@ -16,7 +16,6 @@ import {
   type PeerIdentity,
   type Sodium,
   open,
-  peerIdentity,
   ReplayGuard,
   seal,
   signingSecretKey,
@@ -41,11 +40,8 @@ export class MockTransport implements Transport {
   private outboundCounter = 0;
   private inboundGuard = new ReplayGuard();
   private started = false;
-  private readonly daemonPub: PeerIdentity;
 
-  constructor(private readonly cfg: MockTransportConfig) {
-    this.daemonPub = peerIdentity(cfg.sodium, cfg.daemon);
-  }
+  constructor(private readonly cfg: MockTransportConfig) {}
 
   async start(): Promise<void> {
     this.started = true;
