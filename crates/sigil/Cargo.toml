@@ -41,6 +41,10 @@ sigil-proto = { path = "../sigil-proto" }
 # sigil-relay-client: the daemon's outbound-WebSocket Transport to the blind
 # relay, wired behind the phone approving factor at arm time.
 sigil-relay-client = { path = "../sigil-relay-client" }
+# sigil-direct: the transport-ladder rungs 1-2 (LAN/owned-endpoint direct link,
+# fallback selector, verification gate). Wired behind an opt-in per-device
+# `direct_endpoint`; OFF by default, so the relay path is unchanged when unset.
+sigil-direct = { path = "../sigil-direct" }
 serde.workspace = true
 serde_json.workspace = true
 # anyhow only at the binary edge, per house rules.

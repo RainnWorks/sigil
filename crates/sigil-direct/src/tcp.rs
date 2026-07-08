@@ -382,6 +382,28 @@ impl DirectListener {
         Ok(self.listener.local_addr()?)
     }
 
+    /// Put the listener in (non-)blocking mode. A daemon acceptor sets this
+    /// non-blocking so it can poll [`accept_nonblocking`](Self::accept_nonblocking)
+    /// while honoring a shutdown flag, instead of parking in a blocking
+    /// [`accept`](Self::accept) that no shutdown can interrupt.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<(), DirectError> {
+        self.listener.set_nonblocking(nonblocking)?;
+        Ok(())
+    }
+
+    /// A non-blocking accept for a polling acceptor loop: `Ok(None)` means no
+    /// dial was pending (the listener must be in non-blocking mode, see
+    /// [`set_nonblocking`](Self::set_nonblocking)). Like [`accept`](Self::accept),
+    /// the returned link is UNVERIFIED: promotion must gate on
+    /// [`verify_link`](crate::discovery::verify_link).
+    pub fn accept_nonblocking(&self) -> Result<Option<Arc<DirectLink>>, DirectError> {
+        match self.listener.accept() {
+            Ok((stream, _peer)) => Ok(Some(DirectLink::from_stream(stream)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Block for the next dial and wrap it as a [`DirectLink`]. The returned link
     /// is UNVERIFIED: a same-LAN host can dial too, so promotion to a trusted
     /// primary must gate on [`verify_link`](crate::discovery::verify_link).

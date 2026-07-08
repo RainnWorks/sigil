@@ -51,8 +51,10 @@ use crate::sshagent::{self, ServedIdentity, SignRequest, SshBackend, SshSigner};
 use sigil_proto::{LeasePolicy, SshChallenge};
 
 use sigil_proto::identity::DeviceIdentity;
-use sigil_proto::{mailbox_id, PeerIdentity};
+use sigil_proto::{mailbox_id, PeerIdentity, Transport};
 use sigil_relay_client::DaemonRelay;
+
+use sigil_direct::{DirectListener, FallbackTransport};
 
 /// Default session-lease TTL granted by an "approve for this session" decision.
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
@@ -161,6 +163,12 @@ pub struct RemotePairingConfig {
     /// `None` for a v1 pairing (the DEK path). Not needed per request (the record
     /// carries `E`); pinned here so v2 account-add and re-key can wrap to it.
     pub phone_share: Option<crate::threshold::PhoneShare>,
+    /// The rung-2 owned endpoint (`host:port`) this daemon binds for a direct
+    /// link to this device (#51). `None` (the default) means direct transport is
+    /// OFF for this device: no listener is bound, the approver keeps its bare relay
+    /// transport, and the approval path is byte-identical to the relay-only daemon.
+    /// `Some` opts this device into the direct ladder, still fully envelope-gated.
+    pub direct_endpoint: Option<String>,
 }
 
 impl RemotePairingConfig {
@@ -206,7 +214,8 @@ fn build_gate(
     remote: Vec<RemotePairingConfig>,
     keystore: &Arc<dyn Keystore>,
     pending: &Arc<PendingRegistry>,
-) -> anyhow::Result<(ApprovalGate, Vec<Arc<RemoteApprover>>)> {
+) -> anyhow::Result<(ApprovalGate, Vec<Arc<RemoteApprover>>, Vec<DirectAcceptor>)> {
+    let mut acceptors: Vec<DirectAcceptor> = Vec::new();
     let (approver, listeners): (Box<dyn Approver>, Vec<Arc<RemoteApprover>>) = match factor {
         Factor::Phone => {
             assert!(
@@ -222,18 +231,57 @@ fn build_gate(
             for cfg in remote {
                 let relay = DaemonRelay::new(&cfg.relay_url, cfg.mailbox())
                     .map_err(|e| anyhow::anyhow!("reaching relay {}: {e}", cfg.relay_url))?;
+                let relay: Arc<dyn Transport> = Arc::new(relay);
+
+                // Direct transport (#51) is OFF unless this device carries a
+                // `direct_endpoint`. When set, bind a rung-2 listener and build the
+                // approver over a FallbackTransport (relay + optional verified
+                // direct primary); a bind failure logs and degrades to relay-only,
+                // never refusing to arm. When unset, the approver is built on the
+                // BARE relay exactly as the reviewed path, so it is byte-identical.
+                let (transport, direct, listener): (
+                    Arc<dyn Transport>,
+                    Option<Arc<FallbackTransport>>,
+                    Option<DirectListener>,
+                ) = match cfg.direct_endpoint.as_deref() {
+                    Some(endpoint) => match DirectListener::bind(endpoint) {
+                        Ok(listener) => {
+                            let fb = Arc::new(FallbackTransport::new(relay));
+                            (fb.clone(), Some(fb), Some(listener))
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "sigil daemon: direct endpoint {endpoint} unavailable ({e}); serving this device over the relay only"
+                            );
+                            (relay, None, None)
+                        }
+                    },
+                    None => (relay, None, None),
+                };
+
                 // Hold each approver in an Arc: the gate drives it (bare, or via the
                 // ring) and `serve` keeps a clone to run its ToDaemon owner loop.
                 // They share the waiter map, so the owner (the sole reader) routes
                 // each response to the approval waiting for it.
-                let approver = Arc::new(
-                    RemoteApprover::new(Arc::new(relay), cfg.daemon_identity, cfg.phone)
-                        .with_push(push_store.clone())
-                        // Share the pending registry so a remote request's arrival,
-                        // delivery receipt, or completion bumps the version a
-                        // `subscribe_pending` client waits on (Sent -> Delivered).
-                        .with_pending(pending.clone()),
-                );
+                let mut approver = RemoteApprover::new(transport, cfg.daemon_identity, cfg.phone)
+                    .with_push(push_store.clone())
+                    // Share the pending registry so a remote request's arrival,
+                    // delivery receipt, or completion bumps the version a
+                    // `subscribe_pending` client waits on (Sent -> Delivered).
+                    .with_pending(pending.clone());
+                if let Some(fb) = direct {
+                    // Wire the SAME FallbackTransport as the promote/demote seam.
+                    approver = approver.with_direct(fb);
+                }
+                let approver = Arc::new(approver);
+                // A device with a bound direct listener gets an acceptor thread in
+                // `serve`; a relay-only device produces none.
+                if let Some(listener) = listener {
+                    acceptors.push(DirectAcceptor {
+                        approver: approver.clone(),
+                        listener,
+                    });
+                }
                 devices.push(approver);
             }
             // N == 1: the gate is the bare approver (reviewed path, unchanged).
@@ -262,7 +310,20 @@ fn build_gate(
         ),
         Factor::NoFactor => (Box::new(NullApprover), Vec::new()),
     };
-    Ok((ApprovalGate::new(approver), listeners))
+    Ok((ApprovalGate::new(approver), listeners, acceptors))
+}
+
+/// A bound rung-2 direct listener paired with the [`RemoteApprover`] whose device
+/// it serves (#51). `serve` spawns one acceptor thread per entry, which polls the
+/// listener and hands each dial to
+/// [`RemoteApprover::verify_and_promote`](crate::remote::RemoteApprover::verify_and_promote).
+/// Only devices with a `direct_endpoint` produce one; a relay-only daemon has an
+/// empty vector and spawns no acceptor, so its behavior is unchanged.
+pub struct DirectAcceptor {
+    /// The approver whose device this listener serves.
+    approver: Arc<RemoteApprover>,
+    /// The bound rung-2 listener the phone dials.
+    listener: DirectListener,
 }
 
 impl Core {
@@ -270,7 +331,9 @@ impl Core {
     /// (a paired phone, then a hardware biometric) and `dev_insecure`. With no
     /// real factor and no `--dev-insecure`, the factor is [`Factor::NoFactor`]
     /// and every gated request fails closed.
-    pub fn for_host(dev_insecure: bool) -> anyhow::Result<(Self, Vec<Arc<RemoteApprover>>)> {
+    pub fn for_host(
+        dev_insecure: bool,
+    ) -> anyhow::Result<(Self, Vec<Arc<RemoteApprover>>, Vec<DirectAcceptor>)> {
         let keystore = keystore::for_host();
         let accounts = AccountStore::load().context("loading account store")?;
         // The v2 threshold accounts (if any). A missing/unreadable store is
@@ -291,7 +354,8 @@ impl Core {
             biometric: keystore.is_biometric(),
         };
         let factor = factor::resolve(&inputs);
-        let (gate, remote_listeners) = build_gate(factor, remote, &keystore, &pending)?;
+        let (gate, remote_listeners, direct_acceptors) =
+            build_gate(factor, remote, &keystore, &pending)?;
 
         // Load the served SSH identities from ~/.sigil/ssh-keys.json and build a
         // signer per source (op-fetch + file-based). A bad config is logged and
@@ -336,7 +400,7 @@ impl Core {
                     .unwrap_or(30),
             ),
         };
-        Ok((core, remote_listeners))
+        Ok((core, remote_listeners, direct_acceptors))
     }
 
     /// The full status report, the daemon's answer to `Frame::Status`. It is the
@@ -610,16 +674,20 @@ impl Drop for ConnPermit {
 /// `args` are the `sigil daemon` arguments (e.g. `--dev-insecure`).
 pub fn run(args: &[String]) -> anyhow::Result<()> {
     let dev_insecure = factor::dev_insecure_requested(args);
-    let (core, remote_listeners) = Core::for_host(dev_insecure)?;
+    let (core, remote_listeners, direct_acceptors) = Core::for_host(dev_insecure)?;
     let core = Arc::new(core);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
         .build()
         .context("building tokio runtime")?;
-    rt.block_on(serve(core, remote_listeners))
+    rt.block_on(serve(core, remote_listeners, direct_acceptors))
 }
 
-async fn serve(core: Arc<Core>, remote_listeners: Vec<Arc<RemoteApprover>>) -> anyhow::Result<()> {
+async fn serve(
+    core: Arc<Core>,
+    remote_listeners: Vec<Arc<RemoteApprover>>,
+    direct_acceptors: Vec<DirectAcceptor>,
+) -> anyhow::Result<()> {
     // Roll the launchd append-mode logs if they have grown large, before we add
     // to them. Best-effort: never blocks arming.
     service::rotate_logs(service::LOG_ROTATE_BYTES);
@@ -703,6 +771,26 @@ async fn serve(core: Arc<Core>, remote_listeners: Vec<Arc<RemoteApprover>>) -> a
         })
         .collect();
 
+    // One direct acceptor PER device that opted into rung-2 direct transport
+    // (#51), OFF by default (a device with no `direct_endpoint` produces none, so
+    // a relay-only daemon spawns nothing here and is byte-identical). Each polls
+    // its bound listener for a phone dial and hands each accepted link to that
+    // device's `verify_and_promote`, which installs a direct primary ONLY after an
+    // envelope opens as the pinned peer. A rogue LAN dial is dropped at that gate;
+    // the relay serves throughout, so an acceptor never gates or delays an
+    // approval. Shares the same shutdown flag as the owner loops.
+    let acceptor_handles: Vec<std::thread::JoinHandle<()>> = direct_acceptors
+        .into_iter()
+        .enumerate()
+        .map(|(i, acc)| {
+            let stop = listener_shutdown.clone();
+            std::thread::Builder::new()
+                .name(format!("sigil-direct-acceptor-{i}"))
+                .spawn(move || acc.approver.run_direct_acceptor(&acc.listener, &stop))
+                .expect("spawning the direct acceptor")
+        })
+        .collect();
+
     // The config hot-reloader (#59): picks up `sigil-config` edits without a
     // restart. Shares the shutdown flag so it stops with the daemon.
     let config_watcher = spawn_config_watcher(core.clone(), listener_shutdown.clone());
@@ -770,6 +858,10 @@ async fn serve(core: Arc<Core>, remote_listeners: Vec<Arc<RemoteApprover>>) -> a
     // be mid-poll (up to one relay long-poll hold), so these joins are best-effort
     // and bounded by that; the process is exiting regardless.
     for handle in listener_handles {
+        let _ = handle.join();
+    }
+    // Each direct acceptor wakes within one accept-poll of the flag being set.
+    for handle in acceptor_handles {
         let _ = handle.join();
     }
     // The watcher wakes at most one poll interval after the flag is set.
@@ -3594,6 +3686,7 @@ mod tests {
             daemon_identity: daemon_id,
             phone: softphone.phone_identity(),
             phone_share: None,
+            direct_endpoint: None,
         };
         assert_eq!(cfg.mailbox(), softphone.mailbox());
     }
@@ -3707,6 +3800,7 @@ mod tests {
             daemon_identity: clone_device(&daemon_id),
             phone: phone_pub,
             phone_share: None,
+            direct_endpoint: None,
         };
         assert_eq!(cfg.mailbox(), mailbox);
 
@@ -3881,7 +3975,8 @@ mod tests {
             .unwrap();
         drop(dek);
         let pending = Arc::new(PendingRegistry::new());
-        let (gate, _listeners) = build_gate(factor, Vec::new(), &keystore, &pending).unwrap();
+        let (gate, _listeners, _acceptors) =
+            build_gate(factor, Vec::new(), &keystore, &pending).unwrap();
         Arc::new(Core {
             remote: Vec::new(),
             keystore,
@@ -4097,6 +4192,7 @@ mod tests {
             daemon_identity: daemon_id,
             phone: softphone.phone_identity(),
             phone_share: None,
+            direct_endpoint: None,
         };
         let ks: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
@@ -4110,7 +4206,8 @@ mod tests {
             Factor::Phone
         );
         // And the gate builds the phone approver from the config.
-        let (gate, listeners) = build_gate(Factor::Phone, vec![cfg], &ks, &pending).unwrap();
+        let (gate, listeners, _acceptors) =
+            build_gate(Factor::Phone, vec![cfg], &ks, &pending).unwrap();
         let _ = gate; // constructed without a DEK at rest: inert.
         assert_eq!(
             listeners.len(),
