@@ -84,6 +84,17 @@ impl HttpMailbox {
     pub(crate) fn new(base: &str, mailbox: [u8; 32]) -> Result<Self, TransportError> {
         let client = reqwest::blocking::Client::builder()
             .timeout(HTTP_TIMEOUT)
+            // This client does at most one in-flight request at a time (a held
+            // long-poll every ~25s, or a deposit), so idle connection reuse buys
+            // nothing and is actively harmful: after a laptop sleep or a Wi-Fi
+            // change a pooled keep-alive connection goes dead while the OS still
+            // reports it ESTABLISHED, and reqwest then loops forever on "error
+            // sending request" reusing it. Keep no idle connections so every
+            // request opens a fresh one (one TCP+TLS handshake per poll is
+            // negligible), and bound the connect so a black-holed route fails
+            // fast into the backoff instead of hanging the whole timeout.
+            .pool_max_idle_per_host(0)
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| TransportError::Backend(format!("building http client: {e}")))?;
         Ok(Self {
