@@ -220,7 +220,17 @@ impl RemoteApprover {
             identity,
             phone,
             pairing_id,
-            counter: AtomicU64::new(0),
+            // Seed the outbound envelope counter from the wall clock, not 0.
+            // The phone's replay guard rejects any counter <= the highest it has
+            // seen, so a daemon restart that reset this to 0 made the phone drop
+            // every new request as a stale replay (fetched, never shown). The
+            // clock is a persistent monotonic source: a restart always seeds a
+            // value above the prior session's (millis climb far faster than we
+            // issue requests), so the counter strictly advances across restarts
+            // with no on-disk state. The counter is an opaque monotonic tag, so a
+            // large starting value is fine. (The clean fix is to retire the
+            // counter for age-windowed request-id dedup; tracked separately.)
+            counter: AtomicU64::new(sigil_proto::now_ms()),
             guard: Mutex::new(ReplayGuard::new()),
             timeout: DEFAULT_REMOTE_TIMEOUT,
             machine: hostname(),
