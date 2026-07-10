@@ -1,12 +1,12 @@
 /**
- * The v2 threshold combiner, mirroring crates/proto/src/threshold.rs
+ * The v2 threshold combiner, mirroring crates/sigil-proto/src/threshold.rs
  * byte-for-byte. Decryption is a 2-of-2 AND of two independent P-256 ECDH
  * secrets combined by a KDF; this module is the KDF (`combine`) and the ECDH
  * output shaping (`shapeEcdh`), the two pieces the phone shares with the daemon.
  *
  *   Z_M = x(m·E)      the Mac's partial (daemon-side, software P-256)
  *   Z_F = x(f·E)      the phone's partial (Secure Enclave, under Face ID)
- *   K   = BLAKE2b-256( "latch.threshold.v2" ‖ len·Z_M ‖ len·Z_F ‖ len·E_x963 ‖ len·account_id )
+ *   K   = BLAKE2b-256( "sigil.threshold.v2" ‖ len·Z_M ‖ len·Z_F ‖ len·E_x963 ‖ len·account_id )
  *
  * On device the phone only ever produces `Z_F` (see session/threshold-se.ts) and
  * hands it to the daemon, which runs `combine` and opens the token. `combine`
@@ -25,7 +25,7 @@ import { type EcdhAlgo } from "./requests";
 import { type Sodium } from "./sodium";
 
 /** Domain separator folded into every combiner hash. Matches Rust THRESHOLD_DOMAIN. */
-export const THRESHOLD_DOMAIN: Uint8Array = new TextEncoder().encode("latch.threshold.v2");
+export const THRESHOLD_DOMAIN: Uint8Array = new TextEncoder().encode("sigil.threshold.v2");
 
 /** Combiner identifier persisted in a record's `kdfAlgo`. */
 export const KDF_ALGO_ID = "blake2b-v2";

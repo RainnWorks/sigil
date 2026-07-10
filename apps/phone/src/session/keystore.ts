@@ -27,8 +27,8 @@ import {
   toBase64,
 } from "@/src/protocol";
 
-const IDENTITY_KEY = "latch.pairing.identity";
-const DEK_KEY = "latch.pairing.dek";
+const IDENTITY_KEY = "sigil.pairing.identity";
+const DEK_KEY = "sigil.pairing.dek";
 
 /** The passcode-tier record: everything needed to read (not release). */
 export interface StoredPairing {
@@ -107,7 +107,13 @@ export async function loadPairing(): Promise<StoredPairing | null> {
   if (!raw) return null;
   try {
     return decodeIdentity(JSON.parse(raw) as IdentityJson);
-  } catch {
+  } catch (e) {
+    // The stored identity record is present but unparseable (corrupt / a schema
+    // from a future build). Treat as unpaired and fail closed, but leave a trace:
+    // this is a local storage fault, not hostile input, and is otherwise silent.
+    console.warn(
+      `[keystore] stored pairing identity was unreadable: ${e instanceof Error ? e.message : String(e)}`,
+    );
     return null;
   }
 }

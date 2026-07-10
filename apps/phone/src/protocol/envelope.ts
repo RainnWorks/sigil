@@ -1,6 +1,6 @@
 /**
- * The sealed, signed envelope, mirroring crates/proto/src/envelope.rs. It is
- * the only thing Latch ever puts on a wire; a relay or any hop sees only this.
+ * The sealed, signed envelope, mirroring crates/sigil-proto/src/envelope.rs. It is
+ * the only thing Sigil ever puts on a wire; a relay or any hop sees only this.
  *
  * Sealed with crypto_box (X25519 + XSalsa20-Poly1305) to the pinned recipient
  * agreement key using a fresh per-envelope ephemeral (forward secrecy), signed

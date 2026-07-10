@@ -1,6 +1,6 @@
 /**
  * The pairing checksum (six words) and the routing mailbox id, mirroring
- * crates/proto/src/fingerprint.rs. Both are domain-separated Blake2b512 hashes
+ * crates/sigil-proto/src/fingerprint.rs. Both are domain-separated Blake2b512 hashes
  * of the two pinned identities, absorbed in sorted order so the result does not
  * depend on which device is "a" and which is "b".
  */
@@ -9,8 +9,8 @@ import { type PeerIdentity } from "./identity";
 import { type Sodium } from "./sodium";
 import { WORDS } from "./words";
 
-const FINGERPRINT_DOMAIN = new TextEncoder().encode("latch.fingerprint.v1");
-const MAILBOX_DOMAIN = new TextEncoder().encode("latch.mailbox.v1");
+const FINGERPRINT_DOMAIN = new TextEncoder().encode("sigil.fingerprint.v1");
+const MAILBOX_DOMAIN = new TextEncoder().encode("sigil.mailbox.v1");
 
 /** The two 32-byte halves as one 64-byte string, fixed field order. */
 function identityBytes(p: PeerIdentity): Uint8Array {

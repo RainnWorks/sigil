@@ -1,4 +1,4 @@
-<title>Latch · How the security works</title>
+<title>Sigil · How the security works</title>
 <style>
   :root {
     --bg: oklch(1 0 0);
@@ -359,9 +359,9 @@
 
   <!-- ===================== HERO ===================== -->
   <header class="hero">
-    <span class="kicker"><span class="mark">latch_</span> · How the security works</span>
+    <span class="kicker"><span class="mark">sigil_</span> · How the security works</span>
     <h1>Two halves. One lock. <span class="warm">Neither half can open it alone.</span></h1>
-    <p class="lede">A plain-language tour of how Latch lets you approve a secret from your phone, and why even a hijacked Mac cannot help itself to one. No prior knowledge assumed.</p>
+    <p class="lede">A plain-language tour of how Sigil lets you approve a secret from your phone, and why even a hijacked Mac cannot help itself to one. No prior knowledge assumed.</p>
 
     <div class="hero-art" aria-hidden="true">
       <svg viewBox="0 0 640 200" role="img" width="640" height="200">
@@ -395,9 +395,9 @@
 
   <div class="arc reveal">
     <div>
-      <span class="lbl">What Latch is</span>
+      <span class="lbl">What Sigil is</span>
       <h2>Your secrets, approved from your pocket</h2>
-      <p>Passwords and access tokens live locked on your Mac. Latch lets you approve their use from your phone while keeping them locked to everyone else, including a Mac that has been taken over.</p>
+      <p>Passwords and access tokens live locked on your Mac. Sigil lets you approve their use from your phone while keeping them locked to everyone else, including a Mac that has been taken over.</p>
     </div>
     <div>
       <span class="lbl">Where we are going</span>
@@ -453,7 +453,7 @@
           <path d="M482 122 l-9 6 9 6" class="s-deny"/>
         </svg>
       </div>
-      <figcaption>The prompt waits when you are away. And a hostile program already on the Mac sits right beside the secret. Latch has to answer both without weakening either.</figcaption>
+      <figcaption>The prompt waits when you are away. And a hostile program already on the Mac sits right beside the secret. Sigil has to answer both without weakening either.</figcaption>
     </figure>
   </section>
 
@@ -526,7 +526,7 @@
     <h2>Meeting in person, so no imposter can slip in</h2>
     <div class="prose">
       <p class="lead">Before your Mac and phone can trade locked boxes, each has to be certain it holds the other's real padlock, and not a fake one swapped in by someone in the middle.</p>
-      <p>Latch solves this the way two people would in real life: they meet face to face once. Your Mac shows a <strong>QR code</strong> on its screen. Your phone reads it with its camera. That hop, from a screen to a lens, has no internet in it. Nobody on the network can reach in between a screen and a camera pointed at it. So it is a trustworthy way to hand over the Mac's real padlock.</p>
+      <p>Sigil solves this the way two people would in real life: they meet face to face once. Your Mac shows a <strong>QR code</strong> on its screen. Your phone reads it with its camera. That hop, from a screen to a lens, has no internet in it. Nobody on the network can reach in between a screen and a camera pointed at it. So it is a trustworthy way to hand over the Mac's real padlock.</p>
       <p>The phone sends its own padlock back over the network. Now here is the danger. The network is a crowd of strangers. Someone could intercept the phone's reply and substitute their own padlock, tricking the Mac into trusting the wrong device. This is called a <em>person in the middle</em>.</p>
       <p><strong>The six words are how you catch that.</strong> Once both devices think they have swapped padlocks, each independently boils the two padlocks it holds down to six short, memorable words, and shows them on screen. If an imposter slipped a fake padlock into the exchange, the two devices are holding different sets of padlocks, so their six words <em>will not match</em>. You read the words off both screens. If they agree, no imposter got in. If they differ, you stop. The check is that simple, and that is the point: a mismatch is loud and a human cannot miss it.</p>
     </div>
@@ -608,7 +608,7 @@
         <p class="plate-title">One whole key, or two halves</p>
         <div class="seg" role="group" aria-label="Compare a single key with a split key">
           <button id="keyBtnOne" aria-pressed="false" data-pane="one">One whole key</button>
-          <button id="keyBtnTwo" aria-pressed="true" data-pane="two">Two halves (Latch)</button>
+          <button id="keyBtnTwo" aria-pressed="true" data-pane="two">Two halves (Sigil)</button>
         </div>
 
         <div class="toggle-pane" id="paneOne">
@@ -720,7 +720,7 @@
         <div class="flow-cap" aria-live="polite">
           <span class="fc-step" id="fcStep">Stage 01</span>
           <h4 id="fcTitle">A tool asks for a secret</h4>
-          <p id="fcText">On your Mac, some tool needs a secret to do its job, maybe to read a password or connect to a server. Instead of prompting you at the machine, Latch begins a request bound to this exact command.</p>
+          <p id="fcText">On your Mac, some tool needs a secret to do its job, maybe to read a password or connect to a server. Instead of prompting you at the machine, Sigil begins a request bound to this exact command.</p>
         </div>
         <div class="flow-controls">
           <button id="flowPrev">Back</button>
@@ -795,7 +795,7 @@
     <div class="prose">
       <p class="lead">When you are away from home, your Mac and phone are not on the same network. Their messages have to travel through a middleman server called a relay. The trick is to need no trust in that middleman at all.</p>
       <p>Every message between the two is a <strong>sealed envelope</strong>. It is locked with the recipient's padlock, so only the true recipient can open it, and it carries a tamper-proof <strong>wax seal</strong>, a signature that proves it genuinely came from the other device and was not altered. The relay carries these envelopes back and forth and that is all it can do.</p>
-      <p>It cannot read what is inside, because it lacks the key. It cannot forge a message, because it cannot fake the seal. It cannot secretly resend an old envelope to trick a device, because each one is stamped for single use within a short time window. The relay is a postman who ferries locked mail he can neither open nor counterfeit. This is exactly what lets Latch work from anywhere without you having to trust the server in the middle.</p>
+      <p>It cannot read what is inside, because it lacks the key. It cannot forge a message, because it cannot fake the seal. It cannot secretly resend an old envelope to trick a device, because each one is stamped for single use within a short time window. The relay is a postman who ferries locked mail he can neither open nor counterfeit. This is exactly what lets Sigil work from anywhere without you having to trust the server in the middle.</p>
     </div>
 
     <figure class="plate reveal">
@@ -868,22 +868,22 @@
     <div class="ch-head"><span class="ch-num">09</span><p class="eyebrow">Told straight</p></div>
     <h2>The honest limits, not hidden</h2>
     <div class="prose">
-      <p class="lead">No design is magic, and pretending otherwise would be the real security flaw. Here are the two limits Latch does not remove, explained plainly.</p>
+      <p class="lead">No design is magic, and pretending otherwise would be the real security flaw. Here are the two limits Sigil does not remove, explained plainly.</p>
     </div>
     <div class="cards reveal">
       <div class="card limit">
         <svg class="ico"><use href="#i-alert"/></svg>
-        <div><h4>One brief moment in the open</h4><p>When a tool finally runs, it genuinely needs the secret to do its job, so for that instant the secret exists unscrambled on the Mac. This is unavoidable: a secret nobody can ever read is a secret nobody can ever use. Latch keeps that window as short as physically possible and wipes it immediately after.</p></div>
+        <div><h4>One brief moment in the open</h4><p>When a tool finally runs, it genuinely needs the secret to do its job, so for that instant the secret exists unscrambled on the Mac. This is unavoidable: a secret nobody can ever read is a secret nobody can ever use. Sigil keeps that window as short as physically possible and wipes it immediately after.</p></div>
       </div>
       <div class="card limit">
         <svg class="ico"><use href="#i-alert"/></svg>
-        <div><h4>An approved request does deliver that secret</h4><p>If someone has fully taken over your Mac and, at that same moment, you approve a request on your phone, that one secret is used for that one command. Latch gates the release; it cannot police what an already-approved command then does with it.</p></div>
+        <div><h4>An approved request does deliver that secret</h4><p>If someone has fully taken over your Mac and, at that same moment, you approve a request on your phone, that one secret is used for that one command. Sigil gates the release; it cannot police what an already-approved command then does with it.</p></div>
       </div>
     </div>
 
     <div class="reassure reveal">
       <svg class="ico"><use href="#i-face"/></svg>
-      <p><strong>Which is why your attention is the real last line of defence.</strong> Your phone shows you exactly what is being asked, from which program, on which machine, before you approve. If a request appears that you did not expect or did not start, declining it is the whole defence, and declining is always a single calm tap. Latch is built so that the safe choice is the easy one.</p>
+      <p><strong>Which is why your attention is the real last line of defence.</strong> Your phone shows you exactly what is being asked, from which program, on which machine, before you approve. If a request appears that you did not expect or did not start, declining it is the whole defence, and declining is always a single calm tap. Sigil is built so that the safe choice is the easy one.</p>
     </div>
   </section>
 
@@ -891,7 +891,7 @@
   <section class="closing reveal">
     <p class="eyebrow">The shape of it</p>
     <h2>Cryptography doing the work, not a promise</h2>
-    <p>Notice what Latch never asks you to trust: not the network, not the relay server, not even the Mac by itself. The safety does not rest on a company keeping a promise or a server behaving. It rests on the plain fact that half a key opens nothing, and that the phone's half is created fresh, by your face, only for the request in front of you.</p>
+    <p>Notice what Sigil never asks you to trust: not the network, not the relay server, not even the Mac by itself. The safety does not rest on a company keeping a promise or a server behaving. It rests on the plain fact that half a key opens nothing, and that the phone's half is created fresh, by your face, only for the request in front of you.</p>
 
     <dl class="glossary">
       <dt>Public key (padlock)</dt>
@@ -908,7 +908,7 @@
       <dd>A middleman server that only ferries sealed envelopes. It cannot read, forge, or resend them.</dd>
     </dl>
 
-    <p class="footline">latch · how the security works · a plain-language explainer of the per-request, two-half design · July 2026</p>
+    <p class="footline">sigil · how the security works · a plain-language explainer of the per-request, two-half design · July 2026</p>
   </section>
 
 </div>
@@ -948,7 +948,7 @@
     /* per-request step-through */
     var steps = [
       { s: "Stage 01", t: "A tool asks for a secret",
-        p: "On your Mac, some tool needs a secret to do its job, maybe to read a password or connect to a server. Instead of prompting you at the machine, Latch begins a request bound to this exact command." },
+        p: "On your Mac, some tool needs a secret to do its job, maybe to read a password or connect to a server. Instead of prompting you at the machine, Sigil begins a request bound to this exact command." },
       { s: "Stage 02", t: "The Mac seals a request",
         p: "The Mac works out its own half-key, then packs a request into a sealed, signed envelope addressed to your phone. Inside is the puzzle number the phone will answer, never the secret itself." },
       { s: "Stage 03", t: "A blind relay carries it",

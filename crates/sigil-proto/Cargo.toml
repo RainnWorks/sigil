@@ -1,0 +1,28 @@
+[package]
+name = "sigil-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sigil protocol core: sealed/signed envelopes, pairing, fingerprints"
+
+[dependencies]
+crypto_box.workspace = true
+ed25519-dalek.workspace = true
+rand_core.workspace = true
+zeroize.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+blake2.workspace = true
+base64.workspace = true
+# p256: NIST P-256 ECDH for the Mac Secure-Enclave DEK wrap. The Secure Enclave
+# can hold ONLY P-256 keys (never X25519), so the SE second-recipient wrap must
+# be P-256 ECIES; this is the sole curve the SE seam interoperates with.
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "std"] }
+# sha2: SHA-256 for the ANSI-X9.63 KDF inside Apple's ECIES construction. Must be
+# SHA-256 (not the crate's blake2) to interoperate with SecKeyCreateDecryptedData.
+sha2 = "0.10"
+# aes-gcm 0.10: AES-128-GCM leg of the P-256 ECIES wrap (16-byte KDF-derived IV).
+# Pinned to 0.10 so it shares aead 0.5 with crypto_box already in the tree.
+aes-gcm = "0.10"

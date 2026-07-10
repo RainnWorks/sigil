@@ -1,0 +1,223 @@
+//  PairingView.swift
+//  The QR + six-word fingerprint ceremony, the paired-device list, the "Enable
+//  Mac approvals" toggle and its hardened phone-only opposite.
+
+import SwiftUI
+
+struct PairingView: View {
+    @Environment(AppModel.self) private var model
+    /// The managed relay every install defaults to; the user never has to
+    /// think about it. Mirrors sigil-core's `DEFAULT_RELAY_URL`.
+    private static let sigilRelayURL = "https://relay.rainn.works"
+    private static let sigilRelayHost = "relay.rainn.works"
+
+    @State private var relayURL = PairingView.sigilRelayURL
+    /// Whether the relay field is expanded for a self-hosted or alternate
+    /// relay. Off by default: the relay is invisible plumbing, not a decision
+    /// most pairings need to make.
+    @State private var useCustomRelay = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                if let error = model.lastError { ErrorStrip(message: error) }
+                if let paired = model.paired {
+                    pairedList(paired)
+                    macApprovalsToggle
+                    Divider()
+                    Text("Re-pair").font(.system(size: 13, weight: .semibold))
+                    Text("Pairing again replaces the current phone.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                ceremonyPanel
+            }
+            .padding(20)
+        }
+        .navigationTitle("Pairing")
+        .onAppear {
+            // Only override the managed default when there is a real saved
+            // choice (an existing pairing, or a previously configured
+            // relay) that differs from it; otherwise the Sigil relay stands.
+            let saved = model.paired?.relayURL
+                ?? (model.settings.relayURL.isEmpty ? nil : model.settings.relayURL)
+            if let saved, saved != Self.sigilRelayURL {
+                relayURL = saved
+                useCustomRelay = true
+            }
+        }
+    }
+
+    private func pairedList(_ paired: PairedDevice) -> some View {
+        Section(title: "Paired device") {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Image(systemName: "iphone").foregroundStyle(Palette.cobalt)
+                    Text(paired.name).font(.system(size: 13, weight: .medium))
+                    Spacer()
+                    MonoText("since \(relativeShort(paired.pairedAt))", size: 10, color: .secondary)
+                }
+                HStack(spacing: 6) {
+                    Text("fingerprint").font(.system(size: 10)).foregroundStyle(.tertiary)
+                    MonoText(paired.sasWords.joined(separator: " · "), size: 11, color: Palette.cobalt)
+                }
+                MonoText(paired.relayURL, size: 10, color: .secondary)
+                HStack {
+                    Spacer()
+                    Button("Unpair", role: .destructive) { Task { await model.unpair() } }
+                        .buttonStyle(.glass).controlSize(.small)
+                }
+            }
+        }
+    }
+
+    private var macApprovalsToggle: some View {
+        let enabled = model.macApprovalsMode == .enabled
+        return Section(title: "Mac approvals",
+                       subtitle: "Local approval is a real factor: a live Touch ID unwraps the DEK inside the Secure Enclave. Malware running as you cannot fake it.") {
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle(isOn: Binding(
+                    get: { enabled },
+                    set: { on in Task { await model.setMacApprovals(on ? .enabled : .hardenedPhoneOnly) } }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Enable Mac approvals").font(.system(size: 12, weight: .medium))
+                        Text(enabled
+                             ? "This Mac holds a Secure Enclave envelope of the DEK; the menubar can approve under Touch ID."
+                             : "Hardened, phone-only. This Mac cannot approve; every request needs the iPhone.")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .tint(Palette.seaGreen)
+
+                if !model.approver.biometricsAvailable {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle").foregroundStyle(Palette.brass)
+                        Text("No usable Touch ID on this Mac. Approvals stay phone-only.")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var ceremonyPanel: some View {
+        switch model.ceremony {
+        case .idle:
+            if model.paired == nil { startPanel }
+        case .awaitingPhone(let payload):
+            ceremonyStep {
+                QRCodeView(payload: payload)
+                Text("Scan this with the Sigil approver on your phone.")
+                    .font(.system(size: 12))
+                Text("Waiting for the phone to respond...")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                ProgressView().controlSize(.small)
+            }
+        case .confirmSAS(let words):
+            ceremonyStep {
+                Text("Confirm these six words match your phone's screen.")
+                    .font(.system(size: 12))
+                MonoText(words.joined(separator: " · "), size: 15, color: Palette.cobalt, weight: .medium)
+                Text("Reading them aloud is the human backstop; a mismatch is loud. The key is not sent until you confirm.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                HStack(spacing: 10) {
+                    Button("Doesn't match", role: .destructive) { model.confirmSAS(match: false) }
+                        .buttonStyle(.glass).controlSize(.small)
+                    Button("Words match") { model.confirmSAS(match: true) }
+                        .buttonStyle(.glassProminent).tint(Palette.seaGreen).controlSize(.small)
+                }
+            }
+        case .paired(let device):
+            ceremonyStep {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.seal.fill").foregroundStyle(Palette.seaGreen)
+                    Text("Paired with \(device.name).").font(.system(size: 13, weight: .medium))
+                }
+                Text("The daemon now gates every request on your phone.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+        case .failed(let reason):
+            ceremonyStep {
+                HStack(spacing: 8) {
+                    Image(systemName: "xmark.octagon.fill").foregroundStyle(Palette.rust)
+                    Text("Pairing failed.").font(.system(size: 13, weight: .medium))
+                }
+                MonoText(reason, size: 11, color: .secondary)
+                Button("Try again") { model.ceremony = .idle }.buttonStyle(.glass).controlSize(.small)
+            }
+        }
+    }
+
+    private var startPanel: some View {
+        Section(title: "Pair a phone",
+                subtitle: "The relay carries only sealed envelopes between this Mac and your phone; it can neither read nor forge them.") {
+            VStack(alignment: .leading, spacing: 12) {
+                if useCustomRelay { customRelayField } else { defaultRelayRow }
+                Button("Show QR") { model.beginPairing(relayURL: relayURL) }
+                    .buttonStyle(.glassProminent).tint(Palette.cobalt)
+                    .disabled(relayURL.isEmpty)
+            }
+        }
+    }
+
+    /// The managed-default state: leads with the fact that pairing just
+    /// works, not with a hostname the user never needs to look at.
+    private var defaultRelayRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Circle().fill(Palette.seaGreen).frame(width: 6, height: 6)
+                Text("Using the Sigil relay").font(.system(size: 12, weight: .medium))
+            }
+            MonoText(Self.sigilRelayHost, size: 10, color: .secondary)
+            Button("Use your own relay") { useCustomRelay = true }
+                .buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(Palette.cobalt)
+        }
+    }
+
+    /// The self-host override, tucked behind the disclosure above.
+    private var customRelayField: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Relay").font(.system(size: 12, weight: .medium))
+            TextField("https://relay.example", text: $relayURL)
+                .textFieldStyle(.roundedBorder).font(.mono(11))
+            Text("Self-hosted, or a different shared relay. Same trust surface either way.")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            Button("Use the Sigil relay instead") {
+                relayURL = Self.sigilRelayURL
+                useCustomRelay = false
+            }
+            .buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(.secondary)
+        }
+    }
+
+    private func ceremonyStep<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 10, content: content)
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.background.secondary, in: .rect(cornerRadius: 12))
+    }
+}
+
+#Preview("Paired") {
+    NavigationStack { PairingView() }
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+        .frame(width: 640, height: 640)
+}
+
+#Preview("Unpaired") {
+    NavigationStack { PairingView() }
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .failClosed), approver: MockApprover()))
+        .frame(width: 640, height: 560)
+}
+
+#Preview("Unpair failed") {
+    // The state a silently-failed Unpair would otherwise hide: lastError set,
+    // the paired device still shown (the optimistic-UI bug this closes would
+    // have shown "unpaired" here instead).
+    let model = AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover())
+    model.lastError = "daemon unreachable: socket not listening"
+    return NavigationStack { PairingView() }
+        .environment(model)
+        .frame(width: 640, height: 640)
+}

@@ -1,0 +1,29 @@
+# Caddyfile for the Sigil relay origin.
+#
+# Caddy terminates TLS on :443 using a Cloudflare Origin Certificate (a 15-year,
+# Cloudflare-trusted cert the operator generated in the Cloudflare dashboard and
+# copied to the box), and reverse-proxies plain HTTP to the relay on
+# 127.0.0.1:8080. Cloudflare fronts this with SSL mode Full (strict), and the GCP
+# firewall only admits :443 from Cloudflare ranges, so this origin is never
+# reached directly.
+#
+# The __RELAY_HOST__ token below is substituted with your real relay hostname by
+# setup.sh (from the RELAY_HOST env var) at install time.
+#
+# Install: /etc/caddy/Caddyfile (setup.sh does this).
+
+{
+	# No ACME account is needed: we present an operator-supplied cert, not a
+	# Let's Encrypt one. Silence the automatic-HTTPS machinery.
+	admin off
+}
+
+__RELAY_HOST__ {
+	tls /etc/sigil/origin.crt /etc/sigil/origin.key
+	reverse_proxy 127.0.0.1:8080
+
+	# The relay logs nothing sensitive; keep Caddy quiet too. Errors only.
+	log {
+		level ERROR
+	}
+}

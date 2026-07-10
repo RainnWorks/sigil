@@ -1,12 +1,12 @@
-# Latch SSH agent: design note
+# Sigil SSH agent: design note
 
 Answering Tom's question: *"How is the op ssh-agent going to work, or will it just
 work out of the box?"*
 
 Short answer: it does **not** just work out of the box, but the hard part is small
-and the custody model is confirmed viable. Latch implements the SSH agent protocol
+and the custody model is confirmed viable. Sigil implements the SSH agent protocol
 itself (a few hundred lines), serves Tom's SSH keys, and gates every signature
-through the same phone approval loop as `op`. Tom points `SSH_AUTH_SOCK` at Latch's
+through the same phone approval loop as `op`. Tom points `SSH_AUTH_SOCK` at Sigil's
 socket; from then on `git push` / `ssh` transparently ask the phone. Two honesty
 corrections to the brief are below (host name in the approval screen, and key
 material in daemon RAM).
@@ -42,11 +42,11 @@ do not list the key GitHub expects, auth never even reaches a signature.
 
 **`SSH2_AGENTC_SIGN_REQUEST` (13) → `SSH2_AGENT_SIGN_RESPONSE` (14)**
 The actual approval-worthy event. Request fields:
-- `string key_blob` — which of our advertised public keys to sign with.
-- `string data` — the exact bytes to sign. For user auth this is the SSH
+- `string key_blob`: which of our advertised public keys to sign with.
+- `string data`: the exact bytes to sign. For user auth this is the SSH
   "session identifier + auth request" transcript (RFC 4252 §7); it is **opaque to
   us** and must be signed verbatim.
-- `uint32 flags` — bitwise OR of signature flags. Only meaningful for RSA:
+- `uint32 flags`: bitwise OR of signature flags. Only meaningful for RSA:
   `SSH_AGENT_RS_SHA2_256 = 0x02`, `SSH_AGENT_RS_SHA2_512 = 0x04`. Zero flags on an
   RSA key means legacy `ssh-rsa` (SHA-1), which modern servers reject; GitHub
   requires `rsa-sha2-*`. For ed25519 the flags are ignored.
@@ -60,11 +60,11 @@ footgun.
 ### Can stub (reply `SSH_AGENT_FAILURE` = 5)
 
 - `SSH_AGENTC_ADD_IDENTITY` (17), `ADD_ID_CONSTRAINED` (25),
-  `ADD_SMARTCARD_KEY` (20/26) — we do not accept keys pushed in; ours come from
+  `ADD_SMARTCARD_KEY` (20/26): we do not accept keys pushed in; ours come from
   1Password. `ssh-add <file>` fails cleanly, which is correct.
-- `REMOVE_IDENTITY` (18), `REMOVE_ALL_IDENTITIES` (19) — nothing to remove.
-- `LOCK` (22) / `UNLOCK` (23) — Latch has its own lock model (the phone); refuse.
-- `SSH_AGENTC_EXTENSION` (27) — refuse **except** `session-bind@openssh.com`, which
+- `REMOVE_IDENTITY` (18), `REMOVE_ALL_IDENTITIES` (19): nothing to remove.
+- `LOCK` (22) / `UNLOCK` (23): Sigil has its own lock model (the phone); refuse.
+- `SSH_AGENTC_EXTENSION` (27): refuse **except** `session-bind@openssh.com`, which
   we should accept and record (see §4, host derivation). Refusing an unknown
   extension is protocol-legal and clients tolerate it.
 
@@ -84,27 +84,27 @@ can fail. The protocol is stable and we control both ends of what matters.
 Two custody models. Both were investigated against the live setup; the recommended
 one is **VERIFIED end to end**.
 
-### (a) v1 — fetch-per-signature from 1Password via the service account — VERIFIED
+### (a) v1: fetch-per-signature from 1Password via the service account (VERIFIED)
 
 The question was: can the Rowm service account actually read an SSH private key item
 and hand us signable material? Tested on 2026-07-04 (`OP_SERVICE_ACCOUNT_TOKEN` is
 present in this environment):
 
-- **SA vault visibility — VERIFIED.** `op vault list` as the SA returns
+- **SA vault visibility: VERIFIED.** `op vault list` as the SA returns
   `Engineering, Executive, Finance, Operations, Rowmeo`. The built-in **Personal /
   Private vault is absent**, confirming the earlier finding: an SSH key we want
-  Latch to serve **must live in one of these shared vaults**, never in Personal.
-- **Reading the private key — VERIFIED.** Created a throwaway `SSH Key` item
+  Sigil to serve **must live in one of these shared vaults**, never in Personal.
+- **Reading the private key: VERIFIED.** Created a throwaway `SSH Key` item
   (`ed25519`) in Engineering, then:
   - `op read "op://Engineering/<item>/private key"` returns a **PKCS#8**
     `-----BEGIN PRIVATE KEY-----` body.
   - `op read "op://Engineering/<item>/private key?ssh-format=openssh"` returns
-    `-----BEGIN OPENSSH PRIVATE KEY-----` (the native OpenSSH format — use this).
+    `-----BEGIN OPENSSH PRIVATE KEY-----` (the native OpenSSH format, use this).
   - `ssh-keygen -y -f <the openssh key>` re-derived the public key, proving the
     bytes are a **complete, usable, unencrypted private key**, not a redacted
     reference. Item deleted afterwards; vault is clean.
 - **No biometric.** The SA is headless and non-interactive: the read returned key
-  material with **no Touch ID prompt and no Mac window**. This is the whole point —
+  material with **no Touch ID prompt and no Mac window**. This is the whole point:
   it is exactly the local gate we are trying to escape, and the SA bypasses it.
 
 So v1 works: on each `SIGN_REQUEST`, after phone approval, the daemon runs
@@ -113,22 +113,22 @@ key in Rust, produces the signature, zeroizes the key bytes, and returns only th
 `SIGN_RESPONSE`. The SSH client never sees key material. **We** do the crypto.
 
 What crypto we owe, by key type:
-- **ed25519** — sign with `ed25519-dalek` (already a workspace dependency). This is
+- **ed25519**: sign with `ed25519-dalek` (already a workspace dependency). This is
   the recommended and default type for Rowm's keys; GitHub supports it.
-- **ecdsa-sha2-nistp256** — would need the `p256` crate. Not in v1.
-- **rsa-sha2-256/512** — would need the `rsa` crate and correct flag handling. Not
+- **ecdsa-sha2-nistp256**: would need the `p256` crate. Not in v1.
+- **rsa-sha2-256/512**: would need the `rsa` crate and correct flag handling. Not
   in v1.
 
 Recommendation: **v1 serves ed25519 only** and refuses other key types in
 `IDENTITIES_ANSWER` (simply do not advertise them), keeping the signing surface to
-the ed25519 crate we already vet. Tom standardises his Latch-served keys on ed25519,
+the ed25519 crate we already vet. Tom standardises his Sigil-served keys on ed25519,
 which is a no-op for GitHub and most hosts.
 
-### (b) Alternative — front the 1Password SSH agent — REJECTED for v1
+### (b) Alternative: front the 1Password SSH agent (REJECTED for v1)
 
 1Password ships its own SSH agent. Its socket exists on this machine at
 `~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock` (VERIFIED to
-exist, `srw-------`). We could point `SSH_AUTH_SOCK` at Latch, and have Latch proxy
+exist, `srw-------`). We could point `SSH_AUTH_SOCK` at Sigil, and have Sigil proxy
 `SIGN_REQUEST`s onward to that socket so 1Password does the crypto and keys never
 leave 1Password.
 
@@ -137,18 +137,18 @@ This is rejected because it does not solve Tom's problem:
   and **it is the thing that pops the Mac approval window** on every new
   app/key pair. Proxying it inserts our phone gate *in addition to*, not *instead
   of*, 1Password's local gate. When Tom is remote, the 1Password prompt still sits
-  unanswered on the Mac and the signature still stalls — the exact failure we are
+  unanswered on the Mac and the signature still stalls: the exact failure we are
   removing. (1Password can remember an authorization per app+key for a session, so
   it is not literally every signature, but the first one of any session and any new
   process still blocks locally.)
-- A **service account cannot drive the desktop agent** — it is headless; there is no
+- A **service account cannot drive the desktop agent**: it is headless; there is no
   app to unlock. So the proxy path and the SA path are mutually exclusive, and only
   the SA path is remote-capable.
 - Fronting it still leaves us unable to show a meaningful approval screen, because
   the request we would forward carries no more host context than we already have.
 
-The one thing (b) preserves that (a) gives up — keys never materialise outside
-1Password — is real, and is precisely what **v2 (Secure Enclave resident keys)**
+The one thing (b) preserves that (a) gives up (keys never materialise outside
+1Password) is real, and is precisely what **v2 (Secure Enclave resident keys)**
 restores properly. For v1 the honest trade is: accept key material in daemon RAM for
 one signature (see §5), in exchange for a gate that actually works when Tom is away.
 
@@ -160,24 +160,24 @@ one signature (see §5), in exchange for a gate that actually works when Tom is 
 
 What Tom actually changes:
 
-1. **`SSH_AUTH_SOCK`.** Point it at Latch's socket (e.g.
-   `~/Library/Application Support/latch/ssh-agent.sock`, `0600`). Set via the
-   launchd user environment (`launchctl setenv SSH_AUTH_SOCK ...` from the Latch
+1. **`SSH_AUTH_SOCK`.** Point it at Sigil's socket (e.g.
+   `~/Library/Application Support/sigil/ssh-agent.sock`, `0600`). Set via the
+   launchd user environment (`launchctl setenv SSH_AUTH_SOCK ...` from the Sigil
    launchd agent) plus the shell profile as a fallback. Today in this environment it
-   points at `/private/tmp/com.apple.launchd.*/Listeners` — the **macOS native
-   launchd ssh-agent**, not 1Password — so Latch simply becomes the new target.
+   points at `/private/tmp/com.apple.launchd.*/Listeners`, the **macOS native
+   launchd ssh-agent**, not 1Password, so Sigil simply becomes the new target.
 2. **The key must be a SA-visible SSH Key item.** Tom's GitHub key has to exist as an
    `SSH Key` item in Engineering (or another shared vault), not only on disk and not
-   in Personal. If it is only in `~/.ssh`, Latch has nothing to serve.
+   in Personal. If it is only in `~/.ssh`, Sigil has nothing to serve.
 3. **Nothing in `git` config changes** for the basic case. `git push` shells out to
-   `ssh`, which reads `SSH_AUTH_SOCK`, which is now Latch. It transparently starts
-   asking the phone. Optional `IdentityAgent` in `~/.ssh/config` can scope Latch to
+   `ssh`, which reads `SSH_AUTH_SOCK`, which is now Sigil. It transparently starts
+   asking the phone. Optional `IdentityAgent` in `~/.ssh/config` can scope Sigil to
    specific hosts if Tom wants to keep the native agent for others.
 4. **Nothing breaks** as long as `IDENTITIES_ANSWER` advertises the key the server
-   expects. If it does not, auth fails the same way a missing key always does — no
+   expects. If it does not, auth fails the same way a missing key always does: no
    corruption, just a rejected connection.
 
-### Host derivation — a brief correction
+### Host derivation: a brief correction
 
 The brief (line 377: *"the phone shows the key label, target host, and challenge
 fingerprint"*; line 518: the log line `ssh github-deploy → git@github.com`) implies
@@ -187,19 +187,19 @@ hostname anywhere in the agent protocol.** This must be flagged as a brief
 correction.
 
 What we *can* recover, best-effort:
-- Modern OpenSSH (Tom's client here is **OpenSSH_10.2p1** — VERIFIED, well past the
+- Modern OpenSSH (Tom's client here is **OpenSSH_10.2p1**, VERIFIED, well past the
   8.9 cutoff) sends the **`session-bind@openssh.com`** extension on the agent
   connection *before* the sign request. It carries the **server's host public key**
-  (plus session id, the host's signature, and an is-forwarding flag) — but still
+  (plus session id, the host's signature, and an is-forwarding flag), but still
   **only the host key, never the hostname string.**
 - We can reverse the host key to a name via **`~/.ssh/known_hosts`**. On this machine
-  known_hosts is **unhashed** (VERIFIED — `HashKnownHosts` is off, 12 host patterns,
+  known_hosts is **unhashed** (VERIFIED, `HashKnownHosts` is off, 12 host patterns,
   and **`github.com` is present**). So for any host Tom has connected to before, and
   for `github.com` specifically **today**, host-key → hostname reverse lookup
   succeeds. We track the last `session-bind` host key per agent connection, look it
   up, and show the name.
 - When the lookup misses (a brand-new host, a hashed known_hosts, or a client that
-  does not send `session-bind` — e.g. some libssh2/Go clients), we **cannot** show a
+  does not send `session-bind`, e.g. some libssh2/Go clients), we **cannot** show a
   hostname. The approval screen then shows the **host key fingerprint**
   (`SHA256:...`) instead, which is still the honest, verifiable identity of the
   destination.
@@ -222,7 +222,7 @@ should say so.
   a human. The phone screen must show a stable **hash of the data** (e.g. the same
   Blake2 fingerprint style already used), plus the derived destination (§3). Never
   render raw sign-data.
-- **Key material lifetime — the material difference from `op read`.** This is the one
+- **Key material lifetime: the material difference from `op read`.** This is the one
   place SSH is *worse* than secret release and the reviewer must weigh it. For a
   normal secret, the invariant is "secret bytes never enter daemon memory" (op
   stdout splices straight to the client fd). **That invariant cannot hold for v1
@@ -233,7 +233,7 @@ should say so.
 - **A single approved signature can leak the whole key.** With fetch-per-signature,
   the SA token can read the **entire private key**, not just produce one signature.
   So if the daemon is compromised *at the moment of an approved request*, the
-  attacker gets the key itself and can sign arbitrarily forever after — strictly
+  attacker gets the key itself and can sign arbitrarily forever after, strictly
   worse than the `op`-secret case, where a compromised approved request leaks one
   secret's value but grants no lasting signing power. The brief's line
   *"SSH clients never see key material"* is true of the **client** but not of the
@@ -249,27 +249,27 @@ should say so.
 
 ## 5. v1 build plan (for the rust-core notes)
 
-**Crate layout: a module in `crates/latch`, not a new crate.** The SSH agent shares
+**Crate layout: a module in `crates/sigil`, not a new crate.** The SSH agent shares
 the daemon's approval plumbing (envelope round-trip to the phone, `paths`, `style`,
-the launchd socket lifecycle) and the multicall `latch` binary already dispatches
+the launchd socket lifecycle) and the multicall `sigil` binary already dispatches
 subcommands (daemon / shim / cli). A separate crate would only duplicate that wiring.
 Add:
-- `crates/latch/src/sshagent.rs` — the unix-socket listener, the RFC 9987 wire
+- `crates/sigil/src/sshagent.rs`: the unix-socket listener, the RFC 9987 wire
   framing (hand-rolled length-prefixed reader/writer, same spirit as the hand-rolled
   envelope serde), `REQUEST_IDENTITIES` / `SIGN_REQUEST` handling, `session-bind`
   capture, and refusal of everything else.
-- The signing + `op read` fetch can live alongside it in `latch` (it needs to shell
-  out to `op`, which is a `latch` concern, not a `proto` one). `crates/proto` stays
+- The signing + `op read` fetch can live alongside it in `sigil` (it needs to shell
+  out to `op`, which is a `sigil` concern, not a `proto` one). `crates/sigil-proto` stays
   pure envelope/crypto; do **not** put key-fetch there.
 
 **Signing crates:**
-- `ssh-key` (RustCrypto), features `["ed25519"]` — decodes the
+- `ssh-key` (RustCrypto), features `["ed25519"]`: decodes the
   `-----BEGIN OPENSSH PRIVATE KEY-----` body cleanly (bcrypt-KDF aware, though SA
   keys are unencrypted), produces the public-key wire blob for `IDENTITIES_ANSWER`,
   and signs. It uses `ed25519-dalek` underneath, matching the existing dependency, so
   no new signature primitive enters the tree. This avoids hand-parsing the OpenSSH
   private key container, which is the only genuinely fiddly part.
-- `ed25519-dalek` — already vendored; `ssh-key` delegates to it.
+- `ed25519-dalek`: already vendored; `ssh-key` delegates to it.
 - Optionally `ssh-encoding` for the SSH `string`/`u32` wire helpers, or hand-roll
   them (they are a few lines and match house style). Lean toward hand-rolling to keep
   the dependency surface small.
@@ -285,7 +285,7 @@ Add:
   fields: ~1 day.
 - launchd `SSH_AUTH_SOCK` plumbing + Mac-app config toggle (hand to mac-app): ~0.5
   day.
-- Integration tests: real `ssh`/`git` against the Latch socket, `ssh-add -l`, a
+- Integration tests: real `ssh`/`git` against the Sigil socket, `ssh-add -l`, a
   refused `ssh-add <file>`, and a wrong-key path: ~1 day.
 
 **v2 (out of scope here):** keys become Secure Enclave resident; signing moves into
@@ -299,8 +299,8 @@ retired.
 1. **1Password agent biometric-per-signature specifics.** The desktop 1P agent
    remembers authorization per app+key for a session; the exact first-prompt
    behaviour per new process was not exercised (would require driving the desktop
-   app, which is locked / Tom is away). It does not change the recommendation —
-   proxying it is rejected regardless — but the "not literally every signature" claim
+   app, which is locked / Tom is away). It does not change the recommendation
+   (proxying it is rejected regardless), but the "not literally every signature" claim
    in §2b is from docs, not a live test. Confirm by: with 1P as `SSH_AUTH_SOCK`, run
    two `git` operations in separate shells and observe how many prompts appear.
 2. **`session-bind` host key exactly matches the known_hosts entry format for
@@ -309,18 +309,18 @@ retired.
    per host) needs a live test once the listener exists. Confirm by: log the
    `session-bind` hostkey during a real `git push` and diff against the `github.com`
    line in `~/.ssh/known_hosts`.
-3. **RSA/ecdsa are genuinely not needed.** Assumes Tom's Latch-served keys are all
+3. **RSA/ecdsa are genuinely not needed.** Assumes Tom's Sigil-served keys are all
    ed25519. Confirm by: `op item list --categories "SSH Key"` once Tom has created
    his real key items (today there are **zero** SSH Key items in any SA-visible
-   vault — VERIFIED — so this is a prerequisite Tom must do before v1 can serve
+   vault, VERIFIED, so this is a prerequisite Tom must do before v1 can serve
    anything).
 
 ---
 
 ## Implementation addendum (built 2026-07-04)
 
-The v1 agent is built at `crates/latch/src/sshagent.rs`, wired into the daemon
-(`crates/latch/src/daemon.rs`) and the CLI (`crates/latch/src/cli.rs`). The design
+The v1 agent is built at `crates/sigil/src/sshagent.rs`, wired into the daemon
+(`crates/sigil/src/daemon.rs`) and the CLI (`crates/sigil/src/cli.rs`). The design
 above held on every point; this records the pins, what changed since early 2026,
 and the state of the NEEDS-VERIFICATION list after the build.
 
@@ -336,13 +336,13 @@ Re-checked live on crates.io on 2026-07-04:
   `PublicKey::from_openssh` / `from_bytes`, `PublicKey::fingerprint(HashAlg::Sha256)`,
   `impl Signer<Signature> for PrivateKey` (`try_sign`), and `Signature::algorithm()`
   / `as_bytes()`. It pulls **`ed25519-dalek ^2`** (matches the workspace pin; the
-  already-vendored signing primitive — no new curve impl enters the tree), plus
+  already-vendored signing primitive, no new curve impl enters the tree), plus
   `ssh-encoding 0.2`, `ssh-cipher 0.2`, `sha2 0.10`, `signature 2`, `subtle 2`,
   `pem-rfc7468 0.7`. We do **not** depend on `ssh-encoding` directly (0.3.0 is now
   stable, but the SSH `string`/`u32` helpers are hand-rolled, per house style).
-- **`signature = "2"`** — direct dep to bring the `Signer` trait into scope (same
+- **`signature = "2"`**: direct dep to bring the `Signer` trait into scope (same
   version ssh-key uses; no duplicate).
-- **`sha2 = "0.10"`** — SHA-256 of the data-to-sign for the approval screen, and
+- **`sha2 = "0.10"`**: SHA-256 of the data-to-sign for the approval screen, and
   the host-key fingerprint fallback (already in-tree via ssh-key).
 - **`ed25519-dalek`** as a **dev-dependency only**, to cryptographically verify the
   agent's signatures in tests.
@@ -355,7 +355,7 @@ SIGN_RESPONSE=14, EXTENSION=27 (EXTENSION_FAILURE=28, EXTENSION_RESPONSE=29 adde
 by 9987 but unused here). RSA flags `RSA_SHA2_256=0x02` / `512=0x04` matter only for
 RSA and are read-and-ignored for ed25519. `session-bind@openssh.com` shape confirmed
 from OpenSSH `PROTOCOL.agent`: `byte 27, string name, string hostkey, string
-session-id, string signature, bool is_forwarding` — we capture the hostkey only.
+session-id, string signature, bool is_forwarding`: we capture the hostkey only.
 
 ### What was built and gated (all green: `cargo test && clippy -D warnings && fmt --check`)
 
@@ -368,7 +368,7 @@ session-id, string signature, bool is_forwarding` — we capture the hostkey onl
   account, gates on the phone (same sealed envelope path as an `op` secret, via
   `RequestKind::SshSignature` + the `ApprovalRequest.ssh` `SshChallenge`), unwraps
   the DEK, decrypts the token, then `op read "…/private key?ssh-format=openssh"` into
-  a `Zeroizing` buffer, decodes, signs, and wipes. **Every signature is gated — v1
+  a `Zeroizing` buffer, decodes, signs, and wipes. **Every signature is gated: v1
   uses no lease short-circuit for SSH** (the safest default; leases can be added
   later). The approval screen shows key label + derived destination + a
   `SHA256:` hash of the data-to-sign, never raw bytes.
@@ -376,38 +376,38 @@ session-id, string signature, bool is_forwarding` — we capture the hostkey onl
   `~/.ssh/known_hosts` reverse lookup (skips hashed `|1|…` entries, strips
   `@cert-authority`/`@revoked` markers, normalises `[host]:port`); falls back to the
   host-key `SHA256:` fingerprint. No hostname is ever fabricated.
-- CLI/wiring: the daemon binds a second socket (`$TMPDIR/latch/ssh-agent.sock`,
-  0600, `LATCH_SSH_SOCK` override); `latch ssh add|list|remove` manage
-  `~/.latch/ssh-keys.json` (public key + op coordinates only — inert at rest);
-  `latch sshagent` prints the `SSH_AUTH_SOCK` export; `latch status` shows the served
-  key count; `latch doctor` reports the agent socket + `SSH_AUTH_SOCK` guidance.
+- CLI/wiring: the daemon binds a second socket (`$TMPDIR/sigil/ssh-agent.sock`,
+  0600, `SIGIL_SSH_SOCK` override); `sigil ssh add|list|remove` manage
+  `~/.sigil/ssh-keys.json` (public key + op coordinates only, inert at rest);
+  `sigil sshagent` prints the `SSH_AUTH_SOCK` export; `sigil status` shows the served
+  key count; `sigil doctor` reports the agent socket + `SSH_AUTH_SOCK` guidance.
 
 ### Verification status update
 
-- **NEEDS-VERIFICATION #2 (known_hosts reverse lookup) — CLOSED (unit-tested).** The
+- **NEEDS-VERIFICATION #2 (known_hosts reverse lookup): CLOSED (unit-tested).** The
   lookup is exercised against synthetic known_hosts including a plain match, an
   absent-key fingerprint fallback, a hashed-entry skip, and a `@cert-authority`
   `[host]:port` line. The *live* `github.com` match during a real `git push` is still
   worth a one-time confirm (see the residual list below), but the parsing logic the
   earlier note worried about is now covered.
-- **op read round-trip — RE-VERIFIED live 2026-07-04.** A throwaway ed25519 SSH Key
+- **op read round-trip: RE-VERIFIED live 2026-07-04.** A throwaway ed25519 SSH Key
   item created in `Engineering`, read with `?ssh-format=openssh`, decoded, signed,
   and the signature verified against the item's real public key by the ignored test
   `fetch_and_sign_live_op`; item deleted (vault clean).
-- **Real client — VERIFIED.** `ssh-add -l` (OpenSSH_10.2p1) against both the
-  in-process listener and the **running `latch daemon` binary** listed the served key
+- **Real client: VERIFIED.** `ssh-add -l` (OpenSSH_10.2p1) against both the
+  in-process listener and the **running `sigil daemon` binary** listed the served key
   with the exact `SHA256:` fingerprint.
-- **NEEDS-VERIFICATION #3 (ed25519-only) — still a prerequisite.** There remain
+- **NEEDS-VERIFICATION #3 (ed25519-only): still a prerequisite.** There remain
   **zero** SSH Key items in any SA-visible vault, so before v1 serves anything Tom
   must create his GitHub key as an `SSH Key` item in a shared vault (e.g.
-  `Engineering`) — a service account cannot see Personal.
+  `Engineering`). A service account cannot see Personal.
 
 ### Residual security posture (unchanged from §4, restated honestly)
 
 The v1 trade stands: for one signature the **private key is in daemon RAM** (it
 cannot stream like an `op` secret, because the daemon does the signing), and because
 the SA token can read the *whole* key, a daemon compromise at the moment of an
-approved request leaks **durable signing power**, not one signature — strictly worse
+approved request leaks **durable signing power**, not one signature, strictly worse
 than the secret case. Mitigations in code: `Zeroizing` buffer, no disk, no logging,
 held for one signature. This is the reason v2 moves keys into the Secure Enclave and
 retires the fetch path. Routed to security-reviewer with the build.
@@ -420,10 +420,10 @@ retires the fetch path. Routed to security-reviewer with the build.
    signature GitHub accepts needs (a) Tom's real GitHub key as an SSH Key item in a
    shared vault, (b) a running paired daemon, and (c) a phone tap. Confirm with:
    ```sh
-   latch ssh add --vault Engineering --item GitHub --pubkey-file ~/.ssh/id_ed25519.pub
-   latch restart
+   sigil ssh add --vault Engineering --item GitHub --pubkey-file ~/.ssh/id_ed25519.pub
+   sigil restart
    export SSH_AUTH_SOCK="$(python3 - <<'PY'
-import os; print(os.path.join(os.environ.get("TMPDIR","/tmp"),"latch","ssh-agent.sock"))
+import os; print(os.path.join(os.environ.get("TMPDIR","/tmp"),"sigil","ssh-agent.sock"))
 PY
 )"
    ssh -T git@github.com   # then approve on the phone
@@ -449,11 +449,11 @@ signature, not an env injection), and the **key source is now pluggable** the wa
 the `SecretProvider` seam is pluggable for secrets. The change is additive; the
 wire listener and the phone gate are untouched.
 
-- **`SshSigner` trait** (`crates/latch/src/sshagent.rs`): `identities()`,
+- **`SshSigner` trait** (`crates/sigil/src/sshagent.rs`): `identities()`,
   `needs_account()`, `sign(id, data, credential)`, `owns(key_blob)`. It is the
   key-source seam *inside* the daemon; `SshBackend` remains the listener-facing
   seam. `Core` now holds `Vec<Box<dyn SshSigner>>`, aggregates their identities,
-  and — after the phone approval grants — routes a `SIGN_REQUEST` to the signer
+  and, after the phone approval grants, routes a `SIGN_REQUEST` to the signer
   that owns the key.
 - **Two signers ship.** `OpSshSigner` (the default) is the fetch-per-signature
   path from §2a unchanged: `needs_account()` is true, so the daemon routes the
@@ -465,12 +465,12 @@ wire listener and the phone gate are untouched.
   is read into a `Zeroizing` buffer for the one signature and wiped. v1 both
   signers are ed25519-only.
 - **The gate is signer-agnostic.** `Core::approve_and_sign` applies the same
-  sealed phone-approval round-trip regardless of signer, so `latch ssh` is useful
+  sealed phone-approval round-trip regardless of signer, so `sigil ssh` is useful
   to anyone however they hold their keys. The hard trade from the memory entry
   stands: SA-fetch buys {1Password-managed, works-remotely} at the cost of a brief
   key-in-RAM; a file/SE signer buys {key-never-touches-1Password, works-remotely}
   but is not 1Password-managed. Future SE-resident and proxy signers are new
   `SshSigner` impls; nothing else moves. **Routed to security-reviewer.**
-- **CLI:** `latch ssh add-file --path <key>` registers a file signer entry
-  (`~/.latch/ssh-keys.json` gains a `files` list beside `keys`); `latch ssh list`
+- **CLI:** `sigil ssh add-file --path <key>` registers a file signer entry
+  (`~/.sigil/ssh-keys.json` gains a `files` list beside `keys`); `sigil ssh list`
   shows both sources tagged `1password ·` / `file ·`.

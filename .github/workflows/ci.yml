@@ -35,24 +35,6 @@ jobs:
       - uses: actions/checkout@v4
       - run: python3 scripts/lint/house-rules.py --verbose
 
-  relay:
-    name: relay (typecheck, vitest, bun test)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: relay
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - uses: oven-sh/setup-bun@v2
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm run typecheck:bun
-      - run: npm run test
-      - run: npm run test:bun
-
   phone:
     name: phone (tsc, protocol self-test + rust-vector check)
     runs-on: ubuntu-latest
@@ -71,7 +53,7 @@ jobs:
         working-directory: apps/phone
         run: bun run proto:selftest
       - name: export rust test vectors
-        run: cargo run -p latch-proto --bin export-vectors
+        run: cargo run -p sigil-proto --bin export-vectors
       - name: verify JS protocol layer against the rust vectors
         working-directory: apps/phone
         run: bun run proto:vectors
@@ -92,7 +74,7 @@ jobs:
       # any Apple credentials.
       - run: |
           cd apps/mac
-          xcodebuild -project Latch.xcodeproj -scheme Latch -configuration Debug \
+          xcodebuild -project Sigil.xcodeproj -scheme Sigil -configuration Debug \
             -destination 'platform=macOS' build CODE_SIGNING_ALLOWED=NO
 
   ios-debug-build:

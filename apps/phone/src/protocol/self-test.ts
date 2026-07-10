@@ -145,7 +145,7 @@ async function main(): Promise<void> {
 
   // 9. Pairing handshake parity: the rendezvous mailbox and the confirmation tag
   // over fixed inputs must equal the values the Rust proto produces. These two
-  // hex constants were produced by crates/proto (rendezvous_mailbox for the
+  // hex constants were produced by crates/sigil-proto (rendezvous_mailbox for the
   // mailbox; the tag was accepted by the real DaemonPairing::verify), via the
   // read-only parity harness. If either drifts, the phone can no longer pair with
   // a real daemon. Pattern helper mirrors the harness's fixed key material.
@@ -164,8 +164,8 @@ async function main(): Promise<void> {
     secret: pairSecret,
     createdAt: 1_720_000_000_000,
   };
-  const EXPECTED_MAILBOX = "f8f5836f143eed1bfb3b6cc3639f904452a3b2284f0e04f28f2b997a4f9de42e";
-  const EXPECTED_TAG = "9fcaa8fc71458a31ef409b4096ea57fd12031cd5b1c4790e3f25b83fcf9a8129";
+  const EXPECTED_MAILBOX = "11060033c378a15464fc0866cb24562ffa24ef10ffaf12421dd61c172ce9e3a1";
+  const EXPECTED_TAG = "6d23fe75cbc077aeca874e0c59cc567164a3092071616f0d44484db5f0c51a93";
   ok(
     toHex(rendezvousMailbox(sodium, pairDaemon, pairSecret)) === EXPECTED_MAILBOX,
     "rendezvous mailbox matches proto (rust vector)",

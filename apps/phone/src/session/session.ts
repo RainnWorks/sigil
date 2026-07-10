@@ -10,7 +10,9 @@ import {
   agreementSecretKey,
   type ApprovalRequest,
   type ApprovalResponse,
+  classifyToPhone,
   type Decision,
+  type DeliveryReceiptMessage,
   type DeviceIdentity,
   type Envelope,
   type PeerIdentity,
@@ -31,9 +33,17 @@ export interface SessionConfig {
   transport: Transport;
 }
 
-export class LatchSession {
+export class SigilSession {
   private readonly inboundGuard = new ReplayGuard();
-  private outboundCounter = 0;
+  // Seed the outbound counter from the wall clock, not 0. A new SigilSession is
+  // created on every arm / foreground / reconnect, and the daemon's replay guard
+  // rejects any counter <= the highest it has already seen this run, so a
+  // reset-to-0 counter made the daemon drop our approval responses as stale
+  // replays (the command hangs, "approved but never unlocks"). The clock is a
+  // monotonic source shared with the daemon's own seed (crates/sigil/src/
+  // remote.rs), so a fresh session always resumes above the daemon's last-seen,
+  // with no persisted state. Mirror of the daemon-side fix.
+  private outboundCounter = Date.now();
   private unsubscribe: (() => void) | null = null;
 
   constructor(private readonly cfg: SessionConfig) {}
@@ -50,9 +60,14 @@ export class LatchSession {
   }
 
   private handleInbound(envelope: Envelope): void {
-    let request: ApprovalRequest;
+    let payload: unknown;
     try {
-      request = open<ApprovalRequest>(this.cfg.sodium, envelope, {
+      // Open once to a raw payload; the crypto (signature, replay, decryption) is
+      // verified by `open` regardless of which ToPhone shape this turns out to be.
+      // Both an ApprovalRequest and a ResolutionBroadcast ride the same sealed,
+      // signed, single-use envelope on the daemon->phone counter, so a hostile
+      // relay can neither forge nor replay either.
+      payload = open<unknown>(this.cfg.sodium, envelope, {
         sender: this.cfg.daemonPub,
         recipientAgreementSecret: agreementSecretKey(this.cfg.sodium, this.cfg.phone),
         guard: this.inboundGuard,
@@ -62,7 +77,37 @@ export class LatchSession {
       // silently. Fail closed.
       return;
     }
+    // Demux by the `type` tag, mirroring the daemon's ToDaemon demux.
+    const msg = classifyToPhone(payload);
+    if (!msg) return; // malformed: drop it (fail closed)
+    if (msg.kind === "resolution") {
+      // #36: another paired device resolved this ring-all request (or it expired /
+      // was withdrawn). Dismiss our copy. Zero-knowledge: we learn only that it is
+      // over, never who resolved it or how. Never a decision, never a release, and
+      // never acknowledged with a delivery receipt.
+      store.dismissResolved(msg.resolution.requestId, msg.resolution.status);
+      return;
+    }
+    const request = msg.request;
     store.receive(request);
+    // Task #41: acknowledge receipt so the daemon can advance the requester's
+    // UI Sent -> Delivered. Best-effort and non-blocking: a failed ack leaves
+    // the daemon to fall back to "couldn't confirm"; it never gates display or
+    // the decision path.
+    void this.sendDelivered(request.requestId);
+  }
+
+  /**
+   * Seal and send a {@link DeliveryReceiptMessage} for a just-opened request.
+   * Fails soft: a lost ack only costs the requester the "Delivered" reflection
+   * (the daemon shows "couldn't confirm"), never the approval itself.
+   */
+  private async sendDelivered(requestId: string): Promise<void> {
+    try {
+      await this.sealAndSend<DeliveryReceiptMessage>({ type: "delivered", requestId });
+    } catch (e) {
+      console.warn(`[receipt] delivery ack failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   /**

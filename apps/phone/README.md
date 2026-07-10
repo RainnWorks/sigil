@@ -1,4 +1,4 @@
-# Latch approver (apps/phone)
+# Sigil approver (apps/phone)
 
 The phone is the product's second factor: it holds the device identity keys and
 the DEK wrap, and it never sees a service-account token or a secret value. One
@@ -41,7 +41,7 @@ components/
   ui/                      Sans/Mono text, SF symbol wrapper, primitives
 theme/                     tokens (oklch→hex) and semantic color access
 src/
-  protocol/                crypto layer — byte-matches crates/proto
+  protocol/                crypto layer — byte-matches crates/sigil-proto
   transport/               transport interface + mock (proves the loop)
   session/                 session glue + pairing ceremony state
   state/                   observable store (useSyncExternalStore) + demo data
@@ -51,14 +51,14 @@ src/
 
 ## Protocol layer and the shared test-vector contract
 
-`src/protocol` mirrors `crates/proto` field-for-field: `identity`, `envelope`
+`src/protocol` mirrors `crates/sigil-proto` field-for-field: `identity`, `envelope`
 (seal/open, canonical bytes), `replay`, `fingerprint` (six words + mailbox id,
 sharing the 256-word list in `words.ts`), and `pairing` (QR payload). The one
 libsodium seam is `sodium.ts`; on device it is `react-native-libsodium`, in Node
 tests it is `libsodium-wrappers` (injected via `sodium-node.ts`).
 
 `ApprovalRequest` / `ApprovalResponse` in `requests.ts` are the payloads carried
-*inside* an envelope. `crates/proto` has not landed these yet; this is the
+*inside* an envelope. `crates/sigil-proto` has not landed these yet; this is the
 phone's proposed shape and must be reconciled when the Rust type lands (one file,
 one diff).
 
@@ -86,8 +86,12 @@ implementation; it is a no-op until the file exists, then a hard CI gate.
   `expo-local-authentication`; binding the wrapping key to the enclave with
   `.biometryCurrentSet` semantics needs a small native module or
   `expo-secure-store` with `requireAuthentication`, confirmed on device.
-- **Entitlements**: camera and Face ID usage strings are set in `app.json`;
-  `remote-notification` background mode is declared for the doorbell.
+- **Entitlements**: camera and Face ID usage strings, the `aps-environment`
+  entitlement, and the Apple/Android ids are set in `app.config.js` (a dynamic
+  Expo config that reads `SIGIL_*` env vars, defaulting to the Rainnworks
+  values). A self-hoster rebuilds with their own identity by setting those vars;
+  see `docs/design/self-host-build.md`. `remote-notification` background mode is
+  declared for the doorbell.
 
 ## Stubbed for later
 

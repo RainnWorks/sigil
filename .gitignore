@@ -23,3 +23,6 @@ fastlane/README.md
 # Read-only vendored prior art with its own git history; kept on disk, out of
 # this repo's tree so it is never modified or committed as a broken gitlink.
 reference/
+
+# internal-only material (release runbooks, marketing plans, ops notes); never published
+internal-docs/

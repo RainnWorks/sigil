@@ -16,7 +16,7 @@ import Foundation
 import LocalAuthentication
 import Security
 
-let tag = "co.rowm.latch.selftest.p256".data(using: .utf8)!
+let tag = "works.rainn.sigil.mac.selftest.p256".data(using: .utf8)!
 
 func cfErr(_ e: Unmanaged<CFError>?) -> String {
     guard let e = e?.takeRetainedValue() else { return "unknown" }
@@ -67,7 +67,7 @@ print("OK  ECIES sealed DEK -> \(ct.count) bytes")
 
 // 4. Decrypt under a live Touch ID.
 let ctx = LAContext()
-ctx.localizedReason = "Latch self-test: unwrap the DEK"
+ctx.localizedReason = "Sigil self-test: unwrap the DEK"
 let query: [String: Any] = [
     kSecClass as String: kSecClassKey, kSecAttrApplicationTag as String: tag,
     kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,

@@ -1,7 +1,7 @@
 /**
  * The hero: the approval sheet body. Composes the origin header + brass gauge,
- * type banner, readout well, provenance, the risk line, and the risk-scaled
- * approve control alongside the always-one-tap deny.
+ * type banner, readout well, provenance, the reason line, and the
+ * always-one-tap approve control alongside the always-one-tap deny.
  *
  * Zero-knowledge approver: this sheet renders only the opaque, Mac-provided
  * DISPLAY fields (caller / command / reason / a display-only `kind` hint, plus
@@ -25,6 +25,7 @@ import { space } from "@/theme/tokens";
 import { faceGate } from "@/src/lib/biometric";
 import { isArmed, liveApprove, liveDeny } from "@/src/session/controller";
 import { hapticCommit } from "@/src/lib/haptics";
+import { durationWindow } from "@/src/lib/format";
 import { type Decision } from "@/src/protocol";
 import { type PendingRequest } from "@/src/domain/types";
 import { store, useSelector } from "@/src/state/store";
@@ -37,9 +38,6 @@ import { TypeBanner } from "./type-banner";
 
 /** A fixed slot for the gate/status note so the controls below never shift. */
 const STATUS_SLOT_HEIGHT = 34;
-
-const riskDot = (risk: PendingRequest["request"]["risk"], p: ReturnType<typeof useTheme>) =>
-  risk === "critical" ? p.deny : risk === "elevated" ? p.brass : p.cobalt;
 
 export function ApprovalSheet({
   pending,
@@ -59,6 +57,11 @@ export function ApprovalSheet({
   const [committed, setCommitted] = useState<{ decision: Decision; note?: string } | null>(null);
 
   const { request, state } = pending;
+  // A leasable request lets the human approve once OR keep the grant approved
+  // for a window up to maxSecs. Run-once requests (no policy) show approve-once
+  // only. Purely the daemon's offer; the phone reads the duration and nothing
+  // provider-shaped.
+  const lease = request.leasePolicy?.kind === "leasable" ? request.leasePolicy : null;
   const terminal = state === "approved" || state === "denied" || state === "expired" || state === "superseded";
   const process = request.provenance.processChain[request.provenance.processChain.length - 1] ?? "process";
   const origin = request.provenance.machine || process;
@@ -83,7 +86,7 @@ export function ApprovalSheet({
     return () => clearTimeout(t);
   }, [committed, request.requestId, onDone]);
 
-  async function handleApprove(): Promise<void> {
+  async function handleApprove(leaseWindow?: { ttlMs: number }): Promise<void> {
     setBusy(true);
     setGateNote(null);
     // The biometric is mandatory and non-negotiable; the settings toggle never
@@ -93,7 +96,7 @@ export function ApprovalSheet({
     // stands in. A non-"sent" live outcome only tells us the decision did not
     // leave this phone; it never carries knowledge of the Mac's state.
     if (isArmed()) {
-      const outcome = await liveApprove(request);
+      const outcome = await liveApprove(request, leaseWindow ? { lease: leaseWindow } : {});
       if (outcome !== "sent") {
         setBusy(false);
         setGateNote(
@@ -176,14 +179,26 @@ export function ApprovalSheet({
             {request.reason ? (
               <View style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
                 <View
-                  style={{ width: 7, height: 7, borderRadius: 99, backgroundColor: riskDot(request.risk, p) }}
+                  style={{ width: 7, height: 7, borderRadius: 99, backgroundColor: p.cobalt }}
                 />
                 <Sans size={14} tone="muted" style={{ flexShrink: 1 }}>
                   {request.reason}
                 </Sans>
               </View>
             ) : null}
-            <ApproveControl risk={request.risk} busy={busy} onApprove={handleApprove} />
+            {lease ? (
+              <View style={{ gap: space.sm }}>
+                <ApproveControl label="Approve once" busy={busy} onApprove={() => void handleApprove()} />
+                <ApproveControl
+                  variant="secondary"
+                  label={`Keep approved for ${durationWindow(lease.maxSecs)}`}
+                  busy={busy}
+                  onApprove={() => void handleApprove({ ttlMs: lease.maxSecs * 1000 })}
+                />
+              </View>
+            ) : (
+              <ApproveControl label="Approve" busy={busy} onApprove={() => void handleApprove()} />
+            )}
             {/* Fixed-height status slot: the gate note appears here without ever
                 nudging the deny control below it. */}
             <View style={{ height: STATUS_SLOT_HEIGHT, justifyContent: "center" }}>

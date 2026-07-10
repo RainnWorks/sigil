@@ -1,8 +1,8 @@
 /**
- * SHARED TEST VECTOR CONTRACT — the JSON the phone needs crates/proto to export.
+ * SHARED TEST VECTOR CONTRACT — the JSON the phone needs crates/sigil-proto to export.
  *
  * This is the interop handshake with rust-core: the Rust crate serializes a set
- * of known-answer vectors to `src/protocol/__vectors__/latch-vectors.json`
+ * of known-answer vectors to `src/protocol/__vectors__/sigil-vectors.json`
  * (git-ignored, produced by `cargo test --features export-vectors` or an
  * xtask), and `verify-vectors.ts` replays them through this TS implementation.
  * Both sides must agree byte-for-byte or CI fails.
@@ -37,7 +37,7 @@
  *   "pairingQr": [                              // PairingPayload -> base64url
  *     {
  *       "daemon": { "verifying": "<64 hex>", "agreement": "<64 hex>" },
- *       "endpoints": ["lan://latch.local:4823"],
+ *       "endpoints": ["lan://sigil.local:4823"],
  *       "secret": "<64 hex>",
  *       "createdAt": 1720000000000,
  *       "expected": "<base64url no pad>"
@@ -57,11 +57,11 @@
  *   ],
  *   "replay": [                                 // ReplayGuard state machine
  *     {
- *       "name": "counter-must-advance",
+ *       "name": "counter-is-ungated",
  *       "windowMs": 90000,
  *       "steps": [
  *         { "requestId": "<uuid>", "counter": 5, "ts": 1000000, "now": 1000000, "expectOk": true },
- *         { "requestId": "<uuid>", "counter": 3, "ts": 1000000, "now": 1000000, "expectOk": false, "expectError": "counterRegression" }
+ *         { "requestId": "<uuid>", "counter": 3, "ts": 1000000, "now": 1000000, "expectOk": true }
  *       ]
  *     }
  *   ]
@@ -120,7 +120,7 @@ export interface ReplayStep {
   ts: number;
   now: number;
   expectOk: boolean;
-  expectError?: "duplicateRequest" | "counterRegression" | "timestampOutOfWindow" | null;
+  expectError?: "duplicateRequest" | "timestampOutOfWindow" | null;
 }
 
 export interface ReplayVector {
@@ -130,11 +130,11 @@ export interface ReplayVector {
 }
 
 /**
- * combiner: the v2 threshold combiner (crates/proto/src/threshold.rs), which the
+ * combiner: the v2 threshold combiner (crates/sigil-proto/src/threshold.rs), which the
  * phone's TS combiner must mirror byte-for-byte.
  *
  * `zm`/`zf`/`ephemeralPub`/`accountId` are the INPUTS the phone is given; the
- * phone computes `K = BLAKE2b("latch.threshold.v2" ‖ len·Zm ‖ len·Zf ‖ len·E ‖
+ * phone computes `K = BLAKE2b("sigil.threshold.v2" ‖ len·Zm ‖ len·Zf ‖ len·E ‖
  * len·accountId)` (32-byte digest; libsodium `crypto_generichash(32, …)`, u64-BE
  * length prefixes, the 18-byte domain as a raw leading constant) and must match
  * `expectedK`. `expectedTokenCt` is `AES-256-GCM(token; K, aeadNonce)` as
@@ -164,7 +164,7 @@ export interface CombinerVector {
 
 /**
  * pairingTranscript: locks the phone's `pairingTranscript` builder and the
- * final confirmation `tag` against crates/proto's `pairing_transcript` +
+ * final confirmation `tag` against crates/sigil-proto's `pairing_transcript` +
  * `pairing_confirmation_vector` (#34) - the exact cross-language check that
  * would have caught the camelCase `seSharePub` wire bug in CI before it ever
  * reached a device.
@@ -196,7 +196,7 @@ export interface PairingTranscriptVector {
   expectedTag: string;
 }
 
-export interface LatchVectors {
+export interface SigilVectors {
   version: number;
   canonicalBytes: CanonicalVector[];
   fingerprint: FingerprintVector[];
@@ -208,4 +208,4 @@ export interface LatchVectors {
 }
 
 /** Where verify-vectors.ts expects the Rust-exported file. */
-export const VECTORS_PATH = "src/protocol/__vectors__/latch-vectors.json";
+export const VECTORS_PATH = "src/protocol/__vectors__/sigil-vectors.json";

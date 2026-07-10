@@ -1,5 +1,5 @@
 /**
- * Latch design tokens, converted from the brief's oklch source of truth to
+ * Sigil design tokens, converted from the brief's oklch source of truth to
  * sRGB hex (D65). These are plain strings on purpose: they are safe to hand to
  * Reanimated worklets, unlike PlatformColor / the expo-router Color API, which
  * must never cross into animated styles.

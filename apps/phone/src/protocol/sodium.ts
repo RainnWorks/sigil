@@ -19,7 +19,7 @@
  * agreement keypair is derived from a seed via crypto_box_seed_keypair, which
  * both bindings do export — see identity.ts.)
  *
- * The algorithms this maps onto crates/proto:
+ * The algorithms this maps onto crates/sigil-proto:
  *   crypto_box_easy        = crypto_box crate SalsaBox (X25519 + XSalsa20-Poly1305)
  *   crypto_sign_detached   = ed25519-dalek signature over canonical bytes
  *   crypto_generichash(64) = Blake2b512, unkeyed (fingerprint + mailbox id)
@@ -65,7 +65,7 @@ export interface Sodium {
   /**
    * BLAKE2b. Unkeyed when `key` is omitted (fingerprint, mailbox id, pairing
    * transcript); keyed when `key` is given, which is a first-class PRF and is
-   * how crates/proto's pairing handshake derives its subkey and confirmation
+   * how crates/sigil-proto's pairing handshake derives its subkey and confirmation
    * MAC (the Rust `Blake2bMac`). Both bindings accept the optional key with an
    * identical signature.
    */

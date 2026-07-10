@@ -1,6 +1,6 @@
 /**
  * The real phone-side {@link Transport}: sealed envelopes over the blind
- * relay's v4 HTTP contract (`relay-http.ts`), mirroring crates/relay-client.
+ * relay's v4 HTTP contract (`relay-http.ts`), mirroring crates/sigil-relay-client.
  * There is no persistent connection: the phone drains
  * `GET /mailbox/{id}/to-phone` on demand and posts to
  * `POST /mailbox/{id}/to-daemon` to send. Push sending is the relay's job now
@@ -8,9 +8,9 @@
  * token with the daemon (`src/lib/push.ts`), unaffected by this transport.
  *
  * The APNs push doorbell is the primary wake: a push receipt or tap calls
- * {@link PhoneRelay.wake}, which drains `to-phone` once. While the app is
- * foregrounded, a ~30s backstop (AppState-gated, re-armed on every foreground
- * transition) catches anything a missed push would have delivered. No idle
+ * {@link PhoneRelay.wake}, which drains `to-phone` once. The ~30s backstop is
+ * strictly foreground-only (armed on becoming active, disarmed on backgrounding)
+ * so backgrounded steady state is APNs wakeups ONLY, never a poll. No idle
  * connection, no tight polling loop.
  *
  * `to-phone` is now a long-poll (`relay-http.ts`): an empty mailbox holds the
@@ -66,19 +66,37 @@ export class PhoneRelay implements Transport {
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
-    this.backstopTimer = setInterval(() => void this.wake(), BACKSTOP_INTERVAL_MS);
     this.appStateSub = AppState.addEventListener("change", (state: AppStateStatus) => {
-      if (state === "active") void this.wake();
+      if (state === "active") {
+        void this.wake();
+        this.armBackstop();
+      } else {
+        // Backgrounded: no poll at all. APNs is the only wake until we resume.
+        this.disarmBackstop();
+      }
     });
+    // Arm now iff we start foregrounded; a background start stays poll-free.
+    if (AppState.currentState === "active") this.armBackstop();
   }
 
   stop(): void {
     this.running = false;
     this.listeners.clear();
-    if (this.backstopTimer) clearInterval(this.backstopTimer);
-    this.backstopTimer = null;
+    this.disarmBackstop();
     this.appStateSub?.remove();
     this.appStateSub = null;
+  }
+
+  /** Start the foreground backstop tick if it is not already running. */
+  private armBackstop(): void {
+    if (this.backstopTimer) return;
+    this.backstopTimer = setInterval(() => void this.wake(), BACKSTOP_INTERVAL_MS);
+  }
+
+  /** Stop the backstop tick (backgrounding or teardown). */
+  private disarmBackstop(): void {
+    if (this.backstopTimer) clearInterval(this.backstopTimer);
+    this.backstopTimer = null;
   }
 
   status(): TransportStatus {

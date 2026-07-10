@@ -1,5 +1,5 @@
 /**
- * The pairing handshake's phone half, mirroring crates/proto/src/pairing.rs
+ * The pairing handshake's phone half, mirroring crates/sigil-proto/src/pairing.rs
  * byte-for-byte. The QR (message 0) is decoded by pairing.ts; this module builds
  * the phone's authenticated reply (message 1, `PairingResponse`) and derives the
  * rendezvous mailbox both parties route pairing traffic on before the phone key
@@ -27,9 +27,9 @@ import { type Sodium } from "./sodium";
 const enc = new TextEncoder();
 
 /** Domain separation for everything the pairing handshake hashes or MACs. */
-const PAIRING_DOMAIN = enc.encode("latch.pairing.v1");
+const PAIRING_DOMAIN = enc.encode("sigil.pairing.v1");
 /** Domain for the pairing rendezvous mailbox (message 1 and 3 transport). */
-const RENDEZVOUS_DOMAIN = enc.encode("latch.pairing.rendezvous.v1");
+const RENDEZVOUS_DOMAIN = enc.encode("sigil.pairing.rendezvous.v1");
 /** Label deriving the confirmation-MAC subkey from the pairing secret. */
 const SUBKEY_CONFIRM_LABEL = enc.encode("confirm-tag");
 
@@ -72,7 +72,7 @@ export function rendezvousMailbox(
  * phone identity and a fresh nonce. Unkeyed BLAKE2b-512 truncated to 32 bytes.
  *
  * Exported (only) for the shared-vector harness (verify-vectors.ts), which
- * checks this intermediate value byte-for-byte against crates/proto's
+ * checks this intermediate value byte-for-byte against crates/sigil-proto's
  * `pairing_transcript` before checking the final tag - the same cross-language
  * lock that would have caught the camelCase `seSharePub` bug in CI. Production
  * code never calls this directly; it goes through `buildPairingResponse(WithNonce)`.
@@ -210,8 +210,8 @@ export function pairingResponseToJson(resp: PairingResponse): PairingResponseJso
 
 /**
  * The exact string the phone POSTs to the rendezvous mailbox's `/submit`:
- * base64url(JSON) with no padding, the form `latch pair`'s daemon decodes first
- * (raw JSON is its fallback). See crates/latch/src/pair.rs `decode_response`.
+ * base64url(JSON) with no padding, the form `sigil pair`'s daemon decodes first
+ * (raw JSON is its fallback). See crates/sigil/src/pair.rs `decode_response`.
  */
 export function pairingResponseToSubmitString(resp: PairingResponse): string {
   const json = JSON.stringify(pairingResponseToJson(resp));

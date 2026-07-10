@@ -1,0 +1,53 @@
+# The native Rust blind relay. A single static binary that speaks the exact
+# wire protocol of relay/ (the TS Cloudflare Worker + Bun variants), with the
+# smallest runtime footprint we can manage: a tokio current-thread runtime
+# holding idle long-polls as parked futures, in-memory-only state, no database.
+#
+# Dependency budget (every dep justified; the relay is attack + trust surface):
+#   tokio          async runtime; current-thread flavour, minimal feature set.
+#   hyper          HTTP/1 server, hand-rolled tiny router (no framework).
+#   hyper-util     TokioIo glue between tokio streams and hyper 1.x.
+#   http-body-util body collect + size-Limited guard for request bodies.
+#   bytes          the Bytes body type hyper returns/accepts.
+#   serde/json     parse the deposit body's `env`/`pushToken`, emit byte-exact
+#                  response JSON. Already vendored workspace-wide.
+#   base64         decode the APNs .p8 PEM and base64url the JWT. Workspace dep.
+#   p256           ES256 (ECDSA P-256) JWT signing for the APNs doorbell, and
+#                  PKCS#8 parsing of the .p8 key. RustCrypto, no OpenSSL.
+#   reqwest        the ONLY networking client dep: APNs mandates HTTP/2 over
+#                  TLS, and forwarding an upstream knock is an HTTPS POST too.
+#                  rustls (not OpenSSL) keeps the static musl build clean, and
+#                  webpki-roots avoids a system trust-store dependency. Its
+#                  client is built lazily, only when a doorbell is configured,
+#                  so it costs nothing at idle.
+[package]
+name = "sigil-relay"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Sigil blind relay: native Rust, minimal-footprint, wire-compatible with the TS relay."
+
+[[bin]]
+name = "sigil-relay"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros", "io-util", "signal"] }
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
+reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+# Integration tests drive the real server over loopback and mint a throwaway
+# P-256 key to exercise the JWT path. The `pem` feature (which pulls pkcs8
+# `alloc` for key EXPORT) is dev-only: resolver v2 keeps it out of the release
+# binary, so runtime p256 stays parse+sign only.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls-webpki-roots", "json"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem"] }

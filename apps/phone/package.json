@@ -1,5 +1,5 @@
 {
-  "name": "latch-phone",
+  "name": "sigil-phone",
   "version": "0.1.0",
   "private": true,
   "main": "expo-router/entry",
@@ -9,7 +9,9 @@
     "android": "expo run:android",
     "typecheck": "tsc --noEmit",
     "proto:selftest": "bun run src/protocol/self-test.ts",
-    "proto:vectors": "bun run src/protocol/verify-vectors.ts"
+    "proto:vectors": "bun run src/protocol/verify-vectors.ts",
+    "relay:selftest": "bun run src/transport/relay-http.selftest.ts",
+    "ladder:selftest": "bun run src/transport/ladder-transport.selftest.ts"
   },
   "dependencies": {
     "@expo/ui": "~57.0.3",

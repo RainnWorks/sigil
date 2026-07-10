@@ -1,5 +1,5 @@
 /**
- * Replays the shared test vectors exported by crates/proto through this TS
+ * Replays the shared test vectors exported by crates/sigil-proto through this TS
  * implementation. Run with `npm run proto:vectors` (Node with type stripping).
  * If the vector file is absent it prints how to produce it and exits 0, so the
  * suite is a no-op until rust-core wires up the export, then a hard gate.
@@ -19,7 +19,7 @@ import { ReplayGuard, ReplayRejected } from "./replay";
 import { loadSodiumForTests } from "./sodium-node";
 import { combine } from "./threshold";
 import { envelopeFromWire, type EnvelopeWire } from "./wire";
-import { type LatchVectors, VECTORS_PATH } from "./vectors.contract";
+import { type SigilVectors, VECTORS_PATH } from "./vectors.contract";
 
 /**
  * AES-256-GCM seal returning ciphertext‖tag, mirroring proto `aead_seal`. Uses
@@ -45,14 +45,14 @@ async function main(): Promise<void> {
   } catch {
     console.log(`no shared vectors at ${VECTORS_PATH} yet.`);
     console.log("produce them from the rust proto crate, then re-run:");
-    console.log("  (rust-core) cargo test -p latch-proto --features export-vectors");
-    console.log("  cp <exported>/latch-vectors.json apps/phone/" + VECTORS_PATH);
+    console.log("  (rust-core) cargo run -p sigil-proto --bin export-vectors");
+    console.log("  cp <exported>/sigil-vectors.json apps/phone/" + VECTORS_PATH);
     process.exit(0);
     return;
   }
 
   const sodium = await loadSodiumForTests();
-  const v = JSON.parse(raw) as LatchVectors;
+  const v = JSON.parse(raw) as SigilVectors;
   let pass = 0;
   const fails: string[] = [];
   const check = (ok: boolean, label: string) => {

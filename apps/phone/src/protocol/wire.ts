@@ -2,7 +2,7 @@
  * JSON wire encoding for the envelope, shaped to match `serde_json` output of
  * the Rust `Envelope` so the two sides interoperate over the real transport:
  * fixed byte arrays serialize as arrays of numbers, `request_id` as a uuid
- * string, `sig` as a 64-number array. Tracks crates/proto; a shared vector
+ * string, `sig` as a 64-number array. Tracks crates/sigil-proto; a shared vector
  * pins it (see vectors.contract.ts).
  *
  * The mock transport uses these too, so the dev loop exercises the exact codec

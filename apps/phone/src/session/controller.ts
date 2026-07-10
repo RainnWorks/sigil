@@ -1,7 +1,7 @@
 /**
  * The live session controller: the single place the app arms the real transport
  * and dispatches decisions over it. It ties together the keystore (the stored
- * pairing), the {@link PhoneRelay} transport, and the {@link LatchSession} crypto.
+ * pairing), the {@link PhoneRelay} transport, and the {@link SigilSession} crypto.
  *
  * Two tiers, kept apart exactly as the keystore stores them:
  *   - Arming is a read-path action: it loads the passcode-tier identity, starts
@@ -27,15 +27,20 @@ import {
   toBase64,
 } from "@/src/protocol";
 
-import { computePartial, isSecureEnclaveAvailable } from "@/modules/latch-se";
+import { computePartial, isSecureEnclaveAvailable } from "@/modules/sigil-se";
 import { store } from "@/src/state/store";
 import { PhoneRelay } from "@/src/transport/phone-relay";
-import { LatchSession } from "./session";
+import { SigilSession } from "./session";
 import { clearPairing, loadDek, loadPairing, type StoredPairing } from "./keystore";
 
 interface Live {
-  session: LatchSession;
+  session: SigilSession;
   transport: PhoneRelay;
+}
+
+/** A short, secret-free error string for a diagnostic log line. */
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 let live: Live | null = null;
@@ -56,14 +61,15 @@ export async function armLiveSession(): Promise<boolean> {
   let sodium: Sodium;
   try {
     sodium = await loadSodium();
-  } catch {
+  } catch (e) {
+    console.warn(`[session] arm failed: libsodium did not load: ${errText(e)}`);
     return false;
   }
   const transport = new PhoneRelay({
     base: pairing.relayBase,
     mailbox: pairing.mailbox,
   });
-  const session = new LatchSession({
+  const session = new SigilSession({
     sodium,
     phone: pairing.phone,
     daemonPub: pairing.daemonPub,
@@ -130,7 +136,8 @@ export async function sendPushRegister(token: string): Promise<PushRegisterOutco
       platform: "apns",
     });
     return "sent";
-  } catch {
+  } catch (e) {
+    console.warn(`[session] push token deposit failed: ${errText(e)}`);
     return "error";
   }
 }
@@ -147,6 +154,15 @@ export async function nudgeTransport(): Promise<void> {
 export type ApproveOutcome = "sent" | "refused" | "no-session" | "error";
 
 /**
+ * Options for an approve. `lease` is set only when the human chose "keep
+ * approved for a window" on a leasable request (task #57); the daemon binds the
+ * chosen `ttlMs` to the grant it already resolved. Absent => approve-once.
+ */
+export interface ApproveOptions {
+  lease?: { ttlMs: number };
+}
+
+/**
  * Approve `request` over the live transport. Reads the DEK behind Face ID and,
  * only if the gate passes, seals an `ApprovalResponse` carrying `wrappedDek`
  * (standard-base64 of the raw 32-byte DEK, confidential inside the envelope seal)
@@ -159,19 +175,29 @@ export type ApproveOutcome = "sent" | "refused" | "no-session" | "error";
  * the phone is a zero-knowledge approver, so the outcome on the far side is not
  * its concern and is never reported back through this result.
  */
-export async function liveApprove(request: ApprovalRequest): Promise<ApproveOutcome> {
+export async function liveApprove(
+  request: ApprovalRequest,
+  opts: ApproveOptions = {},
+): Promise<ApproveOutcome> {
   if (!live) return "no-session";
   // v2 accounts carry a threshold challenge: the release factor is the Secure
   // Enclave key-agreement (Z_F), not a stored DEK. Selected by the presence of
   // the challenge, never by a wire flag; a v2 approve never emits a DEK.
-  if (request.threshold) return liveApproveThreshold(request);
+  if (request.threshold) return liveApproveThreshold(request, opts);
 
   const dek = await loadDek("Approve secret release");
   if (!dek) return "refused";
   try {
-    await live.session.respond(request, "approved", { wrappedDek: toBase64(dek) });
+    await live.session.respond(request, "approved", {
+      wrappedDek: toBase64(dek),
+      ...(opts.lease ? { lease: opts.lease } : {}),
+    });
     return "sent";
-  } catch {
+  } catch (e) {
+    // The approve was sealed but the dispatch threw (transport/seal fault). No
+    // secret leaks here: the DEK is a separate, zeroized-below buffer, and the
+    // error is a wire error, not key material.
+    console.warn(`[session] approve dispatch failed: ${errText(e)}`);
     return "error";
   } finally {
     dek.fill(0);
@@ -190,7 +216,10 @@ export async function liveApprove(request: ApprovalRequest): Promise<ApproveOutc
  * routing tag the crypto needs (which pinned key `f` to agree, echoed back for
  * correlation), never a provider/account concept the phone interprets or shows.
  */
-async function liveApproveThreshold(request: ApprovalRequest): Promise<ApproveOutcome> {
+async function liveApproveThreshold(
+  request: ApprovalRequest,
+  opts: ApproveOptions = {},
+): Promise<ApproveOutcome> {
   if (!live) return "no-session";
   const ch = request.threshold;
   if (!ch) return "error";
@@ -214,9 +243,11 @@ async function liveApproveThreshold(request: ApprovalRequest): Promise<ApproveOu
   try {
     await live.session.respond(request, "approved", {
       partial: { accountId: ch.accountId, zf: zfB64 },
+      ...(opts.lease ? { lease: opts.lease } : {}),
     });
     return "sent";
-  } catch {
+  } catch (e) {
+    console.warn(`[session] threshold approve dispatch failed: ${errText(e)}`);
     return "error";
   }
 }
@@ -232,7 +263,8 @@ export async function liveDeny(request: ApprovalRequest): Promise<DenyOutcome> {
   try {
     await live.session.respond(request, "denied");
     return "sent";
-  } catch {
+  } catch (e) {
+    console.warn(`[session] deny dispatch failed: ${errText(e)}`);
     return "error";
   }
 }

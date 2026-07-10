@@ -3,16 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Latch · gated secret injection for any CLI, approved from your phone</title>
-<meta name="description" content="Latch is a personal instrument that gates the environment a command runs in: it holds the call, gets your approval on your phone, injects the approved secret, and runs it. The daemon at rest cannot produce a single secret. 1Password is the first provider; the seam is generic.">
-<link rel="stylesheet" href="latch.css">
+<title>Sigil · gated secret injection for any CLI, approved from your phone</title>
+<meta name="description" content="Sigil is a personal instrument that gates the environment a command runs in: it holds the call, gets your approval on your phone, injects the approved secret, and runs it. The daemon at rest cannot produce a single secret. 1Password is the first provider; the seam is generic.">
+<link rel="stylesheet" href="sigil.css">
 </head>
 <body>
 
 <!-- TODO: repo has no remote yet; point every href="#repo" at the GitHub URL once it exists -->
 <nav class="nav">
   <div class="wrap">
-    <a class="brand" href="index.html">latch<span class="cursor">_</span></a>
+    <a class="brand" href="index.html">sigil<span class="cursor">_</span></a>
     <div class="nav-links">
       <a class="opt" href="#how">How it works</a>
       <a class="opt" href="#layers">Architecture</a>
@@ -30,7 +30,7 @@
       <div class="hero-copy">
         <p class="kicker"><span class="dot"></span> Personal instrument · in development</p>
         <h1>Every secret your tools inject <span class="accent">waits for your thumb</span>.</h1>
-        <p class="hero-sub">Gated environment injection for any CLI: Latch holds a command, asks your phone, injects the approved credential, and runs it.</p>
+        <p class="hero-sub">Gated environment injection for any CLI: Sigil holds a command, asks your phone, injects the approved credential, and runs it.</p>
         <div class="hero-cta">
           <a class="btn btn-primary" href="#how">See the flow <span class="arrow">-&gt;</span></a>
           <a class="btn btn-ghost" href="trust.html">Read the trust model</a>
@@ -38,14 +38,14 @@
       </div>
       <div class="hero-visual">
         <div class="term">
-          <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="lbl">latch status</span></div>
-<pre><span class="t-co">latch</span> <span class="t-faint">·</span> <span class="t-ok">armed</span>
+          <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="lbl">sigil status</span></div>
+<pre><span class="t-co">sigil</span> <span class="t-faint">·</span> <span class="t-ok">armed</span>
 
   <span class="t-dim">daemon</span>       <span class="t-ok">●</span> running         <span class="t-dim">pid 4821 · 2d 14h</span>
   <span class="t-dim">phone</span>        <span class="t-ok">●</span> Tom's iPhone    <span class="t-dim">direct · last seen 12s ago</span>
 
   <span class="t-dim">integrations</span>
-    <span class="t-dim">op shim</span>    <span class="t-ok">✓</span> on PATH         <span class="t-dim">~/.latch/bin/op</span>
+    <span class="t-dim">op shim</span>    <span class="t-ok">✓</span> on PATH         <span class="t-dim">~/.sigil/bin/op</span>
     <span class="t-dim">ssh-agent</span>  <span class="t-ok">✓</span> SSH_AUTH_SOCK   <span class="t-dim">3 keys served</span>
 
   <span class="t-dim">providers</span>
@@ -67,7 +67,7 @@
       </div>
       <div class="prose">
         <p>A dev server needs a database URL. An agent needs an API key. A deploy needs a cloud credential. Each is a secret that has to reach the command's environment before it can run, and each raises a biometric prompt on the Mac.</p>
-        <p>Leave the desk and those prompts sit unanswered. Servers refuse to start, agents block, SSH hangs until you are physically back. Latch answers the prompt from your phone instead. Two properties keep that from being merely convenient and quietly terrifying.</p>
+        <p>Leave the desk and those prompts sit unanswered. Servers refuse to start, agents block, SSH hangs until you are physically back. Sigil answers the prompt from your phone instead. Two properties keep that from being merely convenient and quietly terrifying.</p>
       </div>
     </div>
   </div>
@@ -78,7 +78,7 @@
   <div class="wrap">
     <div class="sec-head">
       <h2>One gate, and everything plugs into it</h2>
-      <p>Latch is a small core that does one thing: hold a command, get your approval, inject the approved credential, and run it. Everything else is a plug-in on one of two sides.</p>
+      <p>Sigil is a small core that does one thing: hold a command, get your approval, inject the approved credential, and run it. Everything else is a plug-in on one of two sides.</p>
     </div>
     <div class="topo">
       <div class="topo-row">
@@ -88,7 +88,7 @@
           <ul>
             <li>a shimmed CLI on <code>PATH</code> <span class="tag-live">op today</span></li>
             <li>the SSH agent, for signatures <span class="tag-live">live</span></li>
-            <li><code>latch run -- cmd</code>, any command <span class="tag-soon">in development</span></li>
+            <li><code>sigil run -- cmd</code>, any command <span class="tag-soon">in development</span></li>
           </ul>
         </div>
         <div class="link"><span class="arrow">-&gt;</span><span class="lbl">argv · cwd<br>environment request</span></div>
@@ -114,11 +114,11 @@
         </div>
       </div>
       <div class="topo-foot">
-        <span class="chip">Adding <b>Latch for X</b> = shim a CLI, add a provider, or add an integration</span>
+        <span class="chip">Adding <b>Sigil for X</b> = shim a CLI, add a provider, or add an integration</span>
         <span class="chip">the approval your phone shows carries an <b>opaque reference</b>, never provider mechanics</span>
       </div>
     </div>
-    <p class="mt-m muted" style="font-size:0.92rem;max-width:74ch">Today one provider is wired (1Password) and one CLI is shimmed (<code>op</code>), plus the SSH agent. The <code>SecretProvider</code> seam, the provider-blind approval protocol, and the injected-credential model all exist in the core now. The second provider, the config-driven shim for any CLI, and the generic <code>latch run</code> wrapper are in development. They are fills of a seam that is already there, not a rewrite.</p>
+    <p class="mt-m muted" style="font-size:0.92rem;max-width:74ch">Today one provider is wired (1Password) and one CLI is shimmed (<code>op</code>), plus the SSH agent. The <code>SecretProvider</code> seam, the provider-blind approval protocol, and the injected-credential model all exist in the core now. The second provider, the config-driven shim for any CLI, and the generic <code>sigil run</code> wrapper are in development. They are fills of a seam that is already there, not a rewrite.</p>
   </div>
 </section>
 
@@ -148,7 +148,7 @@
   <div class="wrap-narrow">
     <div class="sec-head">
       <h2>A request, end to end</h2>
-      <p>The round trip a single request makes, from an unchanged caller to a secret in place. The example is a 1Password read; a <code>latch run</code> wrapper or an SSH signature travels the identical path, and only the first and last steps differ.</p>
+      <p>The round trip a single request makes, from an unchanged caller to a secret in place. The example is a 1Password read; a <code>sigil run</code> wrapper or an SSH signature travels the identical path, and only the first and last steps differ.</p>
     </div>
     <ol class="flow">
       <li><span class="who">integration &rarr; core</span>A tool runs <code>op item get ".env" --vault "Engineering" --format json</code>. The shim forwards argv, cwd, and the environment request over the local socket, byte-for-byte compatible with the real CLI.</li>
@@ -234,7 +234,7 @@
         <h3>What a malicious relay can do, exhaustively</h3>
         <p class="muted mt-s" style="font-size:0.95rem">You cannot prove what a remote server runs, so the proof is client-side: the relay is given no role that requires trust. It does not even distribute keys, because pairing is out-of-band by QR, so there is no man-in-the-middle surface at all.</p>
         <ul class="notes mt-s">
-          <li><b>Drop or delay traffic.</b> This is a denial of service, and Latch fails closed: no envelope, no secret.</li>
+          <li><b>Drop or delay traffic.</b> This is a denial of service, and Sigil fails closed: no envelope, no secret.</li>
           <li><b>Observe metadata.</b> A pairing-hash mailbox address, timing, and blob sizes. Self-host to keep even that at home.</li>
         </ul>
       </div>
@@ -251,7 +251,7 @@
 
     <div class="claim mt-l">
       <span class="k">Claim, code, test</span>
-      <p><strong>The powerlessness is demonstrated, not asserted.</strong> The repository ships a deliberately hostile relay that tampers, replays, forges, and stalls, alongside a client test suite that must reject every attack and fail closed, plus a map from each security claim to the code that enforces it and the test that exercises it. The protocol core and that suite live in <code>crates/proto</code> and run on every platform, provider or no provider.</p>
+      <p><strong>The powerlessness is demonstrated, not asserted.</strong> The repository ships a deliberately hostile relay that tampers, replays, forges, and stalls, alongside a client test suite that must reject every attack and fail closed, plus a map from each security claim to the code that enforces it and the test that exercises it. The protocol core and that suite live in <code>crates/sigil-proto</code> and run on every platform, provider or no provider.</p>
     </div>
   </div>
 </section>
@@ -268,7 +268,7 @@
       <div class="feat-grid">
         <div>
           <span class="st st-live">live today</span>
-          <h3 class="feat-h">Latch for 1Password</h3>
+          <h3 class="feat-h">Sigil for 1Password</h3>
           <p class="muted" style="max-width:44ch">Your project's dev secrets already live in a 1Password item. The <code>op</code> shim routes every <code>op read</code>, <code>op item get</code>, and <code>op run</code> through the gate, so existing scripts, dev servers, and the 1Password SSH agent keep working, now answered from your phone.</p>
           <p class="mt-s"><a class="btn btn-ghost" href="uses-1password.html">See the 1Password flow <span class="arrow">-&gt;</span></a></p>
         </div>
@@ -336,7 +336,7 @@
         <div class="st st-dev">planned · v2</div>
       </div>
     </div>
-    <p class="mt-m muted" style="font-size:0.92rem;max-width:70ch">The daemon, CLI, and shim are <strong>one Rust binary</strong> cross-compiled to a standalone, statically linked target per desktop, so installing Latch is copying a file with no runtime to install. The shim is that same binary invoked through a CLI symlink; <code>op</code> is the first such symlink. The phone is one Expo codebase where the UI layer renders SwiftUI on iOS and Jetpack Compose on Android. All five platforms are committed targets; the seam abstractions exist from the first version so the later ports are fills, not rewrites.</p>
+    <p class="mt-m muted" style="font-size:0.92rem;max-width:70ch">The daemon, CLI, and shim are <strong>one Rust binary</strong> cross-compiled to a standalone, statically linked target per desktop, so installing Sigil is copying a file with no runtime to install. The shim is that same binary invoked through a CLI symlink; <code>op</code> is the first such symlink. The phone is one Expo codebase where the UI layer renders SwiftUI on iOS and Jetpack Compose on Android. All five platforms are committed targets; the seam abstractions exist from the first version so the later ports are fills, not rewrites.</p>
   </div>
 </section>
 
@@ -345,11 +345,11 @@
   <div class="wrap">
     <div class="sec-head">
       <h2>The daemon speaks plainly</h2>
-      <p>The <code>latch</code> CLI carries the same restraint as the apps: aligned columns, one cobalt accent, semantic green, brass, and rust, no banners. It respects <code>NO_COLOR</code> and non-TTY output.</p>
+      <p>The <code>sigil</code> CLI carries the same restraint as the apps: aligned columns, one cobalt accent, semantic green, brass, and rust, no banners. It respects <code>NO_COLOR</code> and non-TTY output.</p>
     </div>
     <div class="term plain">
-      <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="lbl">latch logs -f</span></div>
-<pre><span class="t-faint">$</span> latch logs -f
+      <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="lbl">sigil logs -f</span></div>
+<pre><span class="t-faint">$</span> sigil logs -f
 <span class="t-dim">14:02:11</span>  read  Engineering/.env <span class="t-faint">›</span> graphql-api  <span class="t-dim">claude · ~/Projects/rowm</span>  <span class="t-ok">✓ approved</span> <span class="t-dim">8.2s phone</span>
 <span class="t-dim">14:02:40</span>  ssh   github-deploy <span class="t-faint">→</span> git@github.com  <span class="t-dim">ssh · ~/Projects/rowm</span>    <span class="t-ok">✓ approved</span> <span class="t-dim">0.1s lease</span>
 <span class="t-dim">14:31:07</span>  read  AWS-prod/access-key           <span class="t-dim">zsh · ~/Projects/infra</span>   <span class="t-deny">✗ denied</span> <span class="t-dim">"not me"</span>
@@ -359,12 +359,12 @@
     <div class="tblwrap mt-m">
       <table>
         <tr><th class="mono">command</th><th>does</th></tr>
-        <tr><td class="mono">latch setup</td><td>first run: keys, encrypted store, shim install, service registration, pairing QR; ends by printing the status panel</td></tr>
-        <tr><td class="mono">latch pair</td><td>QR plus six-word fingerprint in the terminal, for re-pairing or a second device</td></tr>
-        <tr><td class="mono">latch account add · list · rotate · remove</td><td>per-provider credential lifecycle; credentials arrive via stdin, never argv</td></tr>
-        <tr><td class="mono">latch status · logs [-f]</td><td>the panels above; the audit log is append-only, names never values</td></tr>
-        <tr><td class="mono">latch lockdown [--clear]</td><td>seal or unseal; clearing needs a biometric</td></tr>
-        <tr><td class="mono">latch doctor</td><td>PATH shim check, socket health, credential validity, routing table, clock skew</td></tr>
+        <tr><td class="mono">sigil setup</td><td>first run: keys, encrypted store, shim install, service registration, pairing QR; ends by printing the status panel</td></tr>
+        <tr><td class="mono">sigil pair</td><td>QR plus six-word fingerprint in the terminal, for re-pairing or a second device</td></tr>
+        <tr><td class="mono">sigil account add · list · rotate · remove</td><td>per-provider credential lifecycle; credentials arrive via stdin, never argv</td></tr>
+        <tr><td class="mono">sigil status · logs [-f]</td><td>the panels above; the audit log is append-only, names never values</td></tr>
+        <tr><td class="mono">sigil lockdown [--clear]</td><td>seal or unseal; clearing needs a biometric</td></tr>
+        <tr><td class="mono">sigil doctor</td><td>PATH shim check, socket health, credential validity, routing table, clock skew</td></tr>
       </table>
     </div>
 
@@ -372,8 +372,8 @@
       <h3>Getting it</h3>
       <p class="muted mt-s" style="font-size:0.92rem;max-width:64ch">No builds are published yet. The protocol core and the 1Password provider are under construction in the open; once the daemon lands, first run is a single command that walks the pairing ceremony and prints the status panel.</p>
       <div class="install mt-s">
-        <code><span class="p">$</span> latch setup</code>
-        <button class="copybtn" type="button" data-copy="latch setup">Copy</button>
+        <code><span class="p">$</span> sigil setup</code>
+        <button class="copybtn" type="button" data-copy="sigil setup">Copy</button>
       </div>
       <p class="mt-s"><span class="status-pill">daemon and phone app in development</span></p>
     </div>
@@ -385,7 +385,7 @@
   <div class="wrap">
     <div class="foot-grid">
       <div>
-        <span class="brand">latch<span class="cursor">_</span></span>
+        <span class="brand">sigil<span class="cursor">_</span></span>
         <p class="tag">A personal instrument that gates the secrets your CLIs inject, behind an approval on your phone. 1Password is the first provider; built for one user, the team never knows it exists.</p>
       </div>
       <div class="foot-links">
@@ -397,14 +397,14 @@
         </div>
         <div class="foot-col">
           <h5>Use</h5>
-          <a href="uses-1password.html">Latch for 1Password</a>
+          <a href="uses-1password.html">Sigil for 1Password</a>
           <a href="#providers">Providers</a>
           <a href="#platforms">Platforms</a>
         </div>
         <div class="foot-col">
           <h5>Build</h5>
           <a href="#repo">Source</a>
-          <!-- TODO: link to a hosted copy of docs/design/latch-design-brief.html if published -->
+          <!-- TODO: link to a hosted copy of docs/design/sigil-design-brief.html if published -->
           <a href="#repo">Design brief</a>
           <a href="#layers">Architecture</a>
         </div>
