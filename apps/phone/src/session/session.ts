@@ -35,7 +35,15 @@ export interface SessionConfig {
 
 export class SigilSession {
   private readonly inboundGuard = new ReplayGuard();
-  private outboundCounter = 0;
+  // Seed the outbound counter from the wall clock, not 0. A new SigilSession is
+  // created on every arm / foreground / reconnect, and the daemon's replay guard
+  // rejects any counter <= the highest it has already seen this run, so a
+  // reset-to-0 counter made the daemon drop our approval responses as stale
+  // replays (the command hangs, "approved but never unlocks"). The clock is a
+  // monotonic source shared with the daemon's own seed (crates/sigil/src/
+  // remote.rs), so a fresh session always resumes above the daemon's last-seen,
+  // with no persisted state. Mirror of the daemon-side fix.
+  private outboundCounter = Date.now();
   private unsubscribe: (() => void) | null = null;
 
   constructor(private readonly cfg: SessionConfig) {}
