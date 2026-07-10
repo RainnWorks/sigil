@@ -21,7 +21,7 @@
  */
 
 /** Maximum allowed clock skew, milliseconds. Matches proto REPLAY_WINDOW_MS. */
-export const REPLAY_WINDOW_MS = 90_000;
+export const REPLAY_WINDOW_MS = 150_000;
 
 /**
  * Hard upper bound on remembered request ids: a memory backstop, not a
