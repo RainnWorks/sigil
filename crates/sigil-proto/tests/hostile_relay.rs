@@ -219,21 +219,21 @@ fn rewound_counter_is_rejected() {
 }
 
 #[test]
-fn a_genuinely_old_lower_counter_message_is_rejected() {
-    // The counter gate does not rely on the signature alone: even a validly
-    // signed but stale-counter envelope (a captured earlier approval) is
-    // refused once a higher counter has been accepted.
+fn a_genuinely_lower_counter_message_is_now_accepted() {
+    // The monotonic-counter gate has been retired (task #67): a per-session
+    // in-memory counter reset to 0 on any daemon restart or phone session
+    // recreation, so a guard that remembered a higher counter dropped a genuine,
+    // user-approved envelope as a false "replay". A validly signed envelope that
+    // rides a lower (or reset) counter but carries a fresh timestamp and its own
+    // unique request id is now ACCEPTED. Replay is still fully covered:
+    // identical-bytes resend is caught by the single-use id
+    // (replay_of_a_delivered_envelope_is_rejected) and a held-late envelope by
+    // the freshness window (an_envelope_held_past_the_window_is_rejected).
     let mut fx = Fixture::new();
     let newer = fx.seal(9, "newer");
-    assert!(fx.open(&newer).is_ok());
-    let older = fx.seal(4, "older but validly signed");
-    assert_eq!(
-        fx.open(&older),
-        Err(OpenError::Replay(ReplayError::CounterRegression {
-            got: 4,
-            last: 9
-        }))
-    );
+    assert_eq!(fx.open(&newer).unwrap(), "newer");
+    let lower = fx.seal(4, "genuine but lower counter");
+    assert_eq!(fx.open(&lower).unwrap(), "genuine but lower counter");
 }
 
 #[test]
@@ -278,22 +278,29 @@ fn an_envelope_held_past_the_window_is_rejected() {
 }
 
 #[test]
-fn reordering_queued_envelopes_is_caught() {
-    // The relay queues two envelopes and delivers them out of order.
+fn reordering_distinct_envelopes_is_accepted() {
+    // With the counter ungated, two DISTINCT genuine envelopes delivered out of
+    // order both open: each carries its own unique request id and a fresh
+    // timestamp, so order no longer decides acceptance. This is the behaviour the
+    // fix intends (a reset/lower counter must not drop a real approval). The
+    // relay still cannot REPLAY: resending identical bytes is caught by the
+    // single-use id (replay_of_a_delivered_envelope_is_rejected), and holding a
+    // captured envelope past the window is caught by freshness
+    // (an_envelope_held_past_the_window_is_rejected).
     let mut fx = Fixture::new();
     let mut relay = MaliciousRelay::new();
     let first = relay.intercept(fx.seal(1, "first"));
     let second = relay.intercept(fx.seal(2, "second"));
 
-    // Deliver the later one first: it is accepted.
+    // Deliver the later one first: accepted.
     assert_eq!(fx.open(&second).unwrap(), "second");
-    // Now the earlier one arrives; its counter has been overtaken.
+    // The earlier, distinct envelope still opens; it is a real message, not a
+    // replay of the one already delivered.
+    assert_eq!(fx.open(&first).unwrap(), "first");
+    // But the exact bytes of an already-delivered envelope cannot be replayed.
     assert_eq!(
-        fx.open(&first),
-        Err(OpenError::Replay(ReplayError::CounterRegression {
-            got: 1,
-            last: 2
-        }))
+        fx.open(&relay.seen[1].clone()),
+        Err(OpenError::Replay(ReplayError::DuplicateRequest))
     );
 }
 
@@ -499,18 +506,14 @@ fn dropping_an_envelope_changes_no_state() {
     // The relay silently drops one message. The caller sees nothing for it, and
     // the recipient's state is untouched: a later message still opens cleanly.
     let mut fx = Fixture::new();
-    let _dropped = fx.seal(1, "never delivered");
-    // The recipient never saw counter 1; a subsequent message is unaffected.
+    let dropped = fx.seal(1, "never delivered");
+    // The recipient never saw the first envelope; a subsequent message is
+    // unaffected and opens.
     let next = fx.seal(2, "delivered");
     assert_eq!(fx.open(&next).unwrap(), "delivered");
-    // And a first message at counter 1 would still be accepted afterwards only
-    // if it had not been overtaken; here counter 2 was accepted, so the dropped
-    // one, if it ever arrived, would now be refused.
-    assert_eq!(
-        fx.open(&_dropped),
-        Err(OpenError::Replay(ReplayError::CounterRegression {
-            got: 1,
-            last: 2
-        }))
-    );
+    // Dropping changed no guard state: if the "dropped" envelope later arrives
+    // within its freshness window it is a distinct, genuine, unseen message and
+    // opens on its own merit (the counter no longer gates it). Delivery order and
+    // gaps do not poison the guard.
+    assert_eq!(fx.open(&dropped).unwrap(), "never delivered");
 }

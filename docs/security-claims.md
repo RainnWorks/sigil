@@ -82,13 +82,32 @@ Extended again at commit `747b3a4` (the P-256 Secure Enclave DEK wrap), section
 
 ## 5. Replay is impossible (post-pairing envelopes)
 
+Two-gate guard (task #67 retired the monotonic-counter gate; see the implementer note below).
+
 | Claim | Enforcing code | Proving test |
 |-------|----------------|--------------|
-| Single-use uuidv7 request id | `replay.rs::ReplayGuard::check_and_record` | `replay.rs::duplicate_request_id_is_rejected`, `hostile_relay.rs::replay_of_a_delivered_envelope_is_rejected` |
-| Per-pairing monotonic counter must strictly advance | `replay.rs` | `replay.rs::counter_must_strictly_advance`, `hostile_relay.rs::a_genuinely_old_lower_counter_message_is_rejected`, `reordering_queued_envelopes_is_caught` |
-| 90s freshness window; held-late and skewed envelopes rejected | `replay.rs`, `lib.rs::REPLAY_WINDOW_MS` | `replay.rs::stale_timestamp_beyond_window_is_rejected`, `future_timestamp_beyond_window_is_rejected`, `hostile_relay.rs::an_envelope_held_past_the_window_is_rejected` |
-| Any field tamper breaks the Ed25519 signature | `envelope.rs::canonical_bytes`, `open` | `envelope.rs::any_field_tamper_breaks_the_signature`, `hostile_relay.rs::{bit_flipped_ciphertext,swapped_ciphertext_between_envelopes,forged_envelope_from_relay_key}_is_rejected` |
+| Single-use uuidv7 request id | `replay.rs::ReplayGuard::check_and_record` | `replay.rs::duplicate_request_id_is_rejected`, `hostile_relay.rs::replay_of_a_delivered_envelope_is_rejected`, `reordering_distinct_envelopes_is_accepted` (identical-bytes resend still rejected) |
+| Freshness window (`REPLAY_WINDOW_MS`, 150s); held-late and skewed envelopes rejected | `replay.rs`, `lib.rs::REPLAY_WINDOW_MS` | `replay.rs::{stale_timestamp_beyond_window_is_rejected,future_timestamp_beyond_window_is_rejected,a_replay_after_the_id_ages_out_is_caught_by_freshness}`, `hostile_relay.rs::an_envelope_held_past_the_window_is_rejected` |
+| Counter is ungated: a lower/reset counter with a fresh ts and a new id is accepted (was a false-replay drop) | `replay.rs::check_and_record` (counter param retained, not gated) | `replay.rs::lower_or_reset_counter_with_fresh_ts_and_new_id_is_accepted`, `envelope.rs::lower_counter_with_fresh_ts_and_new_id_is_accepted`, `hostile_relay.rs::a_genuinely_lower_counter_message_is_now_accepted` |
+| Seen-set memory is bounded by age (plus a hard `MAX_SEEN` backstop) | `replay.rs::{evict_aged,record}` | `replay.rs::{age_eviction_keeps_the_set_bounded_over_a_moving_window,hard_cap_bounds_a_same_instant_burst}` |
+| Any field tamper (incl. the ungated counter) breaks the Ed25519 signature | `envelope.rs::canonical_bytes`, `open` | `envelope.rs::any_field_tamper_breaks_the_signature`, `hostile_relay.rs::{bit_flipped_ciphertext,swapped_ciphertext_between_envelopes,forged_envelope_from_relay_key,bumped_counter,rewound_counter}_is_rejected` |
 | A rejected envelope never poisons later state | `replay.rs::check_and_record` (record only on full pass) | `replay.rs::rejected_envelope_does_not_advance_state` |
+
+### Implementer note (task #67): monotonic-counter gate retired
+
+Behavior change (implementer statement, no verdict; independent reviewer owns the verdict):
+
+- The `ReplayGuard` monotonic-counter gate was removed. The guard now applies exactly two gates in order: freshness (`|now - ts| <= REPLAY_WINDOW_MS`) then single-use request id. Signature verification still runs first in `Envelope::open`, so the guard only ever sees authentic envelopes.
+- Motive: the counter was per-session and in-memory on both ends, seeded from the wall clock but reset on any daemon restart or phone session recreation (arm/foreground/reconnect). A guard that remembered a higher counter then dropped a genuine, user-approved envelope as a "counter regression" and the command hung. The counter was never load-bearing for replay: signature + 150s freshness + single-use uuidv7 are complete.
+- Wire/format unchanged: the `counter` field still travels in the envelope and is still covered by the signed canonical bytes (so `bumped_counter`/`rewound_counter` tamper still yields `BadSignature`). The crypto vectors (`canonicalBytes`, `open`, `combiner`, `pairingTranscript`) are byte-identical; only the `replay` vector outcomes changed to match the two-gate logic, and Rust<->TS parity holds (phone `proto:vectors` 20/20).
+- Seen-set eviction moved from count-based (`MAX_SEEN=4096` FIFO) to age-based: an `(id, ts)` is forgotten once `now - ts > REPLAY_WINDOW_MS`, because a replay of an aged-out id fails the freshness gate regardless. `MAX_SEEN` is retained only as a hard memory backstop for a same-instant burst of distinct authentic ids (a burst that already requires the sender's signing key).
+- The daemon->phone and phone->daemon wall-clock counter seeds (`remote.rs`, `session.ts`) are intentionally left in place: harmless with the counter ungated, and still needed by the already-deployed phone build (whose old guard still gates the counter) until a rebuild ships.
+
+Residuals for the security-reviewer to weigh:
+
+- **Post-restart, within-window single replay.** A guard that just started (daemon restart, or a fresh phone `ReplayGuard`) has an empty seen-set. A relay that captured an authentic envelope can replay it once inside the freshness window (`REPLAY_WINDOW_MS`, 150s) and it will pass. This is **unchanged from the counter design** (the counter also reset to 0 on restart, so a lower-counter replay was accepted post-restart too), and is bounded by the window. It is not a new hole; the window is the bound.
+- **Age-eviction soundness.** `evict_aged` only drops front entries with `now.saturating_sub(ts) > window_ms`; a still-in-window (incl. future-dated) entry stops the sweep, and an out-of-order older entry lingers harmlessly until it reaches the front or `MAX_SEEN` evicts it. Forgetting an aged-out id cannot open a replay because that id's only valid ts is now stale and fails freshness first. The reviewer should confirm the eviction predicate against a clock that can move non-monotonically within one guard's lifetime (the guard is in-memory and resets on restart, so cross-restart clock moves do not apply).
+- **Downstream prose drift.** Several verdict rows below (e.g. the ToDaemon/route_response, delivery-receipt, and resolution-broadcast sections) still describe replay as caught by "the ReplayGuard monotonic counter". Those verdicts still hold, but the mechanism is now the single-use request-id gate, not the counter. The independent reviewer should re-audit and re-word those verdicts; the implementer did not edit reviewer verdict prose per the review-integrity rule.
 
 ## 6. Biometric gating is structural (invariant #5)
 

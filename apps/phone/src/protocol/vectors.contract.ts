@@ -57,11 +57,11 @@
  *   ],
  *   "replay": [                                 // ReplayGuard state machine
  *     {
- *       "name": "counter-must-advance",
+ *       "name": "counter-is-ungated",
  *       "windowMs": 90000,
  *       "steps": [
  *         { "requestId": "<uuid>", "counter": 5, "ts": 1000000, "now": 1000000, "expectOk": true },
- *         { "requestId": "<uuid>", "counter": 3, "ts": 1000000, "now": 1000000, "expectOk": false, "expectError": "counterRegression" }
+ *         { "requestId": "<uuid>", "counter": 3, "ts": 1000000, "now": 1000000, "expectOk": true }
  *       ]
  *     }
  *   ]
@@ -120,7 +120,7 @@ export interface ReplayStep {
   ts: number;
   now: number;
   expectOk: boolean;
-  expectError?: "duplicateRequest" | "counterRegression" | "timestampOutOfWindow" | null;
+  expectError?: "duplicateRequest" | "timestampOutOfWindow" | null;
 }
 
 export interface ReplayVector {

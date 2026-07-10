@@ -324,7 +324,6 @@ fn replay_case(name: &str, window_ms: u64, steps: &[Step]) -> Value {
             let (ok, err) = match res {
                 Ok(()) => (true, Value::Null),
                 Err(ReplayError::DuplicateRequest) => (false, json!("duplicateRequest")),
-                Err(ReplayError::CounterRegression { .. }) => (false, json!("counterRegression")),
                 Err(ReplayError::TimestampOutOfWindow { .. }) => {
                     (false, json!("timestampOutOfWindow"))
                 }
@@ -348,8 +347,12 @@ fn replay_vectors() -> Vec<Value> {
     let id_c = "0190f7a1-0000-7000-8000-000000000003";
     let base = 1_720_000_000_000u64;
     vec![
+        // The counter is ungated: a lower (or reset) counter with a fresh
+        // timestamp and a new request id is now ACCEPTED, where the retired
+        // monotonic gate would have rejected the middle step. This case pins the
+        // fix so Rust and TS agree the counter no longer decides acceptance.
         replay_case(
-            "counter-must-advance",
+            "counter-is-ungated",
             REPLAY_WINDOW_MS,
             &[
                 Step {
@@ -366,7 +369,7 @@ fn replay_vectors() -> Vec<Value> {
                 },
                 Step {
                     request_id: id_c,
-                    counter: 6,
+                    counter: 0,
                     ts: base,
                     now: base,
                 },
@@ -399,6 +402,28 @@ fn replay_vectors() -> Vec<Value> {
                 ts: base,
                 now: base + REPLAY_WINDOW_MS + 1,
             }],
+        ),
+        // Age-eviction is safe: after an id is accepted and the clock advances
+        // past the window, replaying that id can only carry its original stale
+        // ts, so the freshness gate rejects it before the single-use check. Both
+        // guards must agree the late replay is a timestamp rejection.
+        replay_case(
+            "aged-out-replay-fails-freshness",
+            REPLAY_WINDOW_MS,
+            &[
+                Step {
+                    request_id: id_a,
+                    counter: 1,
+                    ts: base,
+                    now: base,
+                },
+                Step {
+                    request_id: id_a,
+                    counter: 1,
+                    ts: base,
+                    now: base + REPLAY_WINDOW_MS * 3,
+                },
+            ],
         ),
     ]
 }

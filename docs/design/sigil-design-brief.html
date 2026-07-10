@@ -625,7 +625,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
 <h3>Shipped and tested <span class="badge shipped">committed</span></h3>
 <div class="tblwrap"><table>
   <tr><th>Area</th><th>What is proven</th></tr>
-  <tr><td>Sealed protocol</td><td>the sealed and signed envelope with a single-use id, monotonic counter, and 90s replay window; any field tamper breaks the signature</td></tr>
+  <tr><td>Sealed protocol</td><td>the sealed and signed envelope with a single-use id and a freshness (replay) window; any field tamper breaks the signature. The counter still rides the signed wire but no longer gates acceptance: it reset to 0 on any restart or session recreation and dropped genuine approvals as false replays, so replay now rests on signature + freshness + single-use id</td></tr>
   <tr><td>Pairing</td><td>the full handshake: optical QR, secret-authenticated return channel, six-word SAS, unwrap-key delivery only after SAS confirmation and a fresh Secure Enclave Touch ID gate, with roughly thirty adversarial MITM proofs plus an independent review of the ordering</td></tr>
   <tr><td>Approval loop</td><td>the gated round-trip with fd passthrough: secret bytes reach the caller's fd, never the daemon; deny and timeout deliver no secret</td></tr>
   <tr><td>Leases</td><td>daemon-verified caller fingerprints, triple-scoped RAM-only grants, coalescing, TTL purge, lockdown clears all</td></tr>

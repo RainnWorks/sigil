@@ -310,18 +310,17 @@ mod tests {
     }
 
     #[test]
-    fn counter_regression_is_rejected() {
+    fn lower_counter_with_fresh_ts_and_new_id_is_accepted() {
+        // The counter no longer gates acceptance. A genuine second envelope that
+        // rides a lower (e.g. restarted) counter but carries a fresh timestamp
+        // and a new request id must open, not be dropped as a false replay. It is
+        // still a distinct signed envelope with its own uuidv7, so replay of the
+        // *first* one remains caught by the single-use id (see exact_replay).
         let link = link();
         let mut guard = ReplayGuard::new();
         let high = seal_at(&link, 5, "first");
         assert!(open(&link, &high, &mut guard).is_ok());
         let low = seal_at(&link, 3, "second");
-        assert_eq!(
-            open(&link, &low, &mut guard),
-            Err(OpenError::Replay(ReplayError::CounterRegression {
-                got: 3,
-                last: 5
-            }))
-        );
+        assert_eq!(open(&link, &low, &mut guard).unwrap(), "second");
     }
 }
