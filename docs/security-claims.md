@@ -712,7 +712,7 @@ passed / 0 failed, `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt
 |-------|----------------|--------------|---------|
 | Register-before-deposit closes the only response-loss window: the waiter is inserted under `request_id` before the request is deposited, and the phone answers only after it receives the deposit, so no response can arrive before its waiter exists | `remote.rs::round_trip` (register then `deposit_and_wait`), `remote.rs::register_waiter` | `remote::tests::an_approval_receives_its_own_response_via_the_owner` | SOUND |
 | No cross-delivery: responses route by sealed, phone-signed `request_id` (uuidv7, unique); a relay cannot forge/redirect a response (fails `Envelope::open` signature) and a response for approval A can never resolve B (distinct ids) | `remote.rs::route_response` (`waiters.get(&resp.request_id)`), `envelope.rs::open` | `remote::tests::two_concurrent_approvals_each_receive_their_own_response` (distinct DEKs asserted) | SOUND |
-| Stale/late/duplicate response cannot resurrect a grant: no waiter -> dropped; a replay is rejected by the `ReplayGuard` monotonic counter (no state change on reject, so it cannot desync a later legitimate response) | `remote.rs::route_response`, `replay.rs::check_and_record` | `hostile_relay::reordering_queued_envelopes_is_caught`, `replay` unit tests | SOUND |
+| Stale/late/duplicate response cannot resurrect a grant: no waiter -> dropped; an exact-bytes replay is rejected by the single-use uuidv7 request-id gate (a held-late copy is caught by the freshness window), and a rejected envelope changes no guard state so it cannot desync a later legitimate response [mechanism corrected under task #67: the monotonic-counter gate is retired; see the "Independent review: #67 retire the monotonic-counter replay gate" verdict below] | `remote.rs::route_response`, `replay.rs::check_and_record` | `hostile_relay::replay_of_a_delivered_envelope_is_rejected`, `replay` unit tests | SOUND |
 | Single reader: exactly one production `recv(ToDaemon)` exists (the owner); no second reader can steal a deposit | `remote.rs::run_todaemon_owner` (only `Direction::ToDaemon` `recv` in the crate) | grep-confirmed sole reader | SOUND |
 | Fail-closed on owner death: a panicked/exited owner routes no responses; every `round_trip` `recv_timeout`s to `None` -> deny. No path opens fail-open | `remote.rs::deposit_and_wait` (`Err(_) => None`), `RemoteApprover::decide` (`unwrap_or_else -> Deny`) | `daemon::tests::denied_request_fails_closed_and_delivers_no_secret` | SOUND |
 | The token path cannot influence a decision: a `PushRegister` only writes `{token, platform}` to the 0600 store; it never touches `waiters`, a DEK, or `Z_F`. The daemon signs no push; the token rides only as an opaque `PushHint` | `remote.rs::dispatch` / `record_registration`, `push_store.rs` (0600) | `remote::tests::the_owner_captures_an_arm_time_registration`, `push_store` 0600 test | SOUND |
@@ -731,13 +731,19 @@ passed / 0 failed, `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt
 
 **Accepted residuals (not defects, called out per the honesty rule):**
 
-- *Hostile-relay reordering is a denial vector, never a wrong approval.* If the
-  relay reorders `ToDaemon` envelopes so a higher counter is opened first, the
-  earlier legitimate response is rejected by the monotonic `ReplayGuard`
-  (counter regression) and dropped; its `round_trip` then times out and denies.
-  This is the intended fail-closed property (invariant #4/#7): the relay can
-  induce a denial (it can already do that by dropping), but cannot induce a grant
-  or a replay. Documented, not fixable without weakening the counter.
+- *Hostile-relay reordering is never a wrong approval.* [Updated under task #67:
+  the monotonic-counter gate is retired.] Reordering two **distinct** genuine
+  `ToDaemon` envelopes now lets both open out of order: each carries its own
+  uuidv7 and a fresh timestamp and routes by `request_id` to its own waiter, so a
+  reordered real response resolves its own approval and nothing else (this is the
+  fix's intent, the prior counter gate would have false-dropped the lower-counter
+  one). The relay still cannot induce a **grant** (a response fails
+  `Envelope::open` unless the phone actually signed it) nor a **replay**
+  (identical bytes are caught by the single-use id; a held-late copy by the
+  freshness window). Dropping or holding an envelope still only induces a denial,
+  which is fail-closed (invariant #4/#7). Proven by
+  `hostile_relay::reordering_distinct_envelopes_is_accepted` and
+  `replay_of_a_delivered_envelope_is_rejected`.
 - *Owner liveness is a single point of failure for the doorbell, but fail-closed.*
   A poisoned `waiters`/`guard` mutex (only reachable if a `round_trip` panics
   while holding it) or an owner panic stops response routing; all in-flight and
@@ -1496,15 +1502,18 @@ fail-closed.
   delivery_receipt_rides_the_sealed_signed_replay_protected_envelope` proves a
   ciphertext bit-flip -> `BadSignature` (no forge) and an exact-bytes replay ->
   `Replay(DuplicateRequest)` (no re-mark). A hostile relay cannot fabricate one.
-- **(c) Cannot desync the shared monotonic ReplayGuard: GREEN.** The guard is
-  consumed at envelope-open, before classification, identically for every
-  inbound kind, matching the phone's single monotonic outbound counter. A
-  `Delivered` advances `last_counter` exactly as a `Response` would. Worst case
-  under relay reordering (hold a `Response`, deliver a later `Delivered` first)
-  is a `CounterRegression` rejection of the delayed message, i.e. fail-closed
-  deny of the *display or the decision*, never a bypass. `mark_delivered` itself
-  only sets `delivered_at_ms` when unset (idempotent; duplicate/unknown/late =
-  no-op).
+- **(c) Cannot desync the shared ReplayGuard: GREEN.** [Mechanism corrected
+  under task #67: the monotonic-counter gate is retired; the guard is now
+  freshness + single-use id, see the #67 verdict below.] The guard is consumed at
+  envelope-open, before classification, identically for every inbound kind. A
+  `Delivered` records its uuidv7 in the seen-set exactly as a `Response` would;
+  there is no counter to regress, and reordering two *distinct* inbound envelopes
+  no longer rejects either (each has its own id). A replayed `Delivered`
+  (identical bytes) is still rejected as `DuplicateRequest`, and a held-late one
+  by freshness, so it can never re-mark delivery. `mark_delivered` is
+  additionally idempotent (sets `delivered_at_ms` only when unset;
+  duplicate/unknown/late = no-op), so even a would-be re-delivery is a no-op.
+  Fail-closed either way.
 - **(d) `pending` surface is display-only; no local-approval bypass: GREEN.**
   Remote in-flight requests are enumerated onto `pending_json` from
   `RemoteApprover::pending_snapshot` (names/provenance only, an
@@ -2220,4 +2229,143 @@ closed denial). Before enabling in an actively-hostile-LAN posture, close R-#51-
 (or run `DepositPolicy::Mirror`, which removes the in-flight-starvation window
 entirely at the cost of always also using the relay) so a promotion cannot cost an
 in-flight relay approval a full-timeout denial.**
+
+---
+
+## Independent review: #67 retire the monotonic-counter replay gate (`1e5ba76`)
+
+Reviewed by the independent security-reviewer (did **not** author this change).
+Scope: the replay guard rewrite at `1e5ba76` on `feat/config-rule-engine` —
+`replay.rs`, `envelope.rs`, `export-vectors.rs`, the phone mirror `replay.ts`,
+and the hostile-relay / vector suites. The counter gate is removed; the guard is
+now two gates in order: (1) freshness `|now - ts| <= REPLAY_WINDOW_MS`, then
+(2) single-use uuidv7 request id, with the seen-set evicted by age (drop ids
+whose `ts` has aged past the window) plus a `MAX_SEEN = 4096` hard backstop. The
+`counter` field still rides the signed wire but is no longer gated.
+
+**Gate results.** `cargo test --workspace` all green (250 + 92 + 18 hostile-relay
++ 26 pairing-mitm + the rest, 0 failed; one pre-existing flaky loopback-TCP test,
+`remote::tests::the_acceptor_loop_promotes_a_dialled_phone`, failed once under
+heavy parallel load then passed 5/5 in isolation and on the full re-run — it is in
+`#51` direct-transport, untouched by #67, and passes on the parent commit too:
+not a #67 regression). `cargo clippy --workspace --all-targets -- -D warnings`
+clean (exit 0). `cargo fmt --check` clean. Phone: `tsc --noEmit` clean;
+`proto:selftest` all green; `proto:vectors` 20 passed / 0 failed.
+
+**1. Replay is still fully caught: GREEN.** The security question — does dropping
+the counter open any replay the id+freshness gates do not catch — is answered no.
+   - *Same-id replay in window* -> `DuplicateRequest` (`replay.rs::duplicate_request_id_is_rejected`,
+     `envelope.rs::exact_replay_is_rejected`, `hostile_relay::replay_of_a_delivered_envelope_is_rejected`).
+   - *Stale or future ts beyond the window* -> `TimestampOutOfWindow`
+     (`stale_timestamp_beyond_window_is_rejected`, `future_timestamp_beyond_window_is_rejected`,
+     `an_envelope_held_past_the_window_is_rejected`).
+   - *Any tamper, including the ungated counter* -> `BadSignature`: `counter` is
+     still in `canonical_bytes` (`envelope.rs:97`, `e.counter.to_be_bytes()`) and
+     the signature is verified before the guard runs
+     (`any_field_tamper_breaks_the_signature`, `hostile_relay::{bumped,rewound}_counter_is_rejected`).
+   - *Force-evict-then-replay* is **not** reachable. Age-eviction drops an id only
+     once `now - ts > window_ms` — at which point any replay carrying that id can
+     only carry its original (now-stale) `ts`, which fails the freshness gate
+     *before* the single-use check runs (`a_replay_after_the_id_ages_out_is_caught_by_freshness`,
+     vector `aged-out-replay-fails-freshness`). The attacker cannot supply a fresh
+     `ts` for an old id because `ts` is inside `canonical_bytes` and re-timestamping
+     breaks the signature. `evict_aged` pops only front entries provably past the
+     window and stops at the first still-in-window (or future-dated) entry, so an
+     in-window id is never evicted by the age sweep.
+   - *`MAX_SEEN` weaponization* is not feasible as a replay lever. Evicting an
+     in-window target id via the backstop requires pushing `4096` **authentic,
+     unforgeable, distinct** envelopes (each a valid Ed25519 signature under the
+     sender's pinned key, each a distinct uuidv7) into a single freshness window
+     ahead of it. The relay holds no signing key, so it cannot manufacture even
+     one; only the genuine sender could, and a sender attacking its own replay
+     guard gains nothing (it can already send). For a single-user personal
+     instrument this is an acceptable, clearly-bounded residual, not a live hole.
+   Net: every replay the retired three-gate design caught is still caught by
+   signature + freshness + single-use. The counter was never the load-bearing
+   gate for replay.
+
+**2. Rust<->TS parity: GREEN, with one pre-existing out-of-scope divergence
+noted (P2).** The two guards are logically identical (freshness then single-use;
+age eviction; `MAX_SEEN = 4096`; no state change on reject) and the regenerated
+KAT vectors drive **both** guards at the same `windowMs = 150000` (the vectors
+carry `windowMs` explicitly and `verify-vectors.ts` passes `r.windowMs` into the
+TS guard), so `proto:vectors` 20/20 proves accept/reject agreement across the
+retired-counter cases (`counter-is-ungated`, `duplicate-request-id`,
+`timestamp-out-of-window`, `aged-out-replay-fails-freshness`). No divergence lets
+one guard accept a *replay* the other rejects.
+   - **P2 (pre-existing, NOT introduced by #67).** The production default freshness
+     window differs between sides: `sigil-proto::REPLAY_WINDOW_MS = 150_000`
+     (`lib.rs:51`, bumped 90k->150k back in `4779473`) but the phone's
+     `replay.ts::REPLAY_WINDOW_MS = 90_000` (unchanged since the original
+     `ecafed8`), and `envelope.ts` opens with that 90s default. #67 touched
+     neither constant. Direction of the mismatch is fail-safe: the daemon opens
+     phone->daemon at 150s, the phone opens daemon->phone at the **stricter** 90s,
+     the same envelope is never checked by both windows, and a shorter window can
+     only *reject* more (never admit a replay the longer one would reject). Worst
+     case is the phone rejecting a genuine daemon->phone `ResolutionBroadcast`
+     whose clock skew lands in the 90–150s band — a fail-closed robustness bug, not
+     a replay admission. Also the `replay.ts:23` comment "Matches proto
+     REPLAY_WINDOW_MS" is now false. Recommend aligning the phone constant to
+     `150_000` (or exporting one shared value) and fixing the comment; out of
+     scope for #67's soundness, filed here as an honesty residual.
+
+**3. Envelope / crypto unchanged: GREEN.** `canonical_bytes` is untouched and
+still length-prefixes and covers `counter` and `ts`; `seal`/`open`'s crypto legs
+are unchanged. `export-vectors.rs`'s diff is confined to the `replay` section
+(removing the `CounterRegression` match arm, renaming `counter-must-advance` ->
+`counter-is-ungated`, adding `aged-out-replay-fails-freshness`); the
+`canonicalBytes` / `open` / `combiner` / `pairingTranscript` generators are
+byte-for-byte identical, confirmed by regenerating the vectors and observing a
+zero diff against the committed `sigil-vectors.json`. Only `replay`-vector
+outcomes changed. `envelope.rs`'s only diff is a renamed test.
+
+**4. Post-restart window: GREEN, unchanged residual.** A fresh guard (daemon
+restart or new phone `ReplayGuard`) has an empty seen-set, so a relay that
+captured an authentic envelope can replay it once within the freshness window and
+it will pass. This is **identical to the retired counter design** — the in-memory
+counter also reset to 0 on restart, so a captured lower-counter envelope was
+equally replayable post-restart — and is bounded by `REPLAY_WINDOW_MS = 150_000`
+(**150 seconds**, `lib.rs:51`). It is not a new hole; the window is the bound.
+Recorded already as a residual in the §"Two-gate guard" implementer note.
+
+**5. Stale verdict prose re-audited and corrected.** Three prior verdicts
+described replay as caught by "the ReplayGuard monotonic counter"; re-audited
+under the new mechanism, the *verdicts* still hold (replay is caught by the
+single-use id, backed by freshness) but the *mechanism prose* was wrong and one
+test reference was broken. Corrected in place:
+   - **route_response row** (§Demux owner): rewritten to attribute rejection to
+     the single-use uuidv7 gate; the cited test
+     `hostile_relay::reordering_queued_envelopes_is_caught` did not exist (the
+     current test is `reordering_distinct_envelopes_is_accepted`, opposite
+     semantics) and was repointed to `replay_of_a_delivered_envelope_is_rejected`.
+   - **reordering residual** (§Accepted residuals): the old text claimed reorder
+     of distinct envelopes is a counter-regression **denial**; under #67 reorder
+     of distinct envelopes is **accepted** (each routes by its own id), so the
+     residual was inverted and is rewritten. The relay still cannot force a grant
+     or a replay.
+   - **#41 delivery receipt item (c)**: "shared monotonic ReplayGuard" /
+     "advances `last_counter`" / "`CounterRegression` rejection" corrected to the
+     single-use-id mechanism; the GREEN verdict stands.
+   The resolution-broadcast section (§#36) still references the per-session
+   *outbound* counter that legitimately survives on the wire, and its
+   replay-rejection claim remains sound via the single-use id; left as-is (the
+   counter it names is the sender's, not a receive-side gate).
+
+**Cross-cutting invariants (spot-check): intact.** Signature-before-guard order
+preserved (invariant on authenticity); a rejected envelope mutates no guard state
+(`rejected_envelope_does_not_advance_state`), so it cannot poison a later
+legitimate one; everything still fails closed (unknown skew / dead clock / restart
+all deny by rejecting or timing out); no secret bytes touch the guard; the relay
+remains powerless (it holds no signing key, so it can neither forge a fresh id nor
+re-timestamp an old one). Zeroize/DEK lifetimes untouched by this change.
+
+**VERDICT: SOUND. Retiring the monotonic counter is safe.** Replay protection is
+complete without it — signature (before the guard) + a 150s freshness window +
+single-use uuidv7, with age-based eviction that provably cannot open a replay and
+a `MAX_SEEN` backstop that cannot be weaponized without the sender's signing key.
+No replay reachable under the new guard was caught by the old three-gate design.
+Green on all five scoped items and on the cross-cutting invariants. One
+pre-existing, out-of-scope, fail-closed parity residual (item 2: phone freshness
+window 90s vs daemon 150s) is recommended for a follow-up alignment; it is not a
+replay hole and does not block this change.**
 
