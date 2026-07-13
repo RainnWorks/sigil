@@ -90,11 +90,12 @@ export function ApprovalSheet({
     setBusy(true);
     setGateNote(null);
     // The biometric is mandatory and non-negotiable; the settings toggle never
-    // removes it. When a live pairing is armed, reading the DEK / running the
-    // enclave key-agreement behind Face ID IS that gate (it seals the response
-    // back to the daemon over the relay); when unpaired (dev/demo), faceGate
-    // stands in. A non-"sent" live outcome only tells us the decision did not
-    // leave this phone; it never carries knowledge of the Mac's state.
+    // removes it. When a live pairing is armed, the Face ID gate (the enclave
+    // key-agreement for a threshold secret, or the bare gate for a plain gate) IS
+    // that gate and seals the response back to the daemon over the relay; when
+    // unpaired (dev/demo), faceGate stands in. A non-"sent" live outcome only
+    // tells us the decision did not leave this phone; it never carries knowledge
+    // of the Mac's state.
     if (isArmed()) {
       const outcome = await liveApprove(request, leaseWindow ? { lease: leaseWindow } : {});
       if (outcome !== "sent") {

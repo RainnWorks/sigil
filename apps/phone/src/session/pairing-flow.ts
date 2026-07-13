@@ -13,39 +13,32 @@
  *                   it, pins this phone, and shows its own six words.
  *   3. sas        - the human compares the six words on both screens (the backstop
  *                   against a leaked secret or a tag-path bug). A match proceeds.
- *   4. deliver    - poll the rendezvous mailbox's `to-phone` for the daemon's
- *                   sealed DEK (message 3), open it, recover the DEK, and store
- *                   it behind Face ID; then arm the live approval session.
+ *   4. finish     - persist the pairing and arm the live approval session. The
+ *                   ceremony delivers no key: after SAS the phone holds only its
+ *                   own identity and its Secure-Enclave share `f` (whose public
+ *                   `F` already rode message 1), so there is nothing to wait for.
  *
  * v4: both the rendezvous mailbox and the steady-state mailbox speak the same
  * plain-HTTP deposit/drain contract (`transport/relay-http.ts`), just keyed
  * differently - there is no persistent connection anywhere.
  *
  * Real key custody: the Ed25519 + X25519 private halves are generated on-device;
- * the DEK is written to the biometric-tier keystore item. See keystore.ts for the
- * on-device NEEDS-VERIFICATION notes.
+ * the Secure-Enclave share `f` is minted non-exportably in the enclave. Nothing
+ * self-sufficient at rest ever leaves this device; see keystore.ts.
  */
 import {
   buildPairingResponse,
   type DeviceIdentity,
-  type Envelope,
-  envelopeFromWire,
-  EnvelopeOpenError,
-  type EnvelopeWire,
-  agreementSecretKey,
   fingerprintWords,
   generateDeviceIdentity,
   loadSodium,
   mailboxId,
-  open,
   type PairingPayload,
   pairingFromQrString,
   pairingResponseToSubmitString,
   type PeerIdentity,
   peerIdentity,
-  recoverDek,
   rendezvousMailbox,
-  ReplayGuard,
   type Sodium,
 } from "@/src/protocol";
 import { RelayMailbox, relayBaseFromEndpoints } from "@/src/transport/relay-http";
@@ -64,8 +57,6 @@ const PHONE_SE_KEY_ID = "phone-se.v2";
 
 /** QR / pairing-secret lifetime, matching proto `PAIRING_SECRET_TTL_MS` (180s). */
 const PAIRING_SECRET_TTL_MS = 180_000;
-/** How long to wait on the rendezvous mailbox for the sealed DEK. */
-const DEK_WAIT_MS = 60_000;
 
 export class PairingExpiredError extends Error {
   constructor() {
@@ -85,11 +76,10 @@ const GENERIC_FAILURE_COPY = "Pairing could not complete. Try again from the Mac
 
 /**
  * House-style copy for a pairing failure, in place of the raw thrown message.
- * The user must never see a technical string like "the delivered key
- * envelope was malformed" or an `EnvelopeOpenError`'s signature/replay/decrypt
- * detail - those are exactly the kind of thing a MITM or a protocol bug would
- * produce, and none of them are actionable to a human either way. The raw
- * cause is logged (for a bug report), never rendered.
+ * The user must never see a technical string like a relay error's internals or a
+ * MAC/replay detail - those are exactly the kind of thing a MITM or a protocol
+ * bug would produce, and none of them are actionable to a human either way. The
+ * raw cause is logged (for a bug report), never rendered.
  */
 export function describePairingError(e: unknown): string {
   // eslint-disable-next-line no-console
@@ -98,21 +88,14 @@ export function describePairingError(e: unknown): string {
   if (e instanceof PairingExpiredError) return e.message; // already house copy
 
   const message = e instanceof Error ? e.message : String(e);
-  if (message === "no scanned pairing to respond to" || message === "pairing is not ready to receive the DEK") {
+  if (message === "no scanned pairing to respond to" || message === "pairing is not ready to complete") {
     return LOST_PLACE_COPY;
   }
-  if (message === "timed out waiting for the Mac to deliver the key") {
-    return "The Mac didn't respond in time. Make sure it's on the same network and try again.";
-  }
-  if (message.startsWith("relay to-daemon:") || message.startsWith("relay to-phone:")) {
+  if (message.startsWith("relay to-daemon:")) {
     return "Could not reach the Mac over the relay. Check the connection and try again.";
   }
-  if (e instanceof EnvelopeOpenError) {
-    return GENERIC_FAILURE_COPY;
-  }
-  // "the delivered key envelope was malformed", a keystore write failure, a
-  // bare network exception, or anything else unrecognized: the same safe
-  // fallback, never the raw cause.
+  // A keystore write failure, a bare network exception, or anything else
+  // unrecognized: the same safe fallback, never the raw cause.
   return GENERIC_FAILURE_COPY;
 }
 
@@ -222,60 +205,33 @@ export async function submitPairingResponse(): Promise<void> {
 }
 
 /**
- * Message 3: poll the rendezvous mailbox's `to-phone` for the daemon's sealed
- * DEK, open it (verify the daemon's signature, replay-check, decrypt), recover
- * the DEK, store it behind Face ID, persist the pairing (including the v2 SE
- * key id, whose `F` was already delivered on message 1), and arm the live
- * approval session. Called only after the human confirmed the SAS. Throws on
- * timeout or a bad DEK envelope (fail closed).
+ * Finish the ceremony after the human confirmed the SAS: persist the pairing
+ * (including the v2 SE key id, whose `F` already rode message 1) and arm the live
+ * approval session. The ceremony delivers no key, so there is nothing to poll for
+ * and nothing to open here - the phone holds only its identity and its non-
+ * exportable Secure-Enclave share `f`, and every secret release is a per-request
+ * threshold partial. Throws (fail closed) only if the in-memory ceremony is
+ * missing a piece it needs to persist.
  */
-export async function awaitDekDelivery(): Promise<void> {
-  const s = await sod();
+export async function finishPairing(): Promise<void> {
   const c = ceremony;
-  if (!c?.scanned || !c.rendezvous || !c.relayBase || !c.mailbox || !c.confirmWords) {
-    throw new Error("pairing is not ready to receive the DEK");
+  if (!c?.scanned || !c.relayBase || !c.mailbox || !c.confirmWords) {
+    throw new Error("pairing is not ready to complete");
   }
-  const rendezvous = new RelayMailbox(c.relayBase, c.rendezvous);
-  const wire = await rendezvous.waitOne(DEK_WAIT_MS);
-  if (!wire) {
-    throw new Error("timed out waiting for the Mac to deliver the key");
-  }
-
-  let env: Envelope;
-  try {
-    env = envelopeFromWire(JSON.parse(wire) as EnvelopeWire);
-  } catch {
-    throw new Error("the delivered key envelope was malformed");
-  }
-
-  // Open the DEK-delivery envelope: signed by the pinned daemon, sealed to this
-  // phone. A fresh guard: this is the first (and only) message on this pairing.
-  const payload = open<number[]>(s, env, {
-    sender: c.scanned.daemon,
-    recipientAgreementSecret: agreementSecretKey(s, c.phone),
-    guard: new ReplayGuard(),
-  });
-  const dek = recoverDek(payload);
 
   // v2: the phone's SE share `F` was already delivered to the Mac ON message 1
-  // (as `se_share_pub`, bound into the confirmation MAC — see
-  // submitPairingResponse), so there is nothing to send here. Persist the SE key
-  // id so per-request approvals can reload `f`; absent on a v1 (no-SE) pairing.
-  const seKeyId = c.seKeyId;
-
-  await savePairing(
-    {
-      phone: c.phone,
-      daemonPub: c.scanned.daemon,
-      mailbox: c.mailbox,
-      relayBase: c.relayBase,
-      sasWords: c.confirmWords,
-      pairedAt: Date.now(),
-      ...(seKeyId ? { seKeyId } : {}),
-    },
-    dek,
-  );
-  dek.fill(0);
+  // (as `se_share_pub`, bound into the confirmation MAC - see
+  // submitPairingResponse). Persist the SE key id so per-request approvals can
+  // reload `f`; absent on a v1 (no-SE) pairing.
+  await savePairing({
+    phone: c.phone,
+    daemonPub: c.scanned.daemon,
+    mailbox: c.mailbox,
+    relayBase: c.relayBase,
+    sasWords: c.confirmWords,
+    pairedAt: Date.now(),
+    ...(c.seKeyId ? { seKeyId: c.seKeyId } : {}),
+  });
   await armLiveSession();
 }
 

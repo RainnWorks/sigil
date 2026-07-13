@@ -73,8 +73,9 @@ export class MockTransport implements Transport {
       recipientAgreementSecret: agreementSecretKey(this.cfg.sodium, this.cfg.daemon),
       guard: this.inboundGuard,
     });
-    // In the real daemon this unwraps the DEK and spawns op; here we just prove
-    // the response was authentic and well-formed.
+    // In the real daemon this combines the phone's partial with the Mac share to
+    // open the secret and runs the gated command; here we just prove the response
+    // was authentic and well-formed.
     // eslint-disable-next-line no-console
     console.log(`[mock daemon] response ${response.decision} for ${response.requestId}`);
   }

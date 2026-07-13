@@ -64,7 +64,7 @@ export function demoRoutineRequest(): ApprovalRequest {
 
 /**
  * A v2 threshold read: elevated, carrying a ThresholdChallenge so the approve
- * path exercises the Secure Enclave partial (Z_F) instead of a DEK. The
+ * path exercises the Secure Enclave partial (Z_F). The
  * `ephemeralPub` is a real on-curve P-256 X9.63 point (from the shared combiner
  * vectors), so on-device validation and key-agreement have a valid E to work on.
  */

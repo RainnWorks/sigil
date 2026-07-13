@@ -112,13 +112,14 @@ export class SigilSession {
 
   /**
    * Seal and send a decision. The caller MUST have passed the Face ID gate for
-   * an approval before invoking this; there is no unguarded approve path.
-   * `wrappedDek` would be produced by the enclave re-wrap on device.
+   * an approval before invoking this; there is no unguarded approve path. The
+   * optional `partial` is the phone's threshold `Z_F`, produced by the Secure
+   * Enclave key-agreement; a plain gate approve carries none.
    */
   async respond(
     request: ApprovalRequest,
     decision: Decision,
-    extras: Pick<ApprovalResponse, "wrappedDek" | "partial" | "lease" | "block"> = {},
+    extras: Pick<ApprovalResponse, "partial" | "lease" | "block"> = {},
   ): Promise<void> {
     const response: ApprovalResponse = {
       requestId: request.requestId,
