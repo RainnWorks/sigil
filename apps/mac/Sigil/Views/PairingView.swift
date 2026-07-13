@@ -1,6 +1,6 @@
 //  PairingView.swift
-//  The QR + six-word fingerprint ceremony, the paired-device list, the "Enable
-//  Mac approvals" toggle and its hardened phone-only opposite.
+//  The QR + six-word fingerprint ceremony and the paired-device list. Approving
+//  is the phone's job, so there is no local-approval toggle here.
 
 import SwiftUI
 
@@ -23,7 +23,6 @@ struct PairingView: View {
                 if let error = model.lastError { ErrorStrip(message: error) }
                 if let paired = model.paired {
                     pairedList(paired)
-                    macApprovalsToggle
                     Divider()
                     Text("Re-pair").font(.system(size: 13, weight: .semibold))
                     Text("Pairing again replaces the current phone.")
@@ -65,37 +64,6 @@ struct PairingView: View {
                     Spacer()
                     Button("Unpair", role: .destructive) { Task { await model.unpair() } }
                         .buttonStyle(.glass).controlSize(.small)
-                }
-            }
-        }
-    }
-
-    private var macApprovalsToggle: some View {
-        let enabled = model.macApprovalsMode == .enabled
-        return Section(title: "Mac approvals",
-                       subtitle: "Local approval is a real factor: a live Touch ID unwraps the DEK inside the Secure Enclave. Malware running as you cannot fake it.") {
-            VStack(alignment: .leading, spacing: 10) {
-                Toggle(isOn: Binding(
-                    get: { enabled },
-                    set: { on in Task { await model.setMacApprovals(on ? .enabled : .hardenedPhoneOnly) } }
-                )) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Enable Mac approvals").font(.system(size: 12, weight: .medium))
-                        Text(enabled
-                             ? "This Mac holds a Secure Enclave envelope of the DEK; the menubar can approve under Touch ID."
-                             : "Hardened, phone-only. This Mac cannot approve; every request needs the iPhone.")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                    }
-                }
-                .toggleStyle(.switch)
-                .tint(Palette.seaGreen)
-
-                if !model.approver.biometricsAvailable {
-                    HStack(spacing: 6) {
-                        Image(systemName: "exclamationmark.triangle").foregroundStyle(Palette.brass)
-                        Text("No usable Touch ID on this Mac. Approvals stay phone-only.")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                    }
                 }
             }
         }
@@ -201,13 +169,13 @@ struct PairingView: View {
 
 #Preview("Paired") {
     NavigationStack { PairingView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle)))
         .frame(width: 640, height: 640)
 }
 
 #Preview("Unpaired") {
     NavigationStack { PairingView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .failClosed), approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .failClosed)))
         .frame(width: 640, height: 560)
 }
 
@@ -215,7 +183,7 @@ struct PairingView: View {
     // The state a silently-failed Unpair would otherwise hide: lastError set,
     // the paired device still shown (the optimistic-UI bug this closes would
     // have shown "unpaired" here instead).
-    let model = AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover())
+    let model = AppModel(daemon: MockDaemonClient(scenario: .armedIdle))
     model.lastError = "daemon unreachable: socket not listening"
     return NavigationStack { PairingView() }
         .environment(model)

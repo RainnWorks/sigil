@@ -428,15 +428,14 @@ private func previewLayeredConfig() -> SigilConfig {
 
 #Preview("Rules") {
     NavigationStack { RulesView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle)))
         .frame(width: 720, height: 640)
 }
 
 // The precedence the drag-to-reorder exists to author, at a comfortable width.
 #Preview("Rules - ordering") {
     NavigationStack { RulesView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: previewLayeredConfig()),
-                              approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: previewLayeredConfig())))
         .frame(width: 720, height: 640)
 }
 
@@ -445,14 +444,12 @@ private func previewLayeredConfig() -> SigilConfig {
 // never overflowing into a horizontal scroll.
 #Preview("Rules - narrow") {
     NavigationStack { RulesView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: previewLayeredConfig()),
-                              approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: previewLayeredConfig())))
         .frame(width: 360, height: 620)
 }
 
 #Preview("Rules - empty") {
     NavigationStack { RulesView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: SigilConfig()),
-                              approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: SigilConfig())))
         .frame(width: 720, height: 640)
 }

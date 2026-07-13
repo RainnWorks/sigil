@@ -1,6 +1,8 @@
 //  MenubarContent.swift
-//  The menubar pulse: pending requests with Touch ID approve and deny, quick
-//  lockdown, a recent-decision peek, and Open Sigil. Admin lives in the window;
+//  The menubar pulse: pending requests with a deny and an "approve on iPhone"
+//  pointer, quick lockdown, a recent-decision peek, and Open Sigil. Approving is
+//  the phone's job (a request unseals only with the phone's per-approval
+//  partial), so this Mac never approves locally. Admin lives in the window;
 //  nothing heavier lives here.
 
 import SwiftUI
@@ -46,9 +48,6 @@ struct MenubarContent: View {
             Text("sigil").font(.mono(13, weight: .medium)).foregroundStyle(Palette.cobalt)
             StatePill(tone: tone)
             Spacer()
-            if model.macApprovalsMode == .hardenedPhoneOnly {
-                Text("phone-only").font(.system(size: 10)).foregroundStyle(.secondary)
-            }
         }
         .padding(.horizontal, 12).padding(.bottom, 6)
     }
@@ -66,8 +65,6 @@ struct MenubarContent: View {
                     ForEach(model.pending) { req in
                         PendingCard(request: req, now: context.date,
                                     reduceMotion: model.settings.reduceMotion,
-                                    canApproveLocally: model.macApprovalsMode == .enabled,
-                                    onApprove: { lease in Task { await model.approveLocally(req, lease: lease) } },
                                     onDeny: { Task { await model.deny(req) } })
                     }
                 }
@@ -127,13 +124,12 @@ struct MenubarContent: View {
 }
 
 /// A pending request in the menubar: the readout well, provenance, gauge, and
-/// the approve/deny controls. Approve is the bespoke sea-green capsule.
+/// the deny control. Approving happens on the iPhone, so the card points there
+/// and never offers a local approve.
 private struct PendingCard: View {
     let request: PendingRequest
     let now: Date
     var reduceMotion: Bool
-    let canApproveLocally: Bool
-    let onApprove: (_ lease: Bool) -> Void
     let onDeny: () -> Void
 
     var body: some View {
@@ -174,34 +170,16 @@ private struct PendingCard: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            if canApproveLocally {
-                HStack(spacing: 8) {
-                    // When a lease is on offer the pair reads once-vs-window, matching
-                    // the phone ("Approve once" beside "Keep approved for ...").
-                    ApproveCapsule(title: request.leasable ? "Approve once" : "Approve", enabled: true) { onApprove(false) }
-                    Button("Deny", role: .destructive, action: onDeny)
-                        .buttonStyle(.glass)
-                        .tint(Palette.rust)
-                }
-                // The lease affordance appears only when the matched rule permits
-                // one; a run-once rule never offers it (the daemon would refuse it).
-                if request.leasable {
-                    Button(request.maxLeaseSecs.map { "Keep approved for \(LeaseDuration.short($0))" }
-                           ?? "Keep approved for a while") { onApprove(true) }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 10))
-                        .foregroundStyle(Palette.seaGreen)
-                }
-            } else {
-                // Hardened / phone-only: degrade, never error.
-                HStack(spacing: 6) {
-                    Image(systemName: "iphone").foregroundStyle(Palette.cobalt).font(.system(size: 11))
-                    Text("Approve on iPhone. This Mac holds no approval envelope.")
-                        .font(.system(size: 10)).foregroundStyle(.secondary)
-                }
-                Button("Deny", role: .destructive, action: onDeny)
-                    .buttonStyle(.glass).tint(Palette.rust).controlSize(.small)
+            // Approving is the phone's job: a request unseals only with the
+            // phone's per-approval partial, so the Mac points there. Deny needs
+            // nothing and stays here.
+            HStack(spacing: 6) {
+                Image(systemName: "iphone").foregroundStyle(Palette.cobalt).font(.system(size: 11))
+                Text("Approve on your iPhone.")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
             }
+            Button("Deny", role: .destructive, action: onDeny)
+                .buttonStyle(.glass).tint(Palette.rust).controlSize(.small)
         }
         .padding(12)
         .background(.background.secondary, in: .rect(cornerRadius: 12))
@@ -210,26 +188,20 @@ private struct PendingCard: View {
 
 #Preview("Menubar pending") {
     MenubarContent(openConfigurator: {})
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .pendingRequests), approver: MockApprover()))
-        .frame(width: 320)
-}
-
-#Preview("Menubar hardened") {
-    MenubarContent(openConfigurator: {})
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .hardenedPhoneOnly), approver: MockApprover(macApprovalsEnabled: false)))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .pendingRequests)))
         .frame(width: 320)
 }
 
 #Preview("Menubar locked") {
     MenubarContent(openConfigurator: {})
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .lockedDown), approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .lockedDown)))
         .frame(width: 320)
 }
 
 #Preview("Menubar deny failed") {
     // The state a silently-failed deny would otherwise hide: lastError set,
     // nothing else about the popover changed.
-    let model = AppModel(daemon: MockDaemonClient(scenario: .pendingRequests), approver: MockApprover())
+    let model = AppModel(daemon: MockDaemonClient(scenario: .pendingRequests))
     model.lastError = "daemon unreachable: socket not listening"
     return MenubarContent(openConfigurator: {})
         .environment(model)

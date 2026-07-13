@@ -84,6 +84,6 @@ private struct LeaseRow: View {
 
 #Preview {
     NavigationStack { LeasesView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle)))
         .frame(width: 640, height: 480)
 }

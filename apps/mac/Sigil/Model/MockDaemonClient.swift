@@ -9,11 +9,10 @@
 import Foundation
 
 /// A tunable scenario so previews and the running app can select a state (armed,
-/// pending, hardened, locked down, fail-closed).
+/// pending, locked down, fail-closed).
 enum MockScenario: Sendable {
     case armedIdle          // paired, armed, nothing pending
     case pendingRequests    // two requests waiting
-    case hardenedPhoneOnly  // paired but Mac approvals off
     case biometricOnly      // no phone; biometric factor
     case failClosed         // no factor at all
     case lockedDown
@@ -25,7 +24,6 @@ actor MockDaemonClient: DaemonClient {
     private var historyStore: [HistoryEntry]
     private var pendingStore: [PendingRequest]
     private var paired: PairedDevice?
-    private var macMode: MacApprovalsMode
     private var locked: Bool
     private var appSettings: AppSettings
     private var configStore: SigilConfig
@@ -39,8 +37,8 @@ actor MockDaemonClient: DaemonClient {
     /// build. Defaults to running for every scenario except fail-closed.
     private var running: Bool
     /// Sealed inline env values, by source name: the mock's stand-in for the
-    /// DEK-sealed blob. Never read back to the UI (the readout is keys-only via
-    /// the source's `keys`); kept only so set/unset and edits behave faithfully.
+    /// threshold-sealed blob. Never read back to the UI (the readout is keys-only
+    /// via the source's `keys`); kept only so set/unset and edits behave faithfully.
     private var envValues: [String: [(String, String)]] = [:]
 
     init(scenario: MockScenario = .armedIdle, config: SigilConfig = Fixtures.config,
@@ -52,7 +50,6 @@ actor MockDaemonClient: DaemonClient {
         self.historyStore = Fixtures.history
         self.pendingStore = (scenario == .pendingRequests) ? Fixtures.pending : []
         self.paired = (scenario == .biometricOnly || scenario == .failClosed) ? nil : Fixtures.paired
-        self.macMode = (scenario == .hardenedPhoneOnly) ? .hardenedPhoneOnly : .enabled
         self.locked = (scenario == .lockedDown)
         self.appSettings = Fixtures.settings
         self.configStore = config
@@ -198,7 +195,7 @@ actor MockDaemonClient: DaemonClient {
         historyStore.insert(.init(id: id, kind: req.kind, label: req.title,
                                   account: "Rowm work", process: req.provenance.processChain.joined(separator: " > "),
                                   cwd: req.provenance.cwd, decision: .approved, note: nil,
-                                  at: Date(), via: "biometric"), at: 0)
+                                  at: Date(), via: "phone"), at: 0)
         if lease {
             leasesStore.insert(.init(grantHex: String(UUID().uuidString.prefix(12)).lowercased(),
                                      caller: req.provenance.processChain.last ?? "op",
@@ -216,7 +213,7 @@ actor MockDaemonClient: DaemonClient {
         historyStore.insert(.init(id: id, kind: req.kind, label: req.title, account: "Rowm work",
                                   process: req.provenance.processChain.joined(separator: " > "),
                                   cwd: req.provenance.cwd, decision: .denied, note: "denied at the Mac",
-                                  at: Date(), via: "biometric"), at: 0)
+                                  at: Date(), via: "phone"), at: 0)
         return .ok(lines: ["denied"])
     }
 
@@ -256,8 +253,6 @@ actor MockDaemonClient: DaemonClient {
         paired = nil
         return .ok(lines: ["phone unpaired; the daemon will fail closed until you pair again"])
     }
-
-    func setMacApprovals(_ mode: MacApprovalsMode) { macMode = mode }
 
     func installShim() -> ControlResult {
         .ok(lines: ["shim installed", "~/.sigil/bin/op -> /usr/local/bin/sigil"])

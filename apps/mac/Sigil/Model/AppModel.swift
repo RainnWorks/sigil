@@ -1,7 +1,7 @@
 //  AppModel.swift
-//  The app's single source of truth. Holds the DaemonClient and the local
-//  approver seams, polls the daemon for status/leases/pending, and exposes the
-//  actions the window and menubar drive. @MainActor because it feeds SwiftUI.
+//  The app's single source of truth. Holds the DaemonClient seam, polls the
+//  daemon for status/leases/pending, and exposes the actions the window and
+//  menubar drive. @MainActor because it feeds SwiftUI.
 
 import SwiftUI
 import Observation
@@ -9,9 +9,8 @@ import Observation
 @MainActor
 @Observable
 final class AppModel {
-    // Seams (swapped for mocks in previews / dev).
+    // Seam (swapped for a mock in previews / dev).
     let daemon: DaemonClient
-    let approver: LocalApprovalService
 
     // Observed state.
     private(set) var status: StatusReport?
@@ -51,17 +50,12 @@ final class AppModel {
     private var pollTask: Task<Void, Never>?
     private var pendingTask: Task<Void, Never>?
 
-    init(daemon: DaemonClient, approver: LocalApprovalService) {
+    init(daemon: DaemonClient) {
         self.daemon = daemon
-        self.approver = approver
     }
 
     /// The coarse arm state that drives the menubar glyph and the header word.
     var armState: ArmState { status?.armState ?? .idle }
-
-    var macApprovalsMode: MacApprovalsMode {
-        approver.macApprovalsEnabled ? .enabled : .hardenedPhoneOnly
-    }
 
     // MARK: lifecycle
 
@@ -160,31 +154,9 @@ final class AppModel {
 
     // MARK: actions
 
-    /// Approve a pending request at the Mac. Presents Touch ID (via the approver
-    /// seam) to unwrap the DEK, then tells the daemon to release. If Mac
-    /// approvals are off (hardened), this is unreachable in the UI; we still fail
-    /// closed with the phone-only message.
-    func approveLocally(_ req: PendingRequest, lease: Bool) async {
-        guard approver.macApprovalsEnabled else {
-            lastError = LocalApprovalError.noMacEnvelope.errorDescription
-            return
-        }
-        do {
-            // In the wired daemon, the daemon hands us the wrapped DEK for this
-            // request; here the seam takes it and returns the unwrapped DEK. The
-            // Touch ID sheet is presented inside approve(...).
-            let reason = "Approve \(req.title)"
-            _ = try await approver.approve(wrappedDEK: Data(), reason: reason)
-            _ = try await daemon.approve(id: req.id, lease: lease)
-            await refresh()
-        } catch let e as LocalApprovalError {
-            if case .userCancelled = e { return }   // cancel is not an error state
-            lastError = e.errorDescription
-        } catch {
-            lastError = describe(error)
-        }
-    }
-
+    // Approving is the phone's job: a request is unsealed only with the phone's
+    // per-approval partial, so this Mac cannot approve locally. The menubar
+    // offers Deny (which needs nothing) and points approvals at the iPhone.
     func deny(_ req: PendingRequest) async {
         await performControl { try await self.daemon.deny(id: req.id) }
     }
@@ -236,7 +208,7 @@ final class AppModel {
     /// brand-new rule goes through `rule add`; an edit keeps the existing identity
     /// and round-trips the whole config through `import` (atomic, revalidated).
     /// Either way the draft's environment is then sealed: new and replaced VALUES
-    /// are encrypted under the DEK in one pass, and removed KEYs are dropped.
+    /// are threshold-sealed in one pass, and removed KEYs are dropped.
     ///
     /// Returns whether it actually took, so the editor sheet dismisses only on a
     /// real success and stays open (with the reason) on a refusal. The reload runs
@@ -362,9 +334,9 @@ final class AppModel {
     }
 
     /// Seal the draft's environment into `source`. New rows (and existing rows the
-    /// user retyped) are sealed together in one `sealEnv` call so the DEK unwraps
-    /// once; KEYs that were present before the edit but are gone from the draft are
-    /// unset. Values live only for the moment of the seal, then are gone.
+    /// user retyped) are sealed together in one `sealEnv` call; KEYs that were
+    /// present before the edit but are gone from the draft are unset. Values live
+    /// only for the moment of the seal, then are gone.
     private func applyEnv(_ draft: RuleDraft, source: String, priorKeys: [String]) async throws {
         let secrets: [EnvSecret] = draft.env.compactMap { row in
             let key = row.key.trimmed
@@ -396,25 +368,20 @@ final class AppModel {
 
     // MARK: SSH keys + routing
 
-    /// Add a served SSH key from a draft: a 1Password reference (public key piped
-    /// to the CLI on stdin) or a local key file. The CLI does all validation
-    /// (ed25519, dedupe, safe host tokens); a refusal lands in `lastError` and the
-    /// editor stays open. Returns whether it took, so the sheet dismisses only on
-    /// a real success. Reloads inline so the caller's check sees the new list.
+    /// Add a served SSH key from a draft: a local key file (the CLI reads the
+    /// sibling `.pub`). The CLI does all validation (ed25519, dedupe, safe host
+    /// tokens); a refusal lands in `lastError` and the editor stays open. Returns
+    /// whether it took, so the sheet dismisses only on a real success. Reloads
+    /// inline so the caller's check sees the new list.
+    ///
+    /// Only the file source is wired here for now; a threshold "stored key"
+    /// source is planned (see docs/design/secret-model.md).
     @discardableResult
     func saveSshKey(_ draft: SSHKeyDraft) async -> Bool {
         var ok = false
         do {
-            switch draft.source {
-            case .onePassword:
-                try await daemon.addSshOnePasswordKey(
-                    vault: draft.vault.trimmed, item: draft.item.trimmed,
-                    field: draft.field.trimmed, comment: draft.comment.trimmed,
-                    hosts: draft.hosts, publicKey: draft.publicKey.trimmed)
-            case .file:
-                try await daemon.addSshFileKey(
-                    path: draft.path.trimmed, comment: draft.comment.trimmed, hosts: draft.hosts)
-            }
+            try await daemon.addSshFileKey(
+                path: draft.path.trimmed, comment: draft.comment.trimmed, hosts: draft.hosts)
             lastError = nil
             ok = true
         } catch {
@@ -455,23 +422,6 @@ final class AppModel {
         await daemon.generatedSshConfig()
     }
 
-    func setMacApprovals(_ mode: MacApprovalsMode) async {
-        do {
-            switch mode {
-            case .enabled:
-                let key = try approver.enableMacApprovals()
-                // Hand the SE public key to the daemon so it wraps the DEK to it.
-                try await daemon.setMacApprovals(.enabled)
-                _ = key   // (the daemon call carries the key in the wired build)
-            case .hardenedPhoneOnly:
-                try approver.disableMacApprovals()
-                try await daemon.setMacApprovals(.hardenedPhoneOnly)
-            }
-        } catch {
-            lastError = describe(error)
-        }
-    }
-
     func beginPairing(relayURL: String) {
         Task {
             for await state in daemon.beginPairing(relayURL: relayURL) {
@@ -482,7 +432,7 @@ final class AppModel {
     }
 
     /// The human's decision at the `.confirmSAS` step. This is the real MITM
-    /// backstop: the DEK is only sealed and sent once `match: true` reaches the
+    /// backstop: the pairing completes only once `match: true` reaches the
     /// running ceremony (see `DaemonClient.confirmPairing`). A mismatch tears
     /// the ceremony down here too, since the CLI side fails closed but has no
     /// way to push a friendlier reason than its own error string.

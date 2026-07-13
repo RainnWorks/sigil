@@ -171,7 +171,7 @@ struct SSHView: View {
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("No keys served").font(.system(size: 13, weight: .semibold))
-            Text("Add a key for the agent to serve. It can live in 1Password (fetched per signature) or be a local key file. Name the hosts you want routed through Sigil, or leave them empty to serve the key without routing.")
+            Text("Add a local key file for the agent to serve. Name the hosts you want routed through Sigil, or leave them empty to serve the key without routing.")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Text("Every signature is approved on your phone.")
@@ -324,21 +324,19 @@ private struct SSHBlockSheet: View {
 
 #Preview("SSH") {
     NavigationStack { SSHView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle)))
         .frame(width: 720, height: 640)
 }
 
 // Routing on, so the "View block" affordance and the routed-through wording show.
 #Preview("SSH - routing on") {
     NavigationStack { SSHView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, sshRouting: true),
-                              approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, sshRouting: true)))
         .frame(width: 720, height: 640)
 }
 
 #Preview("SSH - empty") {
     NavigationStack { SSHView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, sshKeys: SshKeyStore()),
-                              approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, sshKeys: SshKeyStore())))
         .frame(width: 720, height: 640)
 }

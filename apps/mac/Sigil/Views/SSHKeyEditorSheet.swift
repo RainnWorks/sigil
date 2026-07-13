@@ -1,13 +1,15 @@
 //  SSHKeyEditorSheet.swift
-//  Add a served SSH key: a 1Password reference (the private key is fetched per
-//  signature; only the public line is stored here) or a local key file (the CLI
-//  reads the sibling `.pub`). Both carry an optional label and the hosts to route
-//  through Sigil. It never authors config in Swift; Save hands the draft to the
-//  model, which drives the `sigil ssh …` verbs, and the CLI does all validation
-//  (ed25519, dedupe, safe host tokens), so a refusal surfaces its own message.
+//  Add a served SSH key from a local key file: the CLI reads the sibling `.pub`
+//  for the public line and the private key is read only at sign time. The draft
+//  carries an optional label and the hosts to route through Sigil. It never
+//  authors config in Swift; Save hands the draft to the model, which drives the
+//  `sigil ssh …` verbs, and the CLI does all validation (ed25519, dedupe, safe
+//  host tokens), so a refusal surfaces its own message.
 //
-//  There are exactly two sources: 1Password and Key file. A Secure Enclave signer
-//  is not built, so it is not offered here.
+//  Only the key-file source is offered right now. A threshold "stored key"
+//  source (Sigil holds the private key, sealed, opened per-sign with the phone)
+//  is planned; the 1Password path is a gated-command source that is not surfaced
+//  here yet. See docs/design/secret-model.md.
 
 import SwiftUI
 
@@ -18,18 +20,10 @@ struct SSHKeyEditorSheet: View {
     @State private var draft = SSHKeyDraft()
     @State private var saving = false
 
-    /// Why Save is blocked, or nil. The CLI validates for real; these only stop an
+    /// Why Save is blocked, or nil. The CLI validates for real; this only stops an
     /// obviously incomplete draft from a round trip that would just be refused.
     private var blocker: String? {
-        switch draft.source {
-        case .onePassword:
-            if draft.vault.trimmed.isEmpty || draft.item.trimmed.isEmpty {
-                return "Name the vault and item."
-            }
-            if draft.publicKey.trimmed.isEmpty { return "Paste the public key line." }
-        case .file:
-            if draft.path.trimmed.isEmpty { return "Give the path to the private key." }
-        }
+        if draft.path.trimmed.isEmpty { return "Give the path to the private key." }
         return nil
     }
 
@@ -42,11 +36,7 @@ struct SSHKeyEditorSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     if let error = model.lastError { ErrorStrip(message: error) }
-                    sourceSection
-                    switch draft.source {
-                    case .onePassword: onePasswordSection
-                    case .file: fileSection
-                    }
+                    fileSection
                     hostsSection
                     labelSection
                 }
@@ -55,7 +45,7 @@ struct SSHKeyEditorSheet: View {
             Divider()
             footer
         }
-        .frame(width: 540, height: 640)
+        .frame(width: 540, height: 560)
     }
 
     private var header: some View {
@@ -87,62 +77,11 @@ struct SSHKeyEditorSheet: View {
         .padding(.horizontal, 20).padding(.vertical, 14)
     }
 
-    // MARK: source
-
-    private var sourceSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            sectionTitle("Source", "Where the key lives. A 1Password key is fetched per signature; a key file is read from disk at sign time.")
-            Picker("Source", selection: $draft.source) {
-                Text("1Password").tag(SSHKeyDraft.Source.onePassword)
-                Text("Key file").tag(SSHKeyDraft.Source.file)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-        }
-    }
-
-    // MARK: 1Password branch
-
-    private var onePasswordSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            twoUp(
-                labelled("Vault") {
-                    TextField("Engineering", text: $draft.vault)
-                        .textFieldStyle(.roundedBorder).font(.mono(11))
-                },
-                labelled("Item") {
-                    TextField("GitHub", text: $draft.item)
-                        .textFieldStyle(.roundedBorder).font(.mono(11))
-                }
-            )
-            labelled("Field") {
-                TextField("private key", text: $draft.field)
-                    .textFieldStyle(.roundedBorder).font(.mono(11))
-            }
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Reference").font(.system(size: 11)).foregroundStyle(.secondary)
-                MonoText(draft.opReference, size: 11, color: Palette.cobalt)
-                    .lineLimit(1).truncationMode(.middle)
-            }
-
-            labelled("Public key") {
-                VStack(alignment: .leading, spacing: 4) {
-                    TextField("ssh-ed25519 AAAA\u{2026} comment", text: $draft.publicKey, axis: .vertical)
-                        .textFieldStyle(.roundedBorder).font(.mono(11))
-                        .lineLimit(3...6)
-                    Text("The public key line only. The private key stays in 1Password and is fetched per signature.")
-                        .font(.system(size: 10)).foregroundStyle(.tertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-        }
-    }
-
-    // MARK: key-file branch
+    // MARK: key-file source
 
     private var fileSection: some View {
         VStack(alignment: .leading, spacing: 12) {
+            sectionTitle("Key file", "Sigil serves a local key file to the agent and gates every signature on your phone. A threshold stored-key source is planned.")
             labelled("Private key path") {
                 VStack(alignment: .leading, spacing: 4) {
                     TextField("~/.ssh/id_ed25519", text: $draft.path)
@@ -197,13 +136,9 @@ struct SSHKeyEditorSheet: View {
             content()
         }
     }
-
-    private func twoUp<A: View, B: View>(_ a: A, _ b: B) -> some View {
-        HStack(alignment: .top, spacing: 12) { a; b }
-    }
 }
 
 #Preview("Add SSH key") {
     SSHKeyEditorSheet()
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle)))
 }

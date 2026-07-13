@@ -176,32 +176,18 @@ struct SshServedKey: Identifiable, Equatable, Sendable {
     }
 }
 
-/// The editor sheet's working copy. A key is either a 1Password reference or a
-/// local file; both carry an optional comment and the hosts to route. The CLI
+/// The editor sheet's working copy. A key is a local key file: the sibling
+/// `<path>.pub` supplies the public line and the private key is read only at
+/// sign time. It carries an optional comment and the hosts to route. The CLI
 /// validates on save (ed25519, dedupe, safe host tokens), so this only gathers
 /// input and gates the obviously-incomplete cases.
+///
+/// Only the file source is offered for now. A threshold "stored key" source
+/// (Sigil holds the private key, sealed, opened per-sign with the phone) is
+/// planned; the 1Password path is a gated-command source that is not surfaced
+/// here yet. See docs/design/secret-model.md.
 struct SSHKeyDraft {
-    enum Source: Hashable { case onePassword, file }
-
-    var source: Source = .onePassword
-
-    // 1Password branch.
-    var vault = ""
-    var item = ""
-    var field = "private key"
-    var publicKey = ""
-
-    // Key-file branch.
     var path = ""
-
-    // Both branches.
     var comment = ""
     var hosts: [String] = []
-
-    /// The live `op://<vault>/<item>/<field>` preview, with the default field
-    /// filled in so the preview never shows an empty trailing segment.
-    var opReference: String {
-        let f = field.trimmed.isEmpty ? "private key" : field.trimmed
-        return "op://\(vault.trimmed)/\(item.trimmed)/\(f)"
-    }
 }

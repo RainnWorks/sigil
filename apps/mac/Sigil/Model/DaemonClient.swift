@@ -62,11 +62,11 @@ protocol DaemonClient: Sendable {
     func importConfig(_ config: SigilConfig) async throws
 
     // Inline env values (write-once, never read back). Each pair's VALUE is
-    // sealed under the DEK the moment it is set; only its KEY name survives in
-    // `config()`. Setting a value unwraps the DEK, so it presents Touch ID.
+    // threshold-sealed the moment it is set; only its KEY name survives in
+    // `config()`. The ciphertext is opened per-approval with the phone's partial.
     /// `sigil-config source env set <name> --stdin` with the KEY=VALUE pairs on
-    /// stdin (never argv), sealing every value in one DEK unwrap. An existing KEY
-    /// is replaced in place; a new KEY is appended.
+    /// stdin (never argv). An existing KEY is replaced in place; a new KEY is
+    /// appended.
     func sealEnv(source: String, secrets: [EnvSecret]) async throws
     /// `sigil-config source env unset <name> --key <KEY>`: drop one sealed KEY.
     func unsealEnv(source: String, key: String) async throws
@@ -122,14 +122,11 @@ protocol DaemonClient: Sendable {
     func beginPairing(relayURL: String) -> AsyncStream<PairingCeremony>
     /// The human's decision once the ceremony reaches `.confirmSAS`: this is
     /// the actual MITM backstop, so it must only fire from a real tap after the
-    /// six words were compared on both screens. The DEK is not sealed or sent
+    /// six words were compared on both screens. The pairing is not completed
     /// until `match: true` reaches the ceremony; `false` (or never calling this)
     /// fails it closed. A no-op outside an active `.confirmSAS` state.
     func confirmPairing(match: Bool)
     func unpair() async throws -> ControlResult
-    /// Toggle whether the Mac Secure Enclave envelope exists (Enable Mac
-    /// approvals) vs hardened phone-only.
-    func setMacApprovals(_ mode: MacApprovalsMode) async throws
 
     // SSH agent (served keys + managed ~/.ssh/config routing). Reads decode
     // ~/.sigil/ssh-keys.json directly; writes shell out to `sigil ssh …`, which

@@ -14,10 +14,10 @@
 //    - Over the socket: status, doctor, lease_list, pending, history (Reply.json);
 //      lockdown, lease_revoke, approve, deny (Reply.control); and a long-lived
 //      subscribe_pending event stream (Reply.event) that drives the menubar live.
-//    - Shelled out to `sigil … --json` via the composed CLIDaemonClient: account
-//      add/rotate/remove, account list, settings get/set, wipe, mac-approvals,
-//      shim install, unpair, and the pairing NDJSON ceremony. These write the
-//      keystore / ~/.sigil and are deliberately not daemon capabilities.
+//    - Shelled out to `sigil … --json` via the composed CLIDaemonClient:
+//      rule/source authoring, settings get/set, wipe, shim install, unpair, and
+//      the pairing NDJSON ceremony. These write the keystore / ~/.sigil and are
+//      deliberately not daemon capabilities.
 //
 //  When the socket is unreachable the read verbs degrade to a calm "daemon not
 //  running" state rather than throwing, so the window and menubar render an
@@ -157,7 +157,6 @@ struct SocketDaemonClient: DaemonClient {
     func saveSettings(_ settings: AppSettings) async throws { try await cli.saveSettings(settings) }
     func wipe() async throws -> ControlResult { try await cli.wipe() }
 
-    func setMacApprovals(_ mode: MacApprovalsMode) async throws { try await cli.setMacApprovals(mode) }
     func installShim() async throws -> ControlResult { try await cli.installShim() }
 
     // MARK: - Daemon lifecycle

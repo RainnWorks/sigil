@@ -3,15 +3,14 @@
 //  environment to inject into it. Opened blank from the toolbar, pre-filled from
 //  a quick start, or seeded from an existing rule for an in-place edit. It never
 //  authors config in Swift; Save hands the draft to the model, which drives the
-//  `sigil-config` verbs and seals the values under the DEK.
+//  `sigil-config` verbs and threshold-seals the values.
 //
 //  The environment is the whole point: each row is a KEY (always shown) and a
 //  VALUE (write-only). A value you type is sealed on save and never shown again;
 //  re-opening the rule shows the KEY with a masked, "sealed" value you can
-//  replace or remove but never read back. Sealing encrypts the value under the
-//  local device key (the host DEK). On a Secure Enclave keystore that unwrap is
-//  gated by Touch ID; the app currently runs the dev file keystore (SE wrap is
-//  task #24/#49), which seals without a prompt, so the copy never promises one.
+//  replace or remove but never read back. Sealing is a threshold seal: the
+//  ciphertext on disk is openable only with the phone's per-approval partial, so
+//  the daemon at rest holds no key that can decrypt it.
 
 import SwiftUI
 
@@ -483,17 +482,17 @@ private struct FlagEqEditor: View {
 // typed, so a blank value can never silently seal an empty secret.
 #Preview("Quick start (empty value blocks save)") {
     RuleEditorSheet(draft: QuickStart.catalog[0].draft(), editingName: nil)
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle)))
 }
 
 #Preview("Blank rule") {
     RuleEditorSheet(draft: RuleDraft(), editingName: nil)
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle)))
 }
 
 #Preview("Editing (masked values)") {
     RuleEditorSheet(
         draft: RuleDraft(editing: Fixtures.config.rules[0], in: Fixtures.config),
         editingName: "op")
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle)))
 }

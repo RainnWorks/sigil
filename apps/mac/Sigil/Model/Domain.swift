@@ -199,13 +199,6 @@ struct PendingRequest: Identifiable, Equatable, Sendable {
 
 // MARK: - Pairing
 
-/// Whether local Mac approvals are possible. Hardened mode never mints the Mac
-/// Secure Enclave envelope, making the phone strictly required.
-enum MacApprovalsMode: Equatable, Sendable {
-    case enabled            // a Mac SE envelope exists; Touch ID can approve
-    case hardenedPhoneOnly  // no Mac envelope; every approval degrades to phone
-}
-
 struct PairedDevice: Identifiable, Equatable, Sendable {
     var id: String
     var name: String
@@ -222,7 +215,7 @@ enum PairingCeremony: Equatable, Sendable {
     case awaitingPhone(payloadBase64: String)
     /// Phone responded; SAS words to compare on both screens.
     case confirmSAS(words: [String])
-    /// Confirmed, DEK delivered, persisted.
+    /// Confirmed and persisted (the Mac share is provisioned at this step).
     case paired(PairedDevice)
     case failed(reason: String)
 }

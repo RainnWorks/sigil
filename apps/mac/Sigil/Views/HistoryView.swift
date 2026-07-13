@@ -61,6 +61,6 @@ struct HistoryView: View {
 
 #Preview {
     NavigationStack { HistoryView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle)))
         .frame(width: 760, height: 420)
 }

@@ -2,9 +2,9 @@
 //  Drives the `sigil` binary the same way a human would from a shell. Its live
 //  role is the shell-out half of SocketDaemonClient: the CLI-only keystore/config
 //  mutations that the least-privilege split (PROTOCOL.md) keeps out of the daemon
-//  — account add/rotate/remove + list, settings, wipe, mac-approvals, shim
-//  install, unpair, and the pairing NDJSON ceremony. Those `--json` shapes are
-//  specified in crates/sigil/JSON.md.
+//  — rule/source authoring, settings, wipe, shim install, unpair, and the
+//  pairing NDJSON ceremony. Those `--json` shapes are specified in
+//  crates/sigil/JSON.md.
 //
 //  It still conforms to the full DaemonClient (its status/doctor/leases/history/
 //  pending/control verbs shell out too) so it remains a usable headless client on
@@ -15,7 +15,7 @@
 //
 //  `sigil <cmd> --json` outputs (stdout, one JSON value, no ANSI). The v4
 //  rework split configuration mutation into a second binary, `sigil-config`
-//  (task #42): account/settings/mac-approvals/wipe live there now, so the
+//  (task #42): rule/source authoring, settings, and wipe live there now, so the
 //  runtime/pairing verbs below run against `binaryURL` (`run`) and the config
 //  verbs run against `configBinaryURL` (`runConfig`) — see `resolveSigilConfig`.
 //
@@ -31,7 +31,7 @@
 //    sigil-config source add <name> --provider env --json -> {"ok":bool,"lines":[str]}
 //    sigil-config source remove <name> --json -> {"ok":bool,"lines":[str]}
 //    sigil-config source env set <name> --stdin --json   (KEY=VALUE lines on
-//        stdin, sealed under the DEK) -> {"ok":bool,"lines":[str]}
+//        stdin, threshold-sealed) -> {"ok":bool,"lines":[str]}
 //    sigil-config source env unset <name> --key <KEY> --json -> {"ok":bool,"lines":[str]}
 //    sigil lease list --json -> [ {"grant_hex":str,"caller":str,"account":str,
 //        "scope":str,"granted_ms":int,"expires_ms":int}, ... ]
@@ -54,8 +54,6 @@
 //        one line of our stdin and proceeds only if it reads "confirm" — see
 //        `confirmPairing(match:)`.
 //    sigil unpair --json -> {"ok":bool,"lines":[str]}
-//    sigil-config mac-approvals --enable|--phone-only --json -> {"ok":bool}
-//        (mints or drops the Mac Secure Enclave envelope. Pairs with the SE seam.)
 //    sigil shim install --json -> {"ok":bool,"lines":[str]}
 //    sigil-config settings get --json / sigil-config settings set --json <patch>
 //    sigil-config wipe --force --json -> {"ok":bool,"lines":[str]}
@@ -67,8 +65,8 @@ import Foundation
 struct CLIDaemonClient: DaemonClient {
     var binaryURL: URL
     /// `sigil-config`, the sibling binary the v4 rework split config mutation
-    /// into (task #42): account/settings/mac-approvals/wipe. Resolved next to
-    /// `binaryURL` since the two ship together.
+    /// into (task #42): rule/source authoring, settings, and wipe. Resolved next
+    /// to `binaryURL` since the two ship together.
     var configBinaryURL: URL
     /// The stdin pipe of the currently running `pair --json` ceremony (if any),
     /// so `confirmPairing` can reach it. A class because `CLIDaemonClient` is a
@@ -83,12 +81,10 @@ struct CLIDaemonClient: DaemonClient {
     }
 
     /// Environment for every `sigil` invocation. `SIGIL_DEV_KEYSTORE=file` is
-    /// temporary: until the Secure Enclave DEK wrap is wired into the daemon
-    /// (task #24), the real keystore dies with "secure enclave path not yet
-    /// verified on hardware", so pairing and account mutations need the
-    /// dev file-backed keystore to run at all. `OP_SERVICE_ACCOUNT_TOKEN`, if
-    /// present in the app's own environment, already passes through via
-    /// ProcessInfo — nothing extra to do for it.
+    /// temporary: until the Secure Enclave keystore is wired into the daemon
+    /// (task #24), the real keystore (which stores the daemon identity key and
+    /// the Mac threshold share) dies with "secure enclave path not yet verified
+    /// on hardware", so pairing needs the dev file-backed keystore to run at all.
     private static func env() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         env["NO_COLOR"] = "1"
@@ -151,7 +147,7 @@ struct CLIDaemonClient: DaemonClient {
         try await execute(binaryURL, args, stdin: stdin)
     }
 
-    /// Run `sigil-config <args>` (account/settings/mac-approvals/wipe — the
+    /// Run `sigil-config <args>` (rule/source authoring, settings, wipe — the
     /// config-mutation verbs the v4 rework split into their own binary).
     private func runConfig(_ args: [String], stdin: Data? = nil) async throws -> Data {
         try await execute(configBinaryURL, args, stdin: stdin)
@@ -256,8 +252,8 @@ struct CLIDaemonClient: DaemonClient {
     }
 
     /// Seal every pair in one `source env set --stdin` call: the VALUES ride on
-    /// stdin as KEY=VALUE lines (never argv, which `ps` would leak), so one DEK
-    /// unwrap covers the whole batch. Core takes the VALUE verbatim after the
+    /// stdin as KEY=VALUE lines (never argv, which `ps` would leak), so the whole
+    /// batch is threshold-sealed together. Core takes the VALUE verbatim after the
     /// first `=`, so a value may itself contain `=`.
     func sealEnv(source: String, secrets: [EnvSecret]) async throws {
         let body = secrets.map { "\($0.key)=\($0.value)" }.joined(separator: "\n")
@@ -355,11 +351,6 @@ struct CLIDaemonClient: DaemonClient {
     }
 
     func unpair() async throws -> ControlResult { try controlResult(await run(["unpair", "--json"])) }
-
-    func setMacApprovals(_ mode: MacApprovalsMode) async throws {
-        let flag = mode == .enabled ? "--enable" : "--phone-only"
-        _ = try await runConfig(["mac-approvals", flag, "--json"])
-    }
 
     func installShim() async throws -> ControlResult {
         try controlResult(await run(["shim", "install", "--json"]))

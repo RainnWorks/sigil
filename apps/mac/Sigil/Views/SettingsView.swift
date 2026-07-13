@@ -61,6 +61,6 @@ struct SettingsView: View {
 
 #Preview {
     NavigationStack { SettingsView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle)))
         .frame(width: 460, height: 520)
 }

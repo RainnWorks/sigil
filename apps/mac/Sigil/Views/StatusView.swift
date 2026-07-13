@@ -116,19 +116,18 @@ struct StatusView: View {
 
 #Preview("Status armed") {
     NavigationStack { StatusView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle)))
         .frame(width: 640, height: 620)
 }
 
 #Preview("Status fail-closed") {
     NavigationStack { StatusView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .failClosed), approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .failClosed)))
         .frame(width: 640, height: 620)
 }
 
 #Preview("Status · daemon stopped") {
     NavigationStack { StatusView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, running: false),
-                              approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, running: false)))
         .frame(width: 640, height: 660)
 }

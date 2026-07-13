@@ -89,7 +89,6 @@ struct RootWindow: View {
 
 #Preview("Configurator") {
     RootWindow()
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .pendingRequests),
-                              approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .pendingRequests)))
         .frame(width: 820, height: 560)
 }
