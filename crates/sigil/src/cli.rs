@@ -233,10 +233,11 @@ usage: sigil <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
   deny --local --id <id>               deny a pending request at the Mac
   history           the decision audit log (names and metadata only)
   pending           requests currently parked for a local decision
-  ssh add           serve a 1Password SSH key (--vault --item --pubkey-file)
+  ssh add           serve a 1Password SSH key (--vault --item --pubkey-file [--host h])
   ssh add-file      serve a local key file (--path <key>, signs from ~/.ssh/…)
   ssh list          list the SSH keys the agent serves
   ssh remove <item> stop serving an SSH key
+  ssh config        route chosen hosts via ~/.ssh/config (--install / --uninstall)
   sshagent          print the SSH_AUTH_SOCK to point ssh/git at Sigil
   shim install      symlink ~/.sigil/bin/op at this binary
   shim add <cmd>    drop a transparent alias binary for a configured command
@@ -552,7 +553,6 @@ fn read_token_stdin() -> Option<Zeroizing<Vec<u8>>> {
 }
 
 fn account_add(args: &[String], json: bool) -> i32 {
-    let s = Style::stdout();
     let Some(label) = flag_value(args, "--label").map(str::to_string) else {
         eprintln!("usage: sigil account add --token-stdin --label <name>");
         return 2;
@@ -561,110 +561,11 @@ fn account_add(args: &[String], json: bool) -> i32 {
         eprintln!("sigil: refusing to read a token from argv; pass --token-stdin");
         return 2;
     }
-    // A v2 (threshold) account is sealed under the two-party key, not a DEK.
-    if has_flag(args, "--threshold") {
-        return account_add_v2(&label, json);
-    }
-    let Some(token) = read_token_stdin() else {
-        return 1;
-    };
-
-    // Unwrap the DEK (biometric on macOS) and encrypt the token under it.
-    let ks = keystore::for_host();
-    if let Err(e) = ks.ensure_dek() {
-        eprintln!(
-            "sigil: provisioning the DEK: {}\n  (detail: {e})",
-            keystore::dek_error_hint(&e)
-        );
-        return 1;
-    }
-    let dek = match ks.unwrap_dek(&format!("Add the {label} service-account token")) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!(
-                "sigil: unwrapping the DEK: {}\n  (detail: {e})",
-                keystore::dek_error_hint(&e)
-            );
-            return 1;
-        }
-    };
-
-    // Probe the vaults this token can actually route (best effort), through the
-    // provider seam rather than calling `op` directly.
-    let vaults = OpProvider::new().probe(&token).unwrap_or_default();
-    if vaults.is_empty() && !json {
-        println!(
-            "  {} {}",
-            s.brass("\u{2717}"),
-            s.dim("no vaults visible to this token (service accounts cannot see built-in Personal/Shared vaults)")
-        );
-    }
-
-    let mut store = match AccountStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("sigil: loading account store: {e}");
-            return 1;
-        }
-    };
-    // sec-review Note A: account routing matches a hint against an account's
-    // label OR one of its vaults (first hit wins). If this account's label equals
-    // another account's vault name (or vice versa), a routing hint that string is
-    // order-dependent — surprising, though not exploitable (both are the
-    // operator's own accounts and the approval still gates). Warn at authoring so
-    // the ambiguity is visible; prefer labels that are not also vault names.
-    if !json {
-        if let Some(other) = store
-            .accounts
-            .iter()
-            .find(|a| a.vaults.iter().any(|v| v == &label))
-        {
-            println!(
-                "  {} {}",
-                s.brass("\u{2717}"),
-                s.dim(&format!(
-                    "label {label:?} also names a vault of account {:?}; routing that name is ambiguous",
-                    other.label
-                ))
-            );
-        }
-        if let Some((other, vault)) = store.accounts.iter().find_map(|a| {
-            vaults
-                .iter()
-                .find(|v| **v == a.label)
-                .map(|v| (a.label.clone(), v.clone()))
-        }) {
-            println!(
-                "  {} {}",
-                s.brass("\u{2717}"),
-                s.dim(&format!(
-                    "vault {vault:?} of this account matches the label of account {other:?}; routing that name is ambiguous"
-                ))
-            );
-        }
-    }
-    if let Err(e) = store.add(&label, &dek, &token, vaults.clone()) {
-        eprintln!("sigil: {e}");
-        return 1;
-    }
-    if let Err(e) = store.save() {
-        eprintln!("sigil: saving account store: {e}");
-        return 1;
-    }
-
-    if json {
-        // Echo the newly-added account shape the Swift client decodes.
-        if let Some(a) = store.accounts.iter().find(|a| a.label == label) {
-            println!("{}", json::to_line(&account_json(a)));
-        }
-        return 0;
-    }
-
-    println!("{} account {} added", s.ok("\u{2713}"), s.cobalt(&label));
-    if !vaults.is_empty() {
-        println!("  {} {}", s.dim("vaults"), vaults.join(", "));
-    }
-    0
+    // Threshold is the only account mechanism: the token is sealed under the
+    // two-party key K = combine(Z_M, Z_F), openable only with the phone's
+    // per-request partial, so there is no DEK at rest to protect. account_add_v2
+    // owns its own success/json output.
+    account_add_v2(&label, json)
 }
 
 /// Add a v2 (threshold) service account: seal the token under the two-party key
@@ -1792,8 +1693,9 @@ fn cmd_ssh(args: &[String]) -> i32 {
         Some("add-file") => ssh_add_file(&args[1..]),
         Some("list") | None => ssh_list(),
         Some("remove") | Some("rm") => ssh_remove(args.get(1).map(String::as_str)),
+        Some("config") => ssh_config(&args[1..]),
         _ => {
-            eprintln!("usage: sigil ssh <add|add-file|list|remove>");
+            eprintln!("usage: sigil ssh <add|add-file|list|remove|config>");
             2
         }
     }
@@ -1806,13 +1708,20 @@ fn cmd_ssh(args: &[String]) -> i32 {
 fn ssh_add_file(args: &[String]) -> i32 {
     let s = Style::stdout();
     let Some(path) = flag_value(args, "--path").map(str::to_string) else {
-        eprintln!("usage: sigil ssh add-file --path <private-key-path> [--comment <c>]");
+        eprintln!(
+            "usage: sigil ssh add-file --path <private-key-path> [--comment <c>] [--host <h> ...]"
+        );
         return 2;
     };
     let comment = flag_value(args, "--comment").unwrap_or("").to_string();
+    let hosts = flag_values(args, "--host");
+    if let Some(code) = reject_bad_hosts(&s, &hosts) {
+        return code;
+    }
     let entry = crate::sshagent::SshFileEntry {
         path: path.clone(),
         comment,
+        hosts,
     };
     // Validate before persisting: the sibling .pub must parse as ed25519.
     let Some(id) = crate::sshagent::resolve_file_identity(&entry) else {
@@ -1834,6 +1743,7 @@ fn ssh_add_file(args: &[String]) -> i32 {
         eprintln!("sigil: {path} is already served (remove it first to replace)");
         return 1;
     }
+    let hosts = entry.hosts.clone();
     cfg.files.push(entry);
     if let Err(e) = cfg.save() {
         eprintln!("sigil: saving ssh-keys config: {e}");
@@ -1843,11 +1753,42 @@ fn ssh_add_file(args: &[String]) -> i32 {
     println!("{} serving {}", s.ok("\u{2713}"), s.cobalt(&id.label));
     println!("  {}  {}", s.dim("key"), s.dim(&id.fingerprint));
     println!("  {}  {}", s.dim("file"), s.dim(&path));
-    println!(
-        "  {}",
-        s.faint("restart the daemon to serve it: sigil restart")
-    );
+    ssh_add_epilogue(&s, &hosts);
     0
+}
+
+/// Reject any `--host` token that is not a safe ssh_config `Host` value (a token
+/// carrying whitespace or a control character could splice extra directives into
+/// the generated config). Returns `Some(exit_code)` to stop the command, or
+/// `None` when every token is clean.
+fn reject_bad_hosts(s: &Style, hosts: &[String]) -> Option<i32> {
+    for h in hosts {
+        if !crate::sshconfig::valid_host(h) {
+            eprintln!(
+                "{} invalid --host {h:?}: no spaces or control characters",
+                s.deny("\u{2717}")
+            );
+            return Some(2);
+        }
+    }
+    None
+}
+
+/// Shared closing lines for `ssh add` / `ssh add-file`: the restart hint, and,
+/// when the key names hosts, the routing hint to (re)generate the ssh config.
+fn ssh_add_epilogue(s: &Style, hosts: &[String]) {
+    if hosts.is_empty() {
+        println!(
+            "  {}",
+            s.faint("the running daemon serves it within a couple of seconds")
+        );
+    } else {
+        println!("  {}  {}", s.dim("hosts"), s.dim(&hosts.join(" ")));
+        println!(
+            "  {}",
+            s.faint("served automatically; route these hosts with: sigil ssh config --install")
+        );
+    }
 }
 
 /// `sigil ssh add --vault <V> --item <I> [--field <f>] [--comment <c>]
@@ -1862,7 +1803,7 @@ fn ssh_add(args: &[String]) -> i32 {
     ) else {
         eprintln!(
             "usage: sigil ssh add --vault <V> --item <I> [--field <f>] [--comment <c>] \
-             (--pubkey-file <path> | --pubkey-stdin)"
+             [--host <h> ...] (--pubkey-file <path> | --pubkey-stdin)"
         );
         return 2;
     };
@@ -1870,6 +1811,10 @@ fn ssh_add(args: &[String]) -> i32 {
         .unwrap_or("private key")
         .to_string();
     let comment = flag_value(args, "--comment").unwrap_or("").to_string();
+    let hosts = flag_values(args, "--host");
+    if let Some(code) = reject_bad_hosts(&s, &hosts) {
+        return code;
+    }
 
     // The public key line comes from a file or stdin (never secret).
     let public_key = if let Some(path) = flag_value(args, "--pubkey-file") {
@@ -1899,6 +1844,7 @@ fn ssh_add(args: &[String]) -> i32 {
         item: item.clone(),
         field,
         comment,
+        hosts: hosts.clone(),
     };
     // Validate before persisting: it must parse as an ed25519 public key.
     let Some(id) = crate::sshagent::resolve_identity(&entry) else {
@@ -1929,10 +1875,7 @@ fn ssh_add(args: &[String]) -> i32 {
     println!("{} serving {}", s.ok("\u{2713}"), s.cobalt(&id.label));
     println!("  {}  {}", s.dim("key"), s.dim(&id.fingerprint));
     println!("  {}  {}", s.dim("ref"), s.dim(&id.key_ref));
-    println!(
-        "  {}",
-        s.faint("restart the daemon to serve it: sigil restart")
-    );
+    ssh_add_epilogue(&s, &hosts);
     0
 }
 
@@ -1966,6 +1909,13 @@ fn ssh_list() -> i32 {
                         e.vault, e.item, id.comment
                     ))
                 );
+                if !e.hosts.is_empty() {
+                    println!(
+                        "  {}  {}",
+                        pad("", 18),
+                        s.faint(&format!("routed: {}", e.hosts.join(" ")))
+                    );
+                }
             }
             None => println!(
                 "  {}  {}",
@@ -1983,6 +1933,13 @@ fn ssh_list() -> i32 {
                     pad("", 18),
                     s.faint(&format!("file · {} · {}", e.path, id.comment))
                 );
+                if !e.hosts.is_empty() {
+                    println!(
+                        "  {}  {}",
+                        pad("", 18),
+                        s.faint(&format!("routed: {}", e.hosts.join(" ")))
+                    );
+                }
             }
             None => println!(
                 "  {}  {}",
@@ -2007,9 +1964,12 @@ fn ssh_remove(item: Option<&str>) -> i32 {
             return 1;
         }
     };
-    let before = cfg.keys.len();
+    // Match either a 1Password item name (cfg.keys) or a local key-file path
+    // (cfg.files), so a key added by `ssh add-file` is removable too.
+    let before = cfg.keys.len() + cfg.files.len();
     cfg.keys.retain(|k| k.item != item);
-    if cfg.keys.len() == before {
+    cfg.files.retain(|f| f.path != item);
+    if cfg.keys.len() + cfg.files.len() == before {
         println!("  {}", s.dim(&format!("no served key named {item}")));
         return 0;
     }
@@ -2020,9 +1980,96 @@ fn ssh_remove(item: Option<&str>) -> i32 {
     println!("{} stopped serving {}", s.ok("\u{2713}"), s.cobalt(item));
     println!(
         "  {}",
-        s.faint("restart the daemon to apply: sigil restart")
+        s.faint("the running daemon drops it within a couple of seconds")
     );
     0
+}
+
+/// `sigil ssh config [--install | --uninstall]`: manage the `~/.ssh/config`
+/// routing that sends chosen hosts through Sigil's agent (1Password-style), while
+/// every other host stays on the user's normal agent. With no flag it prints the
+/// block to paste by hand; `--install` writes it (with a backup); `--uninstall`
+/// removes it and the generated files.
+fn ssh_config(args: &[String]) -> i32 {
+    let s = Style::stdout();
+
+    if has_flag(args, "--uninstall") {
+        match crate::sshconfig::uninstall() {
+            Ok(changed) => {
+                if changed {
+                    println!(
+                        "{} removed the Sigil block from ~/.ssh/config",
+                        s.ok("\u{2713}")
+                    );
+                } else {
+                    println!("  {}", s.dim("no Sigil block was present in ~/.ssh/config"));
+                }
+                println!("  {}", s.faint("your normal agent now answers every host"));
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("sigil: removing the ssh config block: {e}");
+                return 1;
+            }
+        }
+    }
+
+    let cfg = match crate::sshagent::SshKeyConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("sigil: loading ssh-keys config: {e}");
+            return 1;
+        }
+    };
+    let routed = crate::sshconfig::routed_keys(&cfg);
+    if routed.is_empty() {
+        println!(
+            "  {}",
+            s.dim("no keys name any hosts to route; add hosts with: sigil ssh add ... --host <h>")
+        );
+        return 0;
+    }
+    let sock = crate::sshagent::socket_path();
+
+    if has_flag(args, "--install") {
+        match crate::sshconfig::install(&cfg, &sock) {
+            Ok(report) => {
+                println!("{} routing through Sigil", s.ok("\u{2713}"));
+                for r in &report.routed {
+                    println!("  {}  {}", pad(&r.label, 18), s.dim(&r.hosts.join(" ")));
+                }
+                if let Some(backup) = &report.backup {
+                    println!(
+                        "  {}  {}",
+                        s.dim("backup"),
+                        s.faint(&backup.display().to_string())
+                    );
+                }
+                if !report.ssh_config_changed {
+                    println!("  {}", s.faint("~/.ssh/config already current"));
+                }
+                println!(
+                    "  {}",
+                    s.faint("every other host stays on your normal agent")
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("sigil: installing the ssh config: {e}");
+                1
+            }
+        }
+    } else {
+        // Default: print the block for manual placement, write nothing.
+        println!("{}", s.cobalt("sigil ssh routing (preview)"));
+        println!(
+            "  {}",
+            s.faint("apply with: sigil ssh config --install  (or paste the below by hand)")
+        );
+        println!();
+        print!("{}", crate::sshconfig::preview(&cfg, &sock));
+        0
+    }
 }
 
 /// `sigil sshagent`: print the SSH_AUTH_SOCK a user points `ssh`/`git` at, plus

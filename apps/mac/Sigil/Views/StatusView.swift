@@ -13,6 +13,7 @@ struct StatusView: View {
             VStack(alignment: .leading, spacing: 20) {
                 header
                 if let error = model.lastError { ErrorStrip(message: error) }
+                daemonPanel
                 instrumentPanel
                 doctorPanel
             }
@@ -36,6 +37,44 @@ struct StatusView: View {
             } else {
                 Button("Lock down") { Task { await model.lockdown(clear: false) } }
                     .buttonStyle(.glass)
+            }
+        }
+    }
+
+    private var daemonPanel: some View {
+        Section(title: "Daemon", subtitle: "the local agent that gates every command. start, stop, or repair it here") {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    StatePill(tone: model.daemonRunning ? .armed : .denied,
+                              text: model.daemonRunning ? "Running" : "Stopped")
+                    if model.daemonBusy { ProgressView().controlSize(.small) }
+                    Spacer(minLength: 12)
+                    if let version = model.daemonVersion {
+                        MonoText(version, size: 11, color: .secondary)
+                    }
+                }
+                if let path = model.daemonBinaryPath {
+                    MonoText(path, size: 11, color: .secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                HStack(spacing: 8) {
+                    if model.daemonRunning {
+                        Button("Restart") { Task { await model.restartDaemon() } }
+                            .buttonStyle(.glassProminent).tint(Palette.cobalt)
+                        Button("Stop") { Task { await model.stopDaemon() } }
+                            .buttonStyle(.glass)
+                    } else {
+                        Button("Start") { Task { await model.startDaemon() } }
+                            .buttonStyle(.glassProminent).tint(Palette.cobalt)
+                    }
+                    Button("Install / Repair") { Task { await model.installDaemon() } }
+                        .buttonStyle(.glass)
+                    Spacer()
+                }
+                .controlSize(.small)
+                .disabled(model.daemonBusy)
             }
         }
     }
@@ -85,4 +124,11 @@ struct StatusView: View {
     NavigationStack { StatusView() }
         .environment(AppModel(daemon: MockDaemonClient(scenario: .failClosed), approver: MockApprover()))
         .frame(width: 640, height: 620)
+}
+
+#Preview("Status · daemon stopped") {
+    NavigationStack { StatusView() }
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, running: false),
+                              approver: MockApprover()))
+        .frame(width: 640, height: 660)
 }

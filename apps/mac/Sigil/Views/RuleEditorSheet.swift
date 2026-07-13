@@ -390,9 +390,10 @@ enum EnvKey {
 // MARK: - Token list editor
 
 /// A compact repeated-string editor: type a value, Return or Add appends it, and
-/// each added token shows with a remove control. Used for argv-contains and the
-/// flags-present list.
-private struct TokenListEditor: View {
+/// each added token shows with a remove control. Shared: the rule editor uses it
+/// for argv-contains and the flags-present list; the SSH editor uses it for the
+/// routed-hosts list.
+struct TokenListEditor: View {
     let title: String
     let placeholder: String
     @Binding var tokens: [String]

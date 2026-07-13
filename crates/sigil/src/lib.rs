@@ -38,6 +38,7 @@ pub mod settings;
 pub mod setup;
 pub mod shim;
 pub mod sshagent;
+pub mod sshconfig;
 pub mod style;
 pub mod threshold;
 

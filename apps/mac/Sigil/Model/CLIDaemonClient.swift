@@ -365,6 +365,126 @@ struct CLIDaemonClient: DaemonClient {
         try controlResult(await run(["shim", "install", "--json"]))
     }
 
+    // MARK: daemon lifecycle (launchd agent + control socket)
+    //
+    // The service verbs print human lines (no `--json`), so the mutators here
+    // ignore stdout on success and let a non-zero exit surface as
+    // DaemonError.cli(stderr) through `execute`.
+
+    /// Connect-probe the control socket: listening = running. Resolves the socket
+    /// path the same way SocketDaemonClient does and reuses its connect helper, so
+    /// this stays a usable standalone client. Sends nothing.
+    func daemonRunning() async -> Bool {
+        daemonSocketReachable(path: SocketDaemonClient.defaultSocketPath())
+    }
+
+    /// `sigil version` -> "sigil <semver>", trimmed. nil if the binary would not run.
+    func daemonVersion() async -> String? {
+        guard let data = try? await run(["version"]),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    func daemonBinaryPath() -> String? {
+        FileManager.default.isExecutableFile(atPath: binaryURL.path) ? binaryURL.path : nil
+    }
+
+    func startDaemon() async throws { _ = try await run(["start"]) }
+    func stopDaemon() async throws { _ = try await run(["stop"]) }
+    func restartDaemon() async throws { _ = try await run(["restart"]) }
+
+    /// Install / repair: wire the shim, then install and bootstrap the launchd
+    /// agent. This is `sigil setup` minus its trailing pairing ceremony, which
+    /// blocks on stdin (cli.rs run_pairing) and is driven separately by the
+    /// Pairing pane; shelling out `setup` here would hang with no TTY. In a shipped
+    /// app a bundled-binary copy would slot in ahead of these two steps (future).
+    func installDaemon() async throws {
+        _ = try await run(["shim", "install", "--json"])
+        _ = try await run(["start"])
+    }
+
+    // MARK: SSH agent (served keys + managed ~/.ssh/config routing)
+    //
+    // The `sigil ssh …` verbs have no `--json` mode (they print human lines), so
+    // the mutators here ignore stdout on success and let a non-zero exit surface
+    // as DaemonError.cli(stderr) through `execute`. The reads decode the on-disk
+    // files directly, respecting SIGIL_HOME the same way the CLI does so the
+    // dev-loop and the shipped install both resolve to the right store.
+
+    /// `~/.sigil` (or `$SIGIL_HOME`), matching crate::paths::sigil_home.
+    private static func sigilHome() -> URL {
+        let env = ProcessInfo.processInfo.environment
+        if let home = env["SIGIL_HOME"], !home.isEmpty {
+            return URL(fileURLWithPath: home)
+        }
+        return URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".sigil")
+    }
+
+    /// The user's `~/.ssh/config`, or `$SIGIL_SSH_USER_CONFIG` (dev-loop / tests),
+    /// matching crate::sshconfig::user_ssh_config_path.
+    private static func userSshConfigURL() -> URL {
+        let env = ProcessInfo.processInfo.environment
+        if let path = env["SIGIL_SSH_USER_CONFIG"], !path.isEmpty {
+            return URL(fileURLWithPath: path)
+        }
+        return URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".ssh/config")
+    }
+
+    /// The literal marker `sigil ssh config --install` writes; its presence is the
+    /// routing-on signal (crates/sigil/src/sshconfig.rs BLOCK_START).
+    private static let sshManagedMarker = "# >>> sigil ssh (managed) >>>"
+
+    func sshKeys() async throws -> SshKeyStore {
+        let url = Self.sigilHome().appendingPathComponent("ssh-keys.json")
+        guard let data = try? Data(contentsOf: url) else {
+            return SshKeyStore()   // absent file = empty store
+        }
+        do { return try JSONDecoder().decode(SshKeyStore.self, from: data) }
+        catch { throw DaemonError.cli("could not parse ~/.sigil/ssh-keys.json: \(error)") }
+    }
+
+    func addSshOnePasswordKey(vault: String, item: String, field: String,
+                              comment: String, hosts: [String], publicKey: String) async throws {
+        var args = ["ssh", "add", "--vault", vault, "--item", item]
+        if !field.trimmed.isEmpty { args += ["--field", field] }
+        if !comment.trimmed.isEmpty { args += ["--comment", comment] }
+        for host in hosts { args += ["--host", host] }
+        args.append("--pubkey-stdin")
+        _ = try await run(args, stdin: Data(publicKey.utf8))
+    }
+
+    func addSshFileKey(path: String, comment: String, hosts: [String]) async throws {
+        var args = ["ssh", "add-file", "--path", path]
+        if !comment.trimmed.isEmpty { args += ["--comment", comment] }
+        for host in hosts { args += ["--host", host] }
+        _ = try await run(args)
+    }
+
+    func removeSshKey(item: String) async throws {
+        _ = try await run(["ssh", "remove", item])
+    }
+
+    func installSshRouting() async throws {
+        _ = try await run(["ssh", "config", "--install"])
+    }
+
+    func uninstallSshRouting() async throws {
+        _ = try await run(["ssh", "config", "--uninstall"])
+    }
+
+    func sshRoutingInstalled() async -> Bool {
+        guard let text = try? String(contentsOf: Self.userSshConfigURL(), encoding: .utf8) else {
+            return false
+        }
+        return text.contains(Self.sshManagedMarker)
+    }
+
+    func generatedSshConfig() async -> String? {
+        let url = Self.sigilHome().appendingPathComponent("ssh/config")
+        return try? String(contentsOf: url, encoding: .utf8)
+    }
+
     func settings() async throws -> AppSettings {
         try decode(SettingsDTO.self, await runConfig(["settings", "get", "--json"])).model()
     }

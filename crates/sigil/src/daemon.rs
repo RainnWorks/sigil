@@ -101,6 +101,33 @@ impl From<Config> for ConfigCell {
     }
 }
 
+/// A hot-swappable holder for the built SSH signers, the same shape and rationale
+/// as [`ConfigCell`], so `sigil ssh add|remove` takes effect without a daemon
+/// restart: the watcher rebuilds the signers from `~/.sigil/ssh-keys.json` on a
+/// change. A signing request takes a *snapshot* (clone the `Arc`, release the
+/// lock, then route and sign against that one set); a reload takes a *store*
+/// (swap in a freshly built set). Because a request holds its own `Arc` for its
+/// whole, possibly long, phone-approval duration, a reload mid-request is
+/// invisible to it: it serves the entire old set or, next time, the entire new
+/// one, never a blend.
+struct SshSignersCell(std::sync::RwLock<Arc<Vec<Box<dyn SshSigner>>>>);
+
+impl SshSignersCell {
+    fn new(signers: Vec<Box<dyn SshSigner>>) -> Self {
+        Self(std::sync::RwLock::new(Arc::new(signers)))
+    }
+
+    /// A consistent snapshot for one signing request.
+    fn snapshot(&self) -> Arc<Vec<Box<dyn SshSigner>>> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Atomically replace the live signer set.
+    fn store(&self, signers: Vec<Box<dyn SshSigner>>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(signers);
+    }
+}
+
 /// Shared daemon state, cloned (via `Arc`) into every connection worker.
 pub struct Core {
     keystore: Arc<dyn Keystore>,
@@ -136,10 +163,11 @@ pub struct Core {
     /// The approving factor resolved at arm time (residual #1 mitigation).
     factor: Factor,
     /// The pluggable SSH key sources this daemon serves on the agent socket,
-    /// resolved from `~/.sigil/ssh-keys.json` at arm time. Empty means the agent
-    /// advertises no keys (and `ssh-add -l` shows none). Sigil is the phone-gate
-    /// regardless of which signer holds the key.
-    ssh_signers: Vec<Box<dyn SshSigner>>,
+    /// resolved from `~/.sigil/ssh-keys.json` and hot-reloaded on change (so
+    /// `sigil ssh add|remove` needs no restart). Empty means the agent advertises
+    /// no keys (and `ssh-add -l` shows none). Sigil is the phone-gate regardless
+    /// of which signer holds the key.
+    ssh_signers: SshSignersCell,
     /// Audit logging: `Some(retention_days)` appends a metadata-only line per
     /// decision to `history.jsonl` (pruned to the window); `None` disables it.
     /// The real daemon enables it; tests leave it off so they never write to a
@@ -393,7 +421,7 @@ impl Core {
             config: config.into(),
             lease_ttl: DEFAULT_LEASE_TTL,
             factor,
-            ssh_signers,
+            ssh_signers: SshSignersCell::new(ssh_signers),
             audit: Some(
                 crate::settings::Settings::load()
                     .map(|s| s.retention_days)
@@ -428,6 +456,21 @@ impl Core {
         match Config::load() {
             Ok(cfg) => {
                 self.config.store(cfg);
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Rebuild the SSH signers from `~/.sigil/ssh-keys.json` and swap them in, so
+    /// `sigil ssh add|remove` is served without a restart. Fail-closed like
+    /// [`Self::reload_config`]: on an unreadable/malformed store it returns `Err`
+    /// and the last-good signer set stays live (the watcher logs and keeps
+    /// serving), never dropping to no keys on a transient half-written file.
+    fn reload_ssh_signers(&self) -> Result<(), String> {
+        match sshagent::SshKeyConfig::load() {
+            Ok(cfg) => {
+                self.ssh_signers.store(build_ssh_signers(&cfg, None));
                 Ok(())
             }
             Err(e) => Err(e.to_string()),
@@ -517,6 +560,7 @@ fn build_ssh_signers(
 impl SshBackend for Core {
     fn identities(&self) -> Vec<ServedIdentity> {
         self.ssh_signers
+            .snapshot()
             .iter()
             .flat_map(|s| s.identities())
             .collect()
@@ -536,8 +580,11 @@ impl SshBackend for Core {
             return None;
         }
 
-        // Route the request to the signer that owns this identity.
-        let signer = self.ssh_signers.iter().find(|s| s.owns(&req.id.key_blob))?;
+        // Route the request to the signer that owns this identity. Hold the
+        // snapshot for the whole request so a mid-approval reload cannot swap the
+        // signer set under us.
+        let signers = self.ssh_signers.snapshot();
+        let signer = signers.iter().find(|s| s.owns(&req.id.key_blob))?;
 
         // Route the account only when the signer needs a stored credential (the
         // op-fetch signer); clone what we need before the (possibly long) approval
@@ -900,28 +947,50 @@ fn spawn_config_watcher(
     shutdown: Arc<AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let path = Config::path()?;
+    // The SSH key store is watched on the same tick so `sigil ssh add|remove`
+    // takes effect without a restart, mirroring the rule-config hot-reload.
+    let ssh_path = sshagent::SshKeyConfig::path();
     let handle = std::thread::Builder::new()
         .name("sigil-config-watcher".into())
         .spawn(move || {
             let mut last = config_mtime(&path);
+            let mut last_ssh = ssh_path.as_deref().map(config_mtime);
             while !shutdown.load(Ordering::SeqCst) {
                 std::thread::sleep(CONFIG_POLL_INTERVAL);
                 if shutdown.load(Ordering::SeqCst) {
                     break;
                 }
                 let current = config_mtime(&path);
-                if current == last {
-                    continue;
-                }
-                last = current;
-                match core.reload_config() {
-                    Ok(()) => {
-                        eprintln!("sigil daemon: reloaded config from {}", path.display());
+                if current != last {
+                    last = current;
+                    match core.reload_config() {
+                        Ok(()) => {
+                            eprintln!("sigil daemon: reloaded config from {}", path.display());
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "sigil daemon: config reload failed, keeping last-good rules: {e}"
+                            );
+                        }
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "sigil daemon: config reload failed, keeping last-good rules: {e}"
-                        );
+                }
+                if let Some(ssh_path) = ssh_path.as_deref() {
+                    let current_ssh = Some(config_mtime(ssh_path));
+                    if current_ssh != last_ssh {
+                        last_ssh = current_ssh;
+                        match core.reload_ssh_signers() {
+                            Ok(()) => {
+                                eprintln!(
+                                    "sigil daemon: reloaded SSH keys from {}",
+                                    ssh_path.display()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "sigil daemon: SSH key reload failed, keeping last-good keys: {e}"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -1890,7 +1959,7 @@ mod tests {
             config: config.into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
         };
         (Arc::new(core), pending)
@@ -2020,7 +2089,7 @@ mod tests {
             config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: Some(30),
         };
 
@@ -2470,7 +2539,7 @@ mod tests {
             config: config.into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
         });
 
@@ -2589,7 +2658,7 @@ mod tests {
             config: env_inline_config("faketool", &["TOKEN", "REGION"]).into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
         });
 
@@ -2646,7 +2715,7 @@ mod tests {
             config: env_inline_config("faketool", &["TOKEN"]).into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
         });
 
@@ -2718,7 +2787,7 @@ mod tests {
             config: env_inline_config("faketool", &["TOKEN"]).into(), // readout: TOKEN only
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
         });
 
@@ -2791,7 +2860,7 @@ mod tests {
             config: config.into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
         });
 
@@ -2873,7 +2942,7 @@ mod tests {
             config: env_file_config("faketool", env_path.to_str().unwrap()).into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
         });
 
@@ -2962,10 +3031,10 @@ mod tests {
             config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: vec![Box::new(sshagent::FileSshSigner::new(vec![(
+            ssh_signers: SshSignersCell::new(vec![Box::new(sshagent::FileSshSigner::new(vec![(
                 id.clone(),
                 key_path.clone(),
-            )]))],
+            )]))]),
             audit: None,
         };
 
@@ -3170,7 +3239,7 @@ mod tests {
             config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::Phone,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
         });
         (core, approver)
@@ -3414,7 +3483,7 @@ mod tests {
             config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::Phone,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
         });
         (core, approver)
@@ -3626,7 +3695,7 @@ mod tests {
             config: coexist_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::Phone,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
         });
         let (owner_stop, owner) = spawn_owner(approver);
@@ -3993,7 +4062,7 @@ mod tests {
             config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
         })
     }
@@ -4131,6 +4200,60 @@ mod tests {
             ),
             "the freshly loaded deploy rule gates"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ssh_signers_hot_reload_when_the_key_store_changes() {
+        // A `sigil ssh add` edit to ~/.sigil/ssh-keys.json is picked up by
+        // reload_ssh_signers and swapped in, so a newly served key is advertised
+        // without a daemon restart (mirrors the rule-config hot-reload). HomeGuard
+        // points SIGIL_HOME at a temp dir, so SshKeyConfig::save writes exactly
+        // where reload_ssh_signers reads.
+        let _home = HomeGuard::new("ssh-reload");
+        let dir = tmpdir("ssh-reload");
+        let (core, _) = test_core(
+            &dir,
+            "tok",
+            "secret",
+            DevMode::Off,
+            Duration::from_millis(10),
+        );
+
+        // Before: the agent advertises no keys.
+        assert!(
+            SshBackend::identities(core.as_ref()).is_empty(),
+            "no keys served at start"
+        );
+
+        // Author a file-backed key on disk and register it in ssh-keys.json.
+        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .unwrap();
+        let key_path = dir.join("id_ed25519");
+        std::fs::write(&key_path, key.to_openssh(ssh_key::LineEnding::LF).unwrap()).unwrap();
+        std::fs::write(
+            format!("{}.pub", key_path.display()),
+            key.public_key().to_openssh().unwrap(),
+        )
+        .unwrap();
+        sshagent::SshKeyConfig {
+            keys: Vec::new(),
+            files: vec![sshagent::SshFileEntry {
+                path: key_path.display().to_string(),
+                comment: String::new(),
+                hosts: Vec::new(),
+            }],
+        }
+        .save()
+        .expect("writing ssh-keys.json into SIGIL_HOME");
+
+        core.reload_ssh_signers()
+            .expect("a clean reload swaps in the new key");
+
+        // After: the freshly added key is advertised, no restart.
+        let ids = SshBackend::identities(core.as_ref());
+        assert_eq!(ids.len(), 1, "the newly added key is served after reload");
+        assert_eq!(ids[0].key_blob, key.public_key().to_bytes().unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4500,7 +4623,7 @@ mod tests {
             config: config.into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
         });
 
@@ -4578,10 +4701,10 @@ mod tests {
             config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: vec![Box::new(sshagent::FileSshSigner::new(vec![(
+            ssh_signers: SshSignersCell::new(vec![Box::new(sshagent::FileSshSigner::new(vec![(
                 id.clone(),
                 key_path.clone(),
-            )]))],
+            )]))]),
             audit: None,
         };
 

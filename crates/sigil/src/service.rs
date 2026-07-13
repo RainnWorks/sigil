@@ -51,11 +51,28 @@ fn plist_path_value(shim_dir: &Path) -> String {
 /// Pure and deterministic so it can be unit-tested and diffed. `RunAtLoad`
 /// starts the daemon immediately; `KeepAlive.Crashed` respawns after a crash but
 /// not after a clean exit, so `sigil stop` (a bootout) stays stopped.
-pub fn render_plist(sigil_bin: &Path, logs_dir: &Path, shim_dir: &Path) -> String {
+pub fn render_plist(
+    sigil_bin: &Path,
+    logs_dir: &Path,
+    shim_dir: &Path,
+    dev_keystore: Option<&str>,
+) -> String {
     let program = sigil_bin.display();
     let out_log = logs_dir.join("daemon.out.log");
     let err_log = logs_dir.join("daemon.err.log");
     let path_value = plist_path_value(shim_dir);
+    // Carry the dev keystore mode into the launchd environment when the installer
+    // is running in dev (`SIGIL_DEV_KEYSTORE` set). Without this the launchd-spawned
+    // daemon would default to the real Secure Enclave keystore even though the rest
+    // of the dev loop uses the file keystore, so pairing/approval would break. In a
+    // production install the variable is unset, so nothing is pinned and the daemon
+    // uses the hardware keystore.
+    let keystore_env = match dev_keystore {
+        Some(mode) => {
+            format!("\n        <key>SIGIL_DEV_KEYSTORE</key>\n        <string>{mode}</string>")
+        }
+        None => String::new(),
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -71,7 +88,7 @@ pub fn render_plist(sigil_bin: &Path, logs_dir: &Path, shim_dir: &Path) -> Strin
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>{path_value}</string>
+        <string>{path_value}</string>{keystore_env}
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -110,7 +127,11 @@ pub fn install_plist() -> Result<PathBuf> {
     if let Some(dir) = plist_path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let body = render_plist(&sigil_bin, &logs, &shim_dir);
+    // Pin the dev keystore mode into the plist when this installer is itself
+    // running in dev, so the launchd-spawned daemon matches the dev loop. A
+    // production install has this unset and pins nothing.
+    let dev_keystore = std::env::var("SIGIL_DEV_KEYSTORE").ok();
+    let body = render_plist(&sigil_bin, &logs, &shim_dir, dev_keystore.as_deref());
     std::fs::write(&plist_path, body)
         .with_context(|| format!("writing {}", plist_path.display()))?;
     Ok(plist_path)
@@ -230,6 +251,7 @@ mod tests {
             Path::new("/Users/tom/.cargo/bin/sigil"),
             Path::new("/Users/tom/.sigil/logs"),
             Path::new("/Users/tom/.sigil/bin"),
+            None,
         );
         assert!(plist.contains("<string>works.rainn.sigil</string>"));
         assert!(plist.contains("<string>/Users/tom/.cargo/bin/sigil</string>"));
@@ -241,6 +263,23 @@ mod tests {
         assert!(plist.contains("<string>/Users/tom/.sigil/bin:/opt/homebrew/bin"));
         assert!(plist.contains("daemon.out.log"));
         assert!(plist.contains("daemon.err.log"));
+        // A production install pins no dev keystore, so the daemon uses hardware.
+        assert!(!plist.contains("SIGIL_DEV_KEYSTORE"));
+    }
+
+    #[test]
+    fn plist_pins_the_dev_keystore_when_the_installer_is_in_dev() {
+        // A dev install (SIGIL_DEV_KEYSTORE set) must bake the mode into the
+        // launchd environment, else the launchd-spawned daemon would default to
+        // the Secure Enclave keystore and break the file-keystore dev loop.
+        let plist = render_plist(
+            Path::new("/Users/tom/.sigil/bin/sigil"),
+            Path::new("/Users/tom/.sigil/logs"),
+            Path::new("/Users/tom/.sigil/bin"),
+            Some("file"),
+        );
+        assert!(plist.contains("<key>SIGIL_DEV_KEYSTORE</key>"));
+        assert!(plist.contains("<string>file</string>"));
     }
 
     #[test]

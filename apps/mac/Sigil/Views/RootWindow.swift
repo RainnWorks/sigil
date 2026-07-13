@@ -11,13 +11,14 @@
 import SwiftUI
 
 enum SidebarTab: String, CaseIterable, Identifiable {
-    case status, rules, pairing, leases, history, settings
+    case status, rules, ssh, pairing, leases, history, settings
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .status: return "Status"
         case .rules: return "Rules"
+        case .ssh: return "SSH"
         case .pairing: return "Pairing"
         case .leases: return "Leases"
         case .history: return "History"
@@ -28,6 +29,7 @@ enum SidebarTab: String, CaseIterable, Identifiable {
         switch self {
         case .status: return "dot.radiowaves.left.and.right"
         case .rules: return "arrow.triangle.branch"
+        case .ssh: return "terminal"
         case .pairing: return "qrcode"
         case .leases: return "clock.arrow.circlepath"
         case .history: return "list.bullet.rectangle"
@@ -61,6 +63,7 @@ struct RootWindow: View {
         switch selection {
         case .status: StatusView()
         case .rules: RulesView()
+        case .ssh: SSHView()
         case .pairing: PairingView()
         case .leases: LeasesView()
         case .history: HistoryView()

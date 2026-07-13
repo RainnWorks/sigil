@@ -688,6 +688,14 @@ pub struct SshKeyEntry {
     /// this is empty.
     #[serde(default)]
     pub comment: String,
+    /// SSH hosts to route through Sigil for this key, e.g.
+    /// `["github.com", "gist.github.com"]`. Pure client-side routing metadata:
+    /// the agent serves the key regardless; these only decide which `Host`
+    /// stanzas [`crate::sshconfig`] emits into the managed `~/.ssh/config` block.
+    /// Empty means "served but not routed" (the user points `SSH_AUTH_SOCK`
+    /// globally, or routes it by hand). See `sshconfig` for the layering model.
+    #[serde(default)]
+    pub hosts: Vec<String>,
 }
 
 fn default_field() -> String {
@@ -706,6 +714,10 @@ pub struct SshFileEntry {
     /// Optional comment override; the `.pub` line's own comment is used when empty.
     #[serde(default)]
     pub comment: String,
+    /// SSH hosts to route through Sigil for this key (see [`SshKeyEntry::hosts`]).
+    /// Client-side routing metadata only; empty means served but not routed.
+    #[serde(default)]
+    pub hosts: Vec<String>,
 }
 
 /// The persisted list of served SSH identities, at `~/.sigil/ssh-keys.json`.
@@ -1285,6 +1297,7 @@ mod tests {
             item: "GitHub".to_string(),
             field: "private key".to_string(),
             comment: "tom@github".to_string(),
+            hosts: Vec::new(),
         };
         let id = resolve_identity(&entry).expect("ed25519 entry resolves");
         assert_eq!(id.key_blob, key.public_key().to_bytes().unwrap());

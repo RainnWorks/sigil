@@ -24,6 +24,20 @@ final class AppModel {
     /// The if-this-then-that config: the rules the daemon gates on and the
     /// sources they inject from. Authored on the Rules screen.
     private(set) var config = SigilConfig()
+    /// The SSH keys the agent serves and whether the managed `~/.ssh/config`
+    /// routing is currently installed. Loaded alongside the other secondary
+    /// screens; authored on the SSH screen.
+    private(set) var sshKeys = SshKeyStore()
+    private(set) var sshRoutingInstalled = false
+    /// The local daemon's lifecycle, driven by the Status pane's daemon card:
+    /// whether its control socket is listening, the binary's reported version, and
+    /// the resolved binary path (for display). `daemonBusy` is true while a
+    /// start/stop/restart/install action is in flight, so the card disables its
+    /// buttons and shows an in-flight state.
+    private(set) var daemonRunning = false
+    private(set) var daemonVersion: String?
+    private(set) var daemonBinaryPath: String?
+    private(set) var daemonBusy = false
     /// Whether the first secondary load (config, history, settings) has completed.
     /// The Rules screen gates its teaching empty state on this so it never flashes
     /// before the load or on a pane re-select.
@@ -129,7 +143,19 @@ final class AppModel {
         history = (try? await daemon.history()) ?? history
         settings = (try? await daemon.settings()) ?? settings
         config = (try? await daemon.config()) ?? config
+        sshKeys = (try? await daemon.sshKeys()) ?? sshKeys
+        sshRoutingInstalled = await daemon.sshRoutingInstalled()
+        await refreshDaemonStatus()
         secondaryLoaded = true
+    }
+
+    /// Refresh the daemon lifecycle readout: is the control socket listening, what
+    /// version does the binary report, and where is it. Cheap enough to run on
+    /// every secondary load and after each lifecycle action.
+    func refreshDaemonStatus() async {
+        daemonRunning = await daemon.daemonRunning()
+        daemonVersion = await daemon.daemonVersion()
+        daemonBinaryPath = daemon.daemonBinaryPath()
     }
 
     // MARK: actions
@@ -170,6 +196,31 @@ final class AppModel {
     func installShim() async {
         await performControl { try await self.daemon.installShim() }
     }
+
+    // MARK: daemon lifecycle (start / stop / restart / install)
+
+    /// Run a daemon lifecycle action, showing an in-flight state, surfacing any
+    /// failure via `lastError` (e.g. `sigil start` refusing because something
+    /// already holds the socket), and refreshing both the lifecycle readout and
+    /// the status afterward. Mirrors `performControl`'s shape for the
+    /// throwing-void service verbs.
+    private func performLifecycle(_ operation: () async throws -> Void) async {
+        daemonBusy = true
+        do {
+            try await operation()
+            lastError = nil
+        } catch {
+            lastError = describe(error)
+        }
+        await refreshDaemonStatus()
+        await refresh()
+        daemonBusy = false
+    }
+
+    func startDaemon() async { await performLifecycle { try await self.daemon.startDaemon() } }
+    func stopDaemon() async { await performLifecycle { try await self.daemon.stopDaemon() } }
+    func restartDaemon() async { await performLifecycle { try await self.daemon.restartDaemon() } }
+    func installDaemon() async { await performLifecycle { try await self.daemon.installDaemon() } }
 
     func revokeLease(_ lease: Lease) async {
         await performControl { try await self.daemon.revokeLease(grantPrefix: lease.grantHex) }
@@ -341,6 +392,67 @@ final class AppModel {
         for src in cfg.sources where src.provider == envProviderID && !referenced.contains(src.name) {
             try? await daemon.removeSource(name: src.name)
         }
+    }
+
+    // MARK: SSH keys + routing
+
+    /// Add a served SSH key from a draft: a 1Password reference (public key piped
+    /// to the CLI on stdin) or a local key file. The CLI does all validation
+    /// (ed25519, dedupe, safe host tokens); a refusal lands in `lastError` and the
+    /// editor stays open. Returns whether it took, so the sheet dismisses only on
+    /// a real success. Reloads inline so the caller's check sees the new list.
+    @discardableResult
+    func saveSshKey(_ draft: SSHKeyDraft) async -> Bool {
+        var ok = false
+        do {
+            switch draft.source {
+            case .onePassword:
+                try await daemon.addSshOnePasswordKey(
+                    vault: draft.vault.trimmed, item: draft.item.trimmed,
+                    field: draft.field.trimmed, comment: draft.comment.trimmed,
+                    hosts: draft.hosts, publicKey: draft.publicKey.trimmed)
+            case .file:
+                try await daemon.addSshFileKey(
+                    path: draft.path.trimmed, comment: draft.comment.trimmed, hosts: draft.hosts)
+            }
+            lastError = nil
+            ok = true
+        } catch {
+            lastError = describe(error)
+        }
+        await loadSecondaryScreens()
+        return ok
+    }
+
+    /// Stop serving a key. The CLI `remove <item>` matches a 1Password item name;
+    /// a file key is dropped by its path where the mock supports it.
+    func removeSshKey(_ key: SshServedKey) async {
+        do {
+            try await daemon.removeSshKey(item: key.removeItem)
+            lastError = nil
+        } catch {
+            lastError = describe(error)
+        }
+        await loadSecondaryScreens()
+    }
+
+    /// Toggle the managed `~/.ssh/config` routing on or off. On installs the block
+    /// that sends the routed hosts through Sigil; off restores the normal agent.
+    func setSshRouting(_ install: Bool) async {
+        do {
+            if install { try await daemon.installSshRouting() }
+            else { try await daemon.uninstallSshRouting() }
+            lastError = nil
+        } catch {
+            lastError = describe(error)
+        }
+        await loadSecondaryScreens()
+    }
+
+    /// The generated `~/.sigil/ssh/config` contents for the "View block"
+    /// affordance, read on demand (nil when routing is not installed).
+    func generatedSshConfig() async -> String? {
+        await daemon.generatedSshConfig()
     }
 
     func setMacApprovals(_ mode: MacApprovalsMode) async {

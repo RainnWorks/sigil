@@ -160,6 +160,39 @@ struct SocketDaemonClient: DaemonClient {
     func setMacApprovals(_ mode: MacApprovalsMode) async throws { try await cli.setMacApprovals(mode) }
     func installShim() async throws -> ControlResult { try await cli.installShim() }
 
+    // MARK: - Daemon lifecycle
+    //
+    // `daemonRunning` we answer directly with a connect-probe of our own socket
+    // (no round trip, no frame); the start/stop/restart/install verbs and the
+    // version/path readouts are keystore-adjacent shell-outs, so they delegate to
+    // the CLI half like the other mutations.
+
+    func daemonRunning() async -> Bool { daemonSocketReachable(path: socketPath) }
+    func daemonVersion() async -> String? { await cli.daemonVersion() }
+    func daemonBinaryPath() -> String? { cli.daemonBinaryPath() }
+    func startDaemon() async throws { try await cli.startDaemon() }
+    func stopDaemon() async throws { try await cli.stopDaemon() }
+    func restartDaemon() async throws { try await cli.restartDaemon() }
+    func installDaemon() async throws { try await cli.installDaemon() }
+
+    // SSH agent config: served keys and the managed ~/.ssh/config routing are a
+    // keystore-adjacent concern the daemon does not own, so they delegate to the
+    // shell-out half like the other config mutations.
+    func sshKeys() async throws -> SshKeyStore { try await cli.sshKeys() }
+    func addSshOnePasswordKey(vault: String, item: String, field: String,
+                              comment: String, hosts: [String], publicKey: String) async throws {
+        try await cli.addSshOnePasswordKey(vault: vault, item: item, field: field,
+                                           comment: comment, hosts: hosts, publicKey: publicKey)
+    }
+    func addSshFileKey(path: String, comment: String, hosts: [String]) async throws {
+        try await cli.addSshFileKey(path: path, comment: comment, hosts: hosts)
+    }
+    func removeSshKey(item: String) async throws { try await cli.removeSshKey(item: item) }
+    func installSshRouting() async throws { try await cli.installSshRouting() }
+    func uninstallSshRouting() async throws { try await cli.uninstallSshRouting() }
+    func sshRoutingInstalled() async -> Bool { await cli.sshRoutingInstalled() }
+    func generatedSshConfig() async -> String? { await cli.generatedSshConfig() }
+
     func pairedDevice() async throws -> PairedDevice? { try await cli.pairedDevice() }
     func beginPairing(relayURL: String) -> AsyncStream<PairingCeremony> {
         cli.beginPairing(relayURL: relayURL)
@@ -304,6 +337,16 @@ private enum SocketError: Error {
         case .io(let s): return s
         }
     }
+}
+
+/// A lightweight daemon liveness probe shared by both clients' `daemonRunning`:
+/// can we connect to the control socket at `path`? A successful connect means the
+/// daemon is listening; a refused or absent socket means it is down. No frame is
+/// sent and the connection is dropped at once (deinit closes the fd), so it never
+/// perturbs the daemon. Synchronous: a unix-socket connect resolves immediately,
+/// it never blocks waiting for a listener that is not there.
+func daemonSocketReachable(path: String) -> Bool {
+    (try? UnixSocketConnection(path: path)) != nil
 }
 
 /// A single blocking connection to the daemon control socket. Created, used, and

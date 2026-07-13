@@ -91,6 +91,30 @@ protocol DaemonClient: Sendable {
     // Daemon-wide controls
     func lockdown(clear: Bool) async throws -> ControlResult
 
+    // Daemon lifecycle (the local launchd agent + its control socket). The app
+    // owns the local daemon: whether it is listening, and start / stop / restart /
+    // install it. These mirror the `sigil` service verbs (start/stop/restart) and
+    // the shim+launchd half of `setup`.
+    /// A lightweight liveness probe: a connect to the control socket succeeds
+    /// (daemon listening) or is refused/absent (stopped). Sends no frame, so it
+    /// never perturbs the daemon. Never throws.
+    func daemonRunning() async -> Bool
+    /// `sigil version`, trimmed; nil when the binary could not be run.
+    func daemonVersion() async -> String?
+    /// The resolved `sigil` binary path, for display; nil when none is found.
+    func daemonBinaryPath() -> String?
+    /// `sigil start`: install the launchd plist and bootstrap it.
+    func startDaemon() async throws
+    /// `sigil stop`: bootout the launchd agent.
+    func stopDaemon() async throws
+    /// `sigil restart`: `launchctl kickstart -k` the agent.
+    func restartDaemon() async throws
+    /// Wire the shim and launchd agent: the non-interactive half of `sigil setup`
+    /// (setup itself always ends in the interactive pairing ceremony, which the
+    /// app drives through the Pairing pane). In a shipped app this is also where a
+    /// bundled `sigil` binary would be copied into place before wiring (future).
+    func installDaemon() async throws
+
     // Pairing
     func pairedDevice() async throws -> PairedDevice?
     /// Begin the ceremony; the returned stream yields ceremony states as the
@@ -106,6 +130,32 @@ protocol DaemonClient: Sendable {
     /// Toggle whether the Mac Secure Enclave envelope exists (Enable Mac
     /// approvals) vs hardened phone-only.
     func setMacApprovals(_ mode: MacApprovalsMode) async throws
+
+    // SSH agent (served keys + managed ~/.ssh/config routing). Reads decode
+    // ~/.sigil/ssh-keys.json directly; writes shell out to `sigil ssh …`, which
+    // owns all validation (ed25519, dedupe, safe host tokens). A key add/remove
+    // needs a daemon restart to take effect; the CLI says so.
+    /// The served-key store as `~/.sigil/ssh-keys.json` holds it (empty if absent).
+    func sshKeys() async throws -> SshKeyStore
+    /// `sigil ssh add --vault <V> --item <I> [--field <f>] [--comment <c>]
+    /// [--host <h> …] --pubkey-stdin` with the public-key line piped on stdin.
+    func addSshOnePasswordKey(vault: String, item: String, field: String,
+                              comment: String, hosts: [String], publicKey: String) async throws
+    /// `sigil ssh add-file --path <p> [--comment <c>] [--host <h> …]`. The CLI
+    /// reads the sibling `<p>.pub` for the public key.
+    func addSshFileKey(path: String, comment: String, hosts: [String]) async throws
+    /// `sigil ssh remove <item>` (matches a 1Password item name).
+    func removeSshKey(item: String) async throws
+    /// `sigil ssh config --install`: write the managed `~/.ssh/config` block.
+    func installSshRouting() async throws
+    /// `sigil ssh config --uninstall`: remove it, restoring the normal agent.
+    func uninstallSshRouting() async throws
+    /// Whether the managed block is currently present in `~/.ssh/config` (read
+    /// directly; the marker line is the source of truth). Never throws.
+    func sshRoutingInstalled() async -> Bool
+    /// The generated `~/.sigil/ssh/config` contents, or nil when absent (routing
+    /// not installed). Read directly for the "View block" affordance.
+    func generatedSshConfig() async -> String?
 
     // Shim
     func installShim() async throws -> ControlResult
