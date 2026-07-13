@@ -7,9 +7,6 @@
 //! * `SIGIL_DEV_AUTOAPPROVE` — headless auto-approve for the gated-loop tests
 //!   and dev. Only functions when the daemon enabled it via `with_dev`, which
 //!   happens **only** under `--dev-insecure` (see [`crate::factor`]).
-//! * a live Mac Secure Enclave DEK envelope — prompt Touch ID to unwrap it
-//!   (NEEDS-VERIFICATION; see [`crate::keystore_macos`]). A successful unwrap is
-//!   the biometric approving factor.
 //! * the control socket — register the request as pending and block until a
 //!   `sigil approve --local --id <id>` (or `deny`) arrives, or the timeout fails
 //!   closed. This path is same-UID forgeable (`docs/security-claims.md`
@@ -28,9 +25,6 @@ use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
-
-use crate::keystore::Keystore;
-use crate::secrets::Dek;
 
 /// Default wait for a local decision before failing closed.
 pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -55,52 +49,36 @@ impl Decision {
     }
 }
 
-/// The full result of an approval: the [`Decision`], plus the DEK when the
-/// approving factor *supplied* one.
+/// The full result of an approval: the [`Decision`], plus the phone's threshold
+/// partial `Z_F` when the approving factor supplied one.
 ///
 /// This is the seam that lets the inert daemon serve a secret with no key at
-/// rest. The local approver (Touch ID / control socket) returns `dek: None`; the
-/// daemon then unwraps the DEK from its own keystore. The remote approver (the
-/// paired phone / softphone) returns `dek: Some(_)`: the phone holds the one DEK
-/// and delivers it, re-sealed to the daemon, per approval. Either way the DEK is
-/// used once and zeroized (`Dek` is `Zeroizing`).
+/// rest. A request that opens a threshold-sealed secret needs the phone's partial
+/// `Z_F = x(f·E)`, which only the paired phone can produce; the daemon combines it
+/// with its Mac share `m` to derive the key, uses it once, and zeroizes it. A
+/// local approve (control socket / dev switch) carries no partial, so it can
+/// approve a plain gate but never open a sealed secret (that requires the phone).
 #[derive(Clone)]
 pub struct ApprovalOutcome {
     pub decision: Decision,
-    pub dek: Option<Dek>,
-    /// For a v2 (threshold) account: the phone's partial `Z_F = x(f·E)` the
-    /// daemon combines with its Mac share `m` to open the token. Mutually
-    /// exclusive with [`dek`](Self::dek) in practice — a v1 approve carries a
-    /// DEK, a v2 approve carries this. Zeroize-on-drop.
+    /// For a request that opens a threshold-sealed secret: the phone's partial
+    /// `Z_F = x(f·E)` the daemon combines with its Mac share `m`. Absent on a
+    /// local approve and on a plain-gate approve. Zeroize-on-drop.
     pub zf: Option<zeroize::Zeroizing<[u8; 32]>>,
 }
 
 impl ApprovalOutcome {
-    /// A decision with no key material: the daemon unwraps its own key (local
-    /// path) or, for v2, this is a deny.
+    /// A decision with no key material: a plain-gate approve, a deny, or a local
+    /// approve (which cannot open a sealed secret).
     pub fn local(decision: Decision) -> Self {
-        Self {
-            decision,
-            dek: None,
-            zf: None,
-        }
+        Self { decision, zf: None }
     }
 
-    /// A grant that carries the phone-delivered DEK (remote v1 path).
-    pub fn with_dek(decision: Decision, dek: Dek) -> Self {
-        Self {
-            decision,
-            dek: Some(dek),
-            zf: None,
-        }
-    }
-
-    /// A grant that carries the phone's v2 threshold partial `Z_F` (remote v2
-    /// path). The daemon combines it with the Mac share to derive the token key.
+    /// A grant that carries the phone's threshold partial `Z_F`. The daemon
+    /// combines it with the Mac share to derive the sealed secret's key.
     pub fn with_partial(decision: Decision, zf: zeroize::Zeroizing<[u8; 32]>) -> Self {
         Self {
             decision,
-            dek: None,
             zf: Some(zf),
         }
     }
@@ -138,10 +116,10 @@ pub struct ApprovalContext {
     /// destination, and data-to-sign fingerprint the approver renders. `None`
     /// for secret reads and control requests.
     pub ssh: Option<sigil_proto::SshChallenge>,
-    /// Present when the routed account is a v2 (threshold) account: the base
-    /// point `E` the phone key-agrees against, plus the account binding it shows
-    /// and consents to (R5). The remote approver copies this into the request; a
-    /// v1 account leaves it `None` and takes the DEK path.
+    /// Present when the request opens a threshold-sealed secret: the base point
+    /// `E` the phone key-agrees against, plus the id/label binding it shows and
+    /// consents to (R5). The remote approver copies this into the request; a plain
+    /// gate (no sealed secret) leaves it `None`.
     pub threshold: Option<sigil_proto::ThresholdChallenge>,
 }
 
@@ -340,7 +318,6 @@ impl DevMode {
 /// with a biometric factor the unwrap is the sole gate and an unresolved
 /// decision fails closed rather than parking on the socket.
 pub struct LocalApprover {
-    keystore: Arc<dyn Keystore>,
     pending: Arc<PendingRegistry>,
     timeout: Duration,
     dev: DevMode,
@@ -352,9 +329,8 @@ pub struct LocalApprover {
 impl LocalApprover {
     /// Build an approver with the forgeable paths off: no dev auto-approve and no
     /// control-socket fallback. The caller opts into either explicitly.
-    pub fn new(keystore: Arc<dyn Keystore>, pending: Arc<PendingRegistry>) -> Self {
+    pub fn new(pending: Arc<PendingRegistry>) -> Self {
         Self {
-            keystore,
             pending,
             timeout: DEFAULT_APPROVAL_TIMEOUT,
             dev: DevMode::Off,
@@ -401,42 +377,27 @@ impl Approver for NullApprover {
 
 impl Approver for LocalApprover {
     fn decide(&self, ctx: &ApprovalContext) -> ApprovalOutcome {
-        // The local approver never supplies a DEK; the daemon unwraps its own
-        // key from the keystore once the decision is a grant.
+        // The local approver never supplies a threshold partial; it can approve a
+        // plain gate but not open a sealed secret (that needs the phone).
         ApprovalOutcome::local(self.decide_local(ctx))
     }
 }
 
 impl LocalApprover {
-    /// The local decision, without a DEK. Split out so [`Approver::decide`] just
-    /// wraps it in a DEK-less [`ApprovalOutcome`].
+    /// The local decision, without a partial. Split out so [`Approver::decide`]
+    /// just wraps it in a partial-less [`ApprovalOutcome`].
     fn decide_local(&self, ctx: &ApprovalContext) -> Decision {
         // 1. Dev auto-approve switch.
         if let Some(d) = self.dev.decision() {
             return d;
         }
 
-        // 2. Mac Secure Enclave + Touch ID, when provisioned. The unwrap itself
-        //    is the biometric gate; a successful unwrap is the approval. Only a
-        //    real biometric keystore counts here, so a dev/in-memory keystore
-        //    (whose unwrap is not a biometric) can never auto-approve. A
-        //    declined prompt denies outright; any other error (no DEK
-        //    provisioned, or a Secure Enclave / backend fault -- see
-        //    `keystore_macos.rs`, still pending on-hardware verification) falls
-        //    through to the control-socket path below rather than treating an
-        //    unexpected keystore fault as an approval.
-        if self.keystore.is_biometric() && self.keystore.has_dek() {
-            match self
-                .keystore
-                .unwrap_dek(&format!("Approve {} for {}", ctx.scope, ctx.account))
-            {
-                Ok(_dek) => return Decision::Approve,
-                Err(crate::keystore::KeystoreError::Declined) => return Decision::Deny,
-                Err(_) => { /* no DEK, or a backend fault: fall through */ }
-            }
-        }
-
-        // 3. Park until `sigil approve|deny --local --id <ctx.id>` or timeout —
+        // There is no local biometric approve path anymore: a request that opens a
+        // threshold-sealed secret needs the phone's partial `Z_F`, which the local
+        // approver cannot produce, so approval requires the phone. What remains
+        // here serves the dev/control paths only.
+        //
+        // 2. Park until `sigil approve|deny --local --id <ctx.id>` or timeout —
         //    but ONLY under --dev-insecure. The control socket is same-UID
         //    forgeable (residual #1), so without it the daemon fails closed here
         //    rather than offering a self-approvable gate.
@@ -617,12 +578,11 @@ mod tests {
 
     #[test]
     fn dev_autoapprove_grants_without_biometrics() {
-        let ks: Arc<dyn Keystore> = Arc::new(crate::keystore::MemoryKeystore::new());
-        let approver = LocalApprover::new(ks.clone(), Arc::new(PendingRegistry::new()))
-            .with_dev(DevMode::Approve);
+        let approver =
+            LocalApprover::new(Arc::new(PendingRegistry::new())).with_dev(DevMode::Approve);
         assert_eq!(approver.decide(&ctx("x", "s")).decision, Decision::Approve);
 
-        let lease = LocalApprover::new(ks, Arc::new(PendingRegistry::new()))
+        let lease = LocalApprover::new(Arc::new(PendingRegistry::new()))
             .with_dev(DevMode::Lease(Duration::from_secs(60)));
         assert!(matches!(
             lease.decide(&ctx("x", "s")).decision,
@@ -650,8 +610,7 @@ mod tests {
     #[test]
     fn local_control_round_trip_approves() {
         let pending = Arc::new(PendingRegistry::new());
-        let ks: Arc<dyn Keystore> = Arc::new(crate::keystore::MemoryKeystore::new());
-        let approver = LocalApprover::new(ks, pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Off)
             .with_control_socket(true)
             .with_timeout(Duration::from_secs(2));
@@ -677,9 +636,8 @@ mod tests {
         // its full context (command, kind, cwd) plus a queued time and timeout,
         // so the menubar can render it.
         let pending = Arc::new(PendingRegistry::new());
-        let ks: Arc<dyn Keystore> = Arc::new(crate::keystore::MemoryKeystore::new());
         let approver = Arc::new(
-            LocalApprover::new(ks, pending.clone())
+            LocalApprover::new(pending.clone())
                 .with_control_socket(true)
                 .with_timeout(Duration::from_secs(2)),
         );
@@ -710,9 +668,8 @@ mod tests {
         // The subscribe stream relies on: the version moves when the set changes,
         // and wait_for_change returns immediately if it already moved past `since`.
         let pending = Arc::new(PendingRegistry::new());
-        let ks: Arc<dyn Keystore> = Arc::new(crate::keystore::MemoryKeystore::new());
         let approver = Arc::new(
-            LocalApprover::new(ks, pending.clone())
+            LocalApprover::new(pending.clone())
                 .with_control_socket(true)
                 .with_timeout(Duration::from_secs(2)),
         );
@@ -736,8 +693,7 @@ mod tests {
     #[test]
     fn local_timeout_fails_closed() {
         let pending = Arc::new(PendingRegistry::new());
-        let ks: Arc<dyn Keystore> = Arc::new(crate::keystore::MemoryKeystore::new());
-        let approver = LocalApprover::new(ks, pending)
+        let approver = LocalApprover::new(pending)
             .with_dev(DevMode::Off)
             .with_control_socket(true)
             .with_timeout(Duration::from_millis(30));
@@ -753,9 +709,7 @@ mod tests {
         // decision that no biometric can satisfy must deny immediately, never
         // park on the same-UID-forgeable control socket (residual #1).
         let pending = Arc::new(PendingRegistry::new());
-        let ks: Arc<dyn Keystore> = Arc::new(crate::keystore::MemoryKeystore::new());
-        let approver =
-            LocalApprover::new(ks, pending.clone()).with_timeout(Duration::from_secs(30));
+        let approver = LocalApprover::new(pending.clone()).with_timeout(Duration::from_secs(30));
         let start = std::time::Instant::now();
         assert_eq!(
             approver.decide(&ctx("req-x", "read .env")).decision,
@@ -770,6 +724,5 @@ mod tests {
     fn null_approver_denies_every_request() {
         let outcome = NullApprover.decide(&ctx("req-n", "read .env"));
         assert_eq!(outcome.decision, Decision::Deny);
-        assert!(outcome.dek.is_none());
     }
 }

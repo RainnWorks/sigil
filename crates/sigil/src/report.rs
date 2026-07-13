@@ -35,8 +35,8 @@ impl Runtime {
 pub fn status(daemon_up: bool, runtime: Runtime) -> StatusJson {
     let shim = paths::ShimStatus::detect();
     let real_op = paths::find_real_op();
-    let accounts = crate::secrets::AccountStore::load()
-        .map(|s| s.accounts.len())
+    let accounts = crate::threshold::ThresholdStore::load()
+        .map(|s| s.secrets.len())
         .unwrap_or(0);
 
     let shim_kind = if shim.healthy() {

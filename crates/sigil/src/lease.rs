@@ -365,7 +365,6 @@ impl ProcessTable for SysProcessTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secrets::generate_dek;
     use std::collections::HashMap;
     use zeroize::Zeroizing;
 
@@ -537,7 +536,6 @@ mod tests {
     fn lease_refresh_keeps_one_entry() {
         let store = LeaseStore::new();
         let gk = [3u8; 32];
-        let _ = generate_dek(); // touch the CSPRNG path used by the real flow
         store.grant(gk, "A", "s", token("a"), Duration::from_secs(1));
         store.grant(gk, "A", "s", token("b"), Duration::from_secs(60));
         assert_eq!(store.active(), 1);

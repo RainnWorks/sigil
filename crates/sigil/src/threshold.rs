@@ -69,13 +69,9 @@ pub enum ThresholdStoreError {
     Json(#[from] serde_json::Error),
     #[error("keystore: {0}")]
     Keystore(#[from] crate::keystore::KeystoreError),
-    #[error("the stored Mac share is not a valid P-256 scalar; re-run v2 setup")]
+    #[error("the stored Mac share is not a valid P-256 scalar; re-run pairing")]
     CorruptMacShare,
-    #[error("no v2 account routes vault {0:?}; add one with `sigil account add --threshold`")]
-    NoRoute(String),
-    #[error("v2 account {0:?} already exists")]
-    Duplicate(String),
-    #[error("a duplicate ephemeral base E across accounts breaks account separation (R4)")]
+    #[error("a duplicate ephemeral base E across sealed secrets breaks separation (R4)")]
     DuplicateEphemeral,
     #[error("threshold crypto: {0}")]
     Crypto(#[from] ThresholdError),
@@ -226,37 +222,21 @@ impl PhoneShare {
 }
 
 // ===========================================================================
-// The versioned v2 account store.
+// The threshold-sealed secret store.
 // ===========================================================================
 
-/// One v2 account: the sealed [`ThresholdRecord`] plus the plaintext vault
-/// routing (the same routing model as v1's [`crate::secrets::Account`], so the
-/// daemon can pick the account while inert). `record.account_id` is the label.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ThresholdAccount {
-    #[serde(flatten)]
-    pub record: ThresholdRecord,
-    /// Vault names this account can serve. Plaintext by design, exactly as v1.
-    #[serde(default)]
-    pub vaults: Vec<String>,
-}
-
-impl ThresholdAccount {
-    /// The account label (its stable id, folded into the KDF).
-    pub fn label(&self) -> &str {
-        &self.record.account_id
-    }
-}
-
-/// The v2 account catalogue, persisted at `~/.sigil/threshold.db` as JSON. It
-/// holds token *ciphertext* and the plaintext routing only; no `K`, no `Z_M`, no
-/// `Z_F`, and crucially no `e`. It coexists with the v1
-/// [`AccountStore`](crate::secrets::AccountStore): the two share the AES-256-GCM
-/// token format and differ only in where the key comes from.
+/// The store of threshold-sealed secrets, persisted at `~/.sigil/threshold.db` as
+/// JSON. Each entry is a [`ThresholdRecord`] keyed by its `account_id` (the id of
+/// what it seals, e.g. an inline-`env` source name). It holds ciphertext only; no
+/// `K`, no `Z_M`, no `Z_F`, and crucially no `e`. Opening a secret needs the
+/// phone's per-request partial `Z_F` combined with the Mac share `m`, so the
+/// daemon at rest holds nothing that can release a secret ("no DEK to downgrade
+/// to").
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ThresholdStore {
+    /// Sealed secrets, keyed by `record.account_id`.
     #[serde(default)]
-    pub accounts: Vec<ThresholdAccount>,
+    pub secrets: Vec<ThresholdRecord>,
 }
 
 impl ThresholdStore {
@@ -281,12 +261,10 @@ impl ThresholdStore {
 
     /// Persist the store 0600, creating the parent dir 0700. Enforces the R4
     /// invariant (all ephemeral bases distinct) before writing, so a store that
-    /// would break the "one captured partial ⇒ one account" claim is never saved.
+    /// would break the "one captured partial ⇒ one secret" claim is never saved.
     pub fn save(&self) -> Result<(), ThresholdStoreError> {
         use std::os::unix::fs::PermissionsExt;
-        let records: Vec<ThresholdRecord> =
-            self.accounts.iter().map(|a| a.record.clone()).collect();
-        if !all_ephemerals_unique(&records) {
+        if !all_ephemerals_unique(&self.secrets) {
             return Err(ThresholdStoreError::DuplicateEphemeral);
         }
         let path = Self::path()?;
@@ -300,78 +278,54 @@ impl ThresholdStore {
         Ok(())
     }
 
-    /// Look up a v2 account by label.
-    pub fn get(&self, label: &str) -> Option<&ThresholdAccount> {
-        self.accounts.iter().find(|a| a.label() == label)
+    /// Look up a sealed secret by its id (`account_id`).
+    pub fn get(&self, id: &str) -> Option<&ThresholdRecord> {
+        self.secrets.iter().find(|r| r.account_id == id)
     }
 
-    /// Pick the v2 account matching `hint` (a source's account label or a vault
-    /// name) exactly by **label or vault**, with no single-account fallback. Used
-    /// when v1 accounts coexist (a migration store): v2 then claims only an exact
-    /// match, leaving everything else to v1.
-    pub fn route_exact(&self, hint: Option<&str>) -> Option<&ThresholdAccount> {
-        let v = hint?;
-        self.accounts
-            .iter()
-            .find(|a| a.label() == v || a.vaults.iter().any(|x| x == v))
+    /// Insert or replace the sealed record for its id. Replacement is how a
+    /// write-only re-seal works: the caller mints a fresh record (fresh `E`) for
+    /// the id and the old one is dropped.
+    pub fn upsert(&mut self, record: ThresholdRecord) {
+        let id = record.account_id.clone();
+        self.secrets.retain(|r| r.account_id != id);
+        self.secrets.push(record);
     }
 
-    /// Pick the v2 account for a routing `hint`, mirroring
-    /// [`AccountStore::route`](crate::secrets::AccountStore::route): a matching
-    /// label or vault wins; with a single account and no match it is the fallback;
-    /// `None` means no v2 account serves this request (the caller then tries v1).
-    pub fn route(&self, hint: Option<&str>) -> Option<&ThresholdAccount> {
-        if self.accounts.is_empty() {
-            return None;
-        }
-        match hint {
-            Some(v) => self
-                .accounts
-                .iter()
-                .find(|a| a.label() == v || a.vaults.iter().any(|x| x == v))
-                .or_else(|| (self.accounts.len() == 1).then(|| &self.accounts[0])),
-            None => Some(&self.accounts[0]),
-        }
-    }
-
-    /// Remove the v2 account with `label`. Returns true if one was removed.
-    pub fn remove(&mut self, label: &str) -> bool {
-        let before = self.accounts.len();
-        self.accounts.retain(|a| a.label() != label);
-        self.accounts.len() != before
+    /// Remove the sealed secret with `id`. Returns true if one was removed.
+    pub fn remove(&mut self, id: &str) -> bool {
+        let before = self.secrets.len();
+        self.secrets.retain(|r| r.account_id != id);
+        self.secrets.len() != before
     }
 }
 
-/// Account-add (a Mac-only, human-present CLI ceremony; design §5). Mint a fresh
-/// unique `E` (R4), derive `K` from the Mac share `m` and the pinned phone share
-/// `F`, seal the token, and add the resulting v2 record to `store`. The ephemeral
-/// `e`, `Z_M`, `Z_F`, and `K` are all transient inside
-/// [`ThresholdRecord::seal`] and dropped (zeroized) as it returns; only the
-/// public `E` survives in the record.
+/// Seal `plaintext` under the two-party key `K = combine(Z_M, Z_F, E, id)` and
+/// insert (or replace) it in `store` under `id`. A Mac-only, human-present
+/// ceremony: mint a fresh unique `E` (R4), derive `K` from the Mac share `m` and
+/// the pinned phone share `F`, seal, and destroy the ephemeral `e` so `Z_F`
+/// becomes computable only by the phone's Secure Enclave. The ephemeral `e`,
+/// `Z_M`, `Z_F`, and `K` are all transient inside [`ThresholdRecord::seal`] and
+/// dropped (zeroized) as it returns; only the public `E` survives in the record.
 ///
-/// Rejects a duplicate label. The R4 uniqueness of `E` across the whole store is
-/// re-checked on [`ThresholdStore::save`].
-#[allow(clippy::too_many_arguments)]
-pub fn seal_account(
+/// The R4 uniqueness of `E` across the whole store is re-checked on
+/// [`ThresholdStore::save`].
+pub fn seal_secret(
     store: &mut ThresholdStore,
-    label: &str,
+    id: &str,
     m: &MacShare,
     phone: &PhoneShare,
-    token: &[u8],
-    vaults: Vec<String>,
+    plaintext: &[u8],
 ) -> Result<(), ThresholdStoreError> {
-    if store.get(label).is_some() {
-        return Err(ThresholdStoreError::Duplicate(label.to_string()));
-    }
     let record = ThresholdRecord::seal(
-        label,
+        id,
         m,
         &phone.point,
         phone.ecdh_algo,
         &phone.se_key_id,
-        token,
+        plaintext,
     )?;
-    store.accounts.push(ThresholdAccount { record, vaults });
+    store.upsert(record);
     Ok(())
 }
 
@@ -473,25 +427,17 @@ mod tests {
         let (f, phone) = phone_se("se-key-1", EcdhAlgo::RawX);
 
         let mut store = ThresholdStore::default();
-        seal_account(
-            &mut store,
-            "Rowm",
-            &m,
-            &phone,
-            TOKEN,
-            vec!["Engineering".into()],
-        )
-        .unwrap();
+        seal_secret(&mut store, "deploy", &m, &phone, TOKEN).unwrap();
 
-        let account = store.route(Some("Engineering")).unwrap();
-        assert_eq!(account.record.version, THRESHOLD_RECORD_VERSION);
+        let rec = store.get("deploy").unwrap();
+        assert_eq!(rec.version, THRESHOLD_RECORD_VERSION);
         // e was destroyed: only the public E survives, no scalar in the record.
-        let json = serde_json::to_string(&account.record).unwrap();
+        let json = serde_json::to_string(rec).unwrap();
         assert!(!json.contains("\"e\""), "no ephemeral scalar in the record");
 
-        // The phone contributes Z_F; the Mac supplies m. Together: the token.
-        let zf = phone_partial(&f, &account.record);
-        let recovered = decrypt(&account.record, &m, &zf).unwrap();
+        // The phone contributes Z_F; the Mac supplies m. Together: the secret.
+        let zf = phone_partial(&f, rec);
+        let recovered = decrypt(rec, &m, &zf).unwrap();
         assert_eq!(&recovered[..], TOKEN);
     }
 
@@ -501,8 +447,8 @@ mod tests {
         let m = load_or_create_mac_share(&ks).unwrap();
         let (f, phone) = phone_se("se-key-1", EcdhAlgo::X963Sha256);
         let mut store = ThresholdStore::default();
-        seal_account(&mut store, "Rowm", &m, &phone, TOKEN, vec![]).unwrap();
-        let rec = &store.accounts[0].record;
+        seal_secret(&mut store, "deploy", &m, &phone, TOKEN).unwrap();
+        let rec = &store.secrets[0];
         let zf = phone_partial(&f, rec);
         assert_eq!(&decrypt(rec, &m, &zf).unwrap()[..], TOKEN);
     }
@@ -513,8 +459,8 @@ mod tests {
         let m = load_or_create_mac_share(&ks).unwrap();
         let (_f, phone) = phone_se("se-key-1", EcdhAlgo::RawX);
         let mut store = ThresholdStore::default();
-        seal_account(&mut store, "Rowm", &m, &phone, TOKEN, vec![]).unwrap();
-        let rec = &store.accounts[0].record;
+        seal_secret(&mut store, "deploy", &m, &phone, TOKEN).unwrap();
+        let rec = &store.secrets[0];
 
         // A zero / wrong Z_F yields a wrong K and the GCM tag fails.
         assert!(matches!(
@@ -522,7 +468,7 @@ mod tests {
             Err(ThresholdStoreError::Crypto(ThresholdError::Aead))
         ));
 
-        // A different SE key f' does not open this account's token.
+        // A different SE key f' does not open this secret.
         let other = MacShare::generate();
         let zf_other = phone_partial(&other, rec);
         assert!(matches!(
@@ -537,10 +483,10 @@ mod tests {
         let m = load_or_create_mac_share(&ks).unwrap();
         let (f, phone) = phone_se("se-key-1", EcdhAlgo::RawX);
         let mut store = ThresholdStore::default();
-        seal_account(&mut store, "Rowm", &m, &phone, TOKEN, vec![]).unwrap();
-        let rec = &store.accounts[0].record;
+        seal_secret(&mut store, "deploy", &m, &phone, TOKEN).unwrap();
+        let rec = &store.secrets[0];
         let zf = phone_partial(&f, rec);
-        // The right phone partial but the wrong Mac share still yields no token.
+        // The right phone partial but the wrong Mac share still yields no secret.
         let wrong_m = MacShare::generate();
         assert!(matches!(
             decrypt(rec, &wrong_m, &zf),
@@ -561,51 +507,41 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_label_is_rejected() {
+    fn upsert_replaces_the_record_for_an_id() {
         let ks = MemoryKeystore::new();
         let m = load_or_create_mac_share(&ks).unwrap();
-        let (_f, phone) = phone_se("se-key-1", EcdhAlgo::RawX);
+        let (f, phone) = phone_se("se-key-1", EcdhAlgo::RawX);
         let mut store = ThresholdStore::default();
-        seal_account(&mut store, "Rowm", &m, &phone, TOKEN, vec![]).unwrap();
-        assert!(matches!(
-            seal_account(&mut store, "Rowm", &m, &phone, b"x", vec![]),
-            Err(ThresholdStoreError::Duplicate(_))
-        ));
+        seal_secret(&mut store, "deploy", &m, &phone, b"first").unwrap();
+        let e1 = store.get("deploy").unwrap().ephemeral_pub.clone();
+        // A second seal for the same id replaces the record with a fresh E and
+        // the new plaintext; the store still holds exactly one entry.
+        seal_secret(&mut store, "deploy", &m, &phone, b"second").unwrap();
+        assert_eq!(store.secrets.len(), 1);
+        let rec = store.get("deploy").unwrap();
+        assert_ne!(rec.ephemeral_pub, e1, "re-seal must mint a fresh E");
+        let zf = phone_partial(&f, rec);
+        assert_eq!(&decrypt(rec, &m, &zf).unwrap()[..], b"second");
     }
 
     #[test]
-    fn each_account_gets_a_unique_ephemeral_and_routes() {
+    fn each_secret_gets_a_unique_ephemeral_and_is_keyed_by_id() {
         let ks = MemoryKeystore::new();
         let m = load_or_create_mac_share(&ks).unwrap();
         let (_f, phone) = phone_se("se-key-1", EcdhAlgo::RawX);
         let mut store = ThresholdStore::default();
-        seal_account(
-            &mut store,
-            "Rowm",
-            &m,
-            &phone,
-            b"t1",
-            vec!["Engineering".into()],
-        )
-        .unwrap();
-        seal_account(
-            &mut store,
-            "Personal",
-            &m,
-            &phone,
-            b"t2",
-            vec!["Private".into()],
-        )
-        .unwrap();
-        // R4: distinct E per account.
+        seal_secret(&mut store, "deploy", &m, &phone, b"t1").unwrap();
+        seal_secret(&mut store, "ci", &m, &phone, b"t2").unwrap();
+        // R4: distinct E per sealed secret.
         assert_ne!(
-            store.accounts[0].record.ephemeral_pub, store.accounts[1].record.ephemeral_pub,
-            "each account must get a fresh E"
+            store.secrets[0].ephemeral_pub, store.secrets[1].ephemeral_pub,
+            "each sealed secret must get a fresh E"
         );
-        assert_eq!(store.route(Some("Engineering")).unwrap().label(), "Rowm");
-        assert_eq!(store.route(Some("Private")).unwrap().label(), "Personal");
-        // An unknown vault with several accounts does not route (fail closed).
-        assert!(store.route(Some("Nope")).is_none());
+        assert!(store.get("deploy").is_some());
+        assert!(store.get("ci").is_some());
+        assert!(store.get("nope").is_none());
+        assert!(store.remove("deploy"));
+        assert!(!store.remove("deploy"));
     }
 
     #[test]
@@ -621,26 +557,18 @@ mod tests {
         let m = load_or_create_mac_share(&ks).unwrap();
         let (f, phone) = phone_se("se-key-1", EcdhAlgo::RawX);
         let mut store = ThresholdStore::default();
-        seal_account(
-            &mut store,
-            "Rowm",
-            &m,
-            &phone,
-            b"super-secret-token",
-            vec!["Engineering".into()],
-        )
-        .unwrap();
+        seal_secret(&mut store, "deploy", &m, &phone, b"super-secret-token").unwrap();
         store.save().unwrap();
 
-        // The plaintext token must not appear on disk.
+        // The plaintext secret must not appear on disk.
         let raw = std::fs::read(ThresholdStore::path().unwrap()).unwrap();
         assert!(
             !String::from_utf8_lossy(&raw).contains("super-secret-token"),
-            "plaintext token leaked into the threshold store"
+            "plaintext secret leaked into the threshold store"
         );
 
         let loaded = ThresholdStore::load().unwrap();
-        let rec = &loaded.route(Some("Engineering")).unwrap().record;
+        let rec = loaded.get("deploy").unwrap();
         let zf = phone_partial(&f, rec);
         assert_eq!(&decrypt(rec, &m, &zf).unwrap()[..], b"super-secret-token");
 

@@ -12,8 +12,6 @@ use crate::json::{self, ControlResult};
 use crate::keystore;
 use crate::local::{self, Frame, Reply};
 use crate::paths;
-use crate::provider::{OpProvider, SecretProvider};
-use crate::secrets::AccountStore;
 use crate::settings::{self, Settings};
 use crate::style::Style;
 
@@ -93,7 +91,6 @@ pub fn run_config() -> i32 {
         "add" => config_add(&args[1..], json),
         "remove" | "rm" => config_remove(args.get(1).map(String::as_str), json),
         "proxy" => cmd_proxy(&args[1..], json),
-        "account" => cmd_account(&args[1..], json),
         "settings" => cmd_settings(&args[1..], json),
         "mac-approvals" => cmd_mac_approvals(&args[1..], json),
         "wipe" => cmd_wipe(&args[1..], json),
@@ -283,10 +280,6 @@ usage: sigil-config <cmd> [args...]   author rules/sources, manage accounts
   proxy add <cmd>   install a transparent PATH alias so a bare <cmd> hits Sigil;
                     also: proxy remove <cmd> [--purge] | list | status |
                     doctor [<cmd>] | env [--shell zsh|bash|fish|nu]
-  account add       add a service-account token (reads token from stdin)
-  account list      list configured accounts and their vault routing
-  account rotate --id <id>  replace an account's token (reads from stdin)
-  account remove --id <id>  forget an account
   settings get|set  read or change preferences (timeouts, relay, retention)
   mac-approvals --enable|--phone-only  toggle the Mac local-approval factor
   wipe [--force]    remove pairing, accounts, keys, config, and settings
@@ -373,16 +366,20 @@ fn cmd_status() -> i32 {
         (
             s.ok("\u{2713}"),
             "configured",
-            s.dim(&format!("{} account(s)", st.accounts)),
+            s.dim(&format!("{} sealed secret(s)", st.accounts)),
         )
     } else {
         (
             s.brass("\u{2717}"),
             "none",
-            s.dim("run: sigil account add --token-stdin --label <name>"),
+            s.dim("set inline env values: sigil-config source env set <name> --stdin"),
         )
     };
-    println!("  {} {glyph} {}  {note}", s.dim("accounts"), pad(label, 13));
+    println!(
+        "  {} {glyph} {}  {note}",
+        s.dim("sealed env"),
+        pad(label, 13)
+    );
 
     // factor
     let (glyph, label, note) = match st.factor.kind.as_str() {
@@ -505,322 +502,6 @@ fn flag_values(args: &[String], name: &str) -> Vec<String> {
         }
     }
     out
-}
-
-fn cmd_account(args: &[String], json: bool) -> i32 {
-    match args.first().map(String::as_str) {
-        Some("add") => account_add(&args[1..], json),
-        Some("list") => account_list(json),
-        Some("rotate") => account_rotate(&args[1..], json),
-        Some("remove") | Some("rm") => account_remove(&args[1..], json),
-        _ => {
-            eprintln!("usage: sigil account <add|list|rotate|remove>");
-            2
-        }
-    }
-}
-
-/// The GUI-facing shape for one account. The store keys accounts by their unique
-/// label, so `id == label`; it retains no token-health or last-used metadata, so
-/// those are `healthy`/absent (see JSON.md).
-fn account_json(a: &crate::secrets::Account) -> json::AccountJson {
-    json::AccountJson {
-        id: a.label.clone(),
-        label: a.label.clone(),
-        vaults: a.vaults.clone(),
-        health: "healthy".into(),
-        detail: None,
-        last_used_ms: None,
-    }
-}
-
-/// Read a service-account token from stdin into a wiped buffer, trimming a
-/// trailing newline. `None` (with a printed error) on read failure or empty.
-fn read_token_stdin() -> Option<Zeroizing<Vec<u8>>> {
-    let mut token = Zeroizing::new(Vec::new());
-    if let Err(e) = std::io::stdin().read_to_end(&mut token) {
-        eprintln!("sigil: reading token from stdin: {e}");
-        return None;
-    }
-    while matches!(token.last(), Some(b'\n' | b'\r')) {
-        token.pop();
-    }
-    if token.is_empty() {
-        eprintln!("sigil: empty token on stdin");
-        return None;
-    }
-    Some(token)
-}
-
-fn account_add(args: &[String], json: bool) -> i32 {
-    let Some(label) = flag_value(args, "--label").map(str::to_string) else {
-        eprintln!("usage: sigil account add --token-stdin --label <name>");
-        return 2;
-    };
-    if !has_flag(args, "--token-stdin") {
-        eprintln!("sigil: refusing to read a token from argv; pass --token-stdin");
-        return 2;
-    }
-    // Threshold is the only account mechanism: the token is sealed under the
-    // two-party key K = combine(Z_M, Z_F), openable only with the phone's
-    // per-request partial, so there is no DEK at rest to protect. account_add_v2
-    // owns its own success/json output.
-    account_add_v2(&label, json)
-}
-
-/// Add a v2 (threshold) service account: seal the token under the two-party key
-/// `K = combine(Z_M, Z_F, E, account_id)`, destroying the ephemeral `e` so `Z_F`
-/// becomes computable only by the phone's Secure Enclave. Requires a v2 pairing
-/// (one that pinned the phone's SE share `F`); the Mac share `m` is generated and
-/// sealed on first use.
-fn account_add_v2(label: &str, json: bool) -> i32 {
-    let s = Style::stdout();
-    let ks = keystore::for_host();
-
-    // The pairing must have pinned the phone's SE share F (a v2 pairing).
-    let phone = match crate::pairing_store::load(ks.as_ref()) {
-        Ok(Some(cfg)) => match cfg.phone_share {
-            Some(share) => share,
-            None => {
-                eprintln!(
-                    "sigil: this pairing has no phone Secure-Enclave share; \
-                     re-pair for v2 threshold accounts"
-                );
-                return 1;
-            }
-        },
-        Ok(None) => {
-            eprintln!("sigil: no phone is paired; run `sigil pair` first");
-            return 1;
-        }
-        Err(e) => {
-            eprintln!("sigil: loading the pairing: {e}");
-            return 1;
-        }
-    };
-
-    let token = match read_token_stdin() {
-        Some(t) => t,
-        None => return 1,
-    };
-
-    // Generate/seal the Mac share m on first use, then seal the token.
-    let m = match crate::threshold::load_or_create_mac_share(ks.as_ref()) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("sigil: provisioning the Mac threshold share: {e}");
-            return 1;
-        }
-    };
-
-    let vaults = OpProvider::new().probe(&token).unwrap_or_default();
-
-    let mut store = match crate::threshold::ThresholdStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("sigil: loading the threshold store: {e}");
-            return 1;
-        }
-    };
-    if let Err(e) =
-        crate::threshold::seal_account(&mut store, label, &m, &phone, &token, vaults.clone())
-    {
-        eprintln!("sigil: {e}");
-        return 1;
-    }
-    drop(m);
-    if let Err(e) = store.save() {
-        eprintln!("sigil: saving the threshold store: {e}");
-        return 1;
-    }
-
-    if json {
-        // The v2 account presents the same GUI shape as a v1 account.
-        println!(
-            "{}",
-            json::to_line(&json::AccountJson {
-                id: label.to_string(),
-                label: label.to_string(),
-                vaults: vaults.clone(),
-                health: "healthy".into(),
-                detail: Some("threshold (v2)".into()),
-                last_used_ms: None,
-            })
-        );
-        return 0;
-    }
-
-    println!(
-        "{} threshold account {} added",
-        s.ok("\u{2713}"),
-        s.cobalt(label)
-    );
-    if !vaults.is_empty() {
-        println!("  {} {}", s.dim("vaults"), vaults.join(", "));
-    }
-    0
-}
-
-fn account_rotate(args: &[String], json: bool) -> i32 {
-    let s = Style::stdout();
-    let Some(id) = flag_value(args, "--id").map(str::to_string) else {
-        eprintln!("usage: sigil account rotate --id <id> --token-stdin");
-        return 2;
-    };
-    let Some(token) = read_token_stdin() else {
-        return 1;
-    };
-
-    let ks = keystore::for_host();
-    if let Err(e) = ks.ensure_dek() {
-        eprintln!(
-            "sigil: provisioning the DEK: {}\n  (detail: {e})",
-            keystore::dek_error_hint(&e)
-        );
-        return 1;
-    }
-    let dek = match ks.unwrap_dek(&format!("Rotate the {id} service-account token")) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!(
-                "sigil: unwrapping the DEK: {}\n  (detail: {e})",
-                keystore::dek_error_hint(&e)
-            );
-            return 1;
-        }
-    };
-
-    // Re-probe the vaults the new token can route; an empty probe keeps the
-    // previous routing rather than erasing it.
-    let vaults = OpProvider::new().probe(&token).unwrap_or_default();
-
-    let mut store = match AccountStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("sigil: loading account store: {e}");
-            return 1;
-        }
-    };
-    if let Err(e) = store.rotate(&id, &dek, &token, vaults) {
-        eprintln!("sigil: {e}");
-        return 1;
-    }
-    if let Err(e) = store.save() {
-        eprintln!("sigil: saving account store: {e}");
-        return 1;
-    }
-
-    if json {
-        if let Some(a) = store.accounts.iter().find(|a| a.label == id) {
-            println!("{}", json::to_line(&account_json(a)));
-        }
-        return 0;
-    }
-    println!("{} account {} rotated", s.ok("\u{2713}"), s.cobalt(&id));
-    0
-}
-
-fn account_remove(args: &[String], json: bool) -> i32 {
-    let Some(id) = flag_value(args, "--id").map(str::to_string) else {
-        eprintln!("usage: sigil account remove --id <id>");
-        return 2;
-    };
-    let mut store = match AccountStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("sigil: loading account store: {e}");
-            return 1;
-        }
-    };
-    let mut removed = store.remove(&id);
-    if removed {
-        if let Err(e) = store.save() {
-            eprintln!("sigil: saving account store: {e}");
-            return 1;
-        }
-    }
-    // A label may name a v2 (threshold) account instead; remove it there too.
-    if let Ok(mut v2) = crate::threshold::ThresholdStore::load() {
-        if v2.remove(&id) {
-            removed = true;
-            if let Err(e) = v2.save() {
-                eprintln!("sigil: saving the threshold store: {e}");
-                return 1;
-            }
-        }
-    }
-    let result = if removed {
-        ControlResult::line(true, format!("account {id} removed"))
-    } else {
-        ControlResult::line(false, format!("no account named {id}"))
-    };
-    if json {
-        return emit_local_control(&result);
-    }
-    let s = Style::stdout();
-    for line in &result.lines {
-        let glyph = if result.ok {
-            s.ok("\u{2713}")
-        } else {
-            s.brass("\u{2717}")
-        };
-        println!("  {glyph} {line}");
-    }
-    i32::from(!result.ok)
-}
-
-fn account_list(json: bool) -> i32 {
-    let s = Style::stdout();
-    let store = match AccountStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("sigil: loading account store: {e}");
-            return 1;
-        }
-    };
-    // v2 (threshold) accounts live in a separate store; list both.
-    let v2 = crate::threshold::ThresholdStore::load().unwrap_or_default();
-    if json {
-        let mut list: Vec<_> = store.accounts.iter().map(account_json).collect();
-        list.extend(v2.accounts.iter().map(|a| json::AccountJson {
-            id: a.label().to_string(),
-            label: a.label().to_string(),
-            vaults: a.vaults.clone(),
-            health: "healthy".into(),
-            detail: Some("threshold (v2)".into()),
-            last_used_ms: None,
-        }));
-        println!("{}", json::to_pretty(&list));
-        return 0;
-    }
-    if store.accounts.is_empty() && v2.accounts.is_empty() {
-        println!("  {}", s.dim("no accounts; run: sigil account add"));
-        return 0;
-    }
-    println!("{}", s.cobalt("accounts"));
-    println!();
-    for a in &store.accounts {
-        let vaults = if a.vaults.is_empty() {
-            s.dim("no vaults probed")
-        } else {
-            s.dim(&a.vaults.join(", "))
-        };
-        println!("  {}  {}", pad(&a.label, 20), vaults);
-    }
-    for a in &v2.accounts {
-        let vaults = if a.vaults.is_empty() {
-            s.dim("no vaults probed")
-        } else {
-            s.dim(&a.vaults.join(", "))
-        };
-        println!(
-            "  {}  {}  {}",
-            pad(a.label(), 20),
-            vaults,
-            s.dim("threshold (v2)")
-        );
-    }
-    0
 }
 
 /// Deserialize a `Reply::Json` array body from a query frame into a typed vec,
@@ -1312,26 +993,19 @@ fn run_pairing(args: &[String]) -> i32 {
     }
 
     let ks = keystore::for_host();
-    // Provision (idempotently) the keystore DEK now, so a first-time pair fails
-    // fast if provisioning itself is broken; a later account add reuses it
-    // (ensure_dek never regenerates an existing DEK). This is a public-key-only
-    // operation on a Secure Enclave keystore (no Touch ID yet); the actual
-    // unwrap happens later, gated on the SAS confirm below.
-    if let Err(e) = ks.ensure_dek() {
-        eprintln!(
-            "{} provisioning the DEK: {}\n  (detail: {e})",
-            s.deny("\u{2717}"),
-            keystore::dek_error_hint(&e)
-        );
-        return 1;
-    }
-    // Unwraps the SAME key `sigil account add` seals tokens under. Called by
-    // `run_ceremony` only after the human confirms the SAS, never before: on a
-    // Secure Enclave keystore that is where Touch ID fires, so the biometric
-    // gates authorizing this specific confirmed device.
-    let mut unwrap_dek = || -> anyhow::Result<crate::secrets::Dek> {
-        ks.unwrap_dek("Deliver the encryption key to your phone during pairing")
-            .map_err(|e| anyhow::anyhow!("{}\n  (detail: {e})", keystore::dek_error_hint(&e)))
+    // Arm the pairing after the human confirms the SAS (never before): prove a
+    // live hardware presence (on a Secure Enclave keystore this is the Touch ID
+    // prompt, so the biometric gates authorizing this specific confirmed device)
+    // and provision the Mac threshold share `m`. Nothing is delivered to the
+    // phone: everything at rest is threshold-sealed and opened per-approval.
+    let mut arm_after_sas = || -> anyhow::Result<()> {
+        if ks.is_biometric() {
+            ks.verify_presence("Authorize pairing this phone with Sigil")
+                .map_err(|e| anyhow::anyhow!("proving hardware presence: {e}"))?;
+        }
+        crate::threshold::load_or_create_mac_share(ks.as_ref())
+            .map_err(|e| anyhow::anyhow!("provisioning the Mac threshold share: {e}"))?;
+        Ok(())
     };
     let daemon_identity = DeviceIdentity::generate();
 
@@ -1386,7 +1060,7 @@ fn run_pairing(args: &[String]) -> i32 {
         make_channel: &mut make_channel,
         present_qr: &mut present_qr,
         confirm_sas: &mut confirm,
-        unwrap_dek: &mut unwrap_dek,
+        arm_after_sas: &mut arm_after_sas,
     };
 
     let new_pairing = match crate::pair::run_ceremony(daemon_identity, opts) {
@@ -1453,27 +1127,18 @@ fn run_pairing_json(args: &[String]) -> i32 {
     };
 
     let ks = keystore::for_host();
-    // Same key discipline as the interactive path: the ceremony delivers the
-    // keystore DEK that `sigil account add` seals tokens under, provisioned
-    // idempotently here so a first-time pair still arms the daemon. This is a
-    // public-key-only operation on a Secure Enclave keystore (no Touch ID
-    // yet); the actual unwrap happens later, gated on the SAS confirm below.
-    if let Err(e) = ks.ensure_dek() {
-        emit_ndjson(&serde_json::json!({
-            "event": "failed",
-            // The Mac app renders `reason` verbatim in its error panel, so it
-            // must lead with the actionable hint, never the raw error chain.
-            "reason": format!("provisioning the DEK: {}", keystore::dek_error_hint(&e))
-        }));
-        return 1;
-    }
-    // Unwraps the SAME key `sigil account add` seals tokens under. Called by
-    // `run_ceremony` only after the human writes "confirm" below, never
-    // before: on a Secure Enclave keystore that is where Touch ID fires, so
-    // the biometric gates authorizing this specific confirmed device.
-    let mut unwrap_dek = || -> anyhow::Result<crate::secrets::Dek> {
-        ks.unwrap_dek("Deliver the encryption key to your phone during pairing")
-            .map_err(|e| anyhow::anyhow!("{}\n  (detail: {e})", keystore::dek_error_hint(&e)))
+    // After the human confirms the SAS, arm the pairing: prove a live hardware
+    // presence (Touch ID on a Secure Enclave keystore) and provision the Mac
+    // threshold share `m`. Nothing is delivered to the phone; everything at rest
+    // is threshold-sealed and opened per-approval with the phone's partial.
+    let mut arm_after_sas = || -> anyhow::Result<()> {
+        if ks.is_biometric() {
+            ks.verify_presence("Authorize pairing this phone with Sigil")
+                .map_err(|e| anyhow::anyhow!("proving hardware presence: {e}"))?;
+        }
+        crate::threshold::load_or_create_mac_share(ks.as_ref())
+            .map_err(|e| anyhow::anyhow!("provisioning the Mac threshold share: {e}"))?;
+        Ok(())
     };
     let daemon_identity = DeviceIdentity::generate();
 
@@ -1482,10 +1147,10 @@ fn run_pairing_json(args: &[String]) -> i32 {
     };
     let mut confirm = |words: &[&'static str; 6]| -> bool {
         emit_ndjson(&serde_json::json!({ "event": "sas", "words": words.to_vec() }));
-        // Block here: the DEK must not be sealed and sent until a real human
-        // has compared the six words on both screens and confirmed. The GUI
-        // writes "confirm\n" to our stdin after the tap; anything else (or the
-        // pipe closing) fails the ceremony closed instead of leaking the DEK.
+        // Block here: the pairing must not be armed until a real human has
+        // compared the six words on both screens and confirmed. The GUI writes
+        // "confirm\n" to our stdin after the tap; anything else (or the pipe
+        // closing) fails the ceremony closed.
         let mut line = String::new();
         match std::io::stdin().read_line(&mut line) {
             Ok(0) => false,
@@ -1505,7 +1170,7 @@ fn run_pairing_json(args: &[String]) -> i32 {
         make_channel: &mut make_channel,
         present_qr: &mut present_qr,
         confirm_sas: &mut confirm,
-        unwrap_dek: &mut unwrap_dek,
+        arm_after_sas: &mut arm_after_sas,
     };
 
     match crate::pair::run_ceremony(daemon_identity, opts) {
@@ -1595,8 +1260,8 @@ fn cmd_setup(args: &[String]) -> i32 {
     //    VERIFICATION); a dev keystore provisions immediately. A failure here is
     //    not fatal to the rest of setup, so we report and continue.
     let ks = keystore::for_host();
-    match ks.ensure_dek() {
-        Ok(()) => println!("  {} keystore ready", s.ok("\u{2713}")),
+    match crate::threshold::load_or_create_mac_share(ks.as_ref()) {
+        Ok(_) => println!("  {} keystore ready", s.ok("\u{2713}")),
         Err(e) => println!(
             "  {} keystore: {}",
             s.brass("\u{2717}"),
@@ -2794,44 +2459,20 @@ fn config_source_remove(name: Option<&str>, json: bool) -> i32 {
 /// so removing a source (or clearing its last key) leaves no orphaned ciphertext.
 /// A no-op when there is no blob. Returns false (having printed) on a store error.
 fn purge_env_blob(name: &str) -> bool {
-    let mut store = match AccountStore::load() {
+    let mut store = match crate::threshold::ThresholdStore::load() {
         Ok(st) => st,
         Err(e) => {
-            eprintln!("sigil: loading account store: {e}");
+            eprintln!("sigil: loading the threshold store: {e}");
             return false;
         }
     };
-    if store.remove_env_blob(name) {
+    if store.remove(name) {
         if let Err(e) = store.save() {
-            eprintln!("sigil: saving account store: {e}");
+            eprintln!("sigil: saving the threshold store: {e}");
             return false;
         }
     }
     true
-}
-
-/// Provision (idempotently) and unwrap the host DEK for a config-side seal, the
-/// same key `sigil account add` seals tokens under. On a Secure Enclave keystore
-/// this is where Touch ID fires. `None` (with a printed error) on any failure.
-fn unwrap_host_dek(reason: &str) -> Option<crate::secrets::Dek> {
-    let ks = keystore::for_host();
-    if let Err(e) = ks.ensure_dek() {
-        eprintln!(
-            "sigil: provisioning the DEK: {}\n  (detail: {e})",
-            keystore::dek_error_hint(&e)
-        );
-        return None;
-    }
-    match ks.unwrap_dek(reason) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            eprintln!(
-                "sigil: unwrapping the DEK: {}\n  (detail: {e})",
-                keystore::dek_error_hint(&e)
-            );
-            None
-        }
-    }
 }
 
 /// Whether `k` is a safe environment variable name to inject: non-empty and free
@@ -2873,9 +2514,10 @@ fn cmd_config_source_env(args: &[String], json: bool) -> i32 {
         Some("unset") => config_source_env_unset(&args[1..], json),
         _ => {
             eprintln!(
-                "usage: sigil-config source env <set <name> --key <KEY> | set <name> --stdin | \
-                 unset <name> --key <KEY>>\n  \
-                 (set --key reads the VALUE from stdin; --stdin reads KEY=VALUE lines from stdin)"
+                "usage: sigil-config source env <set <name> --stdin | set <name> --key <KEY> | \
+                 unset <name>>\n  \
+                 (set replaces the source's whole sealed set; values are write-only: sealed under \
+                 threshold and openable only with the phone, so they are never read back here)"
             );
             2
         }
@@ -2905,65 +2547,65 @@ fn load_env_source(name: &str) -> Option<crate::config::Config> {
     }
 }
 
-/// Decode the stored sealed blob for `name` into a mutable pair list, decrypting
-/// under `dek`. An absent blob yields an empty list (first key being set). `Err`
-/// (printed) on a store or decrypt error.
-fn load_env_pairs(
-    store: &AccountStore,
-    name: &str,
-    dek: &crate::secrets::Dek,
-) -> Result<Vec<(String, Zeroizing<String>)>, ()> {
-    match store.env_blob(name) {
-        None => Ok(Vec::new()),
-        Some(Err(e)) => {
-            eprintln!("sigil: reading the sealed env blob: {e}");
-            Err(())
-        }
-        Some(Ok(ct)) => {
-            let plain = crate::secrets::decrypt_token(dek, &ct).map_err(|e| {
-                eprintln!("sigil: opening the sealed env blob: {e}");
-            })?;
-            let pairs = crate::provider::decode_env_pairs(&plain).ok_or_else(|| {
-                eprintln!("sigil: the sealed env blob is corrupt; unset and re-set its keys");
-            })?;
-            Ok(pairs.to_vec())
-        }
-    }
-}
-
-/// Re-seal `pairs` under `dek` into the store for `name` (or remove the blob when
-/// empty), persist the store, then sync the config source's KEY-name list to the
-/// pair set and persist the config. Returns false (printed) on any failure. This
-/// is the one writer that keeps the sealed values (`sigil.db`) and the public KEY
-/// names (`config.json`) in lockstep.
+/// Threshold-seal `pairs` as the inline-env source `name`'s sealed record (or
+/// remove it when empty), persist the threshold store, then sync the source's
+/// public KEY-name list and persist the config. The values seal to the two-party
+/// key `K = combine(Z_M, Z_F)`: openable only with the phone's per-request
+/// partial, so nothing at rest can release them. Write-only by design: the Mac
+/// seals but never reads env values back (opening needs the phone), so a `set`
+/// replaces the source's whole sealed set. Returns false (printed) on failure.
 fn seal_env_pairs(
     mut cfg: crate::config::Config,
     name: &str,
     pairs: &[(String, Zeroizing<String>)],
-    dek: &crate::secrets::Dek,
 ) -> bool {
-    let mut store = match AccountStore::load() {
+    let mut store = match crate::threshold::ThresholdStore::load() {
         Ok(st) => st,
         Err(e) => {
-            eprintln!("sigil: loading account store: {e}");
+            eprintln!("sigil: loading the threshold store: {e}");
             return false;
         }
     };
     if pairs.is_empty() {
-        store.remove_env_blob(name);
+        store.remove(name);
     } else {
-        let encoded = crate::provider::encode_env_pairs(pairs);
-        let ct = match crate::secrets::encrypt_token(dek, &encoded) {
-            Ok(ct) => ct,
+        // Seal to the phone's pinned Secure-Enclave share F plus the Mac share m.
+        let ks = keystore::for_host();
+        let phone = match crate::pairing_store::load(ks.as_ref()) {
+            Ok(Some(pc)) => match pc.phone_share {
+                Some(s) => s,
+                None => {
+                    eprintln!(
+                        "sigil: this pairing has no phone Secure-Enclave share; \
+                         re-pair before sealing env values"
+                    );
+                    return false;
+                }
+            },
+            Ok(None) => {
+                eprintln!("sigil: no phone is paired; run `sigil pair` first");
+                return false;
+            }
             Err(e) => {
-                eprintln!("sigil: sealing the env values: {e}");
+                eprintln!("sigil: loading the pairing: {e}");
                 return false;
             }
         };
-        store.set_env_blob(name, &ct);
+        let m = match crate::threshold::load_or_create_mac_share(ks.as_ref()) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("sigil: provisioning the Mac threshold share: {e}");
+                return false;
+            }
+        };
+        let encoded = crate::provider::encode_env_pairs(pairs);
+        if let Err(e) = crate::threshold::seal_secret(&mut store, name, &m, &phone, &encoded) {
+            eprintln!("sigil: sealing the env values: {e}");
+            return false;
+        }
     }
     if let Err(e) = store.save() {
-        eprintln!("sigil: saving account store: {e}");
+        eprintln!("sigil: saving the threshold store: {e}");
         return false;
     }
     // Sync the public KEY names onto the source (sorted+unique for a stable
@@ -2980,8 +2622,9 @@ fn seal_env_pairs(
 fn config_source_env_set(args: &[String], json: bool) -> i32 {
     let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
         eprintln!(
-            "usage: sigil-config source env set <name> --key <KEY>   (VALUE from stdin)\n       \
-             sigil-config source env set <name> --stdin        (KEY=VALUE lines from stdin)"
+            "usage: sigil-config source env set <name> --stdin        (KEY=VALUE lines from stdin)\n       \
+             sigil-config source env set <name> --key <KEY>   (one VALUE from stdin)\n  \
+             note: set REPLACES the source's whole sealed set (values are write-only under threshold)"
         );
         return 2;
     };
@@ -2989,11 +2632,12 @@ fn config_source_env_set(args: &[String], json: bool) -> i32 {
         return 1;
     };
 
-    // Gather the (KEY, VALUE) updates from stdin. Two shapes: a single --key with
-    // its VALUE on stdin (so a value may hold '='), or --stdin bulk KEY=VALUE
-    // lines. Either way values arrive on stdin, never argv.
+    // Gather the complete (KEY, VALUE) set from stdin. Two shapes: a single --key
+    // with its VALUE on stdin (so a value may hold '='), or --stdin bulk KEY=VALUE
+    // lines. Either way values arrive on stdin, never argv, and REPLACE the whole
+    // set (threshold-sealed values cannot be read back to merge onto).
     let single_key = flag_value(args, "--key").map(str::to_string);
-    let updates: Vec<(String, Zeroizing<String>)> = if let Some(key) = single_key {
+    let pairs: Vec<(String, Zeroizing<String>)> = if let Some(key) = single_key {
         if !valid_env_key(&key) {
             eprintln!("sigil: '{key}' is not a valid environment variable name");
             return 2;
@@ -3012,90 +2656,46 @@ fn config_source_env_set(args: &[String], json: bool) -> i32 {
             None => return 1,
         }
     } else {
-        eprintln!("sigil: pass --key <KEY> (VALUE on stdin) or --stdin (KEY=VALUE lines on stdin)");
+        eprintln!(
+            "sigil: pass --stdin (KEY=VALUE lines on stdin) or --key <KEY> (one VALUE on stdin)"
+        );
         return 2;
     };
 
-    let Some(dek) = unwrap_host_dek(&format!("Seal env values for {name}")) else {
-        return 1;
-    };
-    // Read the current pairs (to merge onto), then release the store; seal reloads
-    // it fresh so no stale copy is held across the merge.
-    let store = match AccountStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("sigil: loading account store: {e}");
-            return 1;
-        }
-    };
-    let mut pairs = match load_env_pairs(&store, &name, &dek) {
-        Ok(p) => p,
-        Err(()) => return 1,
-    };
-    drop(store);
-
-    // Merge the updates: replace an existing KEY in place, else append.
-    let set_names: Vec<String> = updates.iter().map(|(k, _)| k.clone()).collect();
-    for (k, v) in updates {
-        if let Some(existing) = pairs.iter_mut().find(|(ek, _)| ek == &k) {
-            existing.1 = v;
-        } else {
-            pairs.push((k, v));
-        }
-    }
-
-    if !seal_env_pairs(cfg, &name, &pairs, &dek) {
+    let count = pairs.len();
+    if !seal_env_pairs(cfg, &name, &pairs) {
         return 1;
     }
     print_config_result(
-        &ControlResult::line(
-            true,
-            format!("sealed {} value(s) on {name}", set_names.len()),
-        ),
+        &ControlResult::line(true, format!("sealed {count} value(s) on {name}")),
         json,
     )
 }
 
 fn config_source_env_unset(args: &[String], json: bool) -> i32 {
     let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
-        eprintln!("usage: sigil-config source env unset <name> --key <KEY>");
-        return 2;
-    };
-    let Some(key) = flag_value(args, "--key").map(str::to_string) else {
-        eprintln!("usage: sigil-config source env unset <name> --key <KEY>");
+        eprintln!("usage: sigil-config source env unset <name>");
         return 2;
     };
     let Some(cfg) = load_env_source(&name) else {
         return 1;
     };
-    let Some(dek) = unwrap_host_dek(&format!("Re-seal env values for {name}")) else {
-        return 1;
-    };
-    let store = match AccountStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("sigil: loading account store: {e}");
-            return 1;
-        }
-    };
-    let mut pairs = match load_env_pairs(&store, &name, &dek) {
-        Ok(p) => p,
-        Err(()) => return 1,
-    };
-    drop(store);
-    let before = pairs.len();
-    pairs.retain(|(k, _)| k != &key);
-    if pairs.len() == before {
-        return print_config_result(
-            &ControlResult::line(false, format!("no key {key} on {name}")),
-            json,
+    // Threshold-sealed values are write-only, so a single key cannot be dropped
+    // while preserving the others (that would require reading them, which needs
+    // the phone). `unset` therefore clears the source's whole sealed set; re-set
+    // the keys you want to keep with `set --stdin`.
+    if flag_value(args, "--key").is_some() {
+        eprintln!(
+            "sigil: env values are write-only (threshold-sealed); a single key cannot be dropped.\n       \
+             `unset <name>` clears the whole source; re-set the keys to keep with `set --stdin`."
         );
+        return 2;
     }
-    if !seal_env_pairs(cfg, &name, &pairs, &dek) {
+    if !seal_env_pairs(cfg, &name, &[]) {
         return 1;
     }
     print_config_result(
-        &ControlResult::line(true, format!("removed key {key} from {name}")),
+        &ControlResult::line(true, format!("cleared all sealed values on {name}")),
         json,
     )
 }
@@ -3467,11 +3067,11 @@ fn config_import(json: bool) -> i32 {
     )
 }
 
-/// Remove sealed env blobs from the account store whose inline-env source is
-/// absent from `cfg` (an import dropped it). Best-effort: a store error is logged,
-/// not fatal to the import that already succeeded.
+/// Remove threshold-sealed env records whose inline-env source is absent from
+/// `cfg` (an import dropped it). Best-effort: a store error is logged, not fatal
+/// to the import that already succeeded.
 fn prune_orphan_env_blobs(cfg: &crate::config::Config) {
-    let mut store = match AccountStore::load() {
+    let mut store = match crate::threshold::ThresholdStore::load() {
         Ok(st) => st,
         Err(e) => {
             eprintln!("sigil: pruning orphan env blobs: {e}");
@@ -3484,11 +3084,13 @@ fn prune_orphan_env_blobs(cfg: &crate::config::Config) {
         .filter(|s| s.provider == crate::provider::EnvProvider::ID)
         .map(|s| s.name.as_str())
         .collect();
-    let before = store.env_sources.len();
-    store.env_sources.retain(|e| live.contains(e.name.as_str()));
-    if store.env_sources.len() != before {
+    let before = store.secrets.len();
+    store
+        .secrets
+        .retain(|r| live.contains(r.account_id.as_str()));
+    if store.secrets.len() != before {
         if let Err(e) = store.save() {
-            eprintln!("sigil: saving account store after prune: {e}");
+            eprintln!("sigil: saving the threshold store after prune: {e}");
         }
     }
 }
@@ -3683,13 +3285,13 @@ fn cmd_mac_approvals(args: &[String], json: bool) -> i32 {
         return 0;
     }
 
-    // --enable: provision the local DEK envelope. On a dev keystore this
-    // always succeeds; on a real Secure Enclave the mint (`keystore_macos.rs`)
-    // is implemented but still pending on-hardware Touch ID verification, so a
-    // real failure here is surfaced honestly rather than faking success.
+    // --enable: provision the Mac threshold share and confirm the keystore is
+    // usable. The phone is always the approving factor now (there is no local
+    // Touch-ID approve path); this only readies the Mac side. On a dev keystore
+    // this always succeeds; a real keystore failure is surfaced honestly.
     let ks = keystore::for_host();
-    match ks.ensure_dek() {
-        Ok(()) => {
+    match crate::threshold::load_or_create_mac_share(ks.as_ref()) {
+        Ok(_) => {
             settings.mac_approvals = settings::MAC_APPROVALS_ENABLED.to_string();
             if let Err(e) = settings.save() {
                 eprintln!("sigil: saving settings: {e}");
@@ -3699,18 +3301,15 @@ fn cmd_mac_approvals(args: &[String], json: bool) -> i32 {
                 println!("{}", json::to_line(&json::MacApprovalsJson { ok: true }));
             } else {
                 println!(
-                    "{} mac approvals enabled (Touch ID can approve)",
+                    "{} Mac side readied (the phone remains the approving factor)",
                     s.ok("\u{2713}")
                 );
             }
             0
         }
         Err(e) => {
-            // Honest failure: the SE envelope could not be minted here.
             eprintln!(
-                "sigil: cannot enable Mac approvals: {}. \
-                 The phone remains the approving factor.\n  (detail: {e})",
-                keystore::dek_error_hint(&e)
+                "sigil: cannot ready the Mac side: {e}. The phone remains the approving factor."
             );
             if json {
                 println!("{}", json::to_line(&json::MacApprovalsJson { ok: false }));
@@ -3918,7 +3517,6 @@ mod tests {
             "kubectl",
             "mytool",
             "config",
-            "account",
             "settings",
             "wipe",
             "mac-approvals",

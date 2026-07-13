@@ -44,7 +44,6 @@ use crate::local::{self, Frame, Reply};
 use crate::paths::ShimStatus;
 use crate::provider::{ProviderRegistry, ProviderRun};
 use crate::remote::RemoteApprover;
-use crate::secrets::{self, AccountStore};
 use crate::service;
 use crate::sshagent::{self, ServedIdentity, SignRequest, SshBackend, SshSigner};
 
@@ -131,10 +130,9 @@ impl SshSignersCell {
 /// Shared daemon state, cloned (via `Arc`) into every connection worker.
 pub struct Core {
     keystore: Arc<dyn Keystore>,
-    accounts: Mutex<AccountStore>,
-    /// The v2 (threshold) account catalogue, loaded once at arm time, exactly as
-    /// [`accounts`](Self::accounts) is. A record here is opened by the two-party
-    /// combine, never a DEK; its presence (by version) chooses the decrypt path.
+    /// The store of threshold-sealed secrets (inline-`env` source values), loaded
+    /// once at arm time. A record here is opened by the two-party combine (the
+    /// phone's partial `Z_F` plus the Mac share `m`), never a key at rest.
     threshold: Mutex<crate::threshold::ThresholdStore>,
     leases: LeaseStore,
     gate: ApprovalGate,
@@ -240,7 +238,7 @@ fn load_remote_pairing(ks: &Arc<dyn Keystore>) -> Vec<RemotePairingConfig> {
 fn build_gate(
     factor: Factor,
     remote: Vec<RemotePairingConfig>,
-    keystore: &Arc<dyn Keystore>,
+    _keystore: &Arc<dyn Keystore>,
     pending: &Arc<PendingRegistry>,
 ) -> anyhow::Result<(ApprovalGate, Vec<Arc<RemoteApprover>>, Vec<DirectAcceptor>)> {
     let mut acceptors: Vec<DirectAcceptor> = Vec::new();
@@ -323,14 +321,11 @@ fn build_gate(
         }
         // The biometric unwrap is the only gate; an unresolved decision fails
         // closed (no control socket, no dev switch).
-        Factor::Biometric => (
-            Box::new(LocalApprover::new(keystore.clone(), pending.clone())),
-            Vec::new(),
-        ),
+        Factor::Biometric => (Box::new(LocalApprover::new(pending.clone())), Vec::new()),
         // The one place the forgeable dev paths are wired.
         Factor::DevInsecure => (
             Box::new(
-                LocalApprover::new(keystore.clone(), pending.clone())
+                LocalApprover::new(pending.clone())
                     .with_dev(DevMode::from_env())
                     .with_control_socket(true),
             ),
@@ -363,9 +358,9 @@ impl Core {
         dev_insecure: bool,
     ) -> anyhow::Result<(Self, Vec<Arc<RemoteApprover>>, Vec<DirectAcceptor>)> {
         let keystore = keystore::for_host();
-        let accounts = AccountStore::load().context("loading account store")?;
-        // The v2 threshold accounts (if any). A missing/unreadable store is
-        // logged and treated as empty so the daemon still arms on its v1 accounts.
+        // The threshold-sealed secrets (inline-`env` source values). A
+        // missing/unreadable store is logged and treated as empty so the daemon
+        // still arms (env-backed rules then refuse until their values are set).
         let threshold = match crate::threshold::ThresholdStore::load() {
             Ok(s) => s,
             Err(e) => {
@@ -409,7 +404,6 @@ impl Core {
 
         let core = Self {
             keystore,
-            accounts: Mutex::new(accounts),
             threshold: Mutex::new(threshold),
             leases: LeaseStore::new(),
             gate,
@@ -527,29 +521,15 @@ fn ssh_sign_scope(label: &str, data_fingerprint: &str) -> String {
     format!("ssh-sign {label} {data_fingerprint}")
 }
 
-/// The vault segment of an `op://<vault>/<item>/<field>` reference, for account
-/// routing on the SSH sign path.
-fn vault_of_ref(reference: &str) -> Option<String> {
-    reference
-        .strip_prefix("op://")?
-        .split('/')
-        .find(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
-/// Build one SSH signer per configured key source: the op-fetch signer for
-/// 1Password-backed keys, and the file signer for local key files. Either may be
-/// empty; together they form the aggregate the agent serves. `op_path` overrides
-/// `op` discovery for the op signer (tests point it at a fake `op`).
+/// Build one SSH signer per configured key source. Today only the file signer
+/// (local key files) ships; the op-backed source is being reworked into a gated
+/// command (the pending SSH rework), so a key that named an op source serves
+/// nothing until then. `_op_path` is retained for that rework's tests.
 fn build_ssh_signers(
     cfg: &sshagent::SshKeyConfig,
-    op_path: Option<std::path::PathBuf>,
+    _op_path: Option<std::path::PathBuf>,
 ) -> Vec<Box<dyn SshSigner>> {
     let mut signers: Vec<Box<dyn SshSigner>> = Vec::new();
-    let op_ids = cfg.served_identities();
-    if !op_ids.is_empty() {
-        signers.push(Box::new(sshagent::OpSshSigner::new(op_ids, op_path)));
-    }
     let file_keys = cfg.file_keys();
     if !file_keys.is_empty() {
         signers.push(Box::new(sshagent::FileSshSigner::new(file_keys)));
@@ -586,18 +566,10 @@ impl SshBackend for Core {
         let signers = self.ssh_signers.snapshot();
         let signer = signers.iter().find(|s| s.owns(&req.id.key_blob))?;
 
-        // Route the account only when the signer needs a stored credential (the
-        // op-fetch signer); clone what we need before the (possibly long) approval
-        // wait so the store lock is released. A file signer needs no account.
-        let account = if signer.needs_account() {
-            let vault = vault_of_ref(&req.id.key_ref);
-            let store = self.accounts.lock().expect("accounts poisoned");
-            let acct = store.route(vault.as_deref()).ok()?;
-            Some((acct.label.clone(), acct.ciphertext().ok()?))
-        } else {
-            None
-        };
-        let account_label = account.as_ref().map(|(l, _)| l.clone()).unwrap_or_default();
+        // No account credential concept anymore: a signer sources its own key
+        // (a local file today; a threshold-stored or gated-command source is the
+        // pending SSH rework). Sigil is only the phone-gate here.
+        let account_label = String::new();
 
         // The approval screen shows a hash of the data to sign, never raw bytes.
         let data_fingerprint = sshagent::sha256_fingerprint(req.data);
@@ -628,7 +600,7 @@ impl SshBackend for Core {
             // Every signature is gated afresh (no lease short-circuit in v1).
             lease: LeasePolicy::RunOnce,
             ssh: Some(challenge),
-            // SSH keys are v1-only for now (op-fetch / file signers).
+            // The SSH signer sources its own key (no threshold challenge here yet).
             threshold: None,
         };
 
@@ -637,29 +609,10 @@ impl SshBackend for Core {
             return None;
         }
 
-        // For a signer that needs an account, unwrap the DEK (phone-delivered on
-        // approve, else from the keystore), decrypt the one token, and drop the
-        // DEK at once. The credential is handed to the signer, which holds the key
-        // material for the one signature (op-fetch) or reads it from a file.
-        let credential = match &account {
-            Some((label, ciphertext)) => {
-                let dek = match outcome.dek {
-                    Some(dek) => dek,
-                    None => self
-                        .keystore
-                        .unwrap_dek(&format!("Sign with {} for {label}", req.id.label))
-                        .ok()?,
-                };
-                let token = secrets::decrypt_token(&dek, ciphertext).ok()?;
-                drop(dek);
-                Some(token)
-            }
-            None => None,
-        };
-
-        let sig = signer.sign(req.id, req.data, credential.as_ref());
-        drop(credential); // zeroized here (Token is Zeroizing)
-        sig
+        // The gate approved: delegate to the owning signer, which sources its own
+        // key (a local file today) and holds the material only for the one
+        // signature. Sigil injected no credential.
+        signer.sign(req.id, req.data)
     }
 }
 
@@ -766,14 +719,14 @@ async fn serve(
         factor::warn_dev_insecure();
     }
 
-    let accounts = core
-        .accounts
+    let sealed = core
+        .threshold
         .lock()
-        .expect("accounts poisoned")
-        .accounts
+        .expect("threshold store poisoned")
+        .secrets
         .len();
     eprintln!(
-        "sigil daemon: armed on {} · {accounts} account(s) · factor: {}",
+        "sigil daemon: armed on {} · {sealed} sealed secret(s) · factor: {}",
         sock.display(),
         core.factor.label()
     );
@@ -1375,7 +1328,6 @@ fn fulfill(
             return crate::provider::run_passthrough(crate::provider::ProviderRun {
                 command: argv,
                 cwd,
-                credential: None,
                 source: "",
                 stdin,
                 stdout,
@@ -1396,7 +1348,6 @@ fn fulfill(
         );
     };
     let source = action.source_path.as_deref().unwrap_or("");
-    let needs_account = provider.needs_account();
     let needs_sealed_env = provider.needs_sealed_env();
     // What `describe` reads: the env-file path or the inline env KEY names. Names
     // only; no secret value is read here (pre-approval, zero-knowledge readout).
@@ -1409,74 +1360,21 @@ fn fulfill(
     let caller = lease::walk_ancestry(core.proc_table.as_ref(), peer.unwrap_or(-1));
     let gk = lease::grant_key(&caller, cwd, &scope);
 
-    // Route the account only for providers that inject a stored token. Routing is
-    // the source's configured account label (or a legacy vault name) — never argv
-    // archaeology, so the core stays provider-agnostic.
-    let vault = if needs_account {
-        action.account.clone()
-    } else {
-        None
-    };
-
-    // A v2 (threshold) account takes precedence: its token is opened per request
-    // by the two-party combine (Mac share m + the phone's partial Z_F), never a
-    // DEK. The decrypt path is chosen HERE, from the at-rest record (R3: never
-    // from any wire field). When v1 accounts coexist (a migration store) v2 claims
-    // only an EXACT vault match, so it never over-captures a v1 request; once the
-    // store is fully v2 (no v1 accounts) v2 also serves the single-account
-    // fallback. v1 accounts keep the byte-identical DEK path.
-    let v2 = if needs_account {
-        let v1_empty = core
-            .accounts
-            .lock()
-            .expect("accounts poisoned")
-            .accounts
-            .is_empty();
+    // For the inline `env` provider, fetch its threshold-sealed record now. The
+    // record is public (ciphertext plus the base point E), safe to hold across the
+    // approval wait; it is opened only AFTER the grant, by combining the phone's
+    // partial Z_F with the Mac share m, so no plaintext value crosses the wait. A
+    // source with no sealed values fails closed rather than injecting nothing.
+    let sealed_record = if needs_sealed_env {
         let store = core.threshold.lock().expect("threshold store poisoned");
-        let picked = store.route_exact(vault.as_deref()).or_else(|| {
-            if v1_empty {
-                store.route(vault.as_deref())
-            } else {
-                None
-            }
-        });
-        picked.map(|a| (a.label().to_string(), a.record.clone()))
-    } else {
-        None
-    };
-
-    // Clone what we need so the store lock is released before the approval wait.
-    let (account_label, ciphertext) = match &v2 {
-        // v2: the label comes from the record; there is no v1 ciphertext/DEK.
-        Some((label, _)) => (label.clone(), None),
-        None if needs_account => {
-            let store = core.accounts.lock().expect("accounts poisoned");
-            match store.route(vault.as_deref()) {
-                Ok(acct) => match acct.ciphertext() {
-                    Ok(ct) => (acct.label.clone(), Some(ct)),
-                    Err(e) => return fail_closed(stderr, &format!("sigil account error: {e}\n")),
-                },
-                Err(e) => return fail_closed(stderr, &format!("sigil: {e}\n")),
-            }
-        }
-        None => (String::new(), None),
-    };
-
-    // For the inline `env` provider, fetch its sealed value blob now (ciphertext,
-    // safe to hold across the approval wait) and release the store lock. It is
-    // decrypted only AFTER the grant, so no plaintext value crosses the wait. A
-    // source with no values set fails closed rather than injecting nothing.
-    let sealed_ct = if needs_sealed_env {
-        let store = core.accounts.lock().expect("accounts poisoned");
-        match store.env_blob(&action.source_name) {
-            Some(Ok(ct)) => Some(ct),
-            Some(Err(e)) => return fail_closed(stderr, &format!("sigil env store error: {e}\n")),
+        match store.get(&action.source_name) {
+            Some(rec) => Some(rec.clone()),
             None => {
                 return fail_closed(
                     stderr,
                     &format!(
                         "sigil: inline env source '{0}' has no sealed values; set them with: \
-                         sigil-config source env set {0} --key <KEY>\n",
+                         sigil-config source env set {0} --stdin\n",
                         action.source_name
                     ),
                 )
@@ -1486,45 +1384,54 @@ fn fulfill(
         None
     };
 
-    // A live lease short-circuits the approval — only for account-backed
-    // providers, whose credential is what a lease holds. Direct-injection
-    // providers are gated on every run.
-    if needs_account {
-        if let Some(token) = core.leases.token_for(&gk, &account_label, &scope) {
-            let refs = provider.describe(argv, &view);
-            core.record_audit(
-                &uuid::Uuid::now_v7().to_string(),
-                provider.kind(argv),
-                &audit_label(&refs, &scope),
-                &account_label,
-                &caller.provenance(),
-                cwd,
-                "approved",
-                "lease",
-            );
-            return provider.run(ProviderRun {
-                command: argv,
-                cwd,
-                credential: Some(&token),
-                source,
-                stdin,
-                stdout,
-                stderr,
-                proxy_depth: child_depth,
-                env: None,
-            });
-        }
+    // The label shown in the audit/approval for an env source is the source name;
+    // a plain gate (`op`, `env-file`) has none.
+    let account_label = if needs_sealed_env {
+        action.source_name.clone()
+    } else {
+        String::new()
+    };
+
+    // A live lease short-circuits the approval for a plain gate: a leasable rule
+    // may open an auto-approve window so a burst of the same command costs one
+    // glance. There is no secret to hold anymore (the lease is a presence marker),
+    // so this only skips the phone round trip; the command still runs with no
+    // injection. An inline `env` request never leases: its sealed values must be
+    // opened per request with the phone's partial, never served from a stale grant.
+    if !needs_sealed_env && core.leases.token_for(&gk, &account_label, &scope).is_some() {
+        let refs = provider.describe(argv, &view);
+        core.record_audit(
+            &uuid::Uuid::now_v7().to_string(),
+            provider.kind(argv),
+            &audit_label(&refs, &scope),
+            &account_label,
+            &caller.provenance(),
+            cwd,
+            "approved",
+            "lease",
+        );
+        return provider.run(ProviderRun {
+            command: argv,
+            cwd,
+            source,
+            stdin,
+            stdout,
+            stderr,
+            proxy_depth: child_depth,
+            env: None,
+        });
     }
 
-    // For a v2 account, carry the threshold challenge to the phone: the base
-    // point E it key-agrees against, plus the account binding it shows and
+    // For an inline `env` request, carry the threshold challenge to the phone: the
+    // base point E it key-agrees against, plus the source-name binding it shows and
     // consents to (R5). E is public and authenticated by the enclosing signed
-    // envelope; the phone validates it on-curve before its Secure-Enclave op.
-    let threshold = v2
+    // envelope; the phone validates it on-curve before its Secure-Enclave op. A
+    // plain gate (`op`, `env-file`) carries no challenge.
+    let threshold = sealed_record
         .as_ref()
-        .map(|(label, record)| sigil_proto::ThresholdChallenge {
+        .map(|record| sigil_proto::ThresholdChallenge {
             account_id: record.account_id.clone(),
-            label: label.clone(),
+            label: account_label.clone(),
             ephemeral_pub: record.ephemeral_pub.clone(),
             se_key_id: record.se_key_id.clone(),
             ecdh_algo: crate::threshold::ecdh_algo_tag(record.ecdh_algo).to_string(),
@@ -1548,17 +1455,6 @@ fn fulfill(
     };
     let outcome = core.gate.decide(gk, &ctx);
     let decision = outcome.decision;
-    // Enforce the rule's lease policy as the SOLE authority on leasing: a
-    // run-once rule yields no lease even if the approver returned one, and a
-    // leasable rule is clamped to its per-rule cap. Computed once here so every
-    // grant site below honors it (defense in depth: the phone should only offer a
-    // lease when allowed, but the daemon never trusts that and re-checks).
-    let lease_secs = decision.lease_ttl().and_then(|ttl| {
-        action
-            .lease
-            .clamp_secs(ttl.as_secs().min(u32::MAX as u64) as u32)
-    });
-    let lease_ttl = lease_secs.map(|s| Duration::from_secs(u64::from(s)));
     if !decision.is_grant() {
         core.record_audit(
             &ctx.id,
@@ -1573,27 +1469,47 @@ fn fulfill(
         return fail_closed(stderr, "request denied\n");
     }
 
-    // What each provider shape needs on approval: an account-backed provider
-    // needs the decrypted token (`credential`); the inline `env` provider needs
-    // its sealed values opened (`sealed_env`); `env-file` needs neither. These
-    // are mutually exclusive arms of one if/else so each may consume the
-    // approval's key material (`outcome.dek` / `outcome.zf`) without a move
-    // conflict.
-    //
-    // v2 accounts open the token by the two-party combine: the phone returned its
-    // partial Z_F with the approval, and the daemon combines it with its Mac share
-    // m (loaded into mlock'd memory for this one op) to derive K and decrypt. No
-    // full private key is ever assembled; m, K, and the token are all zeroized.
+    // Enforce the rule's lease policy as the SOLE authority on leasing: a run-once
+    // rule yields no lease even if the approver returned one, and a leasable rule
+    // is clamped to its per-rule cap. Only the plain-gate path leases (a presence
+    // marker, no secret held); an inline `env` request never persists a grant.
+    if !needs_sealed_env {
+        let lease_ttl = decision
+            .lease_ttl()
+            .and_then(|ttl| {
+                action
+                    .lease
+                    .clamp_secs(ttl.as_secs().min(u32::MAX as u64) as u32)
+            })
+            .map(|s| Duration::from_secs(u64::from(s)));
+        if let Some(ttl) = lease_ttl {
+            core.leases.grant(
+                gk,
+                &account_label,
+                &scope,
+                zeroize::Zeroizing::new(Vec::new()),
+                ttl,
+            );
+        }
+    }
+
+    // On approval the inline `env` provider needs its sealed values opened; `op`
+    // and `env-file` need nothing. The env open is the two-party combine: the
+    // phone returned its partial Z_F with the approval, and the daemon combines it
+    // with its Mac share m (loaded into mlock'd memory for this one op) to derive
+    // the key and decrypt. No key at rest is ever assembled; m, the derived key,
+    // and the plaintext are all zeroized.
     let mut sealed_env: Option<crate::provider::EnvVars> = None;
-    let credential = if let Some((_, record)) = &v2 {
+    if let Some(record) = &sealed_record {
         let zf = match outcome.zf.as_deref() {
             Some(zf) => zf,
-            // An approve with no partial cannot open a v2 token (e.g. the local
-            // factor cannot produce Z_F): fail closed rather than serving nothing.
+            // An approve with no partial cannot open a sealed secret (e.g. the
+            // local factor cannot produce Z_F): fail closed rather than serving
+            // nothing.
             None => {
                 return fail_closed(
                     stderr,
-                    "sigil: v2 approval carried no threshold partial; no phone factor?\n",
+                    "sigil: approval carried no threshold partial; no phone factor?\n",
                 )
             }
         };
@@ -1602,75 +1518,24 @@ fn fulfill(
             Ok(None) => {
                 return fail_closed(
                     stderr,
-                    "sigil: no Mac threshold share on this daemon; re-pair for v2\n",
+                    "sigil: no Mac threshold share on this daemon; re-pair\n",
                 )
             }
             Err(e) => return fail_closed(stderr, &format!("sigil: {e}\n")),
         };
-        let token = match crate::threshold::decrypt(record, &m, zf) {
-            Ok(t) => t,
-            Err(e) => return fail_closed(stderr, &format!("sigil token decrypt failed: {e}\n")),
-        };
-        drop(m); // the Mac share is held only for the one combine
-        if let Some(ttl) = lease_ttl {
-            core.leases
-                .grant(gk, &account_label, &scope, token.clone(), ttl);
-        }
-        Some(token)
-    } else if let Some(ciphertext) = &ciphertext {
-        let dek = match outcome.dek {
-            Some(dek) => dek,
-            None => match core
-                .keystore
-                .unwrap_dek(&format!("Approve {scope} for {account_label}"))
-            {
-                Ok(dek) => dek,
-                Err(e) => {
-                    return fail_closed(stderr, &format!("sigil could not unwrap the key: {e}\n"))
-                }
-            },
-        };
-        let token = match secrets::decrypt_token(&dek, ciphertext) {
-            Ok(t) => t,
-            Err(e) => return fail_closed(stderr, &format!("sigil token decrypt failed: {e}\n")),
-        };
-        drop(dek);
-        if let Some(ttl) = lease_ttl {
-            core.leases
-                .grant(gk, &account_label, &scope, token.clone(), ttl);
-        }
-        Some(token)
-    } else if let Some(ct) = &sealed_ct {
-        // Inline `env`: open the sealed value blob now that the request is
-        // granted. The DEK arrives with the phone approval (or is unwrapped from
-        // the keystore on a local approval, the same as `op`), is used for this
-        // one decrypt, and is dropped at once. No lease: like env-file, resolved
-        // values must never persist across a TTL.
-        let dek = match outcome.dek {
-            Some(dek) => dek,
-            None => match core.keystore.unwrap_dek(&format!("Approve {scope}")) {
-                Ok(dek) => dek,
-                Err(e) => {
-                    return fail_closed(stderr, &format!("sigil could not unwrap the key: {e}\n"))
-                }
-            },
-        };
-        let plain = match secrets::decrypt_token(&dek, ct) {
+        let plain = match crate::threshold::decrypt(record, &m, zf) {
             Ok(p) => p,
             Err(e) => return fail_closed(stderr, &format!("sigil env decrypt failed: {e}\n")),
         };
-        drop(dek);
+        drop(m); // the Mac share is held only for the one combine
         match crate::provider::decode_env_pairs(&plain) {
             Some(pairs) => {
                 // Readout integrity (invariant #3): the approver consented to
                 // exactly the KEY set the readout/audit was built from
-                // (`action.env_keys`, i.e. `describe`). The sealed blob must inject
-                // that same set and nothing else. A divergence would silently set a
-                // key the human never saw; it can arise from a crash between the two
-                // saves in `cli::seal_env_pairs` (blob updated, config not) or an
-                // import that kept the source NAME but changed its keys while a stale
-                // blob under that name survived. Fail closed on any mismatch rather
-                // than inject what was not approved.
+                // (`action.env_keys`, i.e. `describe`). The sealed record must
+                // inject that same set and nothing else. A divergence would
+                // silently set a key the human never saw; fail closed on any
+                // mismatch rather than inject what was not approved.
                 let injected: std::collections::BTreeSet<&str> =
                     pairs.iter().map(|(k, _)| k.as_str()).collect();
                 let consented: std::collections::BTreeSet<&str> =
@@ -1686,10 +1551,7 @@ fn fulfill(
             }
             None => return fail_closed(stderr, "sigil: inline env blob is corrupt; re-set it\n"),
         }
-        None
-    } else {
-        None
-    };
+    }
 
     core.record_audit(
         &ctx.id,
@@ -1702,15 +1564,14 @@ fn fulfill(
         core.grant_via(),
     );
 
-    // Run through the provider: it injects the credential (op), the env-file's
-    // own values, or the inline env's decrypted pairs, and streams output straight
-    // to the caller's fds. For op the daemon holds only the credential; for the
-    // direct-injection shapes the resolved values transit only as the child's
+    // Run through the provider: `op` runs the gated command injecting nothing, the
+    // env-file provider injects its own file's values, and the inline env provider
+    // injects the decrypted pairs. Output streams straight to the caller's fds; for
+    // the direct-injection shapes the resolved values transit only as the child's
     // spawn env (see the provider module docs).
     let code = provider.run(ProviderRun {
         command: argv,
         cwd,
-        credential: credential.as_ref(),
         source,
         stdin,
         stdout,
@@ -1718,7 +1579,6 @@ fn fulfill(
         proxy_depth: child_depth,
         env: sealed_env.as_ref(),
     });
-    drop(credential); // zeroized here (Token is Zeroizing) when present
     drop(sealed_env); // zeroized here (EnvVars is Zeroizing) when present
     code
 }
@@ -1784,11 +1644,14 @@ mod tests {
     /// A fake `op` that emits a known secret only when the expected token
     /// reached its env. Proves both the approval gate and the token-in-env
     /// delivery without ever printing the token itself.
-    fn write_fake_op(dir: &Path, expected_token: &str, secret: &str) -> PathBuf {
+    // `op` is a plain gated command now: Sigil injects nothing, runs the real op,
+    // and streams its output to the caller. The fake op emits `secret` on its own
+    // (as the real op would resolve and stream a secret), proving the gated child's
+    // output reaches the caller without transiting the daemon (invariant #2). The
+    // `_expected_token` arg is retained so callers need no signature change.
+    fn write_fake_op(dir: &Path, _expected_token: &str, secret: &str) -> PathBuf {
         let path = dir.join("op");
-        let script = format!(
-            "#!/bin/sh\nif [ \"$OP_SERVICE_ACCOUNT_TOKEN\" = \"{expected_token}\" ]; then printf '{secret}'; else printf 'NOTOKEN'; fi\n"
-        );
+        let script = format!("#!/bin/sh\nprintf '{secret}'\n");
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
@@ -1867,44 +1730,6 @@ mod tests {
         cfg
     }
 
-    /// The coexistence config: two op rules routing by an argv marker to two op
-    /// sources, one hinting the v2 vault (`Engineering`) and one the v1 vault
-    /// (`Legacy`). It stands in for the old argv `--vault` routing so the
-    /// v1/v2 coexistence test still drives each token down its own path.
-    fn coexist_config() -> Config {
-        use crate::config::{Action, Match, Rule, RuleMode, Source};
-        let mut cfg = Config::default();
-        for (name, account, marker) in [
-            ("v2", "Engineering", "Engineering"),
-            ("v1", "Legacy", "Legacy"),
-        ] {
-            cfg.add_source(Source {
-                name: name.into(),
-                provider: OpProvider::ID.into(),
-                account: Some(account.into()),
-                path: None,
-                keys: Vec::new(),
-            })
-            .unwrap();
-            cfg.add_rule(Rule {
-                name: name.into(),
-                match_: Match {
-                    command: Some("op".into()),
-                    argv_contains: vec![marker.into()],
-                    ..Match::default()
-                },
-                action: Action {
-                    mode: RuleMode::Gate,
-                    source: name.into(),
-                    lease: LeasePolicy::RunOnce,
-                    timeout_sec: None,
-                },
-            })
-            .unwrap();
-        }
-        cfg
-    }
-
     /// Build a core wired to an in-memory keystore holding one account whose
     /// token decrypts to `token`, a fake `op`, the given dev mode, and the given
     /// local-approval timeout.
@@ -1928,25 +1753,19 @@ mod tests {
         timeout: Duration,
         config: Config,
     ) -> (Arc<Core>, Arc<PendingRegistry>) {
-        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::with_dek());
-        let dek = keystore.unwrap_dek("seed").unwrap();
-        let mut accounts = AccountStore::default();
-        accounts
-            .add("Rowm", &dek, token.as_bytes(), vec!["Engineering".into()])
-            .unwrap();
-        drop(dek);
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let _ = (token, secret);
 
         let pending = Arc::new(PendingRegistry::new());
         // These tests exercise the dev-insecure configuration, so the dev switch
         // and the control-socket park are both enabled.
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(dev)
             .with_control_socket(true)
             .with_timeout(timeout);
         let core = Core {
             remote: Vec::new(),
             keystore,
-            accounts: Mutex::new(accounts),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
@@ -2062,21 +1881,14 @@ mod tests {
         // decision/account/via.
         let _home = HomeGuard::new("audit-approve");
         let dir = tmpdir("audit");
-        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::with_dek());
-        let dek = keystore.unwrap_dek("seed").unwrap();
-        let mut accounts = AccountStore::default();
-        accounts
-            .add("Rowm", &dek, b"tok", vec!["Engineering".into()])
-            .unwrap();
-        drop(dek);
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Core {
             remote: Vec::new(),
             keystore,
-            accounts: Mutex::new(accounts),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
@@ -2109,7 +1921,8 @@ mod tests {
         let hist = crate::audit::load();
         assert_eq!(hist.len(), 1, "one decision, one audit line");
         assert_eq!(hist[0].decision, "approved");
-        assert_eq!(hist[0].account, "Rowm");
+        // `op` is a plain gate: no source/account label to record.
+        assert_eq!(hist[0].account, "");
         assert_eq!(hist[0].via, "dev");
         assert_eq!(hist[0].kind, "secret_read");
         std::fs::remove_dir_all(&dir).ok();
@@ -2521,14 +2334,13 @@ mod tests {
 
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let config = env_file_config("faketool", env_path.to_str().unwrap());
         let core = Arc::new(Core {
             remote: Vec::new(),
             keystore,
-            accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
@@ -2607,104 +2419,18 @@ mod tests {
     }
 
     #[test]
-    fn inline_env_command_runs_gated_and_injects_sealed_values() {
-        // End to end through the daemon: a configured inline `env` command is
-        // gated, the daemon opens the DEK-sealed values on approval, and the child
-        // sees the exact KEY=VALUEs — no account and no lease, values only in RAM.
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = tmpdir("envinline");
-        let bindir = dir.join("bin");
-        std::fs::create_dir_all(&bindir).unwrap();
-        let tool = bindir.join("faketool");
-        std::fs::write(
-            &tool,
-            "#!/bin/sh\nprintf 'tok=%s region=%s' \"$TOKEN\" \"$REGION\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
-
-        // Seal the values under the keystore DEK, exactly as `sigil-config source
-        // env set` would, and stash the ciphertext in the account store.
-        let keystore = MemoryKeystore::with_dek();
-        let dek = keystore.unwrap_dek("test").unwrap();
-        let pairs = vec![
-            ("TOKEN".to_string(), Zeroizing::new("sealed-9".to_string())),
-            ("REGION".to_string(), Zeroizing::new("eu".to_string())),
-        ];
-        let encoded = crate::provider::encode_env_pairs(&pairs);
-        let ct = crate::secrets::encrypt_token(&dek, &encoded).unwrap();
-        drop(dek);
-        let mut accounts = AccountStore::default();
-        accounts.set_env_blob("faketool", &ct);
-
-        let keystore: Arc<dyn Keystore> = Arc::new(keystore);
-        let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
-            .with_dev(DevMode::Approve)
-            .with_control_socket(true);
-        let core = Arc::new(Core {
-            remote: Vec::new(),
-            keystore,
-            accounts: Mutex::new(accounts),
-            threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
-            gate: ApprovalGate::new(Box::new(approver)),
-            pending,
-            lockdown: AtomicBool::new(false),
-            proc_table: Box::new(EmptyTable),
-            providers: ProviderRegistry::with_defaults(),
-            config: env_inline_config("faketool", &["TOKEN", "REGION"]).into(),
-            lease_ttl: Duration::from_secs(60),
-            factor: Factor::DevInsecure,
-            ssh_signers: SshSignersCell::new(Vec::new()),
-            audit: None,
-        });
-
-        let prev = std::env::var_os("PATH");
-        let mut search = vec![bindir.clone()];
-        if let Some(p) = &prev {
-            search.extend(std::env::split_paths(p));
-        }
-        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
-        let (read_end, write_end) = pipe();
-        let code = fulfill(
-            &core,
-            &["faketool".into()],
-            "",
-            None,
-            0,
-            None,
-            Some(write_end),
-            None,
-        );
-        match prev {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
-
-        assert_eq!(code, 0);
-        assert_eq!(read_all(read_end), "tok=sealed-9 region=eu");
-        // Like every direct-injection shape, the inline env provider never leases.
-        assert_eq!(core.leases.active(), 0);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn inline_env_with_no_sealed_values_fails_closed() {
         // A configured inline env source whose values were never set must refuse,
         // not run the child with a blank environment.
         let dir = tmpdir("envinline-empty");
-        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::with_dek());
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Arc::new(Core {
             remote: Vec::new(),
             keystore,
-            accounts: Mutex::new(AccountStore::default()), // no sealed blob
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
@@ -2736,91 +2462,6 @@ mod tests {
     }
 
     #[test]
-    fn inline_env_blob_keys_must_match_the_approved_set_or_fail_closed() {
-        // Readout integrity: the sealed blob carries an EXTRA key (BAR) the config
-        // (and therefore the approval readout) never listed. Injecting it would set
-        // a var the human never consented to, so fulfill must refuse and inject
-        // nothing, even though the crypto opens fine.
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = tmpdir("envinline-drift");
-        let bindir = dir.join("bin");
-        std::fs::create_dir_all(&bindir).unwrap();
-        let tool = bindir.join("faketool");
-        std::fs::write(
-            &tool,
-            "#!/bin/sh\nprintf 'tok=%s bar=%s' \"$TOKEN\" \"$BAR\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
-
-        // Seal TWO keys, but configure the source (and thus the readout) with ONE.
-        let keystore = MemoryKeystore::with_dek();
-        let dek = keystore.unwrap_dek("test").unwrap();
-        let pairs = vec![
-            ("TOKEN".to_string(), Zeroizing::new("sealed".to_string())),
-            ("BAR".to_string(), Zeroizing::new("hidden".to_string())),
-        ];
-        let encoded = crate::provider::encode_env_pairs(&pairs);
-        let ct = crate::secrets::encrypt_token(&dek, &encoded).unwrap();
-        drop(dek);
-        let mut accounts = AccountStore::default();
-        accounts.set_env_blob("faketool", &ct);
-
-        let keystore: Arc<dyn Keystore> = Arc::new(keystore);
-        let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
-            .with_dev(DevMode::Approve)
-            .with_control_socket(true);
-        let core = Arc::new(Core {
-            remote: Vec::new(),
-            keystore,
-            accounts: Mutex::new(accounts),
-            threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
-            gate: ApprovalGate::new(Box::new(approver)),
-            pending,
-            lockdown: AtomicBool::new(false),
-            proc_table: Box::new(EmptyTable),
-            providers: ProviderRegistry::with_defaults(),
-            config: env_inline_config("faketool", &["TOKEN"]).into(), // readout: TOKEN only
-            lease_ttl: Duration::from_secs(60),
-            factor: Factor::DevInsecure,
-            ssh_signers: SshSignersCell::new(Vec::new()),
-            audit: None,
-        });
-
-        let prev = std::env::var_os("PATH");
-        let mut search = vec![bindir.clone()];
-        if let Some(p) = &prev {
-            search.extend(std::env::split_paths(p));
-        }
-        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
-        let (read_end, write_end) = pipe();
-        let code = fulfill(
-            &core,
-            &["faketool".into()],
-            "",
-            None,
-            0,
-            None,
-            Some(write_end),
-            None,
-        );
-        match prev {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
-        assert_ne!(
-            code, 0,
-            "a blob whose keys diverge from the readout must refuse"
-        );
-        assert_eq!(read_all(read_end), "", "nothing injected on a refused run");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn caller_stdin_is_spliced_to_the_tool_child() {
         // Interactive tools must read the CALLER's stdin. Prove the fd handed to
         // fulfill reaches the child: a tool that reads a line from stdin and
@@ -2842,14 +2483,13 @@ mod tests {
 
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let config = env_file_config("faketool", env_path.to_str().unwrap());
         let core = Arc::new(Core {
             remote: Vec::new(),
             keystore,
-            accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
@@ -2925,13 +2565,12 @@ mod tests {
 
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Arc::new(Core {
             remote: Vec::new(),
             keystore,
-            accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
@@ -3014,13 +2653,12 @@ mod tests {
 
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Core {
             remote: Vec::new(),
             keystore,
-            accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
@@ -3140,11 +2778,10 @@ mod tests {
 
     use crate::remote::RemoteApprover;
     use sigil_proto::identity::DeviceIdentity;
-    use sigil_proto::pairing::{DaemonPairing, Dek as ProtoDek};
-    use sigil_proto::{LocalRelay, PairingState};
+    use sigil_proto::pairing::DaemonPairing;
+    use sigil_proto::LocalRelay;
     use sigil_relay_client::{DaemonRelay, PhoneRelay};
     use sigil_softphone::{Pairing, Policy, Softphone};
-    use zeroize::Zeroizing;
 
     const REMOTE_NOW: u64 = 1_720_000_000_000;
 
@@ -3156,10 +2793,10 @@ mod tests {
     }
 
     /// Pair a softphone to a fresh daemon identity in-process and return the
-    /// pieces the daemon side needs: the daemon identity (for the approver), the
-    /// paired softphone (holding the DEK), and the raw 32-byte DEK (so the test
-    /// can seal the account token under the same key).
-    fn pair_softphone(policy: Policy) -> (DeviceIdentity, Softphone, [u8; 32]) {
+    /// pieces the daemon side needs: the daemon identity (for the approver) and the
+    /// paired softphone. The ceremony delivers no key: `op` is a plain gate, so the
+    /// softphone only decides (approve/deny), it releases nothing.
+    fn pair_softphone(policy: Policy) -> (DeviceIdentity, Softphone) {
         let daemon_id = DeviceIdentity::generate();
         let daemon_for_approver = clone_device(&daemon_id);
         let (mut daemon, payload) =
@@ -3172,22 +2809,15 @@ mod tests {
         assert_eq!(daemon.sas_words().unwrap(), pairing.sas_words());
         daemon.confirm().unwrap();
         pairing.confirm().unwrap();
+        let softphone = pairing.finish().unwrap();
 
-        // The one DEK: delivered to the phone via pairing, and (below) used to
-        // seal the account token so the phone-returned key decrypts it.
-        let dek_bytes = *ProtoDek::generate().as_bytes();
-        let env = daemon
-            .deliver_dek(&ProtoDek::from_bytes(dek_bytes), 1)
-            .unwrap();
-        assert_eq!(daemon.state(), PairingState::DekDelivered);
-        let softphone = pairing.receive_dek(&env).unwrap();
-
-        (daemon_for_approver, softphone, dek_bytes)
+        (daemon_for_approver, softphone)
     }
 
     /// Build an inert daemon core whose approval gate is a [`RemoteApprover`]
     /// wired to `transport` (any [`Transport`]: the in-process [`LocalRelay`] or
-    /// the real [`DaemonRelay`]), with the account token sealed under `dek_bytes`.
+    /// the real [`DaemonRelay`]). `op` is a plain gate: the daemon injects nothing
+    /// and holds no secret at rest; the gated op streams its own output.
     #[allow(clippy::too_many_arguments)] // a test helper; each arg is a distinct fixture
     fn remote_core(
         dir: &Path,
@@ -3195,23 +2825,9 @@ mod tests {
         phone: sigil_proto::PeerIdentity,
         transport: Arc<dyn sigil_proto::Transport>,
         timeout: Duration,
-        dek_bytes: [u8; 32],
         token: &str,
         secret: &str,
     ) -> (Arc<Core>, Arc<RemoteApprover>) {
-        // The account store: token ciphertext sealed under the shared DEK. The
-        // daemon holds NO DEK of its own.
-        let sealing_dek: crate::secrets::Dek = Zeroizing::new(dek_bytes);
-        let mut accounts = AccountStore::default();
-        accounts
-            .add(
-                "Rowm",
-                &sealing_dek,
-                token.as_bytes(),
-                vec!["Engineering".into()],
-            )
-            .unwrap();
-
         // Hold the approver in an Arc as production does: the gate takes one clone,
         // the test keeps another to run the ToDaemon owner (the sole reader that
         // routes the phone's response to the waiting round trip). Both clones point
@@ -3225,7 +2841,6 @@ mod tests {
         let pending = Arc::new(PendingRegistry::new());
         let core = Arc::new(Core {
             keystore: Arc::new(MemoryKeystore::new()), // no DEK at rest
-            accounts: Mutex::new(accounts),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver.clone())),
@@ -3276,7 +2891,7 @@ mod tests {
     fn remote_softphone_approval_delivers_secret_over_the_socket() {
         let dir = tmpdir("remote-approve");
         let relay = LocalRelay::new();
-        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Approve);
+        let (daemon_id, softphone) = pair_softphone(Policy::Approve);
         let phone_pub = softphone.phone_identity();
         let mailbox = softphone.mailbox();
 
@@ -3286,7 +2901,6 @@ mod tests {
             phone_pub,
             Arc::new(relay.clone()),
             Duration::from_secs(3),
-            dek_bytes,
             "remote-token-xyz",
             "remote-secret-99",
         );
@@ -3353,7 +2967,7 @@ mod tests {
     fn remote_softphone_denial_fails_closed_with_no_secret() {
         let dir = tmpdir("remote-deny");
         let relay = LocalRelay::new();
-        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Deny);
+        let (daemon_id, softphone) = pair_softphone(Policy::Deny);
         let phone_pub = softphone.phone_identity();
 
         let (core, approver) = remote_core(
@@ -3362,7 +2976,6 @@ mod tests {
             phone_pub,
             Arc::new(relay.clone()),
             Duration::from_secs(3),
-            dek_bytes,
             "tok",
             "should-never-appear",
         );
@@ -3402,354 +3015,12 @@ mod tests {
 
     // --- v2 threshold: the full daemon round trip over the socket ----------
 
-    /// Pair a softphone as in [`pair_softphone`], then attach a software
-    /// Secure-Enclave threshold share `f` to it (standing in for the real
-    /// enclave). Returns the daemon identity, the v2-capable softphone, the
-    /// public share `F` (ANSI X9.63) for the daemon to pin, and the SE key id.
-    fn pair_softphone_v2(
-        policy: Policy,
-    ) -> (
-        DeviceIdentity,
-        Softphone,
-        [u8; sigil_proto::threshold::P256_X963_POINT_LEN],
-        &'static str,
-    ) {
-        let (daemon_for_approver, softphone, _dek) = pair_softphone(policy);
-        let f = sigil_proto::threshold::MacShare::generate();
-        let se_key_id = "se-key-1";
-        let softphone = softphone.with_phone_share(f, se_key_id);
-        let f_x963 = softphone
-            .phone_share_x963()
-            .expect("softphone holds an SE share");
-        (daemon_for_approver, softphone, f_x963, se_key_id)
-    }
-
-    /// An inert daemon core whose one account is a **v2 threshold** account: the
-    /// token is sealed under `K = combine(Z_M, Z_F, E, id)`, the Mac share `m` is
-    /// generated into the (memory) keystore, and the record is held in the core's
-    /// threshold store. The daemon holds NO DEK and no phone secret.
-    #[allow(clippy::too_many_arguments)]
-    fn remote_core_v2(
-        dir: &Path,
-        daemon_id: DeviceIdentity,
-        phone: sigil_proto::PeerIdentity,
-        transport: Arc<dyn sigil_proto::Transport>,
-        timeout: Duration,
-        f_x963: &[u8],
-        se_key_id: &str,
-        token: &str,
-        secret: &str,
-    ) -> (Arc<Core>, Arc<RemoteApprover>) {
-        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
-        // Mint/seal the Mac share m in the keystore, then seal the token to
-        // (m, F) as a v2 record and persist it to the threshold store on disk.
-        let m = crate::threshold::load_or_create_mac_share(keystore.as_ref()).unwrap();
-        let phone_share = crate::threshold::PhoneShare::from_x963(
-            se_key_id,
-            f_x963,
-            sigil_proto::threshold::EcdhAlgo::RawX,
-        )
-        .unwrap();
-        let mut store = crate::threshold::ThresholdStore::default();
-        crate::threshold::seal_account(
-            &mut store,
-            "Rowm",
-            &m,
-            &phone_share,
-            token.as_bytes(),
-            vec!["Engineering".into()],
-        )
-        .unwrap();
-        drop(m);
-
-        let approver = Arc::new(
-            RemoteApprover::new(transport, daemon_id, phone)
-                .with_timeout(timeout)
-                .with_listen_poll(Duration::from_millis(20)),
-        );
-        let core = Arc::new(Core {
-            keystore,                                      // holds m (sealed); NO DEK
-            accounts: Mutex::new(AccountStore::default()), // no v1 accounts
-            threshold: Mutex::new(store),
-            leases: LeaseStore::new(),
-            gate: ApprovalGate::new(Box::new(approver.clone())),
-            remote: vec![approver.clone()],
-            pending: Arc::new(PendingRegistry::new()),
-            lockdown: AtomicBool::new(false),
-            proc_table: Box::new(EmptyTable),
-            providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
-                write_fake_op(dir, token, secret),
-            ))]),
-            config: op_config().into(),
-            lease_ttl: Duration::from_secs(60),
-            factor: Factor::Phone,
-            ssh_signers: SshSignersCell::new(Vec::new()),
-            audit: None,
-        });
-        (core, approver)
-    }
-
-    #[test]
-    fn remote_v2_threshold_approval_decrypts_via_two_party_combine() {
-        // The headline v2 loop: the phone contributes Z_F = x(f·E) under its
-        // policy, the daemon combines it with its Mac share m to derive K, and the
-        // token reaches the caller's fd. No DEK exists anywhere; e was destroyed at
-        // account-add, so only the two parties together can open the token.
-        let _home = HomeGuard::new("remote-v2");
-        let dir = tmpdir("remote-v2");
-        let relay = LocalRelay::new();
-        let (daemon_id, softphone, f_x963, se_key_id) = pair_softphone_v2(Policy::Approve);
-        let phone_pub = softphone.phone_identity();
-        let mailbox = softphone.mailbox();
-
-        let (core, approver) = remote_core_v2(
-            &dir,
-            daemon_id,
-            phone_pub,
-            Arc::new(relay.clone()),
-            Duration::from_secs(3),
-            &f_x963,
-            se_key_id,
-            "v2-token-xyz",
-            "v2-secret-99",
-        );
-        let (owner_stop, owner) = spawn_owner(approver);
-
-        let softphone = Arc::new(softphone);
-        let (shutdown, approver_thread) = spawn_approver(softphone.clone(), relay.clone());
-
-        let (client, server) = UnixStream::pair().unwrap();
-        let (read_end, write_end) = pipe();
-        let (err_r, err_w) = pipe();
-        let argv = vec![
-            "op".into(),
-            "read".into(),
-            "op://Engineering/.env/password".into(),
-        ];
-        local::send_frame(
-            &client,
-            &Frame::Run {
-                argv,
-                cwd: String::new(),
-                proxy_depth: 0,
-            },
-            &[
-                std::io::stdin().as_raw_fd(),
-                write_end.as_raw_fd(),
-                err_w.as_raw_fd(),
-            ],
-        )
-        .unwrap();
-        drop(write_end);
-        drop(err_w);
-
-        let worker = std::thread::spawn(move || handle_conn(core, server));
-        worker.join().unwrap().unwrap();
-
-        // The secret reached the caller, and only via the two-party combine.
-        assert_eq!(read_all(read_end), "v2-secret-99");
-        let mut client = client;
-        assert_eq!(
-            local::recv_reply(&mut client).unwrap(),
-            Reply::Exit { code: 0 }
-        );
-        assert_eq!(
-            relay.depth(mailbox, sigil_proto::Direction::ToDaemon),
-            0,
-            "the v2 partial response was consumed by the daemon"
-        );
-        let _ = err_r;
-
-        shutdown.store(true, Ordering::SeqCst);
-        approver_thread.join().unwrap();
-        owner_stop.store(true, Ordering::SeqCst);
-        owner.join().unwrap();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn remote_v2_denial_fails_closed_with_no_secret() {
-        // A v2 deny carries no partial, so the combine cannot run: fail closed.
-        let _home = HomeGuard::new("remote-v2-deny");
-        let dir = tmpdir("remote-v2-deny");
-        let relay = LocalRelay::new();
-        let (daemon_id, softphone, f_x963, se_key_id) = pair_softphone_v2(Policy::Deny);
-        let phone_pub = softphone.phone_identity();
-
-        let (core, approver) = remote_core_v2(
-            &dir,
-            daemon_id,
-            phone_pub,
-            Arc::new(relay.clone()),
-            Duration::from_secs(3),
-            &f_x963,
-            se_key_id,
-            "tok",
-            "should-never-appear",
-        );
-        let (owner_stop, owner) = spawn_owner(approver);
-
-        let softphone = Arc::new(softphone);
-        let (shutdown, approver_thread) = spawn_approver(softphone.clone(), relay.clone());
-
-        let (read_end, write_end) = pipe();
-        let (err_r, err_w) = pipe();
-        let argv = vec![
-            "op".into(),
-            "read".into(),
-            "op://Engineering/.env/password".into(),
-        ];
-        let code = fulfill(
-            &core,
-            &argv,
-            "",
-            None,
-            0,
-            None,
-            Some(write_end),
-            Some(err_w),
-        );
-        assert_eq!(code, 1, "a v2 denial must fail closed");
-        assert_eq!(read_all(read_end), "", "no secret on a denied v2 request");
-        assert!(read_all(err_r).contains("denied"));
-
-        shutdown.store(true, Ordering::SeqCst);
-        approver_thread.join().unwrap();
-        owner_stop.store(true, Ordering::SeqCst);
-        owner.join().unwrap();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// A fake `op` that echoes whatever token reached its env, so a test can
-    /// assert which account's token was injected on each route.
-    fn write_echo_op(dir: &Path) -> PathBuf {
-        let path = dir.join("op");
-        std::fs::write(
-            &path,
-            "#!/bin/sh\nprintf '%s' \"$OP_SERVICE_ACCOUNT_TOKEN\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
-
-    #[test]
-    fn v1_and_v2_accounts_coexist_and_each_takes_its_own_path() {
-        // The migration invariant (R3): a v1 account still decrypts via the DEK
-        // path while a v2 account in the same store decrypts via the two-party
-        // combine. The path is chosen by the at-rest record, and one paired phone
-        // (holding both the DEK and the SE share f) answers either kind.
-        use sigil_proto::threshold::{EcdhAlgo, MacShare};
-
-        let dir = tmpdir("remote-mixed");
-        let relay = LocalRelay::new();
-        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Approve);
-        let f = MacShare::generate();
-        let se_key_id = "se-key-1";
-        let softphone = softphone.with_phone_share(f, se_key_id);
-        let f_x963 = softphone.phone_share_x963().unwrap();
-        let phone_pub = softphone.phone_identity();
-
-        // v1 account "Legacy", token sealed under the phone-delivered DEK.
-        let sealing_dek: crate::secrets::Dek = Zeroizing::new(dek_bytes);
-        let mut accounts = AccountStore::default();
-        accounts
-            .add("Legacy", &sealing_dek, b"v1-token", vec!["Legacy".into()])
-            .unwrap();
-
-        // v2 account "Rowm", token sealed under (m, F).
-        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
-        let m = crate::threshold::load_or_create_mac_share(keystore.as_ref()).unwrap();
-        let phone_share =
-            crate::threshold::PhoneShare::from_x963(se_key_id, &f_x963, EcdhAlgo::RawX).unwrap();
-        let mut tstore = crate::threshold::ThresholdStore::default();
-        crate::threshold::seal_account(
-            &mut tstore,
-            "Rowm",
-            &m,
-            &phone_share,
-            b"v2-token",
-            vec!["Engineering".into()],
-        )
-        .unwrap();
-        drop(m);
-
-        let approver = Arc::new(
-            RemoteApprover::new(Arc::new(relay.clone()), daemon_id, phone_pub)
-                .with_timeout(Duration::from_secs(3))
-                .with_listen_poll(Duration::from_millis(20)),
-        );
-        let core = Arc::new(Core {
-            keystore,
-            accounts: Mutex::new(accounts),
-            threshold: Mutex::new(tstore),
-            leases: LeaseStore::new(),
-            gate: ApprovalGate::new(Box::new(approver.clone())),
-            remote: vec![approver.clone()],
-            pending: Arc::new(PendingRegistry::new()),
-            lockdown: AtomicBool::new(false),
-            proc_table: Box::new(EmptyTable),
-            providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
-                write_echo_op(&dir),
-            ))]),
-            config: coexist_config().into(),
-            lease_ttl: Duration::from_secs(60),
-            factor: Factor::Phone,
-            ssh_signers: SshSignersCell::new(Vec::new()),
-            audit: None,
-        });
-        let (owner_stop, owner) = spawn_owner(approver);
-
-        let softphone = Arc::new(softphone);
-        let (shutdown, approver_thread) = spawn_approver(softphone.clone(), relay.clone());
-
-        // The v2 vault routes through the threshold combine → the v2 token.
-        let (r2, w2) = pipe();
-        let v2_argv = vec![
-            "op".into(),
-            "read".into(),
-            "--vault".into(),
-            "Engineering".into(),
-            "op://Engineering/x".into(),
-        ];
-        assert_eq!(
-            fulfill(&core, &v2_argv, "", None, 0, None, Some(w2), None),
-            0
-        );
-        assert_eq!(
-            read_all(r2),
-            "v2-token",
-            "v2 vault must use the combine path"
-        );
-
-        // The v1 vault routes through the DEK path → the v1 token.
-        let (r1, w1) = pipe();
-        let v1_argv = vec![
-            "op".into(),
-            "read".into(),
-            "--vault".into(),
-            "Legacy".into(),
-            "op://Legacy/x".into(),
-        ];
-        assert_eq!(
-            fulfill(&core, &v1_argv, "", None, 0, None, Some(w1), None),
-            0
-        );
-        assert_eq!(read_all(r1), "v1-token", "v1 vault must use the DEK path");
-
-        shutdown.store(true, Ordering::SeqCst);
-        approver_thread.join().unwrap();
-        owner_stop.store(true, Ordering::SeqCst);
-        owner.join().unwrap();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     #[test]
     fn remote_pairing_config_derives_the_shared_mailbox() {
         // The persisted phone-factor config must derive the exact mailbox both
         // devices route on, so `build_gate(Factor::Phone, ..)` attaches to the
         // right relay queue. This also constructs the config type end to end.
-        let (daemon_id, softphone, _dek) = pair_softphone(Policy::Approve);
+        let (daemon_id, softphone) = pair_softphone(Policy::Approve);
         let cfg = RemotePairingConfig {
             relay_url: "https://relay.example".into(),
             daemon_identity: daemon_id,
@@ -3859,7 +3130,7 @@ mod tests {
         };
 
         let dir = tmpdir("real-relay");
-        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Approve);
+        let (daemon_id, softphone) = pair_softphone(Policy::Approve);
         let phone_pub = softphone.phone_identity();
         let mailbox = softphone.mailbox();
 
@@ -3882,12 +3153,10 @@ mod tests {
             phone_pub,
             Arc::new(daemon_relay),
             Duration::from_secs(10),
-            dek_bytes,
             "real-token-abc",
             "real-secret-77",
         );
         // The inert-daemon invariant: no DEK at rest; it arrives per-approval.
-        assert!(!core.keystore.has_dek(), "daemon holds no DEK at rest");
         // The daemon's ToDaemon owner reads the real relay and routes the response.
         let (owner_stop, owner) = spawn_owner(approver);
 
@@ -3977,7 +3246,7 @@ mod tests {
         let base = format!("http://127.0.0.1:{port}");
 
         let dir = tmpdir("relay-bounce");
-        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Approve);
+        let (daemon_id, softphone) = pair_softphone(Policy::Approve);
         let phone_pub = softphone.phone_identity();
         let mailbox = softphone.mailbox();
 
@@ -3997,7 +3266,6 @@ mod tests {
             phone_pub,
             Arc::new(daemon_relay),
             Duration::from_secs(20),
-            dek_bytes,
             "bounce-token",
             "bounce-secret-55",
         );
@@ -4036,20 +3304,14 @@ mod tests {
     /// whose token decrypts to `token`. Used to exercise the arm-time factor
     /// policy (residual #1) directly.
     fn factor_core(dir: &Path, token: &str, secret: &str, factor: Factor) -> Arc<Core> {
-        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::with_dek());
-        let dek = keystore.unwrap_dek("seed").unwrap();
-        let mut accounts = AccountStore::default();
-        accounts
-            .add("Rowm", &dek, token.as_bytes(), vec!["Engineering".into()])
-            .unwrap();
-        drop(dek);
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let _ = token;
         let pending = Arc::new(PendingRegistry::new());
         let (gate, _listeners, _acceptors) =
             build_gate(factor, Vec::new(), &keystore, &pending).unwrap();
         Arc::new(Core {
             remote: Vec::new(),
             keystore,
-            accounts: Mutex::new(accounts),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate,
@@ -4309,7 +3571,7 @@ mod tests {
         // `load_remote_pairing` reconstructs) drives `build_gate` to the phone
         // approver with no DEK at rest. No relay is dialed synchronously, so this
         // needs no network.
-        let (daemon_id, softphone, _dek) = pair_softphone(Policy::Approve);
+        let (daemon_id, softphone) = pair_softphone(Policy::Approve);
         let cfg = RemotePairingConfig {
             relay_url: "ws://127.0.0.1:1".into(),
             daemon_identity: daemon_id,
@@ -4337,7 +3599,6 @@ mod tests {
             1,
             "the single-device phone factor hands back exactly one listener handle"
         );
-        assert!(!ks.has_dek());
     }
 
     #[test]
@@ -4347,7 +3608,7 @@ mod tests {
         // load (both go through the same trait object here).
         let ks: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
 
-        let (daemon_id, softphone, _dek) = pair_softphone(Policy::Approve);
+        let (daemon_id, softphone) = pair_softphone(Policy::Approve);
         let daemon_pub = daemon_id.peer_identity();
         let phone = softphone.phone_identity();
         let np = NewPairing {
@@ -4370,7 +3631,6 @@ mod tests {
 
         // Inert at rest: nothing persisted lets the daemon produce a DEK. The
         // keystore holds only the daemon identity blob, never a DEK.
-        assert!(!ks.has_dek(), "no DEK is persisted by pairing");
     }
 
     #[test]
@@ -4394,7 +3654,7 @@ mod tests {
         let _home = HomeGuard::new("reload-e2e");
         let ks: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
 
-        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Approve);
+        let (daemon_id, softphone) = pair_softphone(Policy::Approve);
         let daemon_pub = daemon_id.peer_identity();
         let phone_pub = softphone.phone_identity();
         let mailbox = softphone.mailbox();
@@ -4423,11 +3683,9 @@ mod tests {
             cfg.phone,
             Arc::new(daemon_relay),
             Duration::from_secs(10),
-            dek_bytes,
             "reload-token-abc",
             "reload-secret-88",
         );
-        assert!(!core.keystore.has_dek(), "daemon holds no DEK at rest");
         let (owner_stop, owner) = spawn_owner(approver);
 
         // Phone side over the real HTTP transport.
@@ -4501,7 +3759,7 @@ mod tests {
         };
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
-        use sigil_proto::{now_ms, rendezvous_mailbox, Envelope, PairingPayload};
+        use sigil_proto::{now_ms, rendezvous_mailbox, PairingPayload};
         use sigil_relay_client::Rendezvous;
 
         let (qr_tx, qr_rx) = std::sync::mpsc::channel::<String>();
@@ -4520,12 +3778,7 @@ mod tests {
             rv.send(&URL_SAFE_NO_PAD.encode(serde_json::to_vec(&resp).unwrap()))
                 .unwrap();
             pairing.confirm().unwrap();
-            let env_wire = rv
-                .recv(Duration::from_secs(10))
-                .unwrap()
-                .expect("the daemon sealed the DEK back");
-            let env: Envelope = serde_json::from_str(&env_wire).unwrap();
-            let sp = pairing.receive_dek(&env).unwrap();
+            let sp = pairing.finish().unwrap();
             sp.phone_identity()
         });
 
@@ -4534,8 +3787,7 @@ mod tests {
         let mut make_channel = |mailbox: [u8; 32]| crate::pair::relay_channel(&base, mailbox);
         let mut present_qr = |_u: &str, b64: &str| qr_tx.send(b64.to_string()).unwrap();
         let mut confirm = |_w: &[&'static str; 6]| true;
-        let dek = crate::secrets::generate_dek();
-        let mut unwrap_dek = || -> anyhow::Result<crate::secrets::Dek> { Ok(dek.clone()) };
+        let mut arm_after_sas = || -> anyhow::Result<()> { Ok(()) };
         let opts = crate::pair::CeremonyOpts {
             relay_url: base.clone(),
             response_timeout: Duration::from_secs(15),
@@ -4544,7 +3796,7 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
-            unwrap_dek: &mut unwrap_dek,
+            arm_after_sas: &mut arm_after_sas,
         };
         let np = crate::pair::run_ceremony(daemon_id, opts).expect("pairing over the relay");
 
@@ -4554,15 +3806,6 @@ mod tests {
             "the daemon pinned the phone that responded"
         );
         assert_eq!(np.daemon_identity.peer_identity(), daemon_pub);
-    }
-
-    #[test]
-    fn vault_of_ref_extracts_the_vault_segment() {
-        assert_eq!(
-            vault_of_ref("op://Engineering/GitHub/private key").as_deref(),
-            Some("Engineering")
-        );
-        assert_eq!(vault_of_ref("not-a-ref"), None);
     }
 
     #[test]
@@ -4605,14 +3848,13 @@ mod tests {
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
         // A Lease decision that *would* lease an account-backed provider.
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Lease(Duration::from_secs(60)))
             .with_control_socket(true);
         let config = env_file_config("faketool", env_path.to_str().unwrap());
         let core = Arc::new(Core {
             remote: Vec::new(),
             keystore,
-            accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
@@ -4683,14 +3925,13 @@ mod tests {
 
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Off)
             .with_control_socket(true)
             .with_timeout(Duration::from_millis(50));
         let core = Core {
             remote: Vec::new(),
             keystore,
-            accounts: Mutex::new(AccountStore::default()),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),

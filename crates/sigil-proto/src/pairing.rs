@@ -13,16 +13,12 @@ use base64::Engine;
 use blake2::digest::consts::U32;
 use blake2::digest::Mac;
 use blake2::{Blake2b512, Blake2bMac, Digest};
-use crypto_box::SecretKey as BoxSecretKey;
-use ed25519_dalek::SigningKey;
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::envelope::{Envelope, OpenError, SealError};
-use crate::fingerprint::{fingerprint_words, mailbox_id};
+use crate::fingerprint::fingerprint_words;
 use crate::identity::{DeviceIdentity, PeerIdentity};
-use crate::replay::ReplayGuard;
 
 /// A one-time secret proving the QR was scanned in person, consumed at pairing.
 #[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -383,72 +379,18 @@ impl PairingResponse {
     }
 }
 
-/// The 256-bit data-encryption key: the missing half of the daemon's crypto.
-///
-/// Zeroized on drop. Delivered to the phone once, at pairing, sealed inside an
-/// [`Envelope`] (X25519); optionally wrapped a second time to the Mac's Secure
-/// Enclave (P-256 ECIES, see [`crate::se_ecies`]) for local Touch ID approvals;
-/// then erased from the daemon.
-#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
-pub struct Dek([u8; 32]);
-
-impl Dek {
-    /// Fresh DEK from the platform CSPRNG.
-    pub fn generate() -> Self {
-        let mut bytes = [0u8; 32];
-        rand_core::OsRng.fill_bytes(&mut bytes);
-        Self(bytes)
-    }
-
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for Dek {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Dek(<redacted>)")
-    }
-}
-
-/// Seal the DEK to `recipient`'s pinned X25519 key, signed by `daemon_signing`.
-///
-/// This is the whole DEK-handoff primitive. Delivering to the phone and
-/// wrapping a second copy to the Mac Secure Enclave are the same call with a
-/// different recipient, so both reuse the envelope's sealing, signing, and
-/// replay machinery unchanged.
-pub fn seal_dek(
-    dek: &Dek,
-    pairing_id: [u8; 32],
-    counter: u64,
-    daemon_signing: &SigningKey,
-    recipient: &PeerIdentity,
-) -> Result<Envelope, SealError> {
-    Envelope::seal(dek, pairing_id, counter, daemon_signing, recipient)
-}
-
-/// Open a sealed DEK: verify the daemon signature, replay-check, and decrypt
-/// against `recipient_agreement`. The recovered DEK is zeroized on drop.
-pub fn open_dek(
-    env: &Envelope,
-    daemon: &PeerIdentity,
-    recipient_agreement: &BoxSecretKey,
-    guard: &mut ReplayGuard,
-) -> Result<Dek, OpenError> {
-    env.open(daemon, recipient_agreement, guard)
-}
-
 /// The step both peers have reached in the ceremony. The two driver types
 /// (`DaemonPairing`, `PhonePairing`) share this vocabulary; each enforces its
 /// own legal transitions.
 ///
+/// The ceremony pins keys (and, for v2, the phone's threshold share `F`); it
+/// carries no secret handoff of its own. At-rest secrets are threshold-sealed
+/// and opened per-request with the phone's partial, so there is no key to
+/// deliver at pairing.
+///
 /// ```text
-/// daemon:  Init ------------> ResponseReceived --> Confirmed --> DekDelivered
-/// phone:   Scanned ---------> (respond sent) ----> Confirmed --> DekDelivered
+/// daemon:  Init ------------> ResponseReceived --> Confirmed
+/// phone:   Scanned ---------> (respond sent) ----> Confirmed
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PairingState {
@@ -458,10 +400,8 @@ pub enum PairingState {
     Scanned,
     /// Daemon: a valid response arrived; the phone key is now pinned.
     ResponseReceived,
-    /// Both: the six-word SAS matched on both screens.
+    /// Both: the six-word SAS matched on both screens. Terminal.
     Confirmed,
-    /// Both: the DEK has been sealed to the phone (and erased from the daemon).
-    DekDelivered,
 }
 
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
@@ -481,19 +421,12 @@ pub enum HandshakeError {
     BadThresholdShare,
     #[error("SAS mismatch: the two devices did not pin the same keys")]
     SasMismatch,
-    #[error("sealing the DEK failed: {0}")]
-    Seal(#[from] SealError),
-    #[error("opening the DEK failed: {0}")]
-    Open(#[from] OpenError),
-    #[error("wrapping the DEK to the Mac Secure Enclave failed: {0}")]
-    SeEcies(#[from] crate::se_ecies::SeEciesError),
 }
 
 /// Daemon-side driver for the handshake. Owns the daemon's private identity, the
 /// pairing secret, and the pinned phone key once known.
 pub struct DaemonPairing {
     state: PairingState,
-    identity: DeviceIdentity,
     daemon_pub: PeerIdentity,
     endpoints: Vec<String>,
     secret: PairingSecret,
@@ -524,7 +457,6 @@ impl DaemonPairing {
         };
         let driver = Self {
             state: PairingState::Init,
-            identity,
             daemon_pub,
             endpoints,
             secret,
@@ -615,77 +547,13 @@ impl DaemonPairing {
         Ok(fingerprint_words(&self.daemon_pub, &phone))
     }
 
-    /// Record that the human confirmed the SAS matched on both screens.
+    /// Record that the human confirmed the SAS matched on both screens. This is
+    /// the terminal state of the ceremony: the phone identity (and any v2
+    /// threshold share `F`) are now pinned, and there is no secret to hand off.
     pub fn confirm(&mut self) -> Result<(), HandshakeError> {
         self.expect(PairingState::ResponseReceived)?;
         self.state = PairingState::Confirmed;
         Ok(())
-    }
-
-    /// Seal the DEK to the pinned phone. Requires SAS confirmation first, so a
-    /// key never confirmed by a human never receives the DEK. Advances to
-    /// `DekDelivered`.
-    pub fn deliver_dek(&mut self, dek: &Dek, counter: u64) -> Result<Envelope, HandshakeError> {
-        self.expect(PairingState::Confirmed)?;
-        let phone = self.phone.expect("phone pinned before Confirmed");
-        let pairing_id = mailbox_id(&self.daemon_pub, &phone);
-        let env = seal_dek(dek, pairing_id, counter, &self.identity.signing, &phone)?;
-        self.state = PairingState::DekDelivered;
-        Ok(env)
-    }
-
-    /// Wrap a second copy of the DEK to another **X25519** recipient (e.g. a
-    /// second phone or backup approver) inside a standard [`Envelope`]. Available
-    /// once the SAS is confirmed. Does not change state: it is an extra copy, not
-    /// the phone delivery.
-    ///
-    /// This is NOT the Mac Secure Enclave path: the SE holds only P-256 keys and
-    /// cannot open an X25519 envelope, so the Mac-SE wrap uses
-    /// [`wrap_dek_for_se_p256`](Self::wrap_dek_for_se_p256) instead.
-    pub fn wrap_dek_for(
-        &self,
-        dek: &Dek,
-        recipient: &PeerIdentity,
-        counter: u64,
-    ) -> Result<Envelope, HandshakeError> {
-        if self.state != PairingState::Confirmed && self.state != PairingState::DekDelivered {
-            return Err(HandshakeError::WrongState {
-                expected: PairingState::Confirmed,
-                actual: self.state,
-            });
-        }
-        let pairing_id = mailbox_id(&self.daemon_pub, recipient);
-        Ok(seal_dek(
-            dek,
-            pairing_id,
-            counter,
-            &self.identity.signing,
-            recipient,
-        )?)
-    }
-
-    /// Wrap the DEK to the Mac's Secure Enclave P-256 key for local Touch ID
-    /// approvals. `se_pub_x963` is the SE public key in ANSI X9.63 uncompressed
-    /// form, exported by the Mac app at "Enable Mac approvals" time. Returns the
-    /// Apple-compatible ECIES blob the SE opens under Touch ID (see
-    /// [`crate::se_ecies`]).
-    ///
-    /// This is the P-256 sibling of [`wrap_dek_for`](Self::wrap_dek_for): the
-    /// Secure Enclave holds only P-256 keys, so the Mac-SE wrap cannot reuse the
-    /// phone's X25519 envelope. It is a second, independent wrap of the same DEK,
-    /// gated on the same SAS confirmation, and does not change state.
-    pub fn wrap_dek_for_se_p256(
-        &self,
-        dek: &Dek,
-        se_pub_x963: &[u8],
-    ) -> Result<Vec<u8>, HandshakeError> {
-        if self.state != PairingState::Confirmed && self.state != PairingState::DekDelivered {
-            return Err(HandshakeError::WrongState {
-                expected: PairingState::Confirmed,
-                actual: self.state,
-            });
-        }
-        Ok(crate::se_ecies::wrap_dek_p256(dek, se_pub_x963)?)
     }
 
     fn expect(&self, want: PairingState) -> Result<(), HandshakeError> {
@@ -705,7 +573,6 @@ impl DaemonPairing {
 /// single response.
 pub struct PhonePairing {
     state: PairingState,
-    identity: DeviceIdentity,
     phone_pub: PeerIdentity,
     daemon: PeerIdentity,
     endpoints: Vec<String>,
@@ -737,7 +604,6 @@ impl PhonePairing {
         let phone_pub = identity.peer_identity();
         Ok(Self {
             state: PairingState::Scanned,
-            identity,
             phone_pub,
             daemon: payload.daemon,
             endpoints: payload.endpoints,
@@ -787,24 +653,13 @@ impl PhonePairing {
         fingerprint_words(&self.daemon, &self.phone_pub)
     }
 
-    /// Record that the human confirmed the SAS matched on both screens.
+    /// Record that the human confirmed the SAS matched on both screens. Terminal:
+    /// the daemon identity (and any v2 threshold share) are pinned and there is no
+    /// secret handoff to await.
     pub fn confirm(&mut self) -> Result<(), HandshakeError> {
         self.expect(PairingState::Scanned)?;
         self.state = PairingState::Confirmed;
         Ok(())
-    }
-
-    /// Open the DEK sealed by the daemon. Requires prior SAS confirmation.
-    /// Advances to `DekDelivered`.
-    pub fn receive_dek(
-        &mut self,
-        env: &Envelope,
-        guard: &mut ReplayGuard,
-    ) -> Result<Dek, HandshakeError> {
-        self.expect(PairingState::Confirmed)?;
-        let dek = open_dek(env, &self.daemon, &self.identity.agreement, guard)?;
-        self.state = PairingState::DekDelivered;
-        Ok(dek)
     }
 
     pub fn daemon(&self) -> PeerIdentity {
@@ -893,9 +748,11 @@ mod tests {
         ]
     }
 
-    /// Run the full ceremony and return the two drivers plus the delivered DEK,
-    /// so individual tests can assert on any stage.
-    fn full_ceremony() -> (DaemonPairing, PhonePairing, Dek, Dek) {
+    /// Run the full ceremony through SAS confirmation and return the two drivers,
+    /// so individual tests can assert on any stage. The ceremony has no secret
+    /// handoff of its own: at-rest secrets are threshold-sealed and opened
+    /// per-request with the phone's partial, so pairing only pins keys.
+    fn full_ceremony() -> (DaemonPairing, PhonePairing) {
         let daemon_id = DeviceIdentity::generate();
         let phone_id = DeviceIdentity::generate();
 
@@ -917,7 +774,7 @@ mod tests {
         assert_eq!(pinned, phone.phone_identity());
         assert_eq!(daemon.state(), PairingState::ResponseReceived);
 
-        // 3. SAS matches on both screens (order-independent).
+        // 3. SAS matches on both screens (order-independent). Terminal.
         let daemon_words = daemon.sas_words().unwrap();
         let phone_words = phone.sas_words();
         assert_eq!(daemon_words, phone_words);
@@ -926,27 +783,12 @@ mod tests {
         assert_eq!(daemon.state(), PairingState::Confirmed);
         assert_eq!(phone.state(), PairingState::Confirmed);
 
-        // 4. DEK handoff.
-        let dek = Dek::generate();
-        let env = daemon.deliver_dek(&dek, 1).unwrap();
-        assert_eq!(daemon.state(), PairingState::DekDelivered);
-        let mut guard = ReplayGuard::new();
-        let recovered = phone.receive_dek(&env, &mut guard).unwrap();
-        assert_eq!(phone.state(), PairingState::DekDelivered);
-
-        let original = Dek::from_bytes(*dek.as_bytes());
-        (daemon, phone, original, recovered)
-    }
-
-    #[test]
-    fn full_ceremony_delivers_the_dek() {
-        let (_daemon, _phone, original, recovered) = full_ceremony();
-        assert_eq!(recovered.as_bytes(), original.as_bytes());
+        (daemon, phone)
     }
 
     #[test]
     fn both_sides_derive_the_same_fingerprint() {
-        let (daemon, phone, _o, _r) = full_ceremony();
+        let (daemon, phone) = full_ceremony();
         assert_eq!(daemon.sas_words().unwrap(), phone.sas_words());
     }
 
@@ -1164,103 +1006,6 @@ mod tests {
         assert_ne!(a_words, b_words);
         assert!(!verify_sas(&daemon_b, &phone, &a_words));
         assert!(verify_sas(&daemon_a, &phone, &a_words));
-    }
-
-    #[test]
-    fn dek_not_delivered_before_confirmation() {
-        let daemon_id = DeviceIdentity::generate();
-        let (mut daemon, payload) = DaemonPairing::mint(daemon_id, endpoints(), NOW);
-        let mut phone = PhonePairing::scan(DeviceIdentity::generate(), payload, NOW).unwrap();
-        let resp = phone.respond().unwrap();
-        daemon.receive_response(&resp, NOW).unwrap();
-        // Skipping confirm(): deliver_dek must refuse.
-        let dek = Dek::generate();
-        assert!(matches!(
-            daemon.deliver_dek(&dek, 1),
-            Err(HandshakeError::WrongState {
-                expected: PairingState::Confirmed,
-                actual: PairingState::ResponseReceived,
-            })
-        ));
-    }
-
-    #[test]
-    fn second_recipient_wrap_recovers_the_same_dek() {
-        // After confirmation the daemon wraps a second copy of the DEK to another
-        // X25519 recipient (a second phone / backup approver); that recipient
-        // recovers the same key, and a wrong sender key is rejected on the
-        // signature. (The Mac Secure Enclave path is P-256, tested separately in
-        // `se_p256_wrap_is_gated_on_confirmation_and_round_trips`.)
-        let daemon_id = DeviceIdentity::generate();
-        let daemon_pub = daemon_id.peer_identity();
-        let (mut daemon, payload) = DaemonPairing::mint(daemon_id, endpoints(), NOW);
-        let mut phone = PhonePairing::scan(DeviceIdentity::generate(), payload, NOW).unwrap();
-        let resp = phone.respond().unwrap();
-        daemon.receive_response(&resp, NOW).unwrap();
-        daemon.confirm().unwrap();
-
-        let dek = Dek::generate();
-        let se = DeviceIdentity::generate();
-        let env = daemon.wrap_dek_for(&dek, &se.peer_identity(), 1).unwrap();
-
-        // A wrong sender key fails the signature.
-        let mut guard = ReplayGuard::new();
-        let imposter = DeviceIdentity::generate().peer_identity();
-        assert!(matches!(
-            open_dek(&env, &imposter, &se.agreement, &mut guard),
-            Err(OpenError::BadSignature)
-        ));
-
-        // The real daemon identity recovers the same DEK.
-        let mut guard = ReplayGuard::new();
-        let recovered = open_dek(&env, &daemon_pub, &se.agreement, &mut guard).unwrap();
-        assert_eq!(recovered.as_bytes(), dek.as_bytes());
-    }
-
-    #[test]
-    fn dek_debug_does_not_leak() {
-        let d = Dek::from_bytes([9u8; 32]);
-        assert_eq!(format!("{d:?}"), "Dek(<redacted>)");
-    }
-
-    #[test]
-    fn se_p256_wrap_is_gated_on_confirmation_and_round_trips() {
-        use crate::se_ecies::unwrap_dek_p256;
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
-
-        // A stand-in Secure Enclave P-256 key (software here; on the Mac the
-        // private half never leaves the enclave).
-        let se_secret = p256::SecretKey::random(&mut rand_core::OsRng);
-        let se_pub = se_secret
-            .public_key()
-            .to_encoded_point(false)
-            .as_bytes()
-            .to_vec();
-
-        let daemon_id = DeviceIdentity::generate();
-        let (mut daemon, payload) = DaemonPairing::mint(daemon_id, endpoints(), NOW);
-        let mut phone = PhonePairing::scan(DeviceIdentity::generate(), payload, NOW).unwrap();
-        let resp = phone.respond().unwrap();
-        daemon.receive_response(&resp, NOW).unwrap();
-
-        let dek = Dek::generate();
-
-        // Before SAS confirmation the SE wrap is refused, exactly like the phone
-        // wrap: no DEK material is produced for a key no human confirmed.
-        assert!(matches!(
-            daemon.wrap_dek_for_se_p256(&dek, &se_pub),
-            Err(HandshakeError::WrongState {
-                expected: PairingState::Confirmed,
-                actual: PairingState::ResponseReceived,
-            })
-        ));
-
-        daemon.confirm().unwrap();
-
-        // After confirmation the SE (via its P-256 secret) recovers the same DEK.
-        let sealed = daemon.wrap_dek_for_se_p256(&dek, &se_pub).unwrap();
-        let recovered = unwrap_dek_p256(&sealed, &se_secret).unwrap();
-        assert_eq!(recovered.as_bytes(), dek.as_bytes());
     }
 
     // --- confirmation transcript known-answer vectors -----------------------

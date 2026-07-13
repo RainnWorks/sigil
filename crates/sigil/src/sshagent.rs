@@ -47,8 +47,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::secrets::Token;
-
 // --- RFC 9987 message types -------------------------------------------------
 
 /// Generic failure / refusal. The reply for anything we do not implement.
@@ -260,64 +258,16 @@ pub trait SshSigner: Send + Sync {
     /// The identities this source can serve, for `IDENTITIES_ANSWER`.
     fn identities(&self) -> Vec<ServedIdentity>;
 
-    /// Whether the daemon must decrypt a stored account token before this signer
-    /// can sign (true for [`OpSshSigner`]: the SA token authenticates the fetch;
-    /// false for [`FileSshSigner`]: the key is a local file).
-    fn needs_account(&self) -> bool;
-
     /// Produce the SSH signature blob (`string algorithm` + `string signature`)
     /// over `data` with `id`'s key. Called **after** the daemon's phone approval.
-    /// `credential` is the decrypted account token when [`needs_account`] is true,
-    /// else `None`. Returns `None` on any failure (fail closed).
-    ///
-    /// [`needs_account`]: SshSigner::needs_account
-    fn sign(&self, id: &ServedIdentity, data: &[u8], credential: Option<&Token>)
-        -> Option<Vec<u8>>;
+    /// The signer sources its own key (a local file today); Sigil injects no
+    /// credential. Returns `None` on any failure (fail closed).
+    fn sign(&self, id: &ServedIdentity, data: &[u8]) -> Option<Vec<u8>>;
 
     /// True if this signer serves `key_blob` (so the daemon can route a sign
     /// request to its owning signer).
     fn owns(&self, key_blob: &[u8]) -> bool {
         self.identities().iter().any(|i| i.key_blob == key_blob)
-    }
-}
-
-/// The default signer: fetch-per-signature from 1Password via the service
-/// account. Holds the resolved op identities and the `op` binary to shell out to
-/// (`None` uses PATH discovery; tests point it at a fake `op`).
-pub struct OpSshSigner {
-    identities: Vec<ServedIdentity>,
-    op_path: Option<PathBuf>,
-}
-
-impl OpSshSigner {
-    pub fn new(identities: Vec<ServedIdentity>, op_path: Option<PathBuf>) -> Self {
-        Self {
-            identities,
-            op_path,
-        }
-    }
-}
-
-impl SshSigner for OpSshSigner {
-    fn identities(&self) -> Vec<ServedIdentity> {
-        self.identities.clone()
-    }
-
-    fn needs_account(&self) -> bool {
-        true
-    }
-
-    fn sign(
-        &self,
-        id: &ServedIdentity,
-        data: &[u8],
-        credential: Option<&Token>,
-    ) -> Option<Vec<u8>> {
-        let token = credential?;
-        let op = self.op_path.clone().or_else(crate::paths::find_real_op)?;
-        // fetch_and_sign holds the key in a Zeroizing buffer for the one
-        // signature and wipes it (the v1 custody exception; see module docs).
-        fetch_and_sign(&op, token, &id.key_ref, data)
     }
 }
 
@@ -345,16 +295,7 @@ impl SshSigner for FileSshSigner {
         self.keys.iter().map(|(id, _)| id.clone()).collect()
     }
 
-    fn needs_account(&self) -> bool {
-        false
-    }
-
-    fn sign(
-        &self,
-        id: &ServedIdentity,
-        data: &[u8],
-        _credential: Option<&Token>,
-    ) -> Option<Vec<u8>> {
+    fn sign(&self, id: &ServedIdentity, data: &[u8]) -> Option<Vec<u8>> {
         let (_, path) = self.keys.iter().find(|(i, _)| i.key_blob == id.key_blob)?;
         let pem = Zeroizing::new(std::fs::read(path).ok()?);
         sign_openssh_ed25519(&pem, data)
@@ -1437,51 +1378,16 @@ mod tests {
         std::fs::write(&path, key.to_openssh(ssh_key::LineEnding::LF).unwrap()).unwrap();
 
         let signer = FileSshSigner::new(vec![(id.clone(), path.clone())]);
-        assert!(!signer.needs_account(), "a file signer needs no account");
         assert!(signer.owns(&id.key_blob));
 
         let data = b"file-signer-challenge";
         let sig_blob = signer
-            .sign(&id, data, None)
+            .sign(&id, data)
             .expect("file signer produces a signature");
         let mut r = Reader::new(&sig_blob);
         assert_eq!(r.string(), Some(&b"ssh-ed25519"[..]));
         let raw = r.string().unwrap();
         verify_ed25519(key.public_key(), data, raw);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn op_signer_fetches_and_signs_and_requires_a_credential() {
-        // The default signer: fetch from 1Password per signature via the SA
-        // token, then sign. Proves the same seam the file signer implements.
-        let (key, id) = gen_identity("op://Engineering/Seam/private key");
-        let pem = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
-        let dir = std::env::temp_dir().join(format!("sigil-opsign-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let op = write_fake_op(&dir, "tok-xyz", &pem);
-
-        let signer = OpSshSigner::new(vec![id.clone()], Some(op));
-        assert!(
-            signer.needs_account(),
-            "the op signer needs an account token"
-        );
-
-        let data = b"op-signer-challenge";
-        let token: Token = Zeroizing::new(b"tok-xyz".to_vec());
-        let sig_blob = signer
-            .sign(&id, data, Some(&token))
-            .expect("op signer produces a signature");
-        let mut r = Reader::new(&sig_blob);
-        assert_eq!(r.string(), Some(&b"ssh-ed25519"[..]));
-        let raw = r.string().unwrap();
-        verify_ed25519(key.public_key(), data, raw);
-
-        // Without a credential the op signer fails closed (no key to fetch).
-        assert!(
-            signer.sign(&id, data, None).is_none(),
-            "no credential, no signature"
-        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -24,9 +24,8 @@
 //! If any `#[test]` here starts failing, the product's root of trust is broken.
 
 use sigil_proto::{
-    fingerprint_words, open_dek, seal_dek, verify_sas, DaemonPairing, Dek, DeviceIdentity,
-    HandshakeError, OpenError, PairingPayload, PairingResponse, PairingState, PhonePairing,
-    ReplayGuard, PAIRING_SECRET_TTL_MS,
+    fingerprint_words, verify_sas, DaemonPairing, DeviceIdentity, HandshakeError, PairingPayload,
+    PairingResponse, PairingState, PhonePairing, PAIRING_SECRET_TTL_MS,
 };
 
 const NOW: u64 = 1_720_000_000_000;
@@ -470,121 +469,4 @@ fn sas_words_diverge_whenever_the_pinned_pair_differs() {
     assert_ne!(a, b);
     assert!(verify_sas(&daemon_a, &phone, &a));
     assert!(!verify_sas(&daemon_b, &phone, &a));
-}
-
-// ===========================================================================
-// DEK handoff (message 3): a standard sealed+signed Envelope. The full
-// hostile-relay argument applies; here we confirm the pairing-specific entry
-// points reject a wrong sender, a wrong recipient, and a replay.
-// ===========================================================================
-
-/// Run the ceremony to a confirmed daemon that will seal the DEK, returning the
-/// daemon driver, the pinned-and-confirmed phone driver, and the phone's device
-/// identity (whose agreement secret opens the DEK).
-fn confirmed_ceremony() -> (DaemonPairing, PhonePairing, DeviceIdentity) {
-    let (mut daemon, payload) = mint();
-    let phone_id = DeviceIdentity::generate();
-    let phone_id_clone = DeviceIdentity {
-        signing: phone_id.signing.clone(),
-        agreement: phone_id.agreement.clone(),
-    };
-    let mut phone = PhonePairing::scan(phone_id, payload, NOW).unwrap();
-    let resp = phone.respond().unwrap();
-    daemon.receive_response(&resp, NOW).unwrap();
-    daemon.confirm().unwrap();
-    phone.confirm().unwrap();
-    (daemon, phone, phone_id_clone)
-}
-
-#[test]
-fn dek_delivery_to_the_pinned_phone_round_trips() {
-    let (mut daemon, mut phone, _phone_id) = confirmed_ceremony();
-    let dek = Dek::generate();
-    let env = daemon.deliver_dek(&dek, 1).unwrap();
-    let mut guard = ReplayGuard::new();
-    let recovered = phone.receive_dek(&env, &mut guard).unwrap();
-    assert_eq!(recovered.as_bytes(), dek.as_bytes());
-}
-
-#[test]
-fn dek_from_a_forged_sender_is_rejected() {
-    // A relay manufactures a DEK envelope signed by its OWN key, hoping the
-    // phone does not actually pin the daemon. The phone verifies the envelope
-    // against the pinned daemon identity, so the relay's signature is rejected.
-    let pinned_daemon = DeviceIdentity::generate();
-    let relay = DeviceIdentity::generate();
-    let phone = DeviceIdentity::generate();
-    let dek = Dek::generate();
-    let forged = seal_dek(
-        &dek,
-        [0x33u8; 32],
-        1,
-        &relay.signing,
-        &phone.peer_identity(),
-    )
-    .unwrap();
-    let mut guard = ReplayGuard::new();
-    assert!(matches!(
-        open_dek(
-            &forged,
-            &pinned_daemon.peer_identity(),
-            &phone.agreement,
-            &mut guard
-        ),
-        Err(OpenError::BadSignature)
-    ));
-}
-
-#[test]
-fn dek_to_the_wrong_recipient_cannot_be_opened() {
-    // The signature is the daemon's (so it verifies), but the box was sealed to
-    // the phone; a stranger's agreement key cannot decrypt it.
-    let daemon = DeviceIdentity::generate();
-    let phone = DeviceIdentity::generate();
-    let stranger = DeviceIdentity::generate();
-    let dek = Dek::generate();
-    let env = seal_dek(&dek, [7u8; 32], 1, &daemon.signing, &phone.peer_identity()).unwrap();
-    let mut guard = ReplayGuard::new();
-    assert!(matches!(
-        open_dek(
-            &env,
-            &daemon.peer_identity(),
-            &stranger.agreement,
-            &mut guard
-        ),
-        Err(OpenError::Decrypt)
-    ));
-}
-
-#[test]
-fn a_replayed_dek_envelope_is_rejected() {
-    let daemon = DeviceIdentity::generate();
-    let phone = DeviceIdentity::generate();
-    let dek = Dek::generate();
-    let env = seal_dek(&dek, [7u8; 32], 1, &daemon.signing, &phone.peer_identity()).unwrap();
-    let mut guard = ReplayGuard::new();
-    assert!(open_dek(&env, &daemon.peer_identity(), &phone.agreement, &mut guard).is_ok());
-    // The relay resends the identical envelope: the phone's guard rejects it.
-    assert!(matches!(
-        open_dek(&env, &daemon.peer_identity(), &phone.agreement, &mut guard),
-        Err(OpenError::Replay(_))
-    ));
-}
-
-#[test]
-fn dek_is_never_delivered_before_sas_confirmation() {
-    // Skipping confirm() must block the DEK: a key no human confirmed via SAS
-    // never receives the DEK.
-    let (mut daemon, payload) = mint();
-    let (_phone, resp) = honest_response(&payload);
-    daemon.receive_response(&resp, NOW).unwrap();
-    // No confirm().
-    let dek = Dek::generate();
-    assert!(matches!(
-        daemon.deliver_dek(&dek, 1),
-        Err(HandshakeError::WrongState {
-            expected: PairingState::Confirmed,
-            actual: PairingState::ResponseReceived,
-        })
-    ));
 }

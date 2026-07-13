@@ -591,7 +591,6 @@ pub fn remove(ks: &dyn Keystore) -> Result<bool, PairingStoreError> {
 mod tests {
     use super::*;
     use crate::keystore::MemoryKeystore;
-    use crate::secrets::Dek;
 
     /// A private SIGIL_HOME for one test, plus a guard that restores the env.
     /// Holds the process-wide env lock so parallel tests do not clobber it.
@@ -681,15 +680,6 @@ mod tests {
         fn is_biometric(&self) -> bool {
             true
         }
-        fn has_dek(&self) -> bool {
-            self.inner.has_dek()
-        }
-        fn ensure_dek(&self) -> Result<(), KeystoreError> {
-            self.inner.ensure_dek()
-        }
-        fn unwrap_dek(&self, reason: &str) -> Result<Dek, KeystoreError> {
-            self.inner.unwrap_dek(reason)
-        }
         fn verify_presence(&self, _reason: &str) -> Result<(), KeystoreError> {
             if self.grant_presence {
                 Ok(())
@@ -754,15 +744,6 @@ mod tests {
             }
             fn is_biometric(&self) -> bool {
                 true
-            }
-            fn has_dek(&self) -> bool {
-                self.0.has_dek()
-            }
-            fn ensure_dek(&self) -> Result<(), KeystoreError> {
-                self.0.ensure_dek()
-            }
-            fn unwrap_dek(&self, r: &str) -> Result<Dek, KeystoreError> {
-                self.0.unwrap_dek(r)
             }
             // deliberately no verify_presence override
         }

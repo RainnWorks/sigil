@@ -13,7 +13,6 @@ pub mod identity;
 pub mod pairing;
 pub mod replay;
 pub mod request;
-pub mod se_ecies;
 pub mod threshold;
 pub mod transport;
 
@@ -21,9 +20,9 @@ pub use envelope::{Envelope, OpenError, SealError};
 pub use fingerprint::{fingerprint_words, mailbox_id};
 pub use identity::{DeviceIdentity, PeerIdentity};
 pub use pairing::{
-    open_dek, pairing_confirmation_vector, rendezvous_mailbox, seal_dek, verify_sas, DaemonPairing,
-    Dek, HandshakeError, PairingError, PairingPayload, PairingResponse, PairingSecret,
-    PairingState, PhonePairing, PAIRING_SECRET_TTL_MS,
+    pairing_confirmation_vector, rendezvous_mailbox, verify_sas, DaemonPairing, HandshakeError,
+    PairingError, PairingPayload, PairingResponse, PairingSecret, PairingState, PhonePairing,
+    PAIRING_SECRET_TTL_MS,
 };
 pub use replay::{ReplayError, ReplayGuard};
 pub use request::{
@@ -31,7 +30,6 @@ pub use request::{
     LeasePolicy, Provenance, PushRegister, RequestKind, ResolutionBroadcast, ResolutionStatus,
     SecretRef, SshChallenge, ThresholdChallenge, ThresholdPartial, ToDaemonMessage, ToPhoneMessage,
 };
-pub use se_ecies::{unwrap_dek_p256, wrap_dek_p256, SeEciesError};
 pub use threshold::{
     aead_open, aead_seal, all_ephemerals_unique, combine, decode_partial, EcdhAlgo, MacShare,
     P256Point, ThresholdError, ThresholdRecord, KDF_ALGO_ID, THRESHOLD_DOMAIN,
