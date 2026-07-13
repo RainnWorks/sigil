@@ -40,9 +40,11 @@ int sigil_la_verify_presence(const char *reason_utf8) {
             reason = @"Sigil needs your presence";
         }
 
-        // evaluatePolicy is asynchronous (a reply block). The daemon calls this
-        // from a worker thread, never the main queue, so blocking that thread on
-        // a semaphore until the prompt resolves is safe.
+        // evaluatePolicy is asynchronous (a reply block). LAContext dispatches
+        // that reply on its OWN private queue, and the Touch ID UI is
+        // out-of-process, so blocking the calling thread on the semaphore until
+        // the prompt resolves is safe even when the caller is the main thread
+        // (the `sigil pair` CLI is): the signal never depends on this thread.
         __block int result = 0;
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         [ctx evaluatePolicy:policy

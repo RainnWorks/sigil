@@ -2463,3 +2463,69 @@ Recommend a doc-sweep. Nothing here blocks; the HIGH above does.
 **VERDICT: teardown SOUND; one CONFIRMED HIGH (`verify_presence` entitlement
 dependency) blocks the unsigned-daemon shipping posture until moved to
 LAContext.**
+
+---
+
+## 2026-07-13 - Review: presence gate moved to LAContext (commit 6892bab)
+
+Independent adversarial review (reviewer did not author the change) of the fix
+for the CONFIRMED HIGH above: `verify_presence` now calls
+`LAContext.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics)` through an
+ObjC shim (`crates/sigil/src/presence.m`, compiled by `crates/sigil/build.rs`),
+replacing the persistent Secure-Enclave key that an unsigned binary cannot mint.
+
+Scope reminder: this gate is presence-only. It unwraps/derives/delivers NOTHING;
+it forces a live biometric before `arm_after_sas` (cli.rs:1001) pins phone share
+`F` and provisions Mac share `m`. An attacker who can forge the shim's return is
+already executing in the daemon (out of scope).
+
+- **Policy strength - SOUND.** `LAPolicyDeviceOwnerAuthenticationWithBiometrics`
+  with `localizedFallbackTitle = @""` (presence.m:32,35) is biometry-only; it
+  cannot silently degrade to passcode/password. Correct choice for a "physical
+  presence" gate. Tradeoff residual: biometry lockout after repeated failures
+  (LAErrorBiometryLockout) has no passcode escape here, so a locked-out sensor
+  makes pairing impossible until the OS-level reset - fail-closed, acceptable
+  for a personal instrument, worth knowing.
+- **Fail-closed - SOUND.** The Rust match (keystore_macos.rs:96-107) maps ONLY
+  `1 => Ok`; every other value is `Err`: `0 => Declined`; `rc <= -1000 =>
+  Backend`; wildcard `rc => Backend`. `canEvaluatePolicy == false` returns
+  `-1000 + code` or `-1` (presence.m:41), and `reply(success=false)` returns `0`
+  (presence.m:50) - both land on Err arms. No path yields a false `Ok`. The
+  caller propagates with `?` (cli.rs:1004, pairing_store.rs:396) so any Err
+  aborts before anything is written.
+- **Thread safety - SOUND (with a doc nit).** The production caller is the
+  synchronous `sigil pair` CLI on its main thread; all `daemon.rs` invocations of
+  `arm_after_sas` are test-only no-ops, so no tokio worker blocks on the
+  semaphore in production. `LAContext.evaluatePolicy`'s reply block runs on
+  LAContext's own private queue (not the main run loop), so the
+  `dispatch_semaphore_wait(..., FOREVER)` cannot deadlock even on the main
+  thread; macOS Touch ID UI is presented out-of-process and needs no main-loop
+  pumping. The `__block int result` write precedes `dispatch_semaphore_signal`
+  inside the reply block (presence.m:52-53), and the waiter reads `result` only
+  after the wait returns - correctly ordered, no race. NIT: presence.m:47-48
+  claims the daemon "never" calls this from the main queue; the actual prod
+  caller IS a main thread (harmless here, but the comment's rationale is
+  imprecise).
+- **No secret / no spoofing - SOUND.** The shim returns a small int and reveals
+  nothing; `is_biometric()` is hardcoded `true` on Mac (keystore_macos.rs:85) so
+  the gate is always invoked. The only in-band bypass is `SIGIL_DEV_KEYSTORE`
+  making `is_biometric()` false - the intended, loud dev switch, out of scope.
+  `CString::new(reason).unwrap_or_default()` on an interior-NUL reason yields an
+  empty string that the shim replaces with a default prompt (presence.m:44-45);
+  `reason` is a fixed constant, no attacker input, no weakening.
+- **Build integrity - SOUND.** `build.rs` compiles the object solely from
+  `src/presence.m` via `cc` with `rerun-if-changed` on that file; pinning
+  `/usr/bin/ar` (only when it exists) only selects the archiver that bundles that
+  object, it introduces no path by which a different object is injected. The shim
+  and its `extern "C"` block are `#[cfg(target_os = "macos")]`-gated
+  (build.rs, lib.rs:22-23, keystore.rs:278), so non-macOS targets are unaffected.
+
+Residual carried forward: this closes the runtime HIGH, but the on-hardware
+evidence is the commit's own report (LAError -4 clamshell reaches the biometric
+subsystem; real prompt with lid open); the ignored round-trip test
+(`presence_check_prompts_a_real_touch_id`) is the standing manual proof.
+
+**VERDICT: SOUND. The CONFIRMED HIGH ("verify_presence entitlement dependency")
+is resolved; biometrics-only, fail-closed, no secret exposure, macOS-gated
+build. Doc nit (presence.m:47-48 "worker thread") only. Unsigned-daemon pairing
+posture is unblocked pending the standing manual hardware test.**
