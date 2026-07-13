@@ -6,14 +6,16 @@
 //! this process's memory. What is new is the gate in front of it. For each op
 //! request the daemon:
 //!
-//! 1. resolves the account for the requested vault (routing table in the store);
+//! 1. resolves the matching rule for the command (gate or allow);
 //! 2. measures the caller itself (peer pid, kernel-side ancestry) and derives a
 //!    lease grant key it fully controls;
-//! 3. if a live lease covers this grant key, uses its in-RAM token; otherwise
-//!    requires a fresh approval (coalescing identical in-flight requests);
-//! 4. on approval, unwraps the DEK, decrypts the one token, spawns `op` with the
-//!    token in the child env, splices child stdout onto the caller fd, then
-//!    zeroizes the DEK and token;
+//! 3. if a live lease covers this grant key, runs without a fresh prompt;
+//!    otherwise requires a fresh approval (coalescing identical in-flight
+//!    requests);
+//! 4. on approval, spawns the command on the caller's descriptors. `op` brings
+//!    its own auth (Sigil injects no credential); an inline-`env` rule opens its
+//!    threshold-sealed values with the phone's partial and injects them, then
+//!    zeroizes;
 //! 5. on deny, timeout, or lockdown, fails closed: the shim exits like real `op`.
 //!
 //! Control commands (local approve/deny, lockdown, lease list/revoke) arrive on
@@ -381,10 +383,10 @@ impl Core {
             build_gate(factor, remote, &keystore, &pending)?;
 
         // Load the served SSH identities from ~/.sigil/ssh-keys.json and build a
-        // signer per source (op-fetch + file-based). A bad config is logged and
+        // signer per source (file-based today). A bad config is logged and
         // treated as "no keys" so the daemon still arms.
         let ssh_signers = match sshagent::SshKeyConfig::load() {
-            Ok(cfg) => build_ssh_signers(&cfg, None),
+            Ok(cfg) => build_ssh_signers(&cfg),
             Err(e) => {
                 eprintln!("sigil daemon: ignoring an unreadable ssh-keys config: {e}");
                 Vec::new()
@@ -464,7 +466,7 @@ impl Core {
     fn reload_ssh_signers(&self) -> Result<(), String> {
         match sshagent::SshKeyConfig::load() {
             Ok(cfg) => {
-                self.ssh_signers.store(build_ssh_signers(&cfg, None));
+                self.ssh_signers.store(build_ssh_signers(&cfg));
                 Ok(())
             }
             Err(e) => Err(e.to_string()),
@@ -521,14 +523,12 @@ fn ssh_sign_scope(label: &str, data_fingerprint: &str) -> String {
     format!("ssh-sign {label} {data_fingerprint}")
 }
 
-/// Build one SSH signer per configured key source. Today only the file signer
-/// (local key files) ships; the op-backed source is being reworked into a gated
-/// command (the pending SSH rework), so a key that named an op source serves
-/// nothing until then. `_op_path` is retained for that rework's tests.
-fn build_ssh_signers(
-    cfg: &sshagent::SshKeyConfig,
-    _op_path: Option<std::path::PathBuf>,
-) -> Vec<Box<dyn SshSigner>> {
+/// Build one SSH signer per in-source key source. The file signer (local key
+/// files) is the only in-source signer; the 1Password case is a plain gated
+/// command now, not an SSH signer. The threshold-stored source is NOT an
+/// [`SshSigner`] (its sign needs the phone's partial and the Mac share); it is
+/// served and signed inline in [`Core`] via the threshold store.
+fn build_ssh_signers(cfg: &sshagent::SshKeyConfig) -> Vec<Box<dyn SshSigner>> {
     let mut signers: Vec<Box<dyn SshSigner>> = Vec::new();
     let file_keys = cfg.file_keys();
     if !file_keys.is_empty() {
@@ -537,38 +537,67 @@ fn build_ssh_signers(
     signers
 }
 
+/// The threshold-stored SSH identities configured on disk, each with the id its
+/// sealed private key lives under in the threshold store. Read fresh from
+/// `~/.sigil/ssh-keys.json` (a bad/absent config yields none) so `sigil ssh
+/// add-stored | remove` is reflected without a daemon restart, mirroring the file
+/// signer's hot reload. Holds no key material.
+fn stored_ssh_identities() -> Vec<(ServedIdentity, String)> {
+    sshagent::SshKeyConfig::load()
+        .map(|cfg| cfg.stored_keys())
+        .unwrap_or_default()
+}
+
 impl SshBackend for Core {
     fn identities(&self) -> Vec<ServedIdentity> {
-        self.ssh_signers
+        let mut ids: Vec<ServedIdentity> = self
+            .ssh_signers
             .snapshot()
             .iter()
             .flat_map(|s| s.identities())
-            .collect()
+            .collect();
+        // Advertise the threshold-stored keys alongside the in-source signers.
+        ids.extend(stored_ssh_identities().into_iter().map(|(id, _)| id));
+        ids
     }
 
-    /// Gate one SSH signature on the phone and, on approval, delegate to the
-    /// signer that owns the key. Sigil is the phone-gate regardless of key source:
-    /// the gate here is the same approval path as an `op` secret, with two
+    /// Gate one SSH signature on the phone and, on approval, produce it from the
+    /// source that owns the key. Sigil is the phone-gate regardless of key source:
+    /// the gate here is the same approval path as an injected secret, with two
     /// differences the security review must weigh (see `sshagent` module docs):
-    /// every signature is gated (no lease short-circuit in v1), and for the
-    /// op-fetch signer the private key is briefly in daemon RAM for the one
-    /// signature. A file signer sources the key from a local file instead; either
-    /// way the key never reaches the SSH client.
+    /// every signature is gated (no lease short-circuit), and the private key is
+    /// briefly in daemon RAM for the one signature. Two sources are handled:
+    ///
+    /// * **file** — an [`SshSigner`] reads the key from a local file, signs, wipes.
+    /// * **threshold-stored** — the sealed private key is opened per-signature by
+    ///   combining the phone's returned partial `Z_F` with the Mac share `m` (the
+    ///   same two-party combine as an inline env secret), decoded, signed, and
+    ///   zeroized. This request carries a [`ThresholdChallenge`] so the phone
+    ///   produces `Z_F`; an approve with no partial (e.g. a local factor) fails
+    ///   closed rather than emitting a signature.
+    ///
+    /// Either way the key never reaches the SSH client.
     fn approve_and_sign(&self, req: SignRequest<'_>) -> Option<Vec<u8>> {
         if self.lockdown.load(Ordering::SeqCst) {
             eprintln!("sigil daemon: ssh sign refused; sigil is locked down");
             return None;
         }
 
-        // Route the request to the signer that owns this identity. Hold the
-        // snapshot for the whole request so a mid-approval reload cannot swap the
-        // signer set under us.
+        // Route the request to the source that owns this identity. Hold the file
+        // signer snapshot for the whole request so a mid-approval reload cannot
+        // swap the set under us. A stored key resolves to its sealed record, held
+        // for both the challenge and the per-signature decrypt.
         let signers = self.ssh_signers.snapshot();
-        let signer = signers.iter().find(|s| s.owns(&req.id.key_blob))?;
+        let file_signer = signers.iter().find(|s| s.owns(&req.id.key_blob));
+        let sealed = self.stored_record_for(&req.id.key_blob);
+        if file_signer.is_none() && sealed.is_none() {
+            // A sign request for a key we do not serve (or whose sealed record is
+            // missing): fail closed.
+            return None;
+        }
 
-        // No account credential concept anymore: a signer sources its own key
-        // (a local file today; a threshold-stored or gated-command source is the
-        // pending SSH rework). Sigil is only the phone-gate here.
+        // No account credential concept: a source opens its own key. Sigil is only
+        // the phone-gate here.
         let account_label = String::new();
 
         // The approval screen shows a hash of the data to sign, never raw bytes.
@@ -587,6 +616,18 @@ impl SshBackend for Core {
             host: req.host.host.clone(),
             fingerprint: data_fingerprint,
         };
+        // A stored key carries its threshold challenge to the phone (the base point
+        // E it key-agrees against), exactly like an inline env secret; a file key
+        // sources its own material and carries none.
+        let threshold = sealed
+            .as_ref()
+            .map(|record| sigil_proto::ThresholdChallenge {
+                account_id: record.account_id.clone(),
+                label: req.id.label.clone(),
+                ephemeral_pub: record.ephemeral_pub.clone(),
+                se_key_id: record.se_key_id.clone(),
+                ecdh_algo: crate::threshold::ecdh_algo_tag(record.ecdh_algo).to_string(),
+            });
         let ctx = ApprovalContext {
             id: uuid::Uuid::now_v7().to_string(),
             account: account_label.clone(),
@@ -597,11 +638,10 @@ impl SshBackend for Core {
             command: vec!["ssh-sign".to_string(), req.id.label.clone()],
             secret_refs: Vec::new(),
             kind: sigil_proto::RequestKind::SshSignature,
-            // Every signature is gated afresh (no lease short-circuit in v1).
+            // Every signature is gated afresh (no lease short-circuit).
             lease: LeasePolicy::RunOnce,
             ssh: Some(challenge),
-            // The SSH signer sources its own key (no threshold challenge here yet).
-            threshold: None,
+            threshold,
         };
 
         let outcome = self.gate.decide(gk, &ctx);
@@ -609,10 +649,78 @@ impl SshBackend for Core {
             return None;
         }
 
-        // The gate approved: delegate to the owning signer, which sources its own
-        // key (a local file today) and holds the material only for the one
-        // signature. Sigil injected no credential.
-        signer.sign(req.id, req.data)
+        // The gate approved. A stored key is opened per-signature via the two-party
+        // combine (phone partial Z_F + Mac share m), decoded, signed, and wiped; a
+        // file key is signed from its local file.
+        if let Some(record) = &sealed {
+            return self.sign_stored(record, req.data, &outcome);
+        }
+        // A file signer sources its own key and holds it only for the one signature.
+        file_signer?.sign(req.id, req.data)
+    }
+}
+
+impl Core {
+    /// The sealed threshold record for the stored SSH key advertising `key_blob`,
+    /// or `None` if no stored entry serves it (then it is a file key or unknown).
+    /// Reads `~/.sigil/ssh-keys.json` for the entry and `~/.sigil/threshold.db` for
+    /// its sealed record; a missing store or record yields `None` (fail closed).
+    fn stored_record_for(
+        &self,
+        key_blob: &[u8],
+    ) -> Option<sigil_proto::threshold::ThresholdRecord> {
+        let account_id = stored_ssh_identities()
+            .into_iter()
+            .find(|(id, _)| id.key_blob == key_blob)
+            .map(|(_, account_id)| account_id)?;
+        let store = crate::threshold::ThresholdStore::load().ok()?;
+        store.get(&account_id).cloned()
+    }
+
+    /// Open a threshold-stored SSH private key with the phone's partial `Z_F` and
+    /// the Mac share `m`, sign `data`, and zeroize. `outcome` is the approval that
+    /// carried `Z_F`. The two-party combine and per-request `K` handling are the
+    /// reviewed [`crate::threshold::decrypt`]; the opened key is the OpenSSH PEM,
+    /// decoded and signed by [`sshagent::sign_openssh_ed25519`] in a
+    /// zeroize-on-drop buffer, matching the file signer's custody. Fails closed on
+    /// any missing input (no partial, no Mac share, a wrong combine) rather than
+    /// emitting a signature.
+    fn sign_stored(
+        &self,
+        record: &sigil_proto::threshold::ThresholdRecord,
+        data: &[u8],
+        outcome: &crate::approve::ApprovalOutcome,
+    ) -> Option<Vec<u8>> {
+        // The approve must carry the phone's partial Z_F; a local/dev factor cannot
+        // produce one, so a stored key cannot be opened without the phone.
+        let Some(zf) = outcome.zf.as_deref() else {
+            eprintln!(
+                "sigil daemon: ssh sign refused; approval carried no threshold partial (no phone factor?)"
+            );
+            return None;
+        };
+        let m = match crate::threshold::load_mac_share(self.keystore.as_ref()) {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                eprintln!("sigil daemon: ssh sign refused; no Mac threshold share (re-pair)");
+                return None;
+            }
+            Err(e) => {
+                eprintln!("sigil daemon: ssh sign refused; {e}");
+                return None;
+            }
+        };
+        // K = combine(Z_M, Z_F, E, id); open the sealed PEM into a wiped buffer.
+        let pem = match crate::threshold::decrypt(record, &m, zf) {
+            Ok(pem) => pem,
+            Err(e) => {
+                eprintln!("sigil daemon: ssh sign refused; stored key decrypt failed: {e}");
+                return None;
+            }
+        };
+        drop(m); // the Mac share is held only for the one combine
+                 // Decode and sign inside sshagent; `pem` (Zeroizing) is wiped on drop here.
+        sshagent::sign_openssh_ed25519(&pem, data)
     }
 }
 
@@ -1254,12 +1362,11 @@ fn remote_pending_json(p: crate::remote::RemotePending) -> crate::json::PendingJ
 /// denied invocation.
 ///
 /// The command's config selects the provider; the provider decides the injection
-/// shape. `op` (and any provider that [`needs_account`](crate::provider::SecretProvider::needs_account))
-/// routes a 1Password account, unwraps the DEK, decrypts the one token, and
-/// injects it; a direct-injection provider (`env-file`) needs no account and is
-/// gated on every run (no leasing, so resolved values never sit in RAM across a
-/// TTL). An *unconfigured* command is refused with a pointer to `sigil-config
-/// add`, never run ungated.
+/// shape. `op` is a plain gated command: Sigil injects no credential and op does
+/// its own auth. An inline-`env` rule opens its threshold-sealed values with the
+/// phone's partial and injects them, gated on every run (no leasing, so resolved
+/// values never sit in RAM across a TTL). An *unconfigured* command is refused
+/// with a pointer to `sigil-config add`, never run ungated.
 #[allow(clippy::too_many_arguments)]
 fn fulfill(
     core: &Core,
@@ -3499,12 +3606,12 @@ mod tests {
         )
         .unwrap();
         sshagent::SshKeyConfig {
-            keys: Vec::new(),
             files: vec![sshagent::SshFileEntry {
                 path: key_path.display().to_string(),
                 comment: String::new(),
                 hosts: Vec::new(),
             }],
+            stored: Vec::new(),
         }
         .save()
         .expect("writing ssh-keys.json into SIGIL_HOME");
@@ -3517,6 +3624,103 @@ mod tests {
         assert_eq!(ids.len(), 1, "the newly added key is served after reload");
         assert_eq!(ids[0].key_blob, key.public_key().to_bytes().unwrap());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stored_ssh_key_is_advertised_from_the_config() {
+        // A `sigil ssh add-stored` entry is advertised by the agent (listing a
+        // stored key needs only its public line, not the sealed record).
+        let _home = HomeGuard::new("ssh-stored-adv");
+        let dir = tmpdir("ssh-stored-adv");
+        let (core, _) = test_core(
+            &dir,
+            "tok",
+            "secret",
+            DevMode::Off,
+            Duration::from_millis(10),
+        );
+
+        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .unwrap();
+        let pub_line = key.public_key().to_openssh().unwrap();
+        let fp = key
+            .public_key()
+            .fingerprint(ssh_key::HashAlg::Sha256)
+            .to_string();
+        sshagent::SshKeyConfig {
+            files: Vec::new(),
+            stored: vec![sshagent::SshStoredEntry {
+                public_key: pub_line,
+                account_id: format!("ssh:{fp}"),
+                comment: "tom@stored".into(),
+                hosts: Vec::new(),
+            }],
+        }
+        .save()
+        .expect("writing ssh-keys.json into SIGIL_HOME");
+
+        let ids = SshBackend::identities(core.as_ref());
+        assert_eq!(ids.len(), 1, "the stored key is advertised");
+        assert_eq!(ids[0].key_blob, key.public_key().to_bytes().unwrap());
+        assert_eq!(ids[0].label, "tom@stored");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stored_ssh_key_seals_opens_and_signs() {
+        // The exact crypto composition `Core::sign_stored` performs: seal an
+        // OpenSSH private key under threshold, then open it per-signature with the
+        // phone's partial Z_F plus the Mac share m, decode, sign, and verify. Uses
+        // the real reviewed primitives (a software stand-in for the phone SE key).
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        use sigil_proto::threshold::{EcdhAlgo, MacShare};
+
+        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .unwrap();
+        let pem = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
+
+        // Software phone (f, F) and the Mac share m.
+        let f = MacShare::generate();
+        let f_x963 = *f.public_point().as_x963();
+        let phone = crate::threshold::PhoneShare::from_x963("phone-se.v2", &f_x963, EcdhAlgo::RawX)
+            .unwrap();
+        let m = MacShare::generate();
+
+        // Seal exactly as `sigil ssh add-stored` does.
+        let mut store = crate::threshold::ThresholdStore::default();
+        crate::threshold::seal_secret(&mut store, "ssh:test", &m, &phone, pem.as_bytes()).unwrap();
+        let record = store.get("ssh:test").unwrap();
+        // The private key must not survive in cleartext in the sealed record.
+        let json = serde_json::to_string(record).unwrap();
+        assert!(
+            !json.contains("OPENSSH PRIVATE KEY"),
+            "no key material in the sealed record"
+        );
+
+        // The daemon's per-signature combine: Z_F = x(f·E), then decrypt.
+        let e_point = record.ephemeral_point().unwrap();
+        let zf = f.partial(&e_point, record.ecdh_algo, e_point.as_x963());
+        let pem_back = crate::threshold::decrypt(record, &m, &zf).unwrap();
+
+        // Decode + sign as sign_stored does, and verify the ed25519 signature.
+        let data = b"stored-ssh-challenge-bytes";
+        let sig_blob = sshagent::sign_openssh_ed25519(&pem_back, data)
+            .expect("stored sign produces a signature");
+        // The blob is `string "ssh-ed25519"` + `string <64-byte sig>`; the raw
+        // signature is its final 64 bytes.
+        assert!(sig_blob.len() >= 64);
+        let raw = &sig_blob[sig_blob.len() - 64..];
+        let pk_bytes = key.public_key().key_data().ed25519().unwrap().0;
+        let vk = VerifyingKey::from_bytes(&pk_bytes).unwrap();
+        let sig = Signature::from_slice(raw).unwrap();
+        vk.verify(data, &sig)
+            .expect("the stored-key signature verifies");
+
+        // Fail closed: a wrong/absent partial yields no key (so no signature).
+        assert!(
+            crate::threshold::decrypt(record, &m, &[0u8; 32]).is_err(),
+            "a wrong Z_F fails closed"
+        );
     }
 
     #[test]
@@ -3831,8 +4035,8 @@ mod tests {
         // Leasing is disabled for a direct-injection provider even when the
         // decision would grant a session lease: resolved secret VALUES must never
         // sit in daemon RAM across a TTL. A Lease decision on an env-file command
-        // runs once and leaves no lease behind (the credential block that grants a
-        // lease is gated on `needs_account`, which is false for env-file).
+        // runs once and leaves no lease behind (only a plain gate leases, and its
+        // marker holds no secret).
         let _lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());

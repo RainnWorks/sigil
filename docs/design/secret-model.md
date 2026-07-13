@@ -31,9 +31,19 @@ secrets. It is NOT a credential broker for other tools.
 
 - **Gating** (rules, leases, lockdown, audit).
 - **Own-secret injection** — reframed onto threshold instead of the DEK.
-- **Keystore BLOB storage** (daemon identity key, the Mac share `m`) and
-  `verify_presence` (the Touch-ID pairing gate) — both independent of the DEK,
-  both work from the unsigned binary.
+- **Keystore BLOB storage** (daemon identity key, the Mac share `m`) — legacy
+  login-keychain generic passwords, no entitlement, works from the unsigned
+  binary.
+- **The Touch-ID pairing gate** (`verify_presence`) stays as a concept, but its
+  current implementation mints a PERSISTENT DataProtection-keychain Secure
+  Enclave key, which needs the `keychain-access-groups` entitlement the unsigned
+  daemon does not have (proven: OSStatus -34018 / amfid SIGKILL). So on an
+  unsigned daemon it breaks pairing. OPEN ITEM: move it to
+  `LAContext.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics)`
+  (LocalAuthentication needs no keychain/entitlement) or a transient
+  non-persistent SE key proven on hardware. Until then only the `SIGIL_DEV_KEYSTORE`
+  dev path (no biometric, `m` in the clear) pairs. See
+  [[verify-presence-persistent-se-key-breaks-unsigned]].
 - **Threshold** as the single at-rest seal for everything Sigil owns: injected
   env secrets AND stored SSH keys. Ciphertext on disk, openable only with the
   phone's per-request partial. "No DEK to downgrade to."

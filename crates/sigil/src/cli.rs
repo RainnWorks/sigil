@@ -230,10 +230,10 @@ usage: sigil <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
   deny --local --id <id>               deny a pending request at the Mac
   history           the decision audit log (names and metadata only)
   pending           requests currently parked for a local decision
-  ssh add           serve a 1Password SSH key (--vault --item --pubkey-file [--host h])
-  ssh add-file      serve a local key file (--path <key>, signs from ~/.ssh/…)
+  ssh add-file      serve a local key file (--path <key>, signs from ~/.ssh/… [--host h])
+  ssh add-stored    seal a private key under threshold, phone-gated (key on stdin, [--host h])
   ssh list          list the SSH keys the agent serves
-  ssh remove <item> stop serving an SSH key
+  ssh remove <id>   stop serving an SSH key (by its path or stored id)
   ssh config        route chosen hosts via ~/.ssh/config (--install / --uninstall)
   sshagent          print the SSH_AUTH_SOCK to point ssh/git at Sigil
   shim install      symlink ~/.sigil/bin/op at this binary
@@ -407,7 +407,7 @@ fn cmd_status() -> i32 {
     // ssh agent: how many keys it would serve (a local CLI convenience row; the
     // count is not part of the machine status shape).
     let ssh_count = crate::sshagent::SshKeyConfig::load()
-        .map(|c| c.keys.len())
+        .map(|c| c.files.len() + c.stored.len())
         .unwrap_or(0);
     let (glyph, label, note) = if ssh_count > 0 {
         (
@@ -421,7 +421,7 @@ fn cmd_status() -> i32 {
         (
             s.dim("\u{25cb}"),
             "no keys",
-            s.dim("add one: sigil ssh add --vault <V> --item <I> --pubkey-file <p>"),
+            s.dim("add one: sigil ssh add-file --path <key>"),
         )
     };
     println!("  {}     {glyph} {}  {note}", s.dim("ssh"), pad(label, 13));
@@ -1354,13 +1354,13 @@ fn format_unix_ms(ms: u64) -> String {
 
 fn cmd_ssh(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
-        Some("add") => ssh_add(&args[1..]),
         Some("add-file") => ssh_add_file(&args[1..]),
+        Some("add-stored") => ssh_add_stored(&args[1..]),
         Some("list") | None => ssh_list(),
         Some("remove") | Some("rm") => ssh_remove(args.get(1).map(String::as_str)),
         Some("config") => ssh_config(&args[1..]),
         _ => {
-            eprintln!("usage: sigil ssh <add|add-file|list|remove|config>");
+            eprintln!("usage: sigil ssh <add-file|add-stored|list|remove|config>");
             2
         }
     }
@@ -1422,6 +1422,160 @@ fn ssh_add_file(args: &[String]) -> i32 {
     0
 }
 
+/// `sigil ssh add-stored [--comment <c>] [--host <h> ...]`: seal an OpenSSH
+/// private key (read from stdin) under the v2 threshold, so Sigil holds the key at
+/// rest as ciphertext and opens it per-signature only with the phone's partial.
+/// This is the "store SSH creds for people without 1Password" source. A Mac-side,
+/// human-present ceremony (needs the paired phone's share F and the Mac share m);
+/// v1 seals ed25519 only.
+fn ssh_add_stored(args: &[String]) -> i32 {
+    let s = Style::stdout();
+    let comment = flag_value(args, "--comment").unwrap_or("").to_string();
+    let hosts = flag_values(args, "--host");
+    if let Some(code) = reject_bad_hosts(&s, &hosts) {
+        return code;
+    }
+
+    // Read the private key from stdin into a wiped buffer (never a file, never a
+    // flag). It leaves this function only as threshold ciphertext.
+    let mut raw = Zeroizing::new(Vec::new());
+    if let Err(e) = std::io::stdin().read_to_end(&mut raw) {
+        eprintln!("sigil: reading the private key from stdin: {e}");
+        return 1;
+    }
+    if raw.is_empty() {
+        eprintln!(
+            "usage: sigil ssh add-stored [--comment <c>] [--host <h> ...]   (OpenSSH private key on stdin)"
+        );
+        return 2;
+    }
+
+    // Decode + validate ed25519, then re-encode to a canonical OpenSSH PEM so what
+    // we seal is exactly what the daemon will decode and sign.
+    let key = match ssh_key::PrivateKey::from_openssh(&raw[..]) {
+        Ok(k) => k,
+        Err(_) => {
+            eprintln!("{} not a valid OpenSSH private key", s.deny("\u{2717}"));
+            return 1;
+        }
+    };
+    if key.algorithm() != ssh_key::Algorithm::Ed25519 {
+        eprintln!(
+            "{} only ed25519 keys are served (v1); this key is {}",
+            s.deny("\u{2717}"),
+            key.algorithm().as_str()
+        );
+        return 1;
+    }
+    let pem = match key.to_openssh(ssh_key::LineEnding::LF) {
+        Ok(p) => p, // Zeroizing<String>
+        Err(e) => {
+            eprintln!("sigil: re-encoding the private key: {e}");
+            return 1;
+        }
+    };
+    let public_key = match key.public_key().to_openssh() {
+        Ok(l) => l.trim().to_string(),
+        Err(e) => {
+            eprintln!("sigil: encoding the public key: {e}");
+            return 1;
+        }
+    };
+    let fingerprint = key
+        .public_key()
+        .fingerprint(ssh_key::HashAlg::Sha256)
+        .to_string();
+    // The threshold-store id: stable across re-seals of the same key, unique per
+    // key, and namespaced so it never collides with an env-source id.
+    let account_id = format!("ssh:{fingerprint}");
+
+    // Seal the PEM to the phone's pinned Secure-Enclave share F plus the Mac share
+    // m (the same ceremony as sealing an env source's values).
+    let ks = keystore::for_host();
+    let phone = match crate::pairing_store::load(ks.as_ref()) {
+        Ok(Some(pc)) => match pc.phone_share {
+            Some(share) => share,
+            None => {
+                eprintln!(
+                    "sigil: this pairing has no phone Secure-Enclave share; re-pair before storing a key"
+                );
+                return 1;
+            }
+        },
+        Ok(None) => {
+            eprintln!("sigil: no phone is paired; run `sigil pair` first");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("sigil: loading the pairing: {e}");
+            return 1;
+        }
+    };
+    let m = match crate::threshold::load_or_create_mac_share(ks.as_ref()) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("sigil: provisioning the Mac threshold share: {e}");
+            return 1;
+        }
+    };
+    let mut store = match crate::threshold::ThresholdStore::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("sigil: loading the threshold store: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) =
+        crate::threshold::seal_secret(&mut store, &account_id, &m, &phone, pem.as_bytes())
+    {
+        eprintln!("sigil: sealing the private key: {e}");
+        return 1;
+    }
+    if let Err(e) = store.save() {
+        eprintln!("sigil: saving the threshold store: {e}");
+        return 1;
+    }
+
+    // Register the served entry (public material + the sealed-key id only).
+    let entry = crate::sshagent::SshStoredEntry {
+        public_key,
+        account_id: account_id.clone(),
+        comment,
+        hosts: hosts.clone(),
+    };
+    let Some(id) = crate::sshagent::resolve_stored_identity(&entry) else {
+        eprintln!(
+            "{} could not derive an ed25519 identity from the key",
+            s.deny("\u{2717}")
+        );
+        return 1;
+    };
+    let mut cfg = match crate::sshagent::SshKeyConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("sigil: loading ssh-keys config: {e}");
+            return 1;
+        }
+    };
+    // A re-seal of the same key replaces the entry (the store record was upserted).
+    cfg.stored.retain(|k| k.account_id != account_id);
+    cfg.stored.push(entry);
+    if let Err(e) = cfg.save() {
+        eprintln!("sigil: saving ssh-keys config: {e}");
+        return 1;
+    }
+
+    println!("{} storing {}", s.ok("\u{2713}"), s.cobalt(&id.label));
+    println!("  {}  {}", s.dim("key"), s.dim(&id.fingerprint));
+    println!(
+        "  {}  {}",
+        s.dim("sealed"),
+        s.dim("threshold; opens only with your phone")
+    );
+    ssh_add_epilogue(&s, &hosts);
+    0
+}
+
 /// Reject any `--host` token that is not a safe ssh_config `Host` value (a token
 /// carrying whitespace or a control character could splice extra directives into
 /// the generated config). Returns `Some(exit_code)` to stop the command, or
@@ -1439,8 +1593,8 @@ fn reject_bad_hosts(s: &Style, hosts: &[String]) -> Option<i32> {
     None
 }
 
-/// Shared closing lines for `ssh add` / `ssh add-file`: the restart hint, and,
-/// when the key names hosts, the routing hint to (re)generate the ssh config.
+/// Shared closing lines for `ssh add-file`: the restart hint, and, when the key
+/// names hosts, the routing hint to (re)generate the ssh config.
 fn ssh_add_epilogue(s: &Style, hosts: &[String]) {
     if hosts.is_empty() {
         println!(
@@ -1456,94 +1610,6 @@ fn ssh_add_epilogue(s: &Style, hosts: &[String]) {
     }
 }
 
-/// `sigil ssh add --vault <V> --item <I> [--field <f>] [--comment <c>]
-/// (--pubkey-file <path> | --pubkey-stdin)`: register a 1Password SSH key for the
-/// agent to serve. Only the public key (not secret) is provided here; the private
-/// key is fetched per-signature. v1 accepts ed25519 only.
-fn ssh_add(args: &[String]) -> i32 {
-    let s = Style::stdout();
-    let (Some(vault), Some(item)) = (
-        flag_value(args, "--vault").map(str::to_string),
-        flag_value(args, "--item").map(str::to_string),
-    ) else {
-        eprintln!(
-            "usage: sigil ssh add --vault <V> --item <I> [--field <f>] [--comment <c>] \
-             [--host <h> ...] (--pubkey-file <path> | --pubkey-stdin)"
-        );
-        return 2;
-    };
-    let field = flag_value(args, "--field")
-        .unwrap_or("private key")
-        .to_string();
-    let comment = flag_value(args, "--comment").unwrap_or("").to_string();
-    let hosts = flag_values(args, "--host");
-    if let Some(code) = reject_bad_hosts(&s, &hosts) {
-        return code;
-    }
-
-    // The public key line comes from a file or stdin (never secret).
-    let public_key = if let Some(path) = flag_value(args, "--pubkey-file") {
-        match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("sigil: reading {path}: {e}");
-                return 1;
-            }
-        }
-    } else if has_flag(args, "--pubkey-stdin") {
-        let mut buf = String::new();
-        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-            eprintln!("sigil: reading public key from stdin: {e}");
-            return 1;
-        }
-        buf
-    } else {
-        eprintln!("sigil: provide the public key with --pubkey-file <path> or --pubkey-stdin");
-        return 2;
-    };
-    let public_key = public_key.trim().to_string();
-
-    let entry = crate::sshagent::SshKeyEntry {
-        public_key,
-        vault: vault.clone(),
-        item: item.clone(),
-        field,
-        comment,
-        hosts: hosts.clone(),
-    };
-    // Validate before persisting: it must parse as an ed25519 public key.
-    let Some(id) = crate::sshagent::resolve_identity(&entry) else {
-        eprintln!(
-            "{} not a usable ed25519 public key (v1 serves ed25519 only)",
-            s.deny("\u{2717}")
-        );
-        return 1;
-    };
-
-    let mut cfg = match crate::sshagent::SshKeyConfig::load() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("sigil: loading ssh-keys config: {e}");
-            return 1;
-        }
-    };
-    if cfg.keys.iter().any(|k| k.vault == vault && k.item == item) {
-        eprintln!("sigil: op://{vault}/{item} is already served (remove it first to replace)");
-        return 1;
-    }
-    cfg.keys.push(entry);
-    if let Err(e) = cfg.save() {
-        eprintln!("sigil: saving ssh-keys config: {e}");
-        return 1;
-    }
-
-    println!("{} serving {}", s.ok("\u{2713}"), s.cobalt(&id.label));
-    println!("  {}  {}", s.dim("key"), s.dim(&id.fingerprint));
-    println!("  {}  {}", s.dim("ref"), s.dim(&id.key_ref));
-    ssh_add_epilogue(&s, &hosts);
-    0
-}
-
 fn ssh_list() -> i32 {
     let s = Style::stdout();
     let cfg = match crate::sshagent::SshKeyConfig::load() {
@@ -1553,42 +1619,15 @@ fn ssh_list() -> i32 {
             return 1;
         }
     };
-    if cfg.keys.is_empty() && cfg.files.is_empty() {
+    if cfg.files.is_empty() && cfg.stored.is_empty() {
         println!(
             "  {}",
-            s.dim("no SSH keys served; add one: sigil ssh add --vault <V> --item <I> --pubkey-file <p>  (or: sigil ssh add-file --path <key>)")
+            s.dim("no SSH keys served; add one: sigil ssh add-file --path <key>  (or: sigil ssh add-stored)")
         );
         return 0;
     }
     println!("{}", s.cobalt("ssh keys served"));
     println!();
-    for e in &cfg.keys {
-        match crate::sshagent::resolve_identity(e) {
-            Some(id) => {
-                println!("  {}  {}", pad(&id.label, 18), s.dim(&id.fingerprint));
-                println!(
-                    "  {}  {}",
-                    pad("", 18),
-                    s.faint(&format!(
-                        "1password · op://{}/{} · {}",
-                        e.vault, e.item, id.comment
-                    ))
-                );
-                if !e.hosts.is_empty() {
-                    println!(
-                        "  {}  {}",
-                        pad("", 18),
-                        s.faint(&format!("routed: {}", e.hosts.join(" ")))
-                    );
-                }
-            }
-            None => println!(
-                "  {}  {}",
-                pad(&e.item, 18),
-                s.brass("unusable (not an ed25519 public key)")
-            ),
-        }
-    }
     for e in &cfg.files {
         match crate::sshagent::resolve_file_identity(e) {
             Some(id) => {
@@ -1613,6 +1652,30 @@ fn ssh_list() -> i32 {
             ),
         }
     }
+    for e in &cfg.stored {
+        match crate::sshagent::resolve_stored_identity(e) {
+            Some(id) => {
+                println!("  {}  {}", pad(&id.label, 18), s.dim(&id.fingerprint));
+                println!(
+                    "  {}  {}",
+                    pad("", 18),
+                    s.faint("stored · threshold-sealed; opens only with your phone")
+                );
+                if !e.hosts.is_empty() {
+                    println!(
+                        "  {}  {}",
+                        pad("", 18),
+                        s.faint(&format!("routed: {}", e.hosts.join(" ")))
+                    );
+                }
+            }
+            None => println!(
+                "  {}  {}",
+                pad(&e.account_id, 18),
+                s.brass("unusable (not an ed25519 public key)")
+            ),
+        }
+    }
     0
 }
 
@@ -1629,18 +1692,42 @@ fn ssh_remove(item: Option<&str>) -> i32 {
             return 1;
         }
     };
-    // Match either a 1Password item name (cfg.keys) or a local key-file path
-    // (cfg.files), so a key added by `ssh add-file` is removable too.
-    let before = cfg.keys.len() + cfg.files.len();
-    cfg.keys.retain(|k| k.item != item);
+    // Match a local key-file path (the file source, added by `ssh add-file`) or a
+    // stored key by its id (`ssh:<fp>`) or bare fingerprint (`add-stored`).
+    let before = cfg.files.len() + cfg.stored.len();
     cfg.files.retain(|f| f.path != item);
-    if cfg.keys.len() + cfg.files.len() == before {
+    let stored_id = format!("ssh:{item}");
+    let mut removed_stored: Vec<String> = Vec::new();
+    cfg.stored.retain(|k| {
+        let hit = k.account_id == item || k.account_id == stored_id;
+        if hit {
+            removed_stored.push(k.account_id.clone());
+        }
+        !hit
+    });
+    if cfg.files.len() + cfg.stored.len() == before {
         println!("  {}", s.dim(&format!("no served key named {item}")));
         return 0;
     }
     if let Err(e) = cfg.save() {
         eprintln!("sigil: saving ssh-keys config: {e}");
         return 1;
+    }
+    // Drop the sealed private key(s) from the threshold store too, so removal
+    // leaves no ciphertext behind. Best-effort: the config change already stopped
+    // it being served; a store error is reported but not fatal.
+    if !removed_stored.is_empty() {
+        match crate::threshold::ThresholdStore::load() {
+            Ok(mut store) => {
+                for id in &removed_stored {
+                    store.remove(id);
+                }
+                if let Err(e) = store.save() {
+                    eprintln!("sigil: removing the sealed key from the threshold store: {e}");
+                }
+            }
+            Err(e) => eprintln!("sigil: loading the threshold store to drop the sealed key: {e}"),
+        }
     }
     println!("{} stopped serving {}", s.ok("\u{2713}"), s.cobalt(item));
     println!(
@@ -1690,7 +1777,7 @@ fn ssh_config(args: &[String]) -> i32 {
     if routed.is_empty() {
         println!(
             "  {}",
-            s.dim("no keys name any hosts to route; add hosts with: sigil ssh add ... --host <h>")
+            s.dim("no keys name any hosts to route; add hosts with: sigil ssh add-file --path <key> --host <h>")
         );
         return 0;
     }
@@ -1743,7 +1830,7 @@ fn cmd_sshagent() -> i32 {
     let s = Style::stdout();
     let sock = crate::sshagent::socket_path();
     let count = crate::sshagent::SshKeyConfig::load()
-        .map(|c| c.keys.len())
+        .map(|c| c.files.len() + c.stored.len())
         .unwrap_or(0);
     println!("{}", s.cobalt("sigil ssh-agent"));
     println!();

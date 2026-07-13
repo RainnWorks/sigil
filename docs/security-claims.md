@@ -2369,3 +2369,97 @@ pre-existing, out-of-scope, fail-closed parity residual (item 2: phone freshness
 window 90s vs daemon 150s) is recommended for a follow-up alignment; it is not a
 replay hole and does not block this change.**
 
+
+---
+
+## 2026-07-13 -- Independent review: v1 DEK / accounts / brokering teardown (commit `01e625b`)
+
+Reviewer: independent security-reviewer (did not write the code). Scope: the
+proto + daemon refactor retiring the v1 DEK, `accounts`, and credential
+brokering in favor of "gate, don't broker" -- everything at rest is
+threshold-sealed, openable only with the phone's per-request partial `Z_F`. Gate
+green at review time: `cargo test` (sigil/proto/softphone), `clippy -D warnings`,
+`fmt --check` all clean.
+
+### Teardown itself: SOUND
+
+1. **No secret at rest in the clear.** Env values seal only via
+   `seal_env_pairs` (cli.rs) -> `threshold::seal_secret` -> `ThresholdRecord::seal`;
+   values arrive on stdin only, are `Zeroizing`, and the store persists ciphertext +
+   public `E`. Opening REQUIRES the phone's partial: `fulfill` (daemon.rs ~1503)
+   fails closed if `outcome.zf` is `None` and again if the Mac share `m` is absent.
+   Disk alone (record + `m`) cannot open it (`a_wrong_or_missing_partial_fails_closed`).
+2. **DEK deletion complete + fail-closed.** `se_ecies.rs` deleted;
+   `Dek`/`seal_dek`/`open_dek`/`deliver_dek`/`receive_dek`/`wrapped_dek`/`dek()`/v1
+   `approve` gone from proto; keystore `ensure_dek`/`unwrap_dek`/`has_dek` gone. No
+   live references remain. Approve path is threshold-only (`approve_v2` / `approve_gate`);
+   `outcome_for` (remote.rs ~632) requires `partial_zf()` AND `account_id ==
+   challenge.account_id`, else collapses to Deny (remote.rs 933/1068).
+3. **Kept-vs-deleted correct.** Blob storage (`store_blob`/`load_blob`) still backs
+   the daemon identity keys and the Mac share `m`; `verify_presence` survived. No
+   pairing/identity regression from the deletion.
+4. **Threshold invariants intact.** R2 (E on-curve before scalar mult; F on-curve
+   at pairing), R3 (`require_v2` at decrypt), R4 (fresh unique `E` per seal +
+   `all_ephemerals_unique` enforced fail-closed across the whole store on `save`),
+   R5 (challenge carries id/label, daemon re-checks the returned partial's id). Env
+   re-home reuses the identical seal/combine core.
+5. **Fail-closed + zeroization.** `m`, `Z_M`, combined `K` are mlock'd +
+   zeroize-on-drop in `threshold::decrypt`; `m` dropped right after the one combine;
+   opened plaintext and injected env are `Zeroizing`. Local Touch-ID auto-approve is
+   removed; a local/control-socket approve carries `zf: None`, so even a same-UID
+   forged control approval can approve a plain gate but can NEVER open a sealed secret.
+6. **Provider path.** `OpProvider::run` injects nothing (splices caller fds to real
+   `op`). `needs_account` gone; the credential-injecting `OpSshSigner` and the
+   `credential` param on `sign()` deleted outright. No gate lost its approval;
+   unmatched commands fail closed, only an explicit user `Allow` rule runs ungated.
+
+### CONFIRMED HIGH -- `verify_presence` needs an entitlement the unsigned daemon lacks
+
+`MacKeystore::verify_presence` (keystore_macos.rs:163) mints a **persistent
+Secure Enclave key in the DataProtectionKeychain** via `ensure_presence_key`
+(92) -> `SecKey::generate` with `Token::SecureEnclave` +
+`Location::DataProtectionKeychain` + permanent + re-found by label
+(`find_se_private_key`). Creating a DataProtectionKeychain item requires the
+`keychain-access-groups` entitlement (=> app-bundle signing + provisioning
+profile), which the unsigned/portable daemon lacks: `SecKey::generate` fails
+errSecMissingEntitlement (-34018), or SIGKILL if signed with the group but no
+profile -- both empirically observed on this machine.
+
+Failure chain: production macOS -> `MacKeystore` with `is_biometric() == true`
+-> `sigil pair` after SAS confirm calls `arm_after_sas` (cli.rs:1001), which
+calls `verify_presence` with `?` -> generate fails -> pairing aborts. Pairing is
+the sole path that pins phone share `F` and provisions `m`, so the entire
+threshold model is unreachable in the unsigned posture. Approvals no longer call
+`verify_presence`, so the blast radius is specifically reaching a paired state.
+Blob storage is unaffected (legacy `set/get_generic_password`, no entitlement).
+
+This is not newly introduced (the pre-teardown `ensure_dek` used the same
+persistent-SE mechanism) but it is **reblessed** under a new name AND a new,
+false correctness claim: `docs/design/secret-model.md:35-36` states
+`verify_presence` "work[s] from the unsigned binary." That claim is **UNPROVEN /
+false** as implemented; the code's own NEEDS-VERIFICATION markers
+(keystore_macos.rs:17-20, 187-188) confirm it never ran on hardware.
+
+**Fix direction:** replace the SE-key presence probe with
+`LAContext.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics)`
+(LocalAuthentication -- no keychain item, no SE key, no entitlement; needs an
+objc2/Swift shim since `security-framework` does not expose LAContext).
+Alternatively a transient SE key (`kSecAttrIsPermanent = false`, no
+DataProtectionKeychain, regenerated per call, not re-found by label) MAY work
+unsigned but needs its own on-hardware proof. Recommend blocking the
+unsigned-daemon posture and correcting the secret-model.md claim to UNPROVEN in
+the same change.
+
+### Residual doc-drift (LOW, cosmetic, no runtime effect)
+
+- `daemon.rs:14` module doc still says "unwraps the DEK, decrypts the one token".
+- `daemon.rs:1256-1259` `fulfill` doc describes the deleted DEK/account flow and
+  carries a now-broken intra-doc link `[needs_account](crate::provider::SecretProvider::needs_account)`.
+- `request.rs:281-283` doc still references `wrapped_dek` / v1.
+- `daemon.rs:3835` test comment references `needs_account`.
+
+Recommend a doc-sweep. Nothing here blocks; the HIGH above does.
+
+**VERDICT: teardown SOUND; one CONFIRMED HIGH (`verify_presence` entitlement
+dependency) blocks the unsigned-daemon shipping posture until moved to
+LAContext.**

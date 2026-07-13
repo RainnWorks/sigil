@@ -168,7 +168,7 @@ pub fn doctor(daemon_up: bool) -> Vec<CheckJson> {
     // 7. ssh-agent: report the socket and served-key count. Informational.
     let ssh_sock = crate::sshagent::socket_path();
     let ssh_count = crate::sshagent::SshKeyConfig::load()
-        .map(|c| c.keys.len())
+        .map(|c| c.files.len() + c.stored.len())
         .unwrap_or(0);
     push(
         "ssh-agent socket",

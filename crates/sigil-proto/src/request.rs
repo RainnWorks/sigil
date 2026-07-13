@@ -276,11 +276,11 @@ pub struct BlockDirective {
     pub duration_ms: u64,
 }
 
-/// The phone's ECDH partial for a v2 account (`docs/design/threshold-v2.md` §7):
-/// `Z_F = x(f·E)`, the value the Secure Enclave emits under Face ID. For v2
-/// accounts it replaces `wrapped_dek` — the phone no longer holds a self-sufficient
-/// DEK, only its share. Confidential ONLY by virtue of the enclosing sealed
-/// [`Envelope`], exactly as v1's `wrapped_dek` was.
+/// The phone's ECDH partial for a threshold-sealed secret
+/// (`docs/design/threshold-v2.md` §7): `Z_F = x(f·E)`, the value the Secure
+/// Enclave emits under Face ID. The phone holds only its share, never a
+/// self-sufficient key. Confidential ONLY by virtue of the enclosing sealed
+/// [`Envelope`].
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ThresholdPartial {

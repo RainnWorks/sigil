@@ -363,8 +363,9 @@ fn device_to_config(
     let daemon_identity =
         DeviceIdentity::from_secret_bytes(&blob).ok_or(PairingStoreError::CorruptIdentity)?;
 
-    // Validate and pin the phone's v2 threshold share F on-curve (R2). A v1
-    // pairing has none, which is not an error (it takes the DEK path).
+    // Validate and pin the phone's v2 threshold share F on-curve (R2). A legacy
+    // pairing without F is not an error to load, but it can open no
+    // threshold-sealed secret until re-paired (there is no DEK fallback anymore).
     let phone_share = match &d.phone_share {
         Some(s) => {
             let f = B64
@@ -881,7 +882,7 @@ mod tests {
     #[test]
     fn a_v1_pairing_without_a_phone_share_still_loads() {
         // Additive field: a pairing saved with no v2 share reconstructs with
-        // `phone_share: None` and takes the DEK path, unchanged.
+        // `phone_share: None` (a legacy pairing, no threshold F), unchanged.
         let _home = HomeGuard::new("v1-still");
         let ks = MemoryKeystore::new();
         let (_i, _p, np) = new_pairing();

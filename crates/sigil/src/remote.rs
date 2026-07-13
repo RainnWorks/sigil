@@ -314,8 +314,9 @@ impl RemoteApprover {
             },
             lease_policy: ctx.lease,
             reason: None,
-            // A v2 account carries its threshold challenge to the phone; a v1
-            // account leaves this absent and takes the DEK path.
+            // A threshold-sealed secret (inline env, or a stored SSH key) carries
+            // its threshold challenge to the phone; a plain gate leaves it absent
+            // and approves without a partial.
             threshold: ctx.threshold.clone(),
             expires_at: now + timeout_ms,
             timeout_ms,

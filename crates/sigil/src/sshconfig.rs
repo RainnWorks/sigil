@@ -86,27 +86,13 @@ pub fn valid_host(h: &str) -> bool {
     !h.is_empty() && h.chars().all(|c| !c.is_whitespace() && !c.is_control())
 }
 
-/// Collect the served keys that name at least one host, from both sources.
-/// Entries that fail to resolve to a usable ed25519 key (the same check the
-/// agent applies) or whose `.pub` is unreadable are skipped, so a broken entry
-/// never poisons the whole config. Host tokens are filtered through
-/// [`valid_host`], so an injected token is dropped rather than written.
+/// Collect the served keys that name at least one host, from both sources (file
+/// and threshold-stored). Entries that fail to resolve to a usable ed25519 key
+/// (the same check the agent applies) or whose `.pub` is unreadable are skipped,
+/// so a broken entry never poisons the whole config. Host tokens are filtered
+/// through [`valid_host`], so an injected token is dropped rather than written.
 pub fn routed_keys(cfg: &SshKeyConfig) -> Vec<Routed> {
     let mut out = Vec::new();
-    for e in &cfg.keys {
-        let hosts = safe_hosts(&e.hosts);
-        if hosts.is_empty() {
-            continue;
-        }
-        let Some(id) = crate::sshagent::resolve_identity(e) else {
-            continue;
-        };
-        out.push(Routed {
-            label: id.label,
-            hosts,
-            pub_line: e.public_key.trim().to_string(),
-        });
-    }
     for e in &cfg.files {
         let hosts = safe_hosts(&e.hosts);
         if hosts.is_empty() {
@@ -122,6 +108,20 @@ pub fn routed_keys(cfg: &SshKeyConfig) -> Vec<Routed> {
             label: id.label,
             hosts,
             pub_line: line.trim().to_string(),
+        });
+    }
+    for e in &cfg.stored {
+        let hosts = safe_hosts(&e.hosts);
+        if hosts.is_empty() {
+            continue;
+        }
+        let Some(id) = crate::sshagent::resolve_stored_identity(e) else {
+            continue;
+        };
+        out.push(Routed {
+            label: id.label,
+            hosts,
+            pub_line: e.public_key.trim().to_string(),
         });
     }
     out
@@ -386,35 +386,43 @@ pub fn preview(cfg: &SshKeyConfig, sock: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sshagent::{SshFileEntry, SshKeyConfig, SshKeyEntry};
+    use crate::sshagent::{SshFileEntry, SshKeyConfig};
+    use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// A config with one op-backed routed key and its generated ed25519 pub line.
-    fn one_routed_op(hosts: Vec<String>) -> (SshKeyConfig, String) {
+    /// A config with one file-backed routed key and its generated ed25519 pub
+    /// line. Writes a throwaway key + sibling `.pub` under a unique temp path so
+    /// [`routed_keys`] (which reads the `.pub`) resolves it. The temp files are
+    /// left in the OS temp dir; each call gets a distinct path.
+    fn one_routed_file(hosts: Vec<String>) -> (SshKeyConfig, String) {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
         let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
             .unwrap();
         let pub_line = key.public_key().to_openssh().unwrap();
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sigil-sshcfg-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let keypath = dir.join("id_ed25519");
+        std::fs::write(&keypath, key.to_openssh(ssh_key::LineEnding::LF).unwrap()).unwrap();
+        std::fs::write(format!("{}.pub", keypath.display()), &pub_line).unwrap();
         let cfg = SshKeyConfig {
-            keys: vec![SshKeyEntry {
-                public_key: pub_line.clone(),
-                vault: "Engineering".to_string(),
-                item: "GitHub".to_string(),
-                field: "private key".to_string(),
+            files: vec![SshFileEntry {
+                path: keypath.display().to_string(),
                 comment: String::new(),
                 hosts,
             }],
-            files: Vec::new(),
+            stored: Vec::new(),
         };
         (cfg, pub_line)
     }
 
     #[test]
     fn routed_keys_only_returns_entries_with_hosts() {
-        let (cfg, _) = one_routed_op(vec!["github.com".into(), "gist.github.com".into()]);
+        let (cfg, _) = one_routed_file(vec!["github.com".into(), "gist.github.com".into()]);
         let routed = routed_keys(&cfg);
         assert_eq!(routed.len(), 1);
         assert_eq!(routed[0].hosts, vec!["github.com", "gist.github.com"]);
 
-        let (cfg_none, _) = one_routed_op(vec![]);
+        let (cfg_none, _) = one_routed_file(vec![]);
         assert!(
             routed_keys(&cfg_none).is_empty(),
             "a key with no hosts is served but not routed"
@@ -440,17 +448,16 @@ mod tests {
     fn routed_keys_drops_injected_host_tokens() {
         // A hand-edited ssh-keys.json carrying an injection token must not reach
         // the generated config: routed_keys filters it, keeping only clean hosts.
-        let (mut cfg, _) = one_routed_op(vec![
+        let (mut cfg, _) = one_routed_file(vec![
             "github.com".into(),
             "evil\n    ProxyCommand pwn".into(),
         ]);
-        // The op entry from one_routed_op is index 0.
         let routed = routed_keys(&cfg);
         assert_eq!(routed.len(), 1);
         assert_eq!(routed[0].hosts, vec!["github.com"], "injection dropped");
 
         // A key whose ONLY host is an injection token is not routed at all.
-        cfg.keys[0].hosts = vec!["bad\nToken".into()];
+        cfg.files[0].hosts = vec!["bad\nToken".into()];
         assert!(routed_keys(&cfg).is_empty());
     }
 
@@ -540,7 +547,7 @@ mod tests {
         std::env::set_var("SIGIL_HOME", &home);
         std::env::set_var("SIGIL_SSH_USER_CONFIG", &ssh_config);
 
-        let (cfg, _) = one_routed_op(vec!["github.com".into()]);
+        let (cfg, _) = one_routed_file(vec!["github.com".into()]);
         let sock = PathBuf::from("/run/sigil/ssh-agent.sock");
 
         let report = install(&cfg, &sock).expect("install succeeds");
@@ -556,7 +563,13 @@ mod tests {
         assert!(std::fs::read_to_string(&gen)
             .unwrap()
             .contains("Host github.com"));
-        assert!(home.join("ssh").join("keys").join("GitHub.pub").exists());
+        // The file source labels by the key-file stem, so the generated pub name
+        // is derived from that (`id_ed25519`), not an item name.
+        assert!(home
+            .join("ssh")
+            .join("keys")
+            .join("id_ed25519.pub")
+            .exists());
         // The backup holds the pre-install contents verbatim.
         let backup = std::fs::read_to_string(report.backup.unwrap()).unwrap();
         assert_eq!(backup, "Host example.com\n    User tom\n");
@@ -604,12 +617,12 @@ mod tests {
         .unwrap();
 
         let cfg = SshKeyConfig {
-            keys: Vec::new(),
             files: vec![SshFileEntry {
                 path: keypath.display().to_string(),
                 comment: String::new(),
                 hosts: vec!["old.example.net".into()],
             }],
+            stored: Vec::new(),
         };
         let routed = routed_keys(&cfg);
         assert_eq!(routed.len(), 1);
