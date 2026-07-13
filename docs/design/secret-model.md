@@ -34,16 +34,15 @@ secrets. It is NOT a credential broker for other tools.
 - **Keystore BLOB storage** (daemon identity key, the Mac share `m`) — legacy
   login-keychain generic passwords, no entitlement, works from the unsigned
   binary.
-- **The Touch-ID pairing gate** (`verify_presence`) stays as a concept, but its
-  current implementation mints a PERSISTENT DataProtection-keychain Secure
-  Enclave key, which needs the `keychain-access-groups` entitlement the unsigned
-  daemon does not have (proven: OSStatus -34018 / amfid SIGKILL). So on an
-  unsigned daemon it breaks pairing. OPEN ITEM: move it to
-  `LAContext.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics)`
-  (LocalAuthentication needs no keychain/entitlement) or a transient
-  non-persistent SE key proven on hardware. Until then only the `SIGIL_DEV_KEYSTORE`
-  dev path (no biometric, `m` in the clear) pairs. See
-  [[verify-presence-persistent-se-key-breaks-unsigned]].
+- **The Touch-ID pairing gate** (`verify_presence`) uses
+  `LAContext.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics)` via a tiny
+  ObjC shim (`src/presence.m`, compiled by `build.rs`, Apple `ar` pinned). It
+  forces a live biometric but needs NO keychain item, NO Secure Enclave key, and
+  NO entitlement, so it works from the unsigned daemon. This replaced the earlier
+  persistent-SE-key approach, which an unsigned binary cannot create (-34018 /
+  amfid SIGKILL). Verified on hardware to reach the biometric subsystem from the
+  unsigned binary (LAError -4 clamshell means it got there; a real prompt fires
+  with the lid open). See [[verify-presence-persistent-se-key-breaks-unsigned]].
 - **Threshold** as the single at-rest seal for everything Sigil owns: injected
   env secrets AND stored SSH keys. Ciphertext on disk, openable only with the
   phone's per-request partial. "No DEK to downgrade to."
