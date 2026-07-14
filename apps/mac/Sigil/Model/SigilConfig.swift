@@ -37,7 +37,9 @@ struct SourceConfig: Codable, Sendable, Equatable, Identifiable {
     var account: String?
     var path: String?
     /// The inline `env` provider's KEY names (never values). Empty for other
-    /// providers, and for an env source with nothing sealed yet.
+    /// providers, and for an env source with nothing sealed yet. An env source
+    /// with no sealed record in the threshold store is inert: `export` drops its
+    /// keys, so it presents here as a plain gate (empty), never as "set".
     var keys: [String] = []
 
     var id: String { name }

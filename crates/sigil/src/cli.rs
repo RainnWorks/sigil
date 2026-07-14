@@ -3090,12 +3090,40 @@ fn config_rule_remove(name: Option<&str>, json: bool) -> i32 {
 /// desktop to load or a human to inspect. Inherently machine-readable, so it
 /// ignores `--json` and always emits JSON.
 fn config_export() -> i32 {
-    let cfg = match load_config() {
+    let mut cfg = match load_config() {
         Some(c) => c,
         None => return 1,
     };
+    // An inline `env` source carries only its KEY *names* in config.json; the
+    // VALUES live in the threshold store, keyed by the source name. An env source
+    // with no sealed record is inert dead config (a value was never sealed, or a
+    // migration dropped it): the daemon does not inject from it. So the exported
+    // view drops its declared keys, presenting it as the plain gate it now
+    // behaves as, rather than falsely advertising a key as set. This is a view
+    // only; config.json is untouched, so a later `source env set` re-seals it.
+    reconcile_unsealed_env_sources(&mut cfg);
     println!("{}", json::to_pretty(&cfg));
     0
+}
+
+/// Empty the `keys` of every inline `env` source that has no sealed record in the
+/// threshold store, so a source whose value was never sealed (or was dropped by a
+/// migration) presents as the plain gate it actually behaves as. Operates on a
+/// config VALUE for export/inspection; it never writes config.json. A store that
+/// fails to load leaves the config untouched (conservative: show what is there).
+fn reconcile_unsealed_env_sources(cfg: &mut crate::config::Config) {
+    let store = match crate::threshold::ThresholdStore::load() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    for src in &mut cfg.sources {
+        if src.provider == crate::provider::EnvProvider::ID
+            && !src.keys.is_empty()
+            && store.get(&src.name).is_none()
+        {
+            src.keys.clear();
+        }
+    }
 }
 
 /// `sigil-config import`: replace the whole config from a JSON object on stdin

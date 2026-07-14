@@ -220,6 +220,9 @@ private struct RuleCard: View {
     /// Hover lifts the whole card: the border warms to cobalt and the grip lights
     /// up, so a row reads as a distinct, grabbable object rather than a flat blob.
     @State private var hovering = false
+    /// The env KEY names this rule injects. `export` drops the keys of an env
+    /// source with no sealed value, so an unsealed source arrives here empty and
+    /// reads as a plain gate ("no environment"), never as falsely "set".
     private var keys: [String] { source?.keys ?? [] }
 
     var body: some View {

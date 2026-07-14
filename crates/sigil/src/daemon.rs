@@ -1443,7 +1443,26 @@ fn fulfill(
                 env: None,
             });
         }
-        Some(crate::config::Resolution::Gate(action)) => action,
+        Some(crate::config::Resolution::Gate(mut action)) => {
+            // An inline `env` source with no sealed record is inert dead config
+            // (its value was never sealed, or a migration dropped it). Rather than
+            // fail closed on every invocation, the daemon treats it as the plain
+            // gate it now behaves as: still gated (approval required), but injects
+            // nothing. Clearing the effective env keys here, before the readout is
+            // built, keeps the approval honest (it shows no env, matching what will
+            // be set) and routes the rest of dispatch down the plain-gate path.
+            // config.json is untouched, so `source env set` re-seals it and
+            // restores injection.
+            if let Some(provider) = core.providers.get(&action.provider) {
+                if provider.needs_sealed_env() {
+                    let store = core.threshold.lock().expect("threshold store poisoned");
+                    if store.get(&action.source_name).is_none() {
+                        action.env_keys.clear();
+                    }
+                }
+            }
+            action
+        }
     };
     let Some(provider) = core.providers.get(&action.provider) else {
         return fail_closed(
@@ -1455,7 +1474,10 @@ fn fulfill(
         );
     };
     let source = action.source_path.as_deref().unwrap_or("");
-    let needs_sealed_env = provider.needs_sealed_env();
+    // An env provider only needs a sealed open when it still has keys to inject;
+    // an unsealed env source had its keys cleared above and behaves as a plain
+    // gate.
+    let needs_sealed_env = provider.needs_sealed_env() && !action.env_keys.is_empty();
     // What `describe` reads: the env-file path or the inline env KEY names. Names
     // only; no secret value is read here (pre-approval, zero-knowledge readout).
     let view = crate::provider::SourceView {
@@ -1517,7 +1539,7 @@ fn fulfill(
             "approved",
             "lease",
         );
-        return provider.run(ProviderRun {
+        let run = ProviderRun {
             command: argv,
             cwd,
             source,
@@ -1526,7 +1548,16 @@ fn fulfill(
             stderr,
             proxy_depth: child_depth,
             env: None,
-        });
+        };
+        // A degraded inline `env` source reaches here too (it leases like any
+        // plain gate), but `EnvProvider::run` refuses an empty env. Route it
+        // through the passthrough runner, exactly as the main dispatch does, so a
+        // leased second run is the same bare gate as the first, not an exit-1.
+        return if provider.id() == crate::provider::EnvProvider::ID {
+            crate::provider::run_passthrough(run)
+        } else {
+            provider.run(run)
+        };
     }
 
     // For an inline `env` request, carry the threshold challenge to the phone: the
@@ -1676,7 +1707,13 @@ fn fulfill(
     // injects the decrypted pairs. Output streams straight to the caller's fds; for
     // the direct-injection shapes the resolved values transit only as the child's
     // spawn env (see the provider module docs).
-    let code = provider.run(ProviderRun {
+    //
+    // An inline `env` source that had no sealed record degraded to a plain gate
+    // above (its keys were cleared), so there is nothing to inject. `EnvProvider`
+    // refuses an empty env (that would be a fail-closed bug for a REAL env
+    // request), so route the degraded case through the passthrough runner: same
+    // gated exec discipline, no injection, exactly like `op`.
+    let run = ProviderRun {
         command: argv,
         cwd,
         source,
@@ -1685,7 +1722,12 @@ fn fulfill(
         stderr,
         proxy_depth: child_depth,
         env: sealed_env.as_ref(),
-    });
+    };
+    let code = if sealed_env.is_none() && provider.id() == crate::provider::EnvProvider::ID {
+        crate::provider::run_passthrough(run)
+    } else {
+        provider.run(run)
+    };
     drop(sealed_env); // zeroized here (EnvVars is Zeroizing) when present
     code
 }
@@ -2526,10 +2568,26 @@ mod tests {
     }
 
     #[test]
-    fn inline_env_with_no_sealed_values_fails_closed() {
-        // A configured inline env source whose values were never set must refuse,
-        // not run the child with a blank environment.
+    fn inline_env_with_no_sealed_values_runs_as_a_plain_gate() {
+        // An inline env source whose value was never sealed is inert dead config.
+        // Rather than fail closed on every invocation with a cryptic error, the
+        // daemon treats it as the plain gate it now behaves as: the command is
+        // still gated (approved here via DevMode), then run with NO injection
+        // (the missing env var is simply unset), exactly like `op`. config.json is
+        // untouched, so a later `source env set` re-seals it and restores
+        // injection. This keeps a torn-down or never-set source from bricking the
+        // command it gates.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tmpdir("envinline-empty");
+        let bindir = dir.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = bindir.join("faketool");
+        // Prints the (unset) TOKEN so we can prove nothing was injected.
+        std::fs::write(&tool, "#!/bin/sh\nprintf 'tok=[%s]' \"$TOKEN\"\n").unwrap();
+        std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
         let approver = LocalApprover::new(pending.clone())
@@ -2552,6 +2610,15 @@ mod tests {
             audit: None,
         });
 
+        // The daemon's own env must not carry TOKEN, or the child would inherit it
+        // and blur the "nothing injected" assertion.
+        std::env::remove_var("TOKEN");
+        let prev = std::env::var_os("PATH");
+        let mut search = vec![bindir.clone()];
+        if let Some(p) = &prev {
+            search.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
         let (read_end, write_end) = pipe();
         let code = fulfill(
             &core,
@@ -2563,8 +2630,141 @@ mod tests {
             Some(write_end),
             None,
         );
-        assert_ne!(code, 0, "an unset inline env source must fail closed");
-        assert_eq!(read_all(read_end), "", "no output on a refused run");
+        match prev {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert_eq!(
+            code, 0,
+            "an unsealed inline env source runs as a plain gate"
+        );
+        assert_eq!(
+            read_all(read_end),
+            "tok=[]",
+            "the missing value is not injected (TOKEN stays unset)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn leased_unsealed_inline_env_source_runs_as_a_plain_gate() {
+        // A degraded (unsealed) inline env source leases like any plain gate, so a
+        // second invocation short-circuits on the live lease. That path must ALSO
+        // route through the passthrough runner: `EnvProvider::run` refuses an empty
+        // env, so a naive `provider.run(env: None)` would exit 1 and brick the
+        // command on the second run. Prove the leased run still runs as a bare gate.
+        use crate::config::{Action, Match, Rule, RuleMode, Source};
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("envinline-leased");
+        let bindir = dir.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = bindir.join("faketool");
+        std::fs::write(&tool, "#!/bin/sh\nprintf 'tok=[%s]' \"$TOKEN\"\n").unwrap();
+        std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A leasable gate rule over an unsealed inline env source.
+        let mut config = Config::default();
+        config
+            .add_source(Source {
+                name: "faketool".into(),
+                provider: crate::provider::EnvProvider::ID.into(),
+                account: None,
+                path: None,
+                keys: vec!["TOKEN".into()],
+            })
+            .unwrap();
+        config
+            .add_rule(Rule {
+                name: "faketool".into(),
+                match_: Match {
+                    command: Some("faketool".into()),
+                    ..Match::default()
+                },
+                action: Action {
+                    mode: RuleMode::Gate,
+                    source: "faketool".into(),
+                    lease: LeasePolicy::Leasable { max_secs: 900 },
+                    timeout_sec: None,
+                },
+            })
+            .unwrap();
+
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let pending = Arc::new(PendingRegistry::new());
+        // DevMode::Lease stands in for a phone approval that opens an auto-approve
+        // window, so the second identical run short-circuits on the live lease.
+        let approver = LocalApprover::new(pending.clone())
+            .with_dev(DevMode::Lease(Duration::from_secs(60)))
+            .with_control_socket(true);
+        let core = Arc::new(Core {
+            remote: Vec::new(),
+            keystore,
+            threshold: Mutex::new(Default::default()),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(approver)),
+            pending,
+            lockdown: AtomicBool::new(false),
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::with_defaults(),
+            config: config.into(),
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::DevInsecure,
+            ssh_signers: SshSignersCell::new(Vec::new()),
+            audit: None,
+        });
+
+        std::env::remove_var("TOKEN");
+        let prev = std::env::var_os("PATH");
+        let mut search = vec![bindir.clone()];
+        if let Some(p) = &prev {
+            search.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
+
+        // First run: plain-gate approval opens the lease.
+        let (r1, w1) = pipe();
+        let c1 = fulfill(
+            &core,
+            &["faketool".into()],
+            "",
+            None,
+            0,
+            None,
+            Some(w1),
+            None,
+        );
+        assert_eq!(c1, 0, "first (approved) run is a plain gate");
+        assert_eq!(read_all(r1), "tok=[]");
+        assert_eq!(core.leases.active(), 1, "the plain gate opened a lease");
+
+        // Second run: short-circuits on the live lease and must STILL run, not exit 1.
+        let (r2, w2) = pipe();
+        let c2 = fulfill(
+            &core,
+            &["faketool".into()],
+            "",
+            None,
+            0,
+            None,
+            Some(w2),
+            None,
+        );
+        match prev {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        assert_eq!(
+            c2, 0,
+            "the leased second run is a plain gate, not an exit-1"
+        );
+        assert_eq!(
+            read_all(r2),
+            "tok=[]",
+            "still no injection on the leased run"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

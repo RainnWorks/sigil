@@ -52,9 +52,12 @@ pub struct Source {
     /// Provider-specific: for the inline `env` provider, the KEY **names** whose
     /// VALUES are injected after approval. The names are not secret and drive the
     /// zero-knowledge readout (the phone shows "will set FOO, BAR"); the VALUES
-    /// are NEVER stored here. They are AES-256-GCM sealed under the DEK in the
-    /// account store (`sigil.db`), keyed by this source's `name`, exactly like a
-    /// service-account token. Empty for every other provider. Kept sorted+unique
+    /// are NEVER stored here. They are threshold-sealed in the threshold store
+    /// (`threshold.db`), keyed by this source's `name`, opened per-approval with
+    /// the phone's partial. A name listed here says only that a value was
+    /// DECLARED; whether one is actually sealed is a runtime fact `export`
+    /// overlays as a `sealed` flag (they diverge if a value was never set or a
+    /// migration dropped it). Empty for every other provider. Kept sorted+unique
     /// by the CLI so `export`/`list` render deterministically.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<String>,

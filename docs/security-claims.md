@@ -2529,3 +2529,41 @@ subsystem; real prompt with lid open); the ignored round-trip test
 is resolved; biometrics-only, fail-closed, no secret exposure, macOS-gated
 build. Doc nit (presence.m:47-48 "worker thread") only. Unsigned-daemon pairing
 posture is unblocked pending the standing manual hardware test.**
+
+## Independent review verdict: unsealed inline-env source degrades to a plain gate (2026-07-14)
+
+An inline `env` source that has KEY names declared in `config.json` but NO sealed
+record in the threshold store used to fail closed at dispatch ("inline env source
+'..' has no sealed values"). It now degrades to a PLAIN GATE: still phone-gated,
+but injects nothing (the missing var is simply unset). See
+`crates/sigil/src/daemon.rs` (`fulfill`: the `Gate(mut action)` arm clears
+`env_keys` when `store.get(name).is_none()`; `needs_sealed_env` becomes false; the
+main dispatch and the lease short-circuit both route the degraded `EnvProvider`
+through `run_passthrough`) and `cli.rs` (`config_export` /
+`reconcile_unsealed_env_sources` drops the dead keys in the exported VIEW only,
+never writing `config.json`).
+
+Reviewed independently (implementer did not self-certify). **VERDICT:
+SOUND-WITH-RESIDUALS**, no HIGH/CRITICAL.
+
+- **No leak, gate never bypassed (inv #2/#4/#5).** On the degraded path
+  `sealed_env` is `None`, `run_passthrough` injects nothing, no secret bytes enter
+  daemon RAM, and `core.gate.decide` is unconditionally reached unless a *prior*
+  live lease short-circuits. Deny still fails closed.
+- **Readout integrity (inv #3 / R5).** `env_keys` is cleared BEFORE the
+  `SourceView`, `describe`, `account_label`, and `ThresholdChallenge` are built, so
+  the phone consents to exactly the bare gate that runs; no keys are shown then
+  silently dropped.
+- **F1 (LOW, correctness, fixed same change).** The lease short-circuit initially
+  still called `provider.run(env: None)`, which for a degraded `EnvProvider` hit
+  its empty-env refusal and returned exit 1, bricking the leased second run (fails
+  closed, no leak). Fixed by routing that branch through `run_passthrough` too;
+  regression test `leased_unsealed_inline_env_source_runs_as_a_plain_gate`.
+- **F2 (LOW residual, design-intended).** An attacker who can delete the
+  `threshold.db` record but not `config.json` downgrades a secret-injecting rule to
+  a bare no-injection gate. This is not an escalation (the command runs with LESS
+  than intended, never a leak; previously such tampering DoS'd the command). The
+  readout honestly reflects the bare gate and approval is still required. For a
+  single-UID personal daemon the threshold.db/config.json write boundary is
+  artificial (whoever has one has the other). Accepted residual; matches the agreed
+  "unsealed env source is a plain gate" design.
