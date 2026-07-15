@@ -259,16 +259,16 @@ actor MockDaemonClient: DaemonClient {
     }
 
     // MARK: daemon lifecycle
-    // The mock flips an in-memory `running` flag so Start/Stop/Restart/Install
-    // visibly change the lifecycle card in previews and the dev build.
+    // The mock flips an in-memory `running` flag so the auto-ensure and the
+    // Restart/Stop controls visibly change the lifecycle card in previews and
+    // the dev build.
 
     func daemonRunning() -> Bool { running }
     func daemonVersion() -> String? { "sigil 0.5.0" }
     nonisolated func daemonBinaryPath() -> String? { "~/.sigil/bin/sigil" }
-    func startDaemon() { running = true }
+    func ensureUp() { running = true }
     func stopDaemon() { running = false }
     func restartDaemon() { running = true }
-    func installDaemon() { running = true }
 
     func settings() -> AppSettings { appSettings }
     func saveSettings(_ settings: AppSettings) { appSettings = settings }

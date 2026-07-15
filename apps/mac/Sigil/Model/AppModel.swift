@@ -28,15 +28,20 @@ final class AppModel {
     /// screens; authored on the SSH screen.
     private(set) var sshKeys = SshKeyStore()
     private(set) var sshRoutingInstalled = false
-    /// The local daemon's lifecycle, driven by the Status pane's daemon card:
+    /// The local daemon's lifecycle, shown on the Status pane's daemon card:
     /// whether its control socket is listening, the binary's reported version, and
     /// the resolved binary path (for display). `daemonBusy` is true while a
-    /// start/stop/restart/install action is in flight, so the card disables its
-    /// buttons and shows an in-flight state.
+    /// lifecycle action (auto-ensure, restart, stop) is in flight, so the card
+    /// disables its buttons and shows an in-flight state.
     private(set) var daemonRunning = false
     private(set) var daemonVersion: String?
     private(set) var daemonBinaryPath: String?
     private(set) var daemonBusy = false
+    /// Whether this launch has already run the `sigil up` auto-ensure. The
+    /// ensure runs once at startup (and again only via the explicit Repair
+    /// control), never on a poll observing the daemon down: a human who
+    /// pressed Stop stays stopped.
+    private var autoEnsured = false
     /// Whether the first secondary load (config, history, settings) has completed.
     /// The Rules screen gates its teaching empty state on this so it never flashes
     /// before the load or on a pane re-select.
@@ -61,6 +66,15 @@ final class AppModel {
 
     func start() {
         guard pollTask == nil else { return }
+        // Auto-ensure: the app owns keeping the daemon healthy, the human
+        // never presses Start. `sigil up` is idempotent (a healthy install is
+        // a fast all-ok pass) and heals the wedge a bare liveness probe would
+        // call running. Runs once per launch, before the first refresh lands.
+        Task { [weak self] in
+            guard let self, !self.autoEnsured else { return }
+            self.autoEnsured = true
+            await self.ensureUp()
+        }
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refresh()
@@ -189,10 +203,11 @@ final class AppModel {
         daemonBusy = false
     }
 
-    func startDaemon() async { await performLifecycle { try await self.daemon.startDaemon() } }
+    /// The self-healing keystone (`sigil up`): runs automatically at launch and
+    /// behind the Repair control. Replaces the old Start and Install buttons.
+    func ensureUp() async { await performLifecycle { try await self.daemon.ensureUp() } }
     func stopDaemon() async { await performLifecycle { try await self.daemon.stopDaemon() } }
     func restartDaemon() async { await performLifecycle { try await self.daemon.restartDaemon() } }
-    func installDaemon() async { await performLifecycle { try await self.daemon.installDaemon() } }
 
     func revokeLease(_ lease: Lease) async {
         await performControl { try await self.daemon.revokeLease(grantPrefix: lease.grantHex) }

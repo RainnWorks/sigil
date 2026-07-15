@@ -381,19 +381,14 @@ struct CLIDaemonClient: DaemonClient {
         FileManager.default.isExecutableFile(atPath: binaryURL.path) ? binaryURL.path : nil
     }
 
-    func startDaemon() async throws { _ = try await run(["start"]) }
+    /// The self-healing keystone: everything the old Start and Install/Repair
+    /// buttons pieced together (binary install, plist, bootstrap, shim), plus
+    /// wedge detection and healing, as one idempotent verb. Non-interactive by
+    /// design: pairing is only ever REPORTED as action needed (the ceremony is
+    /// driven by the Pairing pane), so this never hangs without a TTY.
+    func ensureUp() async throws { _ = try await run(["up"]) }
     func stopDaemon() async throws { _ = try await run(["stop"]) }
     func restartDaemon() async throws { _ = try await run(["restart"]) }
-
-    /// Install / repair: wire the shim, then install and bootstrap the launchd
-    /// agent. This is `sigil setup` minus its trailing pairing ceremony, which
-    /// blocks on stdin (cli.rs run_pairing) and is driven separately by the
-    /// Pairing pane; shelling out `setup` here would hang with no TTY. In a shipped
-    /// app a bundled-binary copy would slot in ahead of these two steps (future).
-    func installDaemon() async throws {
-        _ = try await run(["shim", "install", "--json"])
-        _ = try await run(["start"])
-    }
 
     // MARK: SSH agent (served keys + managed ~/.ssh/config routing)
     //

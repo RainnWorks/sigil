@@ -42,7 +42,7 @@ struct StatusView: View {
     }
 
     private var daemonPanel: some View {
-        Section(title: "Daemon", subtitle: "the local agent that gates every command. start, stop, or repair it here") {
+        Section(title: "Daemon", subtitle: "the local agent that gates every command. It keeps itself running; repair or restart it here if something looks off") {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 10) {
                     StatePill(tone: model.daemonRunning ? .armed : .denied,
@@ -60,17 +60,17 @@ struct StatusView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 HStack(spacing: 8) {
+                    // No Start button: the app auto-ensures the daemon at
+                    // launch (`sigil up`), and Repair reruns the same
+                    // idempotent keystone for anything that drifts since.
+                    Button("Repair") { Task { await model.ensureUp() } }
+                        .buttonStyle(.glassProminent).tint(Palette.cobalt)
                     if model.daemonRunning {
                         Button("Restart") { Task { await model.restartDaemon() } }
-                            .buttonStyle(.glassProminent).tint(Palette.cobalt)
+                            .buttonStyle(.glass)
                         Button("Stop") { Task { await model.stopDaemon() } }
                             .buttonStyle(.glass)
-                    } else {
-                        Button("Start") { Task { await model.startDaemon() } }
-                            .buttonStyle(.glassProminent).tint(Palette.cobalt)
                     }
-                    Button("Install / Repair") { Task { await model.installDaemon() } }
-                        .buttonStyle(.glass)
                     Spacer()
                 }
                 .controlSize(.small)
@@ -85,8 +85,8 @@ struct StatusView: View {
                 VStack(spacing: 10) {
                     StatusRow(ok: s.daemonUp, warn: false, label: "daemon",
                               value: s.daemonUp ? s.socketPath : "socket not listening", mono: true,
-                              fixTitle: s.daemonUp ? nil : "Start",
-                              fix: s.daemonUp ? nil : { /* wired: sigil start */ })
+                              fixTitle: s.daemonUp ? nil : "Repair",
+                              fix: s.daemonUp ? nil : { Task { await model.ensureUp() } })
                     Divider()
                     StatusRow(ok: s.shim.kind == .healthy, warn: s.shim.kind != .healthy,
                               label: "shim", value: s.shim.issue ?? s.shim.path, mono: true,

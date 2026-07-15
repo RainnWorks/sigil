@@ -162,17 +162,16 @@ struct SocketDaemonClient: DaemonClient {
     // MARK: - Daemon lifecycle
     //
     // `daemonRunning` we answer directly with a connect-probe of our own socket
-    // (no round trip, no frame); the start/stop/restart/install verbs and the
+    // (no round trip, no frame); the ensure/stop/restart verbs and the
     // version/path readouts are keystore-adjacent shell-outs, so they delegate to
     // the CLI half like the other mutations.
 
     func daemonRunning() async -> Bool { daemonSocketReachable(path: socketPath) }
     func daemonVersion() async -> String? { await cli.daemonVersion() }
     func daemonBinaryPath() -> String? { cli.daemonBinaryPath() }
-    func startDaemon() async throws { try await cli.startDaemon() }
+    func ensureUp() async throws { try await cli.ensureUp() }
     func stopDaemon() async throws { try await cli.stopDaemon() }
     func restartDaemon() async throws { try await cli.restartDaemon() }
-    func installDaemon() async throws { try await cli.installDaemon() }
 
     // SSH agent config: served keys and the managed ~/.ssh/config routing are a
     // keystore-adjacent concern the daemon does not own, so they delegate to the

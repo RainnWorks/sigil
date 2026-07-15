@@ -103,17 +103,16 @@ protocol DaemonClient: Sendable {
     func daemonVersion() async -> String?
     /// The resolved `sigil` binary path, for display; nil when none is found.
     func daemonBinaryPath() -> String?
-    /// `sigil start`: install the launchd plist and bootstrap it.
-    func startDaemon() async throws
+    /// `sigil up`: the idempotent, self-healing keystone. Installs the binary
+    /// and launchd agent, heals a dead or wedged daemon, wires the shim, and
+    /// checks pairing, reporting what it fixed. The app runs this on launch
+    /// (auto-ensure) instead of offering a Start button: the human never
+    /// manages the daemon.
+    func ensureUp() async throws
     /// `sigil stop`: bootout the launchd agent.
     func stopDaemon() async throws
     /// `sigil restart`: `launchctl kickstart -k` the agent.
     func restartDaemon() async throws
-    /// Wire the shim and launchd agent: the non-interactive half of `sigil setup`
-    /// (setup itself always ends in the interactive pairing ceremony, which the
-    /// app drives through the Pairing pane). In a shipped app this is also where a
-    /// bundled `sigil` binary would be copied into place before wiring (future).
-    func installDaemon() async throws
 
     // Pairing
     func pairedDevice() async throws -> PairedDevice?
