@@ -118,6 +118,11 @@ struct SSHView: View {
             }
             .toggleStyle(.switch)
             .tint(Palette.cobalt)
+            // Nothing to route means the install is a no-op (it writes no block),
+            // so the switch would flip on then snap back with no explanation. Lock
+            // it off until a key names a host; a live install stays toggleable so
+            // it can always be turned back off.
+            .disabled(!model.sshRoutingInstalled && routedCount == 0)
 
             if model.sshRoutingInstalled {
                 Button("View block") {
@@ -127,10 +132,12 @@ struct SSHView: View {
                     }
                 }
                 .buttonStyle(.glass).controlSize(.small)
-            } else if routedCount == 0 && !served.isEmpty {
+            } else if routedCount == 0 {
                 HStack(spacing: 6) {
                     Image(systemName: "info.circle").font(.system(size: 10)).foregroundStyle(Palette.brass)
-                    Text("No key names hosts yet, so there is nothing to route. Add hosts to a key first.")
+                    Text(served.isEmpty
+                         ? "Add an SSH key below first, then give it hosts to route them through Sigil."
+                         : "No key names any hosts yet, so there is nothing to route. Add hosts to a key first.")
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
