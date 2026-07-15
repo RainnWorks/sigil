@@ -1,9 +1,8 @@
 //  MenubarContent.swift
 //  The menubar pulse: pending requests with a deny and an "approve on iPhone"
-//  pointer, quick lockdown, a recent-decision peek, and Open Sigil. Approving is
-//  the phone's job (a request unseals only with the phone's per-approval
-//  partial), so this Mac never approves locally. Admin lives in the window;
-//  nothing heavier lives here.
+//  pointer, a recent-decision peek, and Open Sigil. Approving is the phone's job
+//  (a request unseals only with the phone's per-approval partial), so this Mac
+//  never approves locally. Admin lives in the window; nothing heavier lives here.
 
 import SwiftUI
 
@@ -24,9 +23,9 @@ struct MenubarContent: View {
         .task { model.start(); await model.refresh() }
     }
 
-    /// A compact ErrorStrip for the ~320pt popover: every control here (Deny,
-    /// Lock down, Unseal, Approve) routes through AppModel.performControl,
-    /// which already captures a refusal or a failure into `lastError` - this
+    /// A compact ErrorStrip for the ~320pt popover: the Deny control here routes
+    /// through AppModel.performControl, which already captures a refusal or a
+    /// failure into `lastError` - this
     /// is what makes that visible. Without it a failed deny reads as a
     /// successful one: the popover just sits there looking unchanged, and the
     /// person walks away believing they denied something they did not.
@@ -42,7 +41,7 @@ struct MenubarContent: View {
 
     private var header: some View {
         let tone: StateTone = switch model.armState {
-        case .armed: .armed; case .lockedDown: .lockedDown; case .idle: .neutral
+        case .armed: .armed; case .idle: .neutral
         }
         return HStack(spacing: 8) {
             Text("sigil").font(.mono(13, weight: .medium)).foregroundStyle(Palette.cobalt)
@@ -55,9 +54,7 @@ struct MenubarContent: View {
     // MARK: content
 
     @ViewBuilder private var content: some View {
-        if model.armState == .lockedDown {
-            peek("Locked down. No requests will be served.", tone: .lockedDown)
-        } else if model.pending.isEmpty {
+        if model.pending.isEmpty {
             recentDecisionPeek
         } else {
             TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -88,30 +85,10 @@ struct MenubarContent: View {
         .padding(.horizontal, 12).padding(.vertical, 8)
     }
 
-    private func peek(_ text: String, tone: StateTone) -> some View {
-        HStack(spacing: 6) {
-            Circle().fill(tone.color).frame(width: 7, height: 7)
-            Text(text).font(.system(size: 11)).foregroundStyle(.secondary)
-            Spacer()
-        }
-        .padding(.horizontal, 12).padding(.vertical, 8)
-    }
-
     // MARK: footer
 
     private var footer: some View {
         HStack(spacing: 8) {
-            if model.armState == .lockedDown {
-                Button { Task { await model.lockdown(clear: true) } } label: {
-                    Label("Unseal", systemImage: "lock.open").font(.system(size: 11))
-                }
-                .buttonStyle(.glass).tint(Palette.rust)
-            } else {
-                Button { Task { await model.lockdown(clear: false) } } label: {
-                    Label("Lock down", systemImage: "lock").font(.system(size: 11))
-                }
-                .buttonStyle(.glass)
-            }
             Spacer()
             Button("Open Sigil", action: openConfigurator).buttonStyle(.glass)
             Button { NSApplication.shared.terminate(nil) } label: {
@@ -189,12 +166,6 @@ private struct PendingCard: View {
 #Preview("Menubar pending") {
     MenubarContent(openConfigurator: {})
         .environment(AppModel(daemon: MockDaemonClient(scenario: .pendingRequests)))
-        .frame(width: 320)
-}
-
-#Preview("Menubar locked") {
-    MenubarContent(openConfigurator: {})
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .lockedDown)))
         .frame(width: 320)
 }
 

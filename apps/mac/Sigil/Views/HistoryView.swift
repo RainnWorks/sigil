@@ -51,7 +51,7 @@ struct HistoryView: View {
     private var empty: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("No history yet").font(.system(size: 13, weight: .semibold))
-            Text("Every approval, denial, and lockdown lands here as it happens, with its process, account, and how it was decided.")
+            Text("Every approval and denial lands here as it happens, with its process, account, and how it was decided.")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
         }
         .padding(16).frame(maxWidth: .infinity, alignment: .leading)

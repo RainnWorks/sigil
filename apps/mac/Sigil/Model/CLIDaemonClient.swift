@@ -23,7 +23,7 @@
 //      { "daemon_up": bool, "socket": str, "shim": {"kind": "healthy|drift|not_installed|unknown",
 //        "path": str?, "issue": str?}, "op": {"found": bool, "path": str?},
 //        "accounts": int, "factor": {"kind":"phone|biometric|fail_closed","relay":str?},
-//        "relay_reachable": bool?, "relay_url": str?, "locked_down": bool }
+//        "relay_reachable": bool?, "relay_url": str? }
 //    sigil doctor --json   -> [ {"label": str, "ok": bool, "hint": str}, ... ]
 //    sigil-config export -> {version, sources:[{name,provider,account?,path?,
 //        keys?:[str]}], rules:[...]}   (the whole config; env sources carry KEY
@@ -43,7 +43,6 @@
 //        (NEW verb; menubar needs to enumerate what the daemon is holding)
 //    sigil approve --local --id <id> [--lease] --json -> {"ok":bool,"lines":[str]}
 //    sigil deny --local --id <id> --json -> {"ok":bool,"lines":[str]}
-//    sigil lockdown [--clear] --json -> {"ok":bool,"lines":[str]}
 //    sigil pair list --json -> {"paired": {"name":str,"sas_words":[str],
 //        "relay_url":str,"paired_ms":int} | null }
 //    sigil pair --relay <url> --json  (streams NDJSON ceremony events on stdout:
@@ -292,13 +291,6 @@ struct CLIDaemonClient: DaemonClient {
         try controlResult(await run(["deny", "--local", "--id", id, "--json"]))
     }
 
-    func lockdown(clear: Bool) async throws -> ControlResult {
-        var args = ["lockdown"]
-        if clear { args.append("--clear") }
-        args.append("--json")
-        return try controlResult(await run(args))
-    }
-
     func pairedDevice() async throws -> PairedDevice? {
         let dto = try decode(PairListDTO.self, await run(["pair", "list", "--json"]))
         return dto.paired?.model()
@@ -528,7 +520,6 @@ struct StatusDTO: Decodable {
     let factor: FactorDTO
     let relay_reachable: Bool?
     let relay_url: String?
-    let locked_down: Bool
 
     func model() -> StatusReport {
         let shimKind: ShimState.Kind = switch shim.kind {
@@ -543,8 +534,7 @@ struct StatusDTO: Decodable {
         return StatusReport(daemonUp: daemon_up, socketPath: socket,
                             shim: ShimState(kind: shimKind, path: shim.path, issue: shim.issue),
                             opFound: op.found, opPath: op.path,
-                            factor: f, relayReachable: relay_reachable, relayURL: relay_url,
-                            lockedDown: locked_down)
+                            factor: f, relayReachable: relay_reachable, relayURL: relay_url)
     }
 }
 

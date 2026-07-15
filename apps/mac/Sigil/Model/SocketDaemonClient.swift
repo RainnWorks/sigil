@@ -12,7 +12,7 @@
 //
 //  Split, so the two paths never blur:
 //    - Over the socket: status, doctor, lease_list, pending, history (Reply.json);
-//      lockdown, lease_revoke, approve, deny (Reply.control); and a long-lived
+//      lease_revoke, approve, deny (Reply.control); and a long-lived
 //      subscribe_pending event stream (Reply.event) that drives the menubar live.
 //    - Shelled out to `sigil … --json` via the composed CLIDaemonClient:
 //      rule/source authoring, settings get/set, wipe, shim install, unpair, and
@@ -96,10 +96,6 @@ struct SocketDaemonClient: DaemonClient {
 
     func deny(id: String) async throws -> ControlResult {
         await control(.deny(id: id))
-    }
-
-    func lockdown(clear: Bool) async throws -> ControlResult {
-        await control(.lockdown(clear: clear))
     }
 
     // MARK: - Live pending subscription (Reply.event stream)
@@ -254,7 +250,6 @@ struct SocketDaemonClient: DaemonClient {
     /// A request frame. Tagged by `kind` on the wire (crates/sigil/src/local.rs).
     private enum Frame {
         case status, doctor, leaseList, pending, history, subscribePending
-        case lockdown(clear: Bool)
         case leaseRevoke(prefix: String)
         case approve(id: String, lease: Bool)
         case deny(id: String)
@@ -269,7 +264,6 @@ struct SocketDaemonClient: DaemonClient {
         case .pending: object = ["kind": "pending"]
         case .history: object = ["kind": "history"]
         case .subscribePending: object = ["kind": "subscribe_pending"]
-        case .lockdown(let clear): object = ["kind": "lockdown", "clear": clear]
         case .leaseRevoke(let prefix): object = ["kind": "lease_revoke", "prefix": prefix]
         case .approve(let id, let lease): object = ["kind": "approve", "id": id, "lease": lease]
         case .deny(let id): object = ["kind": "deny", "id": id]
@@ -319,7 +313,7 @@ struct SocketDaemonClient: DaemonClient {
             socketPath: socketPath,
             shim: ShimState(kind: .unknown, path: nil, issue: "daemon not running"),
             opFound: false, opPath: nil,
-            factor: .failClosed, relayReachable: nil, relayURL: nil, lockedDown: false)
+            factor: .failClosed, relayReachable: nil, relayURL: nil)
     }
 }
 

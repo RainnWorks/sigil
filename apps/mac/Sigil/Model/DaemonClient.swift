@@ -88,9 +88,6 @@ protocol DaemonClient: Sendable {
     func approve(id: String, lease: Bool) async throws -> ControlResult
     func deny(id: String) async throws -> ControlResult
 
-    // Daemon-wide controls
-    func lockdown(clear: Bool) async throws -> ControlResult
-
     // Daemon lifecycle (the local launchd agent + its control socket). The app
     // owns the local daemon: whether it is listening, and start / stop / restart /
     // install it. These mirror the `sigil` service verbs (start/stop/restart) and

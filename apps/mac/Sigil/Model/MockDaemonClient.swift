@@ -3,19 +3,18 @@
 //  no daemon running. This mirrors the phone app's mock transport: the app is
 //  fully exercisable in a dev build and in SwiftUI previews.
 //
-//  The mock keeps mutable in-memory state so approve/deny/lockdown/pair actually
-//  change what the screens show, making the whole flow demoable end to end.
+//  The mock keeps mutable in-memory state so approve/deny/pair actually change
+//  what the screens show, making the whole flow demoable end to end.
 
 import Foundation
 
 /// A tunable scenario so previews and the running app can select a state (armed,
-/// pending, locked down, fail-closed).
+/// pending, fail-closed).
 enum MockScenario: Sendable {
     case armedIdle          // paired, armed, nothing pending
     case pendingRequests    // two requests waiting
     case biometricOnly      // no phone; biometric factor
     case failClosed         // no factor at all
-    case lockedDown
 }
 
 actor MockDaemonClient: DaemonClient {
@@ -24,7 +23,6 @@ actor MockDaemonClient: DaemonClient {
     private var historyStore: [HistoryEntry]
     private var pendingStore: [PendingRequest]
     private var paired: PairedDevice?
-    private var locked: Bool
     private var appSettings: AppSettings
     private var configStore: SigilConfig
     /// The in-memory SSH store and its routing state, so the SSH pane's list,
@@ -50,7 +48,6 @@ actor MockDaemonClient: DaemonClient {
         self.historyStore = Fixtures.history
         self.pendingStore = (scenario == .pendingRequests) ? Fixtures.pending : []
         self.paired = (scenario == .biometricOnly || scenario == .failClosed) ? nil : Fixtures.paired
-        self.locked = (scenario == .lockedDown)
         self.appSettings = Fixtures.settings
         self.configStore = config
         self.sshStore = sshKeys
@@ -70,7 +67,7 @@ actor MockDaemonClient: DaemonClient {
 
     func status() -> StatusReport {
         StatusReport(
-            daemonUp: scenario != .failClosed || locked,
+            daemonUp: scenario != .failClosed,
             socketPath: "/var/folders/xy/sigil/daemon.sock",
             shim: scenario == .failClosed
                 ? ShimState(kind: .drift, path: "~/.sigil/bin/op", issue: "another op wins on PATH (/opt/homebrew/bin/op)")
@@ -79,8 +76,7 @@ actor MockDaemonClient: DaemonClient {
             opPath: "/opt/homebrew/bin/op",
             factor: factor,
             relayReachable: paired != nil ? true : nil,
-            relayURL: paired?.relayURL,
-            lockedDown: locked
+            relayURL: paired?.relayURL
         )
     }
 
@@ -174,7 +170,7 @@ actor MockDaemonClient: DaemonClient {
 
     func importConfig(_ config: SigilConfig) { configStore = config }
 
-    func leases() -> [Lease] { locked ? [] : leasesStore }
+    func leases() -> [Lease] { leasesStore }
 
     func revokeLease(grantPrefix: String) -> ControlResult {
         let before = leasesStore.count
@@ -185,7 +181,7 @@ actor MockDaemonClient: DaemonClient {
 
     func history() -> [HistoryEntry] { historyStore }
 
-    func pending() -> [PendingRequest] { locked ? [] : pendingStore }
+    func pending() -> [PendingRequest] { pendingStore }
 
     func approve(id: String, lease: Bool) -> ControlResult {
         guard let req = pendingStore.first(where: { $0.id == id }) else {
@@ -215,11 +211,6 @@ actor MockDaemonClient: DaemonClient {
                                   cwd: req.provenance.cwd, decision: .denied, note: "denied at the Mac",
                                   at: Date(), via: "phone"), at: 0)
         return .ok(lines: ["denied"])
-    }
-
-    func lockdown(clear: Bool) -> ControlResult {
-        locked = !clear
-        return .ok(lines: [clear ? "unsealed" : "sealed: denied everything pending, refusing new"])
     }
 
     func pairedDevice() -> PairedDevice? { paired }

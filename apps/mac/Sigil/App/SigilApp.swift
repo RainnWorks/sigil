@@ -21,8 +21,7 @@ struct SigilApp: App {
         .windowResizability(.contentMinSize)
         .windowToolbarStyle(.unified)
 
-        // The menubar pulse: the four shape states, a pending list, quick
-        // lockdown, and Open Sigil.
+        // The menubar pulse: the shape states, a pending list, and Open Sigil.
         MenuBarExtra {
             MenubarContent(openConfigurator: { openConfigurator() })
                 .environment(model)

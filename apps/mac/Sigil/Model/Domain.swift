@@ -72,24 +72,21 @@ struct StatusReport: Equatable, Sendable {
 
     /// The coarse arm state that drives the menubar and the header word.
     var armState: ArmState {
-        if lockedDown { return .lockedDown }
         if !daemonUp { return .idle }
         switch factor {
         case .failClosed: return .idle
         default: return .armed
         }
     }
-    var lockedDown: Bool = false
 }
 
 enum ArmState: Equatable, Sendable {
-    case idle, armed, lockedDown
+    case idle, armed
 
     var menubar: MenubarState {
         switch self {
         case .idle: return .idle
         case .armed: return .armed
-        case .lockedDown: return .locked
         }
     }
 }
@@ -118,7 +115,6 @@ enum RequestKind: String, Sendable, Equatable {
     case secretRead = "secret_read"
     case sshSignature = "ssh_signature"
     case resume
-    case lockdownClear = "lockdown_clear"
 }
 
 struct HistoryEntry: Identifiable, Equatable, Sendable {

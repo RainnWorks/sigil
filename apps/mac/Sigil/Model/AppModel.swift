@@ -175,10 +175,6 @@ final class AppModel {
         await performControl { try await self.daemon.deny(id: req.id) }
     }
 
-    func lockdown(clear: Bool) async {
-        await performControl { try await self.daemon.lockdown(clear: clear) }
-    }
-
     func installShim() async {
         await performControl { try await self.daemon.installShim() }
     }

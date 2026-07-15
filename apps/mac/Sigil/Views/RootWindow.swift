@@ -71,11 +71,10 @@ struct RootWindow: View {
         }
     }
 
-    /// The armed word and lockdown at the foot of the sidebar, always visible.
+    /// The armed word at the foot of the sidebar, always visible.
     private var sidebarFooter: some View {
         let tone: StateTone = switch model.armState {
         case .armed: .armed
-        case .lockedDown: .lockedDown
         case .idle: .neutral
         }
         return HStack(spacing: 8) {

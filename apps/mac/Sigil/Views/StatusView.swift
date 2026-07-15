@@ -25,19 +25,12 @@ struct StatusView: View {
 
     private var header: some View {
         let tone: StateTone = switch model.armState {
-        case .armed: .armed; case .lockedDown: .lockedDown; case .idle: .neutral
+        case .armed: .armed; case .idle: .neutral
         }
         return HStack(spacing: 10) {
             Text("sigil").font(.mono(20, weight: .medium)).foregroundStyle(Palette.cobalt)
             StatePill(tone: tone)
             Spacer()
-            if model.armState == .lockedDown {
-                Button("Unseal") { Task { await model.lockdown(clear: true) } }
-                    .buttonStyle(.glassProminent).tint(Palette.rust)
-            } else {
-                Button("Lock down") { Task { await model.lockdown(clear: false) } }
-                    .buttonStyle(.glass)
-            }
         }
     }
 
