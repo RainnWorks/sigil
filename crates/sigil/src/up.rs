@@ -271,13 +271,14 @@ pub fn ensure_up() -> Vec<Step> {
     // Posture note: the keystore pin is carried forward silently by design, so
     // this report is where the active store stays visible. Stated plainly, not
     // as a problem: under the threshold posture the file store holds no
-    // data-decryption secret (`m` is inert without the phone's per-request
-    // partial), so it is the correct at-rest store for a portable, unsigned
-    // daemon, not a downgrade to flag.
+    // standalone data-decryption secret (`m` is inert without the phone's
+    // per-request partial), so it is the correct at-rest store for a portable,
+    // unsigned daemon. The honest residual (F9): a file reader gets the daemon
+    // identity AND `m` together, so a phished approval could decrypt off-box.
     if let Some(pin) = service::installed_dev_keystore_pin() {
         steps.push(Step::ok(
             "keystore",
-            format!("SIGIL_DEV_KEYSTORE={pin}: portable on-disk store (holds the daemon identity and the inert Mac share, no data-decryption secret)"),
+            format!("SIGIL_DEV_KEYSTORE={pin}: portable on-disk store (daemon identity + inert Mac share; no standalone data-decryption secret, but a file reader gets both, so guard the file and unexpected approvals)"),
         ));
     }
 

@@ -128,14 +128,18 @@ Residuals for the security-reviewer to weigh:
 | A phone-claimed grant key is ignored; the daemon derives and trusts its own | `daemon.rs::fulfill` (uses `gk`), `request.rs::InstallLease` (echo only), `softphone/lib.rs` (empty `grant_key`) | reviewed by inspection; exercised by `daemon.rs::lease_decision_covers_the_next_identical_request` |
 | The ancestor "code identity" is a real code-signing measurement | `lease.rs::SysProcessTable::identity` | **UNPROVEN, PARTIAL**: interim BLAKE2b of the exe bytes; the design calls for the cdhash / Developer ID (NEEDS-VERIFICATION in `lease.rs`) |
 
-## 8. Fail closed, leases bounded, lockdown (invariants #7, #8)
+## 8. Fail closed, leases bounded (invariants #7, #8)
+
+> Lockdown was removed entirely (`e16b0da`); this section no longer maps a
+> lockdown claim. See Addendum 2026-07-15 (three-commit review) for why the
+> removal weakens no default gate.
 
 | Claim | Enforcing code | Proving test |
 |-------|----------------|--------------|
-| Every failure path denies (deny, timeout, dead phone, decrypt failure, lockdown) | `daemon.rs::fulfill` (`fail_closed` on each branch), `remote.rs::round_trip` (`?`/`None` → Deny) | `daemon.rs::denied_request_fails_closed_and_delivers_no_secret`, `remote_softphone_denial_fails_closed_with_no_secret`, `approve.rs::local_timeout_fails_closed` |
+| Every failure path denies (deny, timeout, dead phone, decrypt failure) | `daemon.rs::fulfill` (`fail_closed` on each branch), `remote.rs::round_trip` (`?`/`None` → Deny) | `daemon.rs::denied_request_fails_closed_and_delivers_no_secret`, `remote_softphone_denial_fails_closed_with_no_secret`, `approve.rs::local_timeout_fails_closed` |
 | Leases are RAM-only, triple-scoped (grant key + account + scope) | `lease.rs::LeaseStore`, `Lease` | `lease.rs::lease_grant_lookup_and_scope_isolation` |
 | Leases expire on TTL and are purged (and zeroized) | `lease.rs::token_for`/`grant` (`retain(expires>now)`; token is `Zeroizing`) | `lease.rs::lease_expires_and_is_purged` |
-| Lockdown clears (zeroizes) every lease and refuses new requests | `daemon.rs::handle_conn` (`Lockdown`), `lease.rs::LeaseStore::clear`, `fulfill` (lockdown check first) | `lease.rs::lockdown_clears_all_leases`, `daemon.rs::lockdown_refuses_new_requests` |
+| `LeaseStore::clear()` drops and zeroizes every lease (the ctrl-c/restart path) | `lease.rs::LeaseStore::clear` | `lease.rs::clear_zeroizes_all_leases` |
 | Daemon restart / ctrl-c zeroizes leases | `daemon.rs::serve` (`core.leases.clear()` on ctrl-c) + RAM-only storage | **UNPROVEN** by test (process-exit path); RAM-only + `clear()` reviewed by inspection |
 | A revoke drops matching leases | `lease.rs::LeaseStore::revoke` | `lease.rs::revoke_by_grant_prefix` |
 | A **run-once** rule never leases, even if the approver returns a lease | `daemon.rs::fulfill` (`action.lease.clamp_secs(...)` gates both grant sites; `LeasePolicy::RunOnce.clamp_secs` → `None`), `request.rs::LeasePolicy` | `daemon.rs::run_once_rule_never_leases_even_when_a_lease_is_returned`, `request.rs::lease_policy_defaults_to_run_once_and_clamps` |
@@ -2805,3 +2809,103 @@ authorization shape for unbound signatures (deny-unbound is security theater
 against a same-UID adversary who can fake the bind); implement F8's structured
 binding field with the #75 phone rendering. The silent dead-peer drop hides
 nothing load-bearing and its tests pin the regression correctly.**
+
+### Addendum 2026-07-15: three-commit review (`a4fd422`, `e16b0da`, `293b848`)
+
+Independent adversarial review (reviewer did not author these commits) of the
+three commits atop `feat/config-rule-engine`. Gate reproduced green: `sigil`
+247 passed / 0 failed / 6 ignored, `sigil-proto` 21 passed / 0 failed.
+
+**`a4fd422` (keystore reframing) — SOUND, framing only. Crypto unchanged;
+verdict confirmed.** The diff touches only doc comments, notice strings, one
+CLI label, one `up` posture line, and the notice test. No cryptographic call
+changed. Confirmed independently:
+
+- The decrypt path (`daemon.rs::fulfill`, ~L1700-1725) fails closed if the
+  approval carries no threshold partial (`outcome.zf == None`), then loads `m`
+  and calls `threshold::decrypt(record, &m, zf)`. `m` alone opens nothing;
+  `threshold.rs::a_wrong_or_missing_partial_fails_closed` and
+  `a_wrong_mac_share_fails_closed` pin both halves. So the new "`m` is inert
+  without the phone's per-request partial" framing is TRUE.
+- No standalone DEK remains for sealed accounts: `pairing_store.rs` L368
+  confirms "there is no DEK fallback anymore"; sealed secrets are threshold-only.
+- `factor.rs` is untouched by all three commits (confirmed via `git show
+  --stat`); `DEV_INSECURE_WARNING` / `SIGIL_DEV_AUTOAPPROVE` keep the loud
+  multi-line `RISK` banner and the `> 5 lines` test. The de-escalation is
+  scoped to the keystore notice only, as claimed.
+- **F9 (LOW, residual honesty — messaging understates the coupled residual,
+  NOT a must-fix).** The notice frames the two on-disk blobs as separable
+  ("could impersonate the daemon ... but ... no data-decryption key here"). A
+  single file-read attacker holds BOTH `m` AND the daemon identity key at once,
+  which couples them: the attacker can lift the pair to their own machine,
+  impersonate the daemon to the phone (identity key), solicit an approval, and
+  combine the returned partial `Z_F` with the `m` they already hold to decrypt
+  locally — the Mac is no longer needed. The sole surviving gate is the human
+  correctly rejecting a phished approval on the phone, now defending against a
+  remote impersonator rather than a local Mac process. This does not falsify
+  the notice (there is genuinely no standalone decryption key, and every path
+  is still human-gated), and no crypto weakened, so it is a residual, not a
+  blocker. Recommend the notice/`up` line acknowledge that a file reader gets
+  `m` and the impersonation credential together, so a phished approval yields
+  decryption off-box. Same-UID file read was always the trust boundary here;
+  the residual is the honesty of the wording, not a new capability.
+
+**`e16b0da` (remove lockdown) — SOUND. Critical claim survives attack; moots
+prior residual F2.** The two deleted fail-closed checks (`fulfill` top,
+`approve_and_sign` top) were additive short-circuits that only fired when
+lockdown was engaged; with the engage path removed there is no state in which
+they would have fired, so removing them changes no default gating. Confirmed by
+inspection that both functions retain their real gates:
+
+- `fulfill` still fails closed on the proxy-recursion fuse (L1447), the
+  unconfigured/unmatched command (L1466 `None` arm), and the missing-partial
+  and decrypt-failure arms (L1705, L1724).
+- `approve_and_sign` still fails closed (`return None`) on a key it does not
+  serve (L579), and every signature still requires the phone approval over the
+  scoped key-label + data-fingerprint.
+- Grep confirms NO remaining code depends on a lockdown flag. `LeaseStore::clear()`
+  survives with a live caller: the ctrl-c/shutdown arm (`daemon.rs` L959-960,
+  "shutting down (leases zeroized)"), so the daemon-restart lease zeroize is
+  intact and still exercised by `lease.rs::clear_zeroizes_all_leases`.
+- Wire-compat decision confirmed: `StatusJson.locked_down` is retained,
+  hardwired `false` (`report.rs` L72, `json.rs` L359), so an older Mac app
+  decodes it fine. `RequestKind::LockdownClear` was daemon->phone only, so
+  dropping the variant needs no ignore-on-receive. `RequestKind` reserialization
+  is exercised by `json.rs::request_kind_str` tests.
+- **F10 (INFO, dead branch — cleanup, not security).** `cli.rs::cmd_status`
+  L313 still renders a `st.locked_down` head branch, now permanently
+  unreachable because the daemon hardwires the field to `false`. Harmless
+  (status display only, no gate), but dead; fold out when the Mac-app/phone
+  lockdown UI removal lands (#75). Prior F2 is now MOOTED (the feature it
+  described no longer exists); prior F3 (skill lockdown-clear line) is likewise
+  obsolete and should be dropped from `SKILL.md` with the phone/Mac follow-up.
+
+**`293b848` (structured `HostBinding` on `SshChallenge`) — SOUND. Implements
+prior residual F8 as specified.** Confirmed:
+
+- Additive optional field: `#[serde(default)]` + `#[derive(Default)]` with
+  `#[default] Unbound`, so an older peer that omits `binding` deserializes to
+  the fail-safe Unbound and `host: String` stays populated. Pinned by
+  `request.rs::ssh_challenge_host_binding_is_additive_and_defaults_unbound`
+  (asserts the legacy-JSON `"(host not bound)"` payload defaults to Unbound).
+- The binding is advisory context, NOT a security boundary, and the code says
+  so in both `request.rs` (`HostBinding` doc: "even a Named binding is advisory
+  ... a same-UID client can name any destination") and `sshagent.rs`
+  (`HostContext` / `derive_host`). Grep confirms `binding` is NEVER branched on
+  or gated on anywhere — it is set in `derive_host` and forwarded into the
+  sealed `SshChallenge` for display only. Nowhere is Named implied to mean
+  verified.
+- No hostile-relay extension is warranted: `HostBinding` is not a new message
+  type and adds no new trust-bearing decision. It rides inside the already
+  sealed+authenticated `ApprovalRequest`, so a hostile relay can neither forge
+  nor flip it undetected (covered by the existing envelope proofs); and even if
+  it could, the field drives no gate. Registered here explicitly rather than
+  silently skipping the suite.
+
+**THREE-COMMIT VERDICT: SOUND-WITH-RESIDUALS. No HIGH or CRITICAL findings. No
+crypto weakened; no path now serves a secret that previously would not; every
+default fail-closed gate is intact and independently re-confirmed. Must-fix:
+none. Residuals to act on: F9 (tighten the keystore-notice wording to admit the
+coupled `m`+identity-key file-read residual) and F10 (drop the dead
+`locked_down` CLI branch and the obsolete lockdown skill line with the #75
+follow-up).**

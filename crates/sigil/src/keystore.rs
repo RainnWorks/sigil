@@ -228,10 +228,13 @@ fn dev_keystore_notice(mode: &str, path: Option<&std::path::Path>) -> String {
             ),
             "On disk are the daemon identity key and the Mac threshold share `m`.\n\
              Neither can open a sealed secret alone: every secret also needs the\n\
-             phone's per-request partial, so `m` is inert without a live approval.\n\
-             The identity key could let someone impersonate this daemon to the\n\
-             phone, but every request is still human-gated on the phone. There is\n\
-             no data-decryption key here.\n"
+             phone's per-request partial, so `m` is inert without a live approval,\n\
+             and there is no standalone data-decryption key here.\n\
+             The honest residual is that a reader of this file gets BOTH at once:\n\
+             the identity key impersonates this daemon to the phone, and a phished\n\
+             approval returns a partial that combines with the `m` they already\n\
+             hold to decrypt off-box, no Mac needed. The only surviving gate is\n\
+             then the human rejecting an approval they did not initiate.\n"
                 .to_string(),
         ),
         None => (
@@ -360,12 +363,14 @@ mod tests {
         let file = dev_keystore_notice("file", Some(std::path::Path::new("/tmp/x.json")));
         assert!(file.contains("SIGIL_DEV_KEYSTORE=file"));
         assert!(file.contains("/tmp/x.json"));
-        // Honest about the actual residual: identity-key impersonation, still
-        // phone-gated, and no data-decryption secret. Not an alarm.
+        // Honest about the actual residual: no standalone decryption secret, but
+        // a file reader gets the identity key AND `m` together, so a phished
+        // approval decrypts off-box (F9). Not an alarm, but not falsely reassuring.
         assert!(file.contains("identity key"));
         assert!(file.contains("inert"));
-        assert!(file.contains("human-gated on the phone"));
-        assert!(file.contains("no data-decryption key"));
+        assert!(file.contains("no standalone data-decryption key"));
+        assert!(file.contains("BOTH"));
+        assert!(file.contains("phished"));
         // And it does not resurrect the old scare framing.
         assert!(!file.contains("RISK"));
 

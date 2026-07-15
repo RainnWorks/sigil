@@ -88,7 +88,6 @@ gated.
 sigil up | status | doctor | history | pending
 sigil pair --relay <url>       # pairing ceremony (HUMAN scans QR + compares words)
 sigil lease list | lease revoke <prefix>
-sigil lockdown [--clear]       # panic switch: deny and refuse everything
 sigil ssh ... | sigil sshagent # SSH (below)
 
 # configuration
@@ -204,6 +203,3 @@ Only unencrypted ed25519 keys are served (v1). After `sigil ssh config
   cannot complete it.
 - **Approvals**: on the phone, hardware biometrics. You wait.
 - **Secret values**: typed or piped by the human, per the rule above.
-- **Clearing a lockdown**: `sigil lockdown` is the human's panic switch. If
-  you find Sigil locked down, report it and stop; never run
-  `sigil lockdown --clear` yourself, even to "fix" a failing task.

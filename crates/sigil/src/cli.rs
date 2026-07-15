@@ -310,9 +310,7 @@ fn cmd_status() -> i32 {
     let s = Style::stdout();
     let st = fetch_status();
 
-    let head = if st.locked_down {
-        s.brass("locked down")
-    } else if st.daemon_up && st.factor.kind != "fail_closed" {
+    let head = if st.daemon_up && st.factor.kind != "fail_closed" {
         s.ok("armed")
     } else if st.daemon_up {
         s.brass("idle")
