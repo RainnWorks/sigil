@@ -12,8 +12,8 @@
 //!    identity (path + hash) of each ancestor is bound in.
 //!
 //! A lease holds the unwrapped SA token in RAM, scoped to that grant key plus
-//! the account and request scope, until a TTL elapses. Expiry, revoke,
-//! lockdown, and daemon restart all zeroize it. Client-supplied ancestry is
+//! the account and request scope, until a TTL elapses. Expiry, revoke, and
+//! daemon restart all zeroize it. Client-supplied ancestry is
 //! never consulted; the whole chain is measured here.
 //!
 //! NEEDS-VERIFICATION: the ancestor "code identity" here is a BLAKE2b hash of
@@ -224,7 +224,7 @@ impl LeaseStore {
         before - leases.len()
     }
 
-    /// Drop and zeroize every lease. The lockdown and restart path.
+    /// Drop and zeroize every lease. The daemon-restart path.
     pub fn clear(&self) -> usize {
         let mut leases = self.inner.lock().expect("lease store poisoned");
         let n = leases.len();
@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn lockdown_clears_all_leases() {
+    fn clear_zeroizes_all_leases() {
         let store = LeaseStore::new();
         store.grant([1u8; 32], "A", "s", token("a"), Duration::from_secs(60));
         store.grant([2u8; 32], "B", "s", token("b"), Duration::from_secs(60));

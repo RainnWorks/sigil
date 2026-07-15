@@ -18,7 +18,7 @@ keystore/tokens/config or wipe**. Those are short-lived, user-invoked CLI
 operations so a compromised daemon cannot perform them. Therefore:
 
 - **Over this socket (daemon):** status, doctor, leases (list + revoke), pending
-  (+ live subscription), history, lockdown (engage/clear), approve/deny.
+  (+ live subscription), history, approve/deny.
 - **CLI-only mutations (the Mac app shells out to `sigil … --json`):** account
   add/rotate/remove, **command config** (`config add|list|remove`), settings
   get/set, wipe `--force`, mac-approvals `--enable|--phone-only`, shim
@@ -73,7 +73,7 @@ too: `exit` | `control` | `json` | `event`.
 The reply is `{"kind":"json","body":"<the JSON text>"}`; the client parses
 `body`. The daemon is the source of truth: it computes the host facts (shim
 drift, `op` discovery, pairing factor, relay reachability, counts) *and* holds
-the runtime facts (lockdown, live leases, the pending set, the audit log).
+the runtime facts (live leases, the pending set, the audit log).
 
 `StatusJson`:
 ```json
@@ -82,7 +82,8 @@ the runtime facts (lockdown, live leases, the pending set, the audit log).
   "op": { "found": bool, "path": str? },
   "accounts": int,
   "factor": { "kind": "phone|biometric|fail_closed", "relay": str? },
-  "relay_reachable": bool?, "relay_url": str?, "locked_down": bool }
+  "relay_reachable": bool?, "relay_url": str?,
+  "locked_down": bool (always false; retained for wire compatibility) }
 ```
 `CheckJson`: `{ "label": str, "ok": bool, "hint": str }` — the last row
 (`ssh-agent socket`) is informational (always `ok`).
@@ -108,8 +109,6 @@ the runtime facts (lockdown, live leases, the pending set, the audit log).
 
 | Frame | Effect |
 |-------|--------|
-| `{"kind":"lockdown","clear":false}` | seal: deny + refuse, zeroize leases |
-| `{"kind":"lockdown","clear":true}` | unseal |
 | `{"kind":"lease_revoke","prefix":str}` | revoke leases whose grant hex starts with `prefix` |
 | `{"kind":"approve","id":str,"lease":bool}` | resolve a parked local request as approve (optionally lease) |
 | `{"kind":"deny","id":str}` | resolve a parked local request as deny |
@@ -151,7 +150,7 @@ this; it is the shim / primitive channel.
 line(s), parse `body`):
 - `status()` → `status`; `doctor()` → `doctor`; `leases()` → `lease_list`;
   `pending()` → `pending`; `history()` → `history`.
-- `revokeLease` → `lease_revoke`; `lockdown(clear:)` → `lockdown`;
+- `revokeLease` → `lease_revoke`;
   `approve/deny` → `approve`/`deny` (read the `control` `{ok,lines}`).
 - A long-lived `subscribe_pending` connection feeding the menubar; reconnect on
   drop.

@@ -23,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The `{"ok":bool,"lines":[str]}` shape every control verb returns (approve,
-/// deny, lockdown, lease revoke, account remove, shim install, unpair, wipe).
+/// deny, lease revoke, account remove, shim install, unpair, wipe).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlResult {
     pub ok: bool,
@@ -269,7 +269,6 @@ pub fn request_kind_str(kind: sigil_proto::RequestKind) -> &'static str {
         SecretRead => "secret_read",
         SshSignature => "ssh_signature",
         Resume => "resume",
-        LockdownClear => "lockdown_clear",
     }
 }
 
@@ -324,10 +323,7 @@ mod tests {
             request_kind_str(sigil_proto::RequestKind::SshSignature),
             "ssh_signature"
         );
-        assert_eq!(
-            request_kind_str(sigil_proto::RequestKind::LockdownClear),
-            "lockdown_clear"
-        );
+        assert_eq!(request_kind_str(sigil_proto::RequestKind::Resume), "resume");
     }
 
     #[test]

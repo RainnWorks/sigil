@@ -40,7 +40,6 @@ pub fn run_gating() -> i32 {
         "unpair" => cmd_unpair(json),
         "start" | "stop" | "restart" => cmd_service(&args[0]),
         "lease" => cmd_lease(&args[1..]),
-        "lockdown" => cmd_lockdown(&args[1..]),
         "approve" => cmd_approve(&args[1..]),
         "deny" => cmd_deny(&args[1..]),
         "history" => cmd_history(),
@@ -132,7 +131,6 @@ pub fn is_reserved_verb(cmd: &str) -> bool {
             | "stop"
             | "restart"
             | "lease"
-            | "lockdown"
             | "approve"
             | "deny"
             | "history"
@@ -230,7 +228,6 @@ usage: sigil <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
   start|stop|restart   control the launchd daemon agent
   lease list        list active session leases with countdowns
   lease revoke <p>  revoke leases whose grant-key hex starts with <p>
-  lockdown [--clear]  seal the daemon (deny + refuse) or unseal it
   approve --local --id <id> [--lease]  approve a pending request at the Mac
   deny --local --id <id>               deny a pending request at the Mac
   history           the decision audit log (names and metadata only)
@@ -251,7 +248,7 @@ binary: run `sigil-config help`. Keeping it off this binary means a program
 literally named `config`/`account`/… stays gateable as `sigil <that-name> …`.
 
 The Mac app speaks the daemon control socket directly (see PROTOCOL.md):
-status, doctor, lease, lockdown, approve, deny, history, and pending are
+status, doctor, lease, approve, deny, history, and pending are
 socket queries the human CLI renders."
     );
 }
@@ -306,7 +303,7 @@ fn fetch_status() -> json::StatusJson {
             return st;
         }
     }
-    crate::report::status(false, crate::report::Runtime::down())
+    crate::report::status(false)
 }
 
 fn cmd_status() -> i32 {
@@ -559,12 +556,6 @@ fn cmd_lease(args: &[String]) -> i32 {
             2
         }
     }
-}
-
-fn cmd_lockdown(args: &[String]) -> i32 {
-    print_control(send_control(&Frame::Lockdown {
-        clear: has_flag(args, "--clear"),
-    }))
 }
 
 fn cmd_approve(args: &[String]) -> i32 {

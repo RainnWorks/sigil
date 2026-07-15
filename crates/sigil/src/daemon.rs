@@ -16,9 +16,9 @@
 //!    its own auth (Sigil injects no credential); an inline-`env` rule opens its
 //!    threshold-sealed values with the phone's partial and injects them, then
 //!    zeroizes;
-//! 5. on deny, timeout, or lockdown, fails closed: the shim exits like real `op`.
+//! 5. on deny or timeout, fails closed: the shim exits like real `op`.
 //!
-//! Control commands (local approve/deny, lockdown, lease list/revoke) arrive on
+//! Control commands (local approve/deny, lease list/revoke) arrive on
 //! the same socket and mutate this shared state.
 
 use std::fs;
@@ -147,7 +147,6 @@ pub struct Core {
     /// approvers the ToDaemon owner loops drive; read-only here. A single-device
     /// daemon holds exactly one, behaving as before.
     remote: Vec<Arc<RemoteApprover>>,
-    lockdown: AtomicBool,
     proc_table: Box<dyn ProcessTable + Send + Sync>,
     /// The provider registry: a command's config names a provider by id, and the
     /// daemon dispatches the run to it. 1Password and env-file ship by default;
@@ -411,7 +410,6 @@ impl Core {
             gate,
             pending,
             remote: remote_listeners.clone(),
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(SysProcessTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
@@ -428,16 +426,9 @@ impl Core {
     }
 
     /// The full status report, the daemon's answer to `Frame::Status`. It is the
-    /// source of truth: the host-side facts from [`crate::report`] plus the
-    /// daemon's own runtime state (lockdown + live lease count).
+    /// source of truth for the host-side facts from [`crate::report`].
     fn status_report(&self) -> crate::json::StatusJson {
-        crate::report::status(
-            true,
-            crate::report::Runtime {
-                locked_down: self.lockdown.load(Ordering::SeqCst),
-                leases: self.leases.active(),
-            },
-        )
+        crate::report::status(true)
     }
 
     /// Reload the rule/source config from disk into the hot cell (#59).
@@ -578,11 +569,6 @@ impl SshBackend for Core {
     ///
     /// Either way the key never reaches the SSH client.
     fn approve_and_sign(&self, req: SignRequest<'_>) -> Option<Vec<u8>> {
-        if self.lockdown.load(Ordering::SeqCst) {
-            eprintln!("sigil daemon: ssh sign refused; sigil is locked down");
-            return None;
-        }
-
         // Route the request to the source that owns this identity. Hold the file
         // signer snapshot for the whole request so a mid-approval reload cannot
         // swap the set under us. A stored key resolves to its sealed record, held
@@ -1236,19 +1222,6 @@ fn handle_conn(core: Arc<Core>, mut stream: UnixStream) -> anyhow::Result<()> {
                 },
             )
         }
-        Frame::Lockdown { clear } => {
-            if clear {
-                core.lockdown.store(false, Ordering::SeqCst);
-                control_reply(true, "lockdown cleared; requests will route again")
-            } else {
-                core.lockdown.store(true, Ordering::SeqCst);
-                let n = core.leases.clear();
-                control_reply(
-                    true,
-                    &format!("locked down; {n} lease(s) zeroized, new requests refused"),
-                )
-            }
-        }
         Frame::LeaseRevoke { prefix } => {
             let n = core.leases.revoke(&prefix);
             control_reply(n > 0, &format!("revoked {n} lease(s)"))
@@ -1466,10 +1439,6 @@ fn fulfill(
     stdout: Option<OwnedFd>,
     stderr: Option<OwnedFd>,
 ) -> i32 {
-    if core.lockdown.load(Ordering::SeqCst) {
-        return fail_closed(stderr, "sigil is locked down; no secrets served\n");
-    }
-
     // Proxy recursion fuse: the caller's depth reached us over the socket (the
     // daemon has no other view of it). If it is already at the limit, a runaway
     // alias -> daemon -> tool -> alias loop is in progress; fail closed rather
@@ -2095,7 +2064,6 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending: pending.clone(),
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
@@ -2218,7 +2186,6 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(&dir, "tok", "secret-1"),
@@ -2582,28 +2549,6 @@ mod tests {
     }
 
     #[test]
-    fn lockdown_refuses_new_requests() {
-        let dir = tmpdir("lockdown");
-        let (core, _) = test_core(
-            &dir,
-            "tok",
-            "secret",
-            DevMode::Approve,
-            Duration::from_millis(50),
-        );
-        core.lockdown.store(true, Ordering::SeqCst);
-
-        let (read_end, write_end) = pipe();
-        let argv = vec!["op".into(), "read".into(), "op://Engineering/x".into()];
-        assert_eq!(
-            fulfill(&core, &argv, "/p", None, 0, None, Some(write_end), None),
-            1
-        );
-        assert_eq!(read_all(read_end), "");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn unconfigured_command_is_refused_with_a_config_hint() {
         // The invocation-model contract: a command with no config is never run
         // ungated; it fails closed with the exact command to configure it.
@@ -2670,7 +2615,6 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
@@ -2776,7 +2720,6 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
             config: env_inline_config("faketool", &["TOKEN"]).into(),
@@ -2882,7 +2825,6 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
@@ -2977,7 +2919,6 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
@@ -3058,7 +2999,6 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
             config: env_file_config("faketool", env_path.to_str().unwrap()).into(),
@@ -3146,7 +3086,6 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
             config: op_config().into(),
@@ -3329,7 +3268,6 @@ mod tests {
             gate: ApprovalGate::new(Box::new(approver.clone())),
             remote: vec![approver.clone()],
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
@@ -3799,7 +3737,6 @@ mod tests {
             leases: LeaseStore::new(),
             gate,
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
@@ -4439,7 +4376,6 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
@@ -4516,7 +4452,6 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
             config: op_config().into(),

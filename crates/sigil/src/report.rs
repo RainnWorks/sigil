@@ -3,36 +3,18 @@
 //! reachability, counts) that the `status` and `doctor` control messages carry.
 //!
 //! The daemon is the source of truth for the machine interface, so it answers
-//! `Frame::Status` / `Frame::Doctor` by calling these with its own runtime state
-//! ([`Runtime`]: lockdown + live lease count). The human `sigil` CLI renders the
-//! same shapes: when the daemon is up it renders the daemon's reply, and when
-//! the daemon is down it falls back to these builders locally (with a
-//! down/empty [`Runtime`]) so `status`/`doctor` still work headless. One builder,
+//! `Frame::Status` / `Frame::Doctor` by calling these. The human `sigil` CLI
+//! renders the same shapes: when the daemon is up it renders the daemon's reply,
+//! and when the daemon is down it falls back to these builders locally (with
+//! `daemon_up = false`) so `status`/`doctor` still work headless. One builder,
 //! two renderers, no divergence.
 
 use crate::json::{CheckJson, FactorJson, OpJson, ShimJson, StatusJson};
 use crate::{keystore, paths};
 
-/// The runtime facts only the daemon holds (they are not on disk): whether it is
-/// locked down and how many leases are live. The CLI's daemon-down fallback uses
-/// [`Runtime::down`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Runtime {
-    pub locked_down: bool,
-    pub leases: usize,
-}
-
-impl Runtime {
-    /// The runtime view when the daemon is unreachable: nothing locked, no leases.
-    pub fn down() -> Self {
-        Self::default()
-    }
-}
-
 /// Build the full status report. `daemon_up` is whether the control socket is
-/// listening (always true when the daemon answers its own `Frame::Status`);
-/// `runtime` carries the daemon-only facts.
-pub fn status(daemon_up: bool, runtime: Runtime) -> StatusJson {
+/// listening (always true when the daemon answers its own `Frame::Status`).
+pub fn status(daemon_up: bool) -> StatusJson {
     let shim = paths::ShimStatus::detect();
     let real_op = paths::find_real_op();
     let accounts = crate::threshold::ThresholdStore::load()
@@ -85,7 +67,9 @@ pub fn status(daemon_up: bool, runtime: Runtime) -> StatusJson {
         factor,
         relay_reachable,
         relay_url,
-        locked_down: runtime.locked_down,
+        // Lockdown was removed; the field stays on the wire (always false) so an
+        // older Mac app that still decodes `locked_down` keeps working.
+        locked_down: false,
     }
 }
 
@@ -221,18 +205,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn status_reflects_runtime_lockdown_and_daemon_up() {
-        let up = status(
-            true,
-            Runtime {
-                locked_down: true,
-                leases: 3,
-            },
-        );
+    fn status_reflects_daemon_up() {
+        let up = status(true);
         assert!(up.daemon_up);
-        assert!(up.locked_down);
+        // Lockdown was removed; the wire field stays but is always false.
+        assert!(!up.locked_down);
 
-        let down = status(false, Runtime::down());
+        let down = status(false);
         assert!(!down.daemon_up);
         assert!(!down.locked_down);
         // The socket path is reported in both cases.

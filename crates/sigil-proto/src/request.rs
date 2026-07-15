@@ -30,7 +30,7 @@
 //! all flagged for the phone team:
 //!
 //! 1. **`RequestKind`** is a provider-neutral display hint
-//!    (`secret_read | ssh_signature | resume | lockdown_clear`), replacing the
+//!    (`secret_read | ssh_signature | resume`), replacing the
 //!    op-flavoured `read_secret | ssh_signature`. The approver switches rendering
 //!    on it; it must not switch mechanism.
 //! 2. **`SecretRef`** is provider-agnostic: `{ provider, reference, segments,
@@ -123,10 +123,8 @@ pub enum RequestKind {
     SecretRead,
     /// An SSH signature over a challenge (see [`SshChallenge`]).
     SshSignature,
-    /// Resume a session after a lockdown or a lease lapse.
+    /// Resume a session after a lease lapse.
     Resume,
-    /// Clear an active lockdown.
-    LockdownClear,
 }
 
 /// A provider-agnostic reference to one requested secret.
@@ -214,7 +212,7 @@ pub struct ApprovalRequest {
     /// The argv the shim intercepted, e.g. `["op", "read", "op://…"]`.
     pub command: Vec<String>,
     /// Provider-agnostic references to the secrets this command will resolve.
-    /// Empty for kinds that read no secret (Resume, LockdownClear).
+    /// Empty for kinds that read no secret (e.g. Resume).
     #[serde(default)]
     pub secrets: Vec<SecretRef>,
     /// Present for `ssh_signature`.
@@ -473,7 +471,7 @@ pub enum ResolutionStatus {
     Settled,
     /// The request timed out on the daemon before any device answered.
     Expired,
-    /// The daemon withdrew it (lockdown, restart, or the requester went away).
+    /// The daemon withdrew it (restart, or the requester went away).
     Withdrawn,
 }
 

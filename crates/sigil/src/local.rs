@@ -9,7 +9,7 @@
 //!   the caller's own stdout/stderr file descriptors over SCM_RIGHTS, so the
 //!   underlying tool's child writes secrets straight to the caller's terminal or
 //!   pipe and the daemon never sees output; and
-//! * **control commands** from the CLI (local approve/deny, lockdown, lease
+//! * **control commands** from the CLI (local approve/deny, lease
 //!   list/revoke), which carry no descriptors.
 //!
 //! The daemon replies with a [`Reply`]: an exit code to mirror for run requests,
@@ -108,8 +108,8 @@ pub fn socket_path() -> PathBuf {
 /// app speaks directly and the human CLI renders (see `crates/sigil/PROTOCOL.md`).
 /// It splits into three groups: read/report queries that return a
 /// [`Reply::Json`] body (`Status`, `Doctor`, `LeaseList`, `Pending`, `History`),
-/// runtime-control commands that return a [`Reply::Control`] result (`Lockdown`,
-/// `LeaseRevoke`, `Approve`, `Deny`), and the [`Frame::SubscribePending`] stream
+/// runtime-control commands that return a [`Reply::Control`] result (`LeaseRevoke`,
+/// `Approve`, `Deny`), and the [`Frame::SubscribePending`] stream
 /// that emits a [`Reply::Event`] per pending-set change. The `Run` variant is the
 /// shim / `sigil <cmd>` separate SCM_RIGHTS secret path and is untouched by the
 /// control surface. Keystore/config *mutations* (account add/rotate/remove,
@@ -134,8 +134,8 @@ pub enum Frame {
         #[serde(default)]
         proxy_depth: u32,
     },
-    /// The full status report (armed state, factor, shim drift, relay, counts,
-    /// lockdown). Returns [`Reply::Json`] of a `StatusJson`.
+    /// The full status report (armed state, factor, shim drift, relay, counts).
+    /// Returns [`Reply::Json`] of a `StatusJson`.
     Status,
     /// The doctor checks. Returns [`Reply::Json`] of a `[CheckJson]`.
     Doctor,
@@ -147,8 +147,6 @@ pub enum Frame {
     /// The decision audit log, newest-first. Returns [`Reply::Json`] of a
     /// `[HistoryJson]`.
     History,
-    /// Seal (or, with `clear`, unseal) the daemon. Returns [`Reply::Control`].
-    Lockdown { clear: bool },
     /// Revoke leases whose grant-key hex starts with `prefix`. [`Reply::Control`].
     LeaseRevoke { prefix: String },
     /// Resolve a pending local approval as approve; `lease` makes it a session
@@ -169,7 +167,7 @@ pub enum Reply {
     /// The `op` exit code to mirror.
     Exit { code: i32 },
     /// A control result: success flag plus display lines. The reply to the
-    /// runtime-control commands (`Lockdown`, `LeaseRevoke`, `Approve`, `Deny`).
+    /// runtime-control commands (`LeaseRevoke`, `Approve`, `Deny`).
     Control { ok: bool, lines: Vec<String> },
     /// A pre-serialized JSON body (one value, no trailing newline) for the
     /// read/report queries. Carried as a `String` so [`Reply`] stays `Eq`; the
