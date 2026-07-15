@@ -344,7 +344,7 @@
       <ul>
         <li>pairing · phone approval · leases</li>
         <li>transport · keystore · sealed protocol</li>
-        <li>lease policy · audit · lockdown</li>
+        <li>lease policy · audit</li>
         <li class="cant">produce a secret while at rest</li>
         <li class="cant">read the secret bytes it brokers</li>
       </ul>
@@ -372,7 +372,7 @@
 <div class="cols">
   <div>
     <h4>Layer 1 · Core</h4>
-    <p style="max-width:48ch">The generic machine. Its whole job is: gate a command on a phone, then inject the approved environment into it and run it. It carries the pairing handshake, the sealed and signed protocol, leases, the transport ladder, the keystore seam, the per-rule lease policy, the audit log, and lockdown. It has no concept of 1Password or SSH. The protocol types it seals to the phone name no provider: a request carries the raw argv, a list of opaque secret references, and a display hint, never a vault or a field.</p>
+    <p style="max-width:48ch">The generic machine. Its whole job is: gate a command on a phone, then inject the approved environment into it and run it. It carries the pairing handshake, the sealed and signed protocol, leases, the transport ladder, the keystore seam, the per-rule lease policy, and the audit log. It has no concept of 1Password or SSH. The protocol types it seals to the phone name no provider: a request carries the raw argv, a list of opaque secret references, and a display hint, never a vault or a field.</p>
   </div>
   <div>
     <h4>Layer 2 · Integrations</h4>
@@ -422,7 +422,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
 <h3>Leases: approve once, cover the session <span class="badge shipped">shipped</span></h3>
 <div class="prose">
   <p>One dev session can fire dozens of gated calls, and the callers cannot be changed; they think they are running the real tool. So the caller's identity is derived instead: the daemon reads the true peer pid from the socket, walks the ancestor chain kernel-side, and resolves each ancestor to its executable and code-signing identity (never raw pids, which recycle). The hash of that chain plus the project root plus the requested scope is the <strong>grant key</strong>. The daemon verifies all of it itself; a client's claims about its own ancestry are ignored.</p>
-  <p>Approving "for this session" turns the approval into a <strong>lease</strong>: the unwrapped credential is held in RAM only, scoped to that grant key, account, and scope, until the TTL expires, then zeroed. A lease is a leased capability, not a policy flag; the daemon still cannot serve anything outside it without the phone. Lockdown, deny-and-block, restart, or expiry kill a lease instantly, and the phone lists every active lease with a countdown and one-tap revoke.</p>
+  <p>Approving "for this session" turns the approval into a <strong>lease</strong>: the unwrapped credential is held in RAM only, scoped to that grant key, account, and scope, until the TTL expires, then zeroed. A lease is a leased capability, not a policy flag; the daemon still cannot serve anything outside it without the phone. Deny-and-block, restart, or expiry kill a lease instantly, and the phone lists every active lease with a countdown and one-tap revoke.</p>
   <p>Spam is handled before it reaches you: requests with an identical grant key arriving while one is pending coalesce behind it, so one decision settles the whole burst; pushes collapse to a count; per-caller rate limits back-pressure anything pathological. Honest limit: a process-tree key reduces fatigue, it does not upgrade the security boundary; same-user malware could imitate a caller during a live lease window, which is exactly why leases are triple-scoped, TTL-bound, and memory-only, and cannot widen their own scope.</p>
 </div>
 
@@ -473,11 +473,11 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
     <p style="max-width:46ch">Run-once is enforced end to end: even if a compromised approver returns a lease, the daemon refuses it, and an over-long request is clamped down to the rule's cap. Every approve additionally passes Face ID: the Secure Enclave will not release the unwrap key without it, so a stolen unlocked phone still cannot approve. Long-press deny offers "Deny and block this process for 1 hour." An SSH request swaps the readout well for key label, host, and challenge fingerprint, the two things worth verifying.</p>
     <h4>The rest of the app <span class="badge shipped">shipped</span></h4>
     <div class="tblwrap"><table>
-      <tr><td class="mono">home</td><td>armed state at a glance: <span class="dim">Armed &middot; studio.local connected &middot; 2 accounts</span>, last decision, lockdown control</td></tr>
+      <tr><td class="mono">home</td><td>this phone's own state at a glance: <span class="dim">Armed</span> or <span class="dim">Idle</span> with a quiet link dot, last decision. The transport is plumbing and is never named a party; the paired Mac's name comes only from what it says about itself in a daemon-signed request, never from a relay address.</td></tr>
       <tr><td class="mono">history</td><td>dense reverse-chron audit mirror; decision-colored rows; swipe to block a process; searchable. Never stores values.</td></tr>
       <tr><td class="mono">accounts</td><td>credential health per account: <span class="dim">healthy &middot; rotate &middot; expires in 6d</span>, last used</td></tr>
+      <tr><td class="mono">devices</td><td>the paired Macs this phone approves for: which Mac, a link/no-link dot, when it was pinned, this phone's own fingerprint. The relay is never shown.</td></tr>
       <tr><td class="mono">leases</td><td>active grants with live TTL countdowns, one-tap revoke: <span class="dim">launcher &middot; Engineering/.env, 41m left</span></td></tr>
-      <tr><td class="mono">lockdown</td><td>hold-to-seal. Denies everything pending, refuses everything new, until Face ID plus hold releases it.</td></tr>
     </table></div>
   </div>
 </div>
@@ -540,7 +540,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
   <tr><th>Threat</th><th>Answer</th><th>Honest residual</th></tr>
   <tr><td>Daemon store stolen (cold disk)</td><td>ciphertext without the phone or Mac enclave; the daemon private identity is in the login Keychain, so a powered-off disk reveals no key material</td><td>rotate credentials on suspicion anyway</td></tr>
   <tr><td>Live same-UID compromise</td><td>the unwrap key still never releases without a fresh hardware-gated tap, so nothing is served automatically</td><td>a live attacker holding the signing key can originate a request with chosen provenance; the phone's last defense is a human declining a request they did not initiate</td></tr>
-  <tr><td>Phone stolen</td><td>keys are enclave-gated; every approve needs Face ID</td><td>remote lockdown from the Mac, re-pair, rotate</td></tr>
+  <tr><td>Phone stolen</td><td>keys are enclave-gated; every approve needs Face ID</td><td>re-pair and rotate from the Mac</td></tr>
   <tr><td>Malicious process calls an integration</td><td>every fulfillment needs a fresh out-of-band approval showing process and cwd</td><td>an approved request does deliver that secret; Sigil gates release, it does not sandbox the recipient</td></tr>
   <tr><td>Approval replay</td><td>single-use ids, per-pairing counters, 90s window, sealed per-response ephemeral keys</td><td>aggressive clock skew rejects valid responses; doctor flags it</td></tr>
   <tr><td>Relay compromised</td><td>sees only sealed envelopes plus a transient, per-deposit push token; cannot read, forge, or replay; dropping traffic fails closed</td><td>metadata: mailbox hash, timing, sizes; can flood a known mailbox (bounded, rate-limited DoS) or ring a stolen push token with content-free doorbell noise (nuisance only, never a secret or an approval); self-host to keep even that at home</td></tr>
@@ -628,7 +628,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
   <tr><td>Sealed protocol</td><td>the sealed and signed envelope with a single-use id and a freshness (replay) window; any field tamper breaks the signature. The counter still rides the signed wire but no longer gates acceptance: it reset to 0 on any restart or session recreation and dropped genuine approvals as false replays, so replay now rests on signature + freshness + single-use id</td></tr>
   <tr><td>Pairing</td><td>the full handshake: optical QR, secret-authenticated return channel, six-word SAS, unwrap-key delivery only after SAS confirmation and a fresh Secure Enclave Touch ID gate, with roughly thirty adversarial MITM proofs plus an independent review of the ordering</td></tr>
   <tr><td>Approval loop</td><td>the gated round-trip with fd passthrough: secret bytes reach the caller's fd, never the daemon; deny and timeout deliver no secret</td></tr>
-  <tr><td>Leases</td><td>daemon-verified caller fingerprints, triple-scoped RAM-only grants, coalescing, TTL purge, lockdown clears all</td></tr>
+  <tr><td>Leases</td><td>daemon-verified caller fingerprints, triple-scoped RAM-only grants, coalescing, TTL purge</td></tr>
   <tr><td>Factor policy</td><td>phone &gt; biometric &gt; fail-closed; the dev path is behind <code>--dev-insecure</code> with a loud warning; the same-UID self-approval finding is closed</td></tr>
   <tr><td>Provider seam</td><td>the <code>SecretProvider</code> trait with 1Password as provider #1; the protocol carries no op-specific field names</td></tr>
   <tr><td>Transport</td><td>the v4 relay transport: daemon and phone both deposit and drain opaque envelopes over plain HTTP, proven cross-process end-to-end over the real Bun relay, including recovery after a relay restart</td></tr>
@@ -670,7 +670,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
   <div class="sw"><div class="c" style="background:oklch(0.45 0.086 230)"></div><div class="i"><div class="n">Cobalt</div><div class="v">accent &middot; app tint<br>oklch(0.45 0.086 230)</div></div></div>
   <div class="sw"><div class="c" style="background:oklch(0.62 0.115 75)"></div><div class="i"><div class="n">Brass</div><div class="v">pending &middot; the gauge<br>oklch(0.62 0.115 75)</div></div></div>
   <div class="sw"><div class="c" style="background:oklch(0.5 0.095 165)"></div><div class="i"><div class="n">Sea green</div><div class="v">approved<br>oklch(0.5 0.095 165)</div></div></div>
-  <div class="sw"><div class="c" style="background:oklch(0.5 0.15 25)"></div><div class="i"><div class="n">Oxidized rust</div><div class="v">denied &middot; lockdown<br>oklch(0.5 0.15 25)</div></div></div>
+  <div class="sw"><div class="c" style="background:oklch(0.5 0.15 25)"></div><div class="i"><div class="n">Oxidized rust</div><div class="v">denied<br>oklch(0.5 0.15 25)</div></div></div>
   <div class="sw"><div class="c" style="background:oklch(0.175 0.014 245)"></div><div class="i"><div class="n">Ink</div><div class="v">terminal ground<br>oklch(0.175 0.014 245)</div></div></div>
 </div>
 
@@ -679,7 +679,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
     <h4>Type and shape</h4>
     <p style="max-width:46ch">SF Pro for UI voice via Dynamic Type; SF Mono for content voice: paths, fingerprints, process chains, timestamps, all tabular. No display face; the wordmark is lowercase mono. Native squircle control shapes everywhere; the single bespoke control is the full-radius approve capsule, because it is the most important interaction in the product.</p>
     <h4>Motion</h4>
-    <p style="max-width:46ch">Platform motion plus a small set of custom movements: the brass gauge depleting (a real clock), the approve capsule press-in with its commit haptic and symbol change, and one weightier lockdown seal from cobalt to rust. There is no drag track: approve is a tap, never a swipe. Reduced motion collapses the gauge to a numeric countdown. No confetti, ever.</p>
+    <p style="max-width:46ch">Platform motion plus a small set of custom movements: the brass gauge depleting (a real clock), and the approve capsule press-in with its commit haptic and symbol change. There is no drag track: approve is a tap, never a swipe. Reduced motion collapses the gauge to a numeric countdown. No confetti, ever.</p>
   </div>
   <div>
     <h4>Voice</h4>
@@ -687,7 +687,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
       <tr><td class="mono dim">push</td><td>"Approval requested" <span class="dim">(nothing more until unlocked)</span></td></tr>
       <tr><td class="mono dim">approve</td><td>"Approved. Secret delivered."</td></tr>
       <tr><td class="mono dim">timeout</td><td>"Request expired. No secret was delivered."</td></tr>
-      <tr><td class="mono dim">lockdown</td><td>"Locked down. No requests will be served."</td></tr>
+      <tr><td class="mono dim">ssh unbound</td><td>"Destination unverified" <span class="dim">(no host binding was sent)</span></td></tr>
       <tr><td class="mono dim">phone gone</td><td>"Phone unreachable. No secrets can be unsealed until it reconnects."</td></tr>
       <tr><td class="mono dim">pairing</td><td>"Confirm both devices show: tide &middot; brass &middot; anchor"</td></tr>
     </table></div>

@@ -15,7 +15,6 @@ const BANNER: Record<RequestKind, { icon: SymbolViewProps["name"]; caption: stri
   secret_read: { icon: "key.fill", caption: "READ SECRET" },
   ssh_signature: { icon: "signature", caption: "SSH SIGNATURE" },
   resume: { icon: "play.fill", caption: "RESUME" },
-  lockdown_clear: { icon: "lock.open.fill", caption: "CLEAR LOCKDOWN" },
 };
 
 export function TypeBanner({ kind }: { kind: RequestKind }) {

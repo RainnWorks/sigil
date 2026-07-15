@@ -109,7 +109,7 @@ export default function ConfirmScreen() {
               : "Do both screens match?"}
         </Sans>
         <Sans size={15} tone="muted" style={{ textAlign: "center", maxWidth: 320 }}>
-          Confirm both devices show these six words.
+          Your Mac should be showing the same six words.
         </Sans>
       </View>
 

@@ -18,6 +18,7 @@
 import { useEffect, useState } from "react";
 import { View } from "react-native";
 
+import { Sf } from "@/components/ui/sf";
 import { Sans } from "@/components/ui/text";
 import { Mono } from "@/components/ui/text";
 import { useTheme } from "@/theme/colors";
@@ -139,11 +140,21 @@ export function ApprovalSheet({
   return (
     <View style={{ flex: 1 }}>
       <View style={{ flex: 1, paddingHorizontal: space.xl, gap: space.lg }}>
-        {/* origin header + gauge */}
-        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
-          <Mono size={14} tone="muted">
-            {origin}
-          </Mono>
+        {/* the asking machine + gauge: the party first, the clock second */}
+        <View
+          style={{
+            flexDirection: "row",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: space.md,
+          }}
+        >
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 8, flexShrink: 1 }}>
+            <Sf name="laptopcomputer" color={p.muted} size={16} />
+            <Mono size={15} weight="medium" numberOfLines={1} style={{ flexShrink: 1 }}>
+              {origin}
+            </Mono>
+          </View>
           <TimeoutGauge
             expiresAt={request.expiresAt}
             timeoutMs={request.timeoutMs}

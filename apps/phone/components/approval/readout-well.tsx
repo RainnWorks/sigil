@@ -85,14 +85,7 @@ export function SshReadout({ ssh }: { ssh: SshChallenge }) {
         </Mono>
       </View>
       <Hairline />
-      <View style={{ flexDirection: "row", justifyContent: "space-between", gap: space.md }}>
-        <Mono size={13} tone="faint">
-          host
-        </Mono>
-        <Mono size={15} selectable style={{ color: p.label }}>
-          {ssh.host}
-        </Mono>
-      </View>
+      <SshDestination ssh={ssh} />
       <Hairline />
       <View style={{ gap: 4 }}>
         <Mono size={13} tone="faint">
@@ -103,5 +96,69 @@ export function SshReadout({ ssh }: { ssh: SshChallenge }) {
         </Mono>
       </View>
     </Well>
+  );
+}
+
+/**
+ * The signature's destination, rendered off the structured host binding (F8),
+ * never by parsing `host`. Only a `named` binding is a verified destination; a
+ * `fingerprint` binding is a host key that matched nothing in known_hosts; an
+ * `unbound` binding (the default, incl. an older daemon) means no destination
+ * was proven, so we say so plainly rather than dressing up a marker string as a
+ * host.
+ */
+function SshDestination({ ssh }: { ssh: SshChallenge }) {
+  const p = useTheme();
+  const binding = ssh.binding ?? "unbound";
+
+  if (binding === "named") {
+    return (
+      <View style={{ flexDirection: "row", justifyContent: "space-between", gap: space.md }}>
+        <Mono size={13} tone="faint">
+          host
+        </Mono>
+        <Mono size={15} selectable style={{ color: p.label }}>
+          {ssh.host}
+        </Mono>
+      </View>
+    );
+  }
+
+  if (binding === "fingerprint") {
+    return (
+      <View style={{ gap: 4 }}>
+        <View style={{ flexDirection: "row", justifyContent: "space-between", gap: space.md }}>
+          <Mono size={13} tone="faint">
+            host key
+          </Mono>
+          <Mono size={13} tone="brass">
+            unrecognized
+          </Mono>
+        </View>
+        <Mono size={13} selectable tone="muted" style={{ lineHeight: 20 }}>
+          {ssh.host}
+        </Mono>
+        <Mono size={12} tone="faint">
+          Not in known_hosts. Verify the fingerprint before you approve.
+        </Mono>
+      </View>
+    );
+  }
+
+  // unbound
+  return (
+    <View style={{ gap: 4 }}>
+      <View style={{ flexDirection: "row", justifyContent: "space-between", gap: space.md }}>
+        <Mono size={13} tone="faint">
+          destination
+        </Mono>
+        <Mono size={13} weight="medium" tone="deny">
+          unverified
+        </Mono>
+      </View>
+      <Mono size={12} tone="faint">
+        No host binding was sent, so where this signature goes cannot be shown.
+      </Mono>
+    </View>
   );
 }

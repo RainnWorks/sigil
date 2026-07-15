@@ -1,8 +1,7 @@
 /**
  * A tiny observable app store exposed through useSyncExternalStore. Single
  * source of truth for every screen; the mock transport and the demo seed both
- * write here, and the UI only ever reads. Fails closed: lockdown denies all
- * pending and refuses new requests until cleared.
+ * write here, and the UI only ever reads.
  */
 import { useSyncExternalStore } from "react";
 
@@ -51,7 +50,6 @@ class Store {
 
   /** A new request arrived. Identical grant keys coalesce behind the pending one. */
   receive(request: ApprovalRequest): void {
-    if (this.state.arm === "lockedDown") return; // fail closed
     const key = grantKey(request);
     const existing = this.state.pending.find(
       (p) => p.state !== "approved" && p.state !== "denied" && grantKey(p.request) === key,
@@ -129,21 +127,6 @@ class Store {
     this.remove(requestId);
   }
 
-  lockdown(): void {
-    // Deny everything pending, refuse everything new. Denied requests are recorded
-    // and cleared from the queue, so lockdown leaves nothing dangling.
-    for (const p of this.state.pending) {
-      if (p.state !== "approved" && p.state !== "denied" && p.state !== "expired") {
-        this.record(p, "denied", "locked down");
-      }
-    }
-    this.patch({ arm: "lockedDown", pending: [] });
-  }
-
-  clearLockdown(): void {
-    this.patch({ arm: "armed" });
-  }
-
   revokeLease(id: string): void {
     this.patch({ leases: this.state.leases.filter((l) => l.id !== id) });
   }
@@ -159,14 +142,16 @@ class Store {
   /**
    * Reflect a real stored pairing into the store, called once the live session is
    * armed (at boot from the keystore, or right after the pairing ceremony). Marks
-   * the phone paired and arms it, unless it is currently locked down.
+   * the phone paired and arms it. Carries no machine name on purpose: the
+   * pairing pins keys, and the paired Mac names itself through signed provenance
+   * (see {@link pairedMacName}), never through a transport address.
    */
-  reflectPairing(info: { ownFingerprint: string | null; machine: string; seenAt: number }): void {
+  reflectPairing(info: { ownFingerprint: string | null; seenAt: number }): void {
     this.patch({
       paired: true,
-      arm: this.state.arm === "lockedDown" ? "lockedDown" : "armed",
+      arm: "armed",
       ownFingerprint: info.ownFingerprint,
-      connection: { rung: "relay", machine: info.machine, lastSeenAt: info.seenAt },
+      connection: { rung: "relay", lastSeenAt: info.seenAt },
     });
   }
 
@@ -239,6 +224,25 @@ function grantKey(r: ApprovalRequest): string {
 }
 
 export const store = new Store();
+
+/**
+ * The paired Mac's display name, as far as this phone can truthfully know it.
+ * The steady-state connection carries no machine name (pairing pins keys, not
+ * hostnames), so the name comes from what the Mac has actually said about
+ * itself: the daemon-signed provenance on a live request, else the most recent
+ * history entry. Null until a first request names it; screens fall back to
+ * "your Mac". Never derived from a transport address: the relay is plumbing,
+ * not a party, and its hostname must never stand in for the Mac.
+ */
+export function pairedMacName(s: AppState): string | null {
+  for (const p of s.pending) {
+    if (p.request.provenance.machine) return p.request.provenance.machine;
+  }
+  for (const h of s.history) {
+    if (h.origin) return h.origin;
+  }
+  return null;
+}
 
 export function useAppState(): AppState {
   return useSyncExternalStore(store.subscribe, store.getState, store.getState);

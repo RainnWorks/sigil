@@ -13,9 +13,12 @@ import { beginCeremony, currentCeremony } from "@/src/session/pairing-flow";
 type Step = "generating" | "ready" | "sealing" | "sealed" | "error";
 
 /**
- * The key-generation ceremony: mint Ed25519 + X25519 on-device, then create the
- * SE-gated wrapping key behind a Face ID confirmation, with a plain-language
- * explanation and this phone's own public-key fingerprint.
+ * The key-generation ceremony: mint Ed25519 + X25519 on-device, then take a
+ * Face ID confirmation authorizing the pairing itself, with a plain-language
+ * explanation and this phone's own public-key fingerprint. The phone holds no
+ * unwrap key: it keeps only its own identity and, on capable hardware, a
+ * Secure Enclave share minted later in the ceremony; approving supplies a
+ * per-request partial, never a stored key.
  */
 export default function KeysScreen() {
   const p = useTheme();
@@ -44,9 +47,9 @@ export default function KeysScreen() {
     };
   }, []);
 
-  async function sealWrappingKey(): Promise<void> {
+  async function confirmPairing(): Promise<void> {
     setStep("sealing");
-    const gate = await faceGate("Create the key that holds your unwrap key");
+    const gate = await faceGate("Authorize pairing this phone");
     if (!gate.ok) {
       setStep("ready");
       return;
@@ -62,9 +65,9 @@ export default function KeysScreen() {
           This phone is the key
         </Sans>
         <Sans size={16} tone="muted" style={{ lineHeight: 24 }}>
-          Sigil just generated a signing key and an agreement key inside this phone&apos;s secure
-          hardware. The private halves never leave it. Your Mac holds only ciphertext; approving is
-          the missing half of the cryptography, not a permission flag.
+          Sigil just generated this phone&apos;s own keys inside its secure hardware. The private
+          halves never leave it. Your Mac keeps only ciphertext; your approval supplies the missing
+          half of the cryptography, not a permission flag.
         </Sans>
       </View>
 
@@ -91,7 +94,7 @@ export default function KeysScreen() {
         <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
           <Sf name="checkmark.seal.fill" color={p.ok} size={20} />
           <Sans size={15} style={{ color: p.ok }}>
-            Wrapping key created and sealed to the Secure Enclave.
+            Confirmed. This phone is ready to pair.
           </Sans>
         </View>
       ) : null}
@@ -99,7 +102,7 @@ export default function KeysScreen() {
       <View style={{ gap: space.sm }}>
         <Pressable
           disabled={step === "generating" || step === "error"}
-          onPress={step === "sealed" ? () => router.push("/pairing/scan") : sealWrappingKey}
+          onPress={step === "sealed" ? () => router.push("/pairing/scan") : confirmPairing}
           style={{
             height: 52,
             borderRadius: radius.capsule,
@@ -110,7 +113,7 @@ export default function KeysScreen() {
           }}
         >
           <Sans size={17} weight="semibold" style={{ color: p.cobaltInk }}>
-            {step === "sealing" ? "Confirming…" : step === "sealed" ? "Scan the Mac" : "Create wrapping key (Face ID)"}
+            {step === "sealing" ? "Confirming…" : step === "sealed" ? "Scan the Mac" : "Confirm with Face ID"}
           </Sans>
         </Pressable>
       </View>

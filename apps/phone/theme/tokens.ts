@@ -5,8 +5,8 @@
  * must never cross into animated styles.
  *
  * Identity budget is deliberately small: one cobalt accent, three semantic
- * state colors (brass = pending, sea green = approved, rust = denied /
- * lockdown), plus neutrals. Dark-first; approvals happen on the couch.
+ * state colors (brass = pending, sea green = approved, rust = denied), plus
+ * neutrals. Dark-first; approvals happen on the couch.
  *
  * When the brief's oklch values change, regenerate with scratchpad/oklch.mjs.
  */
@@ -36,7 +36,7 @@ export interface Palette {
   brass: string;
   /** Approved. */
   ok: string;
-  /** Denied, lockdown. Never an alarm color; the calm safe default. */
+  /** Denied. Never an alarm color; the calm safe default. */
   deny: string;
 }
 

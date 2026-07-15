@@ -29,7 +29,7 @@ secrets. It is NOT a credential broker for other tools.
 
 ## What stays
 
-- **Gating** (rules, leases, lockdown, audit).
+- **Gating** (rules, leases, audit).
 - **Own-secret injection** — reframed onto threshold instead of the DEK.
 - **Keystore BLOB storage** (daemon identity key, the Mac share `m`) — legacy
   login-keychain generic passwords, no entitlement, works from the unsigned

@@ -65,13 +65,18 @@ export interface Settings {
 
 export type ConnectionRung = "lan" | "endpoint" | "relay" | "none";
 
+/**
+ * The transport link, a quiet status dot only. Deliberately carries no machine
+ * name: the pairing pins keys, not hostnames, and a transport address (the
+ * relay's, say) must never stand in for the paired Mac. The Mac's display name
+ * comes from daemon-signed provenance (see `pairedMacName`).
+ */
 export interface Connection {
   rung: ConnectionRung;
-  machine: string;
   lastSeenAt: number;
 }
 
-export type ArmState = "armed" | "lockedDown" | "idle";
+export type ArmState = "armed" | "idle";
 
 export interface AppState {
   paired: boolean;

@@ -28,7 +28,7 @@ export default function DoneScreen() {
       </Sans>
       <Sans size={16} tone="muted" style={{ textAlign: "center", maxWidth: 320 }}>
         {paired
-          ? "This phone is now the approver. Requests will arrive here, sealed and signed."
+          ? "This phone now decides for your Mac. When it asks, the request arrives here, sealed and signed; nothing proceeds without you."
           : "The words did not match, so nothing was pinned. That mismatch is exactly what pairing is designed to catch. Start again from the Mac."}
       </Sans>
 

@@ -81,10 +81,11 @@ export async function armLiveSession(): Promise<boolean> {
   live = { session, transport };
   // Reflect the real pairing into the store so the UI shows paired (not demo) and
   // stops routing into the pairing flow. This is the single point both boot-time
-  // hydration and a just-completed ceremony pass through.
+  // hydration and a just-completed ceremony pass through. Deliberately no machine
+  // name here: the pairing pins keys, not hostnames, and the relay's address must
+  // never stand in for the Mac (see `pairedMacName` for where the name comes from).
   store.reflectPairing({
     ownFingerprint: ownFingerprint(sodium, pairing),
-    machine: relayHost(pairing.relayBase),
     seenAt: pairing.pairedAt,
   });
   return true;
@@ -96,12 +97,7 @@ function ownFingerprint(sodium: Sodium, pairing: StoredPairing): string {
   return fingerprintWords(sodium, pub, pub).join(" ");
 }
 
-/** Host label for the connection line, derived from the relay base URL. */
-function relayHost(relayBase: string): string {
-  return relayBase.replace(/^https?:\/\//, "").replace(/\/.*$/, "") || "relay";
-}
-
-/** Tear the live session down (lockdown or app teardown). Keeps the stored pairing. */
+/** Tear the live session down (app teardown). Keeps the stored pairing. */
 export function disarmLiveSession(): void {
   live?.session.stop();
   live = null;

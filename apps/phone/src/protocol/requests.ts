@@ -24,7 +24,7 @@
  * layout, never how the daemon fulfills the request (that is the provider seam's
  * job). Serializes snake_case to match the Rust enum.
  */
-export type RequestKind = "secret_read" | "ssh_signature" | "resume" | "lockdown_clear";
+export type RequestKind = "secret_read" | "ssh_signature" | "resume";
 
 /**
  * A provider-agnostic reference to one requested secret. `reference` is OPAQUE:
@@ -63,10 +63,30 @@ export interface LeasePolicy {
   maxSecs: number;
 }
 
-/** An SSH signature: the two things worth verifying. */
+/**
+ * The trust level of an SSH challenge's `host`, mirroring proto `HostBinding`
+ * (serde snake_case). Additive and defaulted to `unbound` so an older daemon
+ * that omits it is treated as unverified (fail-safe). Render the destination's
+ * trust off THIS, never by parsing the `host` string.
+ *   named       - a session-bind host key matched ~/.ssh/known_hosts; `host` is that name.
+ *   fingerprint - a host key was captured but matched nothing; `host` is its SHA256:… fingerprint.
+ *   unbound     - no session-bind was sent; the destination is unverified and `host` is a marker only.
+ */
+export type HostBinding = "named" | "fingerprint" | "unbound";
+
+/** An SSH signature: the things worth verifying before signing. */
 export interface SshChallenge {
   keyLabel: string;
+  /**
+   * Best-effort destination string. Its trust level is {@link binding}; render
+   * "destination unverified" off that, never by parsing this string.
+   */
   host: string;
+  /**
+   * Structured host-binding state. Optional/defaulted to `"unbound"` so a request
+   * that predates the field is treated as unverified.
+   */
+  binding?: HostBinding;
   /** Challenge fingerprint, e.g. "SHA256:….". */
   fingerprint: string;
 }
@@ -137,7 +157,7 @@ export interface ApprovalRequest {
   command: string[];
   /**
    * Provider-agnostic references to the secrets this command will resolve.
-   * Empty for kinds that read no secret (resume, lockdown_clear).
+   * Empty for kinds that read no secret (resume).
    */
   secrets: SecretRef[];
   /** Present for "ssh_signature". */

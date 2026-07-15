@@ -33,7 +33,6 @@ app/                       expo-router routes
   _layout.tsx              root Stack + providers + modal surfaces
   (tabs)/                  Home · History · Accounts · Settings (native tabs)
   approval.tsx             the hero: approval sheet (form sheet w/ detents)
-  lockdown.tsx             hold-to-seal
   pairing/                 priming → keys → scan → confirm → done
 components/
   approval/                gauge, type banner, readout well, provenance,

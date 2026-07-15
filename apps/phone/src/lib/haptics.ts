@@ -1,6 +1,6 @@
 /**
- * Haptics for the three moments that matter: a decision committing, a slide/hold
- * reaching its threshold, and lockdown sealing. iOS only; a no-op elsewhere.
+ * Haptics for the moments that matter: a decision committing and a slide/hold
+ * reaching its threshold. iOS only; a no-op elsewhere.
  */
 import * as Haptics from "expo-haptics";
 
@@ -26,10 +26,4 @@ export async function hapticThreshold(): Promise<void> {
 export async function hapticTick(): Promise<void> {
   if (!onIos) return;
   await Haptics.selectionAsync();
-}
-
-/** The weightier lockdown seal. */
-export async function hapticSeal(): Promise<void> {
-  if (!onIos) return;
-  await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
 }

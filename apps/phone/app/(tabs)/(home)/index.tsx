@@ -1,14 +1,14 @@
-import { Link, useRouter } from "expo-router";
+import { useRouter } from "expo-router";
 import { Pressable, ScrollView, View } from "react-native";
 
 import { Sf } from "@/components/ui/sf";
 import { Mono, Sans } from "@/components/ui/text";
 import { Card, Hairline, SectionHeader, StatePill } from "@/components/ui/primitives";
 import { stateLabel, useTheme } from "@/theme/colors";
-import { radius, space } from "@/theme/tokens";
+import { space } from "@/theme/tokens";
 import { relativeTime, secretRefLabel } from "@/src/lib/format";
 import { type PendingRequest } from "@/src/domain/types";
-import { useAppState } from "@/src/state/store";
+import { pairedMacName, useAppState } from "@/src/state/store";
 
 export default function HomeScreen() {
   const p = useTheme();
@@ -17,33 +17,35 @@ export default function HomeScreen() {
 
   const live = s.pending.filter((r) => r.state === "fresh" || r.state === "expiring");
   const last = s.history[0];
-  const armLabelState =
-    s.arm === "lockedDown" ? "lockedDown" : s.arm === "armed" ? "armed" : "expired";
+  const mac = pairedMacName(s) ?? "your Mac";
+  const linked = s.paired && s.connection.rung !== "none";
 
   return (
     <ScrollView
       contentInsetAdjustmentBehavior="automatic"
       contentContainerStyle={{ padding: space.lg, gap: space.xl, paddingBottom: 48 }}
     >
-      {/* status line */}
-      <View style={{ gap: space.md }}>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: space.md }}>
-          <StatePill state={armLabelState} label={stateLabel(armLabelState)} />
-          {s.connection.rung !== "none" ? (
-            <Mono size={13} tone="muted">
-              {s.connection.machine} connected
+      {/* status: this phone's own state. The transport is a quiet dot at the
+          margin, never a named party and never the headline. */}
+      <View
+        style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}
+      >
+        <StatePill state={s.arm} label={stateLabel(s.arm)} />
+        {s.paired ? (
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+            <View
+              style={{
+                width: 7,
+                height: 7,
+                borderRadius: 99,
+                backgroundColor: linked ? p.ok : p.faint,
+              }}
+            />
+            <Mono size={12} tone="faint">
+              {linked ? "link" : "no link"}
             </Mono>
-          ) : (
-            <Mono size={13} tone="deny">
-              phone unreachable
-            </Mono>
-          )}
-        </View>
-        <Mono size={13} tone="faint">
-          {s.connection.rung === "none"
-            ? "no link"
-            : `${s.connection.rung} · seen ${relativeTime(s.connection.lastSeenAt)}`}
-        </Mono>
+          </View>
+        ) : null}
       </View>
 
       {/* pending */}
@@ -61,7 +63,9 @@ export default function HomeScreen() {
         </View>
       ) : (
         <Card style={{ padding: space.lg }}>
-          <Sans tone="muted">Nothing pending. You will be asked when a secret is requested.</Sans>
+          <Sans tone="muted">
+            Nothing pending. When {mac} asks for an approval, you decide here.
+          </Sans>
         </Card>
       )}
 
@@ -90,29 +94,6 @@ export default function HomeScreen() {
           </Card>
         </View>
       ) : null}
-
-      {/* lockdown */}
-      <Link href="/lockdown" asChild>
-        <Pressable
-          style={{
-            flexDirection: "row",
-            alignItems: "center",
-            justifyContent: "center",
-            gap: 8,
-            height: 52,
-            borderRadius: radius.control,
-            borderCurve: "continuous",
-            borderWidth: 1,
-            borderColor: s.arm === "lockedDown" ? p.deny : p.line,
-            backgroundColor: s.arm === "lockedDown" ? p.deny + "1a" : "transparent",
-          }}
-        >
-          <Sf name={s.arm === "lockedDown" ? "lock.fill" : "lock"} color={p.deny} size={18} />
-          <Sans size={16} weight="medium" style={{ color: p.deny }}>
-            {s.arm === "lockedDown" ? "Locked down · tap to release" : "Lock down"}
-          </Sans>
-        </Pressable>
-      </Link>
     </ScrollView>
   );
 }

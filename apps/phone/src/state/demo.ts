@@ -200,7 +200,7 @@ export function emptyInitialState(): AppState {
   return {
     paired: false,
     arm: "idle",
-    connection: { rung: "none", machine: "", lastSeenAt: 0 },
+    connection: { rung: "none", lastSeenAt: 0 },
     pending: [],
     history: [],
     leases: [],
@@ -214,7 +214,7 @@ export function demoInitialState(): AppState {
   return {
     paired: true,
     arm: "armed",
-    connection: { rung: "lan", machine: "studio.local", lastSeenAt: now - 12_000 },
+    connection: { rung: "lan", lastSeenAt: now - 12_000 },
     pending: [],
     history: demoHistory,
     leases: demoLeases,
