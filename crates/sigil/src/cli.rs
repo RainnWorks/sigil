@@ -3577,7 +3577,7 @@ fn cmd_wipe(args: &[String], json: bool) -> i32 {
             ("config", home.join("config.json")),
             ("legacy command config", home.join("commands.json")),
             ("settings", home.join("settings.json")),
-            ("dev keystore", home.join("dev-keystore.json")),
+            ("keystore file", home.join("dev-keystore.json")),
             ("history", home.join("history.jsonl")),
         ] {
             match std::fs::remove_file(&path) {

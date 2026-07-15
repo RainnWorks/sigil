@@ -268,14 +268,16 @@ pub fn ensure_up() -> Vec<Step> {
         steps.push(Step::action("pairing", "no phone paired; run: sigil pair"));
     }
 
-    // Posture note (sec-review F1): the dev-keystore pin is carried forward
-    // silently by design, and the daemon's own banner prints once per
-    // process, so this report is where the plaintext-share posture must stay
-    // visible. Ok-state (it is deliberate), but always shown.
+    // Posture note: the keystore pin is carried forward silently by design, so
+    // this report is where the active store stays visible. Stated plainly, not
+    // as a problem: under the threshold posture the file store holds no
+    // data-decryption secret (`m` is inert without the phone's per-request
+    // partial), so it is the correct at-rest store for a portable, unsigned
+    // daemon, not a downgrade to flag.
     if let Some(pin) = service::installed_dev_keystore_pin() {
         steps.push(Step::ok(
             "keystore",
-            format!("SIGIL_DEV_KEYSTORE={pin} is pinned in the plist: the Mac share and daemon identity are NOT hardware-protected"),
+            format!("SIGIL_DEV_KEYSTORE={pin}: portable on-disk store (holds the daemon identity and the inert Mac share, no data-decryption secret)"),
         ));
     }
 

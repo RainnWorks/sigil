@@ -60,7 +60,7 @@ pub trait Keystore: Send + Sync {
     /// real hardware check, or the pairing gate refuses. Non-biometric dev
     /// keystores keep this default and are simply never asked: the pairing gate
     /// calls this only when `is_biometric()` is true, so `SIGIL_DEV_KEYSTORE`
-    /// (which makes `is_biometric()` false, behind its own loud warning) is the
+    /// (which makes `is_biometric()` false, behind its own one-time notice) is the
     /// single switch that lets headless dev and tests through without a biometric.
     fn verify_presence(&self, reason: &str) -> Result<(), KeystoreError> {
         let _ = reason;
@@ -120,10 +120,14 @@ impl Keystore for MemoryKeystore {
     }
 }
 
-/// A dev keystore that persists blobs to a 0600 JSON file. It is **not secure**
-/// (the Mac threshold share `m` sits on disk in the clear) and exists only to make
-/// the full gated loop runnable headlessly, standing in for the Secure Enclave.
-/// It is selected only by `SIGIL_DEV_KEYSTORE=file`, never by default.
+/// A keystore that persists blobs to a 0600 JSON file. Under the threshold
+/// posture this is the correct at-rest store for a portable, unsigned daemon:
+/// the only blobs it holds are the daemon identity key and the Mac threshold
+/// share `m`, and neither is a data-decryption secret. `m` is inert on its own
+/// (opening any sealed secret also needs the phone's per-request partial), so a
+/// reader of this file still cannot decrypt anything without a live phone
+/// approval. It is selected by `SIGIL_DEV_KEYSTORE=file`; on macOS the default
+/// remains the login-keychain-backed [`crate::keystore_macos::MacKeystore`].
 pub struct DevFileKeystore {
     path: std::path::PathBuf,
     inner: std::sync::Mutex<()>,
@@ -209,66 +213,69 @@ impl Keystore for DevFileKeystore {
     }
 }
 
-/// The loud, multi-line warning that must appear whenever `SIGIL_DEV_KEYSTORE`
-/// is honored. Mirrors [`crate::factor::DEV_INSECURE_WARNING`] in shape: it
-/// names the concrete risk (the Mac threshold share `m`, and the daemon identity
-/// keys, in plaintext on disk or in RAM with no biometric gate) so a dev config
-/// can never be mistaken for a safe one. `mode` is `"file"` or `"memory"`; `path`
-/// is the on-disk location for `file`, `None` for `memory`.
-fn dev_keystore_warning(mode: &str, path: Option<&std::path::Path>) -> String {
-    let where_line = match path {
-        Some(p) => format!(
-            "!!  Threshold share on disk in the clear at: {}\n",
-            p.display()
+/// An honest, calm notice that the non-default `SIGIL_DEV_KEYSTORE` store is
+/// active. It is deliberately NOT an alarm: under the threshold posture the
+/// file store holds no data-decryption secret. It names the actual residual so
+/// the posture is never mistaken for either a scary hack or a hardware-sealed
+/// vault. `mode` is `"file"` or `"memory"`; `path` is the on-disk location for
+/// `file`, `None` for `memory`.
+fn dev_keystore_notice(mode: &str, path: Option<&std::path::Path>) -> String {
+    let (where_line, residual) = match path {
+        Some(p) => (
+            format!(
+                "Storing daemon blobs as a 0600 JSON file at: {}\n",
+                p.display()
+            ),
+            "On disk are the daemon identity key and the Mac threshold share `m`.\n\
+             Neither can open a sealed secret alone: every secret also needs the\n\
+             phone's per-request partial, so `m` is inert without a live approval.\n\
+             The identity key could let someone impersonate this daemon to the\n\
+             phone, but every request is still human-gated on the phone. There is\n\
+             no data-decryption key here.\n"
+                .to_string(),
         ),
-        None => "!!  Blobs held in plaintext RAM for this process only.\n".to_string(),
+        None => (
+            "Blobs held in plaintext RAM for this process only.\n".to_string(),
+            "Nothing survives a restart, so the pairing is re-created each run.\n\
+             Intended for tests and headless dev, not a persistent install.\n"
+                .to_string(),
+        ),
     };
     format!(
         "\n\
-         !! ============================================================ !!\n\
-         !!  SIGIL_DEV_KEYSTORE={mode} IS ACTIVE                          !!\n\
-         !! ------------------------------------------------------------ !!\n\
-         !!  The Secure Enclave / Keychain-backed keystore is bypassed.   !!\n\
+         sigil keystore: SIGIL_DEV_KEYSTORE={mode} is active.\n\
          {where_line}\
-         !!                                                              !!\n\
-         !!  RISK: anyone with access to this machine (or the file,      !!\n\
-         !!  for `file`) can read the Mac threshold share and the daemon  !!\n\
-         !!  identity keys with no biometric gate.                        !!\n\
-         !!                                                              !!\n\
-         !!  Use this ONLY for local development. Unset                  !!\n\
-         !!  SIGIL_DEV_KEYSTORE for a real hardware-backed keystore.      !!\n\
-         !! ============================================================ !!\n"
+         {residual}"
     )
 }
 
-/// Print the dev-keystore warning once per process, not once per
-/// construction: the daemon resolves a keystore on hot paths (each relay poll
-/// cycle re-resolves it), and the repeated banner amounted to tens of
-/// megabytes of log per day while burying the lines that mattered. Once per
-/// process is just as loud and stays honest. Silent under `cfg(test)`, like
-/// the inline prints it replaces.
+/// Print the keystore notice once per process, not once per construction: the
+/// daemon resolves a keystore on hot paths (each relay poll cycle re-resolves
+/// it), and a repeated banner amounted to tens of megabytes of log per day
+/// while burying the lines that mattered. Once per process is enough. Silent
+/// under `cfg(test)`, like the inline prints it replaces.
 #[cfg(not(test))]
-fn warn_dev_keystore_once(mode: &str, path: Option<&std::path::Path>) {
+fn note_dev_keystore_once(mode: &str, path: Option<&std::path::Path>) {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| eprintln!("{}", dev_keystore_warning(mode, path)));
+    ONCE.call_once(|| eprintln!("{}", dev_keystore_notice(mode, path)));
 }
 
 #[cfg(test)]
-fn warn_dev_keystore_once(_mode: &str, _path: Option<&std::path::Path>) {}
+fn note_dev_keystore_once(_mode: &str, _path: Option<&std::path::Path>) {}
 
 /// Select the keystore for the daemon and CLI. Both must agree so the Mac
 /// threshold share `m` a `sigil` command seals with is the same one the daemon
 /// combines against.
 ///
 /// * `SIGIL_DEV_KEYSTORE=file` -> [`DevFileKeystore`] at `~/.sigil/dev-keystore.json`
-///   (or `$SIGIL_HOME/dev-keystore.json`). Headless demo of the full loop.
+///   (or `$SIGIL_HOME/dev-keystore.json`). The portable on-disk store; holds no
+///   data-decryption secret under the threshold posture.
 /// * `SIGIL_DEV_KEYSTORE=memory` -> [`MemoryKeystore`] (ephemeral; single process).
-/// * macOS default -> the Secure Enclave keystore (`MacKeystore`).
+/// * macOS default -> the login-keychain-backed keystore (`MacKeystore`).
 /// * other platforms default -> [`MemoryKeystore`] until their fill lands.
 ///
-/// Honoring either dev override prints a loud stderr warning outside tests, the
-/// same discipline `--dev-insecure` gets from
-/// [`crate::factor::warn_dev_insecure`].
+/// Selecting either override prints a one-time stderr notice outside tests so
+/// the active posture is visible; it is informational, not an alarm.
 pub fn for_host() -> std::sync::Arc<dyn Keystore> {
     use std::sync::Arc;
     match std::env::var("SIGIL_DEV_KEYSTORE").ok().as_deref() {
@@ -280,11 +287,11 @@ pub fn for_host() -> std::sync::Arc<dyn Keystore> {
                 })
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
             let path = base.join("dev-keystore.json");
-            warn_dev_keystore_once("file", Some(&path));
+            note_dev_keystore_once("file", Some(&path));
             Arc::new(DevFileKeystore::new(path))
         }
         Some("memory") => {
-            warn_dev_keystore_once("memory", None);
+            note_dev_keystore_once("memory", None);
             Arc::new(MemoryKeystore::new())
         }
         _ => {
@@ -349,14 +356,20 @@ mod tests {
     }
 
     #[test]
-    fn dev_keystore_warning_names_the_concrete_risk() {
-        let file = dev_keystore_warning("file", Some(std::path::Path::new("/tmp/x.json")));
+    fn dev_keystore_notice_names_the_honest_residual() {
+        let file = dev_keystore_notice("file", Some(std::path::Path::new("/tmp/x.json")));
         assert!(file.contains("SIGIL_DEV_KEYSTORE=file"));
         assert!(file.contains("/tmp/x.json"));
-        assert!(file.contains("no biometric gate"));
-        assert!(file.lines().count() > 5);
+        // Honest about the actual residual: identity-key impersonation, still
+        // phone-gated, and no data-decryption secret. Not an alarm.
+        assert!(file.contains("identity key"));
+        assert!(file.contains("inert"));
+        assert!(file.contains("human-gated on the phone"));
+        assert!(file.contains("no data-decryption key"));
+        // And it does not resurrect the old scare framing.
+        assert!(!file.contains("RISK"));
 
-        let memory = dev_keystore_warning("memory", None);
+        let memory = dev_keystore_notice("memory", None);
         assert!(memory.contains("SIGIL_DEV_KEYSTORE=memory"));
         assert!(memory.contains("plaintext RAM"));
     }
