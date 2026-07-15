@@ -602,6 +602,16 @@ impl SshBackend for Core {
 
         // The approval screen shows a hash of the data to sign, never raw bytes.
         let data_fingerprint = sshagent::sha256_fingerprint(req.data);
+        // The same one-line request log the op path gets (`log_request`), so a
+        // sign request is always visible in the daemon log the moment it
+        // arrives, before the phone answers. Metadata only: key label, derived
+        // host, and the data hash the approver will see; never key material.
+        log_ssh_sign_request(
+            &req.id.label,
+            &req.host.host,
+            &data_fingerprint,
+            req.caller_pid,
+        );
         // The data fingerprint is folded into the scope so the gate's grant-key
         // coalescing can never let two DIFFERENT challenges share one approval: a
         // signature is a distinct auth event over distinct data, and the human
@@ -786,9 +796,46 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     let core = Arc::new(core);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
+        .enable_time()
         .build()
         .context("building tokio runtime")?;
-    rt.block_on(serve(core, remote_listeners, direct_acceptors))
+    let result = rt.block_on(serve(core, remote_listeners, direct_acceptors));
+    // Bound the teardown instead of joining it. `Runtime::drop` waits for
+    // in-flight blocking tasks, and a long-lived connection handler (the Mac
+    // app's `subscribe_pending` stream never returns while its client stays
+    // connected) can pin that join forever. That exact wedge shipped: serve()
+    // bailed, both listeners dropped, and the process sat alive-but-deaf for a
+    // day while launchd's KeepAlive saw a healthy pid and never respawned it.
+    // A bounded shutdown abandons stragglers so an erroring daemon EXITS and
+    // launchd brings up a clean one within seconds.
+    rt.shutdown_timeout(Duration::from_secs(2));
+    result
+}
+
+/// How long the accept loop pauses after a listener-level `accept` error
+/// before retrying, so a persistent condition (fd exhaustion) cannot spin the
+/// loop hot. Errors on an individual accepted connection do not wait.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Ready one accepted connection for its blocking handler: back to a std,
+/// blocking stream with the read timeout armed.
+///
+/// An error here is a property of the ONE connection, never of the listener:
+/// macOS returns EINVAL from `setsockopt(SO_RCVTIMEO)` when the peer has
+/// already disconnected, and a connect-then-close liveness probe (the Mac
+/// app's `daemonRunning()`) races the daemon into exactly that. The caller
+/// logs and drops the connection and MUST keep accepting; propagating this
+/// out of the serve loop shipped as a daemon-killing bug (five probe races =
+/// five full daemon deaths in one day's log).
+fn ready_conn(stream: tokio::net::UnixStream) -> anyhow::Result<UnixStream> {
+    let std_stream = stream.into_std().context("into_std")?;
+    std_stream
+        .set_nonblocking(false)
+        .context("set_nonblocking")?;
+    std_stream
+        .set_read_timeout(Some(CONN_READ_TIMEOUT))
+        .context("set_read_timeout")?;
+    Ok(std_stream)
 }
 
 async fn serve(
@@ -912,18 +959,31 @@ async fn serve(
                 break;
             }
             accepted = listener.accept() => {
-                let (stream, _) = accepted.context("accept")?;
+                // A listener-level accept error (fd exhaustion, a torn-down
+                // socket) must not end the daemon: log, breathe, keep serving.
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        eprintln!("sigil daemon: control accept error: {e}");
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                        continue;
+                    }
+                };
                 let Some(permit) = conns.try_enter() else {
                     eprintln!(
                         "sigil daemon: refusing a control connection: at the concurrency cap ({MAX_CONCURRENT_CONNS})"
                     );
                     continue; // dropping `stream` closes it
                 };
-                let std_stream = stream.into_std().context("into_std")?;
-                std_stream.set_nonblocking(false).context("set_nonblocking")?;
-                std_stream
-                    .set_read_timeout(Some(CONN_READ_TIMEOUT))
-                    .context("set_read_timeout")?;
+                // A failed ready-up is the one connection's problem (usually a
+                // peer that already hung up); drop it and keep accepting.
+                let std_stream = match ready_conn(stream) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("sigil daemon: dropping a control connection: {e:#}");
+                        continue;
+                    }
+                };
                 let core = core.clone();
                 // Per-connection work is blocking syscalls (recvmsg, spawn,
                 // waitpid) plus a possibly long approval wait; keep it off the
@@ -936,18 +996,27 @@ async fn serve(
                 });
             }
             accepted = ssh_listener.accept() => {
-                let (stream, _) = accepted.context("ssh accept")?;
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        eprintln!("sigil daemon: ssh accept error: {e}");
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                        continue;
+                    }
+                };
                 let Some(permit) = conns.try_enter() else {
                     eprintln!(
                         "sigil daemon: refusing an ssh-agent connection: at the concurrency cap ({MAX_CONCURRENT_CONNS})"
                     );
                     continue;
                 };
-                let std_stream = stream.into_std().context("ssh into_std")?;
-                std_stream.set_nonblocking(false).context("ssh set_nonblocking")?;
-                std_stream
-                    .set_read_timeout(Some(CONN_READ_TIMEOUT))
-                    .context("ssh set_read_timeout")?;
+                let std_stream = match ready_conn(stream) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("sigil daemon: dropping an ssh-agent connection: {e:#}");
+                        continue;
+                    }
+                };
                 let core = core.clone();
                 // An SSH connection is also blocking (per-signature fetch, spawn,
                 // approval wait); serve it on the blocking pool with the Core as
@@ -1748,6 +1817,22 @@ fn fail_closed(stderr: Option<OwnedFd>, msg: &str) -> i32 {
         let _ = f.write_all(msg.as_bytes());
     }
     1
+}
+
+/// Log one SSH sign request's metadata: key label, derived host, and the
+/// data-to-sign hash (never raw bytes or key material). The sign path's
+/// counterpart to [`log_request`]; without it a sign request that dies on the
+/// phone leg leaves no daemon-side trace at all, which made "did the request
+/// ever fire?" undiagnosable from the log.
+fn log_ssh_sign_request(label: &str, host: &str, data_fingerprint: &str, peer: Option<i32>) {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    eprintln!(
+        "sigil daemon: [{ts}] ssh-sign {label} \u{b7} host {host} \u{b7} data {data_fingerprint} \u{b7} pid {}",
+        peer.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+    );
 }
 
 /// Log request metadata: argv (item names, not secret values), cwd, peer pid.

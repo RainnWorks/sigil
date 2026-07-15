@@ -241,6 +241,21 @@ fn dev_keystore_warning(mode: &str, path: Option<&std::path::Path>) -> String {
     )
 }
 
+/// Print the dev-keystore warning once per process, not once per
+/// construction: the daemon resolves a keystore on hot paths (each relay poll
+/// cycle re-resolves it), and the repeated banner amounted to tens of
+/// megabytes of log per day while burying the lines that mattered. Once per
+/// process is just as loud and stays honest. Silent under `cfg(test)`, like
+/// the inline prints it replaces.
+#[cfg(not(test))]
+fn warn_dev_keystore_once(mode: &str, path: Option<&std::path::Path>) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| eprintln!("{}", dev_keystore_warning(mode, path)));
+}
+
+#[cfg(test)]
+fn warn_dev_keystore_once(_mode: &str, _path: Option<&std::path::Path>) {}
+
 /// Select the keystore for the daemon and CLI. Both must agree so the Mac
 /// threshold share `m` a `sigil` command seals with is the same one the daemon
 /// combines against.
@@ -265,13 +280,11 @@ pub fn for_host() -> std::sync::Arc<dyn Keystore> {
                 })
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
             let path = base.join("dev-keystore.json");
-            #[cfg(not(test))]
-            eprintln!("{}", dev_keystore_warning("file", Some(&path)));
+            warn_dev_keystore_once("file", Some(&path));
             Arc::new(DevFileKeystore::new(path))
         }
         Some("memory") => {
-            #[cfg(not(test))]
-            eprintln!("{}", dev_keystore_warning("memory", None));
+            warn_dev_keystore_once("memory", None);
             Arc::new(MemoryKeystore::new())
         }
         _ => {
