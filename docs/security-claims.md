@@ -2733,3 +2733,75 @@ weakened anywhere, fail-closed is preserved on every new path, the new log
 line is metadata-only, and the skill gives an agent no route to a secret. Act
 on F1 (surface the dev-keystore pin in `sigil up` output) ahead of the planned
 keychain migration, and fold F3's lockdown line into the skill.**
+
+### Addendum 2026-07-15: dead-peer EINVAL pin (`e777758`) and the host-unbound signature call
+
+Same independent reviewer, same baseline. Also verified (not authored):
+`ea561f4` resolves F1 (an always-shown `keystore` line in `sigil up` whenever
+the plist carries the pin, via `service.rs::installed_dev_keystore_pin`) and
+F3 (lockdown clearing added to the skill's human-only list) as specified.
+
+**Authorization call, host-unbound SSH signatures: CONCUR with ALLOW plus the
+honest label.** The reasoning holds under adversarial scrutiny:
+
+- `session-bind` is unauthenticated client input (`sshagent.rs::extension`
+  records the host key without verifying the host's signature over it, and
+  `derive_host`'s own doc calls the host line advisory). The only party who
+  can reach the agent socket is same-UID, and that party can present any real
+  host's PUBLIC key and render as impeccably bound to github.com. Deny-unbound
+  therefore stops the adversary zero times while breaking every honest pre-8.9
+  OpenSSH, Go x/crypto, libssh2, and JGit client. Worse, it would promote a
+  client-claimed field into a load-bearing gate condition, which is exactly
+  the decorative-identity trap invariant 6 forbids, and it would train the
+  human that "bound" means "safe" when it means nothing.
+- A daemon-side warn state buys nothing either: the daemon cannot distinguish
+  an honest legacy client from a liar, so any warning keyed on bind presence
+  has the same false-comfort failure mode, inverted.
+- Fail-closed is unaffected: bound or not, every signature still requires the
+  phone approval over the load-bearing fields (key label plus data
+  fingerprint, folded into the scope so distinct challenges never coalesce).
+- The real improvement is exactly where the implementer put it: the phone
+  rendering unbound and fingerprint-only destinations as suspicious (#75).
+
+- **F8 (LOW, protocol hygiene, do with #75).** The unbound state rides in-band
+  as the sentinel string `"(host not bound)"` inside `SshChallenge.host`,
+  multiplexing three states (known_hosts name, `SHA256:` fingerprint, unbound)
+  through one display string. The string is daemon-authored, so sentinel
+  forgery is same-UID baseline, but the phone cannot reliably key a
+  "destination unverified" rendering on string parsing across app versions.
+  Fold a structured discriminator into `SshChallenge` (e.g. `binding: named |
+  fingerprint | unbound`) in the same protocol change as #75; an added
+  optional field is a compatible migration under the durable-pairing
+  principle.
+
+**Silent dead-peer drops (`is_dead_peer`): SOUND.**
+
+- Nothing security-relevant is hidden. The daemon log was never a control
+  against the only party who can connect (0600 socket, same-UID), and the
+  events that matter still log loudly: the concurrency-cap refusal (the actual
+  exhaustion signal), every non-EINVAL ready-up failure, and every request
+  arrival. A connect-then-close flood holds no permit past the drop and could
+  previously only generate log noise; masking one's own noise is not a
+  capability.
+- Breadth check: `is_dead_peer` classifies ANY EINVAL from
+  `set_nonblocking`/`set_read_timeout` as a dead peer. A pathological
+  persistent EINVAL of some other origin would become log-silent, but not
+  invisible: `sigil up`'s Status probe holds its connection open, so a daemon
+  dropping live peers fails the probe and reports failed. Optional hardening,
+  not required: a rate-limited drop counter. (INFO)
+- Portability: on platforms where a closed peer does not EINVAL, the silent
+  arm never fires; behavior is unchanged there.
+- The two regression tests are sound and non-flaky as pinned. The
+  classification test is correctly `cfg(target_os = "macos")` (the EINVAL
+  behavior is macOS-specific and deterministic; the peer's close completes
+  in-kernel before the subsequent accept). The storm test is deliberately
+  portable: on a non-EINVAL platform the 50 probes pass ready-up and hit the
+  immediate-EOF `Err(_) => continue` arm instead, every read is bounded by
+  the 30 s `CONN_READ_TIMEOUT` so no hang is possible, and exactly one serve
+  is asserted. Both pass in the suite at review (248 passed, 0 failed).
+
+**ADDENDUM VERDICT: both items SOUND. Allow-and-label is the correct
+authorization shape for unbound signatures (deny-unbound is security theater
+against a same-UID adversary who can fake the bind); implement F8's structured
+binding field with the #75 phone rendering. The silent dead-peer drop hides
+nothing load-bearing and its tests pin the regression correctly.**
