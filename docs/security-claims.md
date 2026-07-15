@@ -2567,3 +2567,169 @@ SOUND-WITH-RESIDUALS**, no HIGH/CRITICAL.
   single-UID personal daemon the threshold.db/config.json write boundary is
   artificial (whoever has one has the other). Accepted residual; matches the agreed
   "unsealed env source is a plain gate" design.
+
+---
+
+## 2026-07-15 - Independent review: agent-operated Sigil change set (`8308fc8`, `7702fa9`, `f7e955d`, `c733b45`)
+
+Independent adversarial review (reviewer did not author these changes) of the
+agent-operated rework: serve-loop hardening + bounded teardown + ssh-sign log
+(`8308fc8`), the `sigil up` keystone with the installed binary, plist rewrite,
+and shim retarget (`7702fa9`), the Mac app auto-ensure (`f7e955d`), and the
+agent-facing skill (`c733b45`). Design rationale reviewed alongside:
+`docs/design/agent-operated-sigil.md`. Baseline held throughout: a same-UID
+attacker was already game over per every prior review (unauthenticated 0600
+control socket, user-writable plist, shim dir, and binaries); each finding below
+is judged relative to that baseline, not against a boundary that never existed.
+Tree at review: `cargo test -p sigil` green (246 passed, 0 failed, 6 ignored,
+the known manual/device tests).
+
+### Per-angle assessment
+
+- **Serve-loop non-fatal error handling - SOUND.** Every new non-fatal path
+  (listener accept error, `ready_conn` failure, concurrency-cap refusal) ends in
+  the connection being dropped with no reply, which the shim/client reads as
+  deny; `daemon.rs::ready_conn` errors are strictly per-connection (the macOS
+  EINVAL race is a property of the one dead peer). No served request skips
+  `gate.decide`; the approve/inject logic is untouched. A hostile same-UID
+  client can hold the 32-connection cap (pre-existing `ConnGate`), which
+  REFUSES further connections: starvation is availability-only and denies. The
+  previous behavior (whole-daemon death on a probe race, killing in-flight
+  approvals) was strictly worse for availability and no better for security.
+- **The ssh-sign log line - CLEAN.** `daemon.rs::log_ssh_sign_request` emits
+  key label, derived host, `SHA256:` fingerprint of the data-to-sign, and peer
+  pid. The fingerprint is the same digest the phone readout shows; the SSH
+  data-to-sign contains a random session id, so the hash is not invertible or
+  confirmable offline. No key material, no raw challenge bytes, no secret
+  values. Same metadata class as the pre-existing op-path `log_request`.
+- **`shutdown_timeout(2s)` teardown - SOUND, one residual (F7).** With accept
+  errors now non-fatal, the teardown path fires only on pre-loop bind failures
+  or ctrl-c. Abandoning in-flight blocking handlers cannot release a secret:
+  an abandoned handler writes no reply (client fails closed), an
+  already-approved child owns its fds and env exactly as after any crash, and
+  the gate state it held dies with the process.
+- **Installed binary + shim retarget - no change to the tamper surface.**
+  `~/.sigil/bin/sigil` is user-writable, and so was the old
+  `target/release/sigil` the plist pointed at, and so is the plist itself. The
+  security-relevant resolver `paths.rs::find_real` is unchanged: rule 2
+  (proxy-dir residency) already excludes anything in `~/.sigil/bin` from being
+  mistaken for the real tool, and rule 1's `proxy::alias_target` covers the
+  sibling runtime. `ShimStatus.resolves_to_current`'s new second arm is
+  diagnostics only (F4).
+- **Dev-keystore pin carry-forward - no new attacker capability, one real
+  visibility regression (F1).** An attacker who can plant the pin can rewrite
+  `ProgramArguments` outright; the plist was never a boundary.
+- **Unconditional KeepAlive - fail-closed preserved.** Daemon down is deny at
+  every consumer (shim exec-fallback excepted as ever, and that path injects
+  nothing). A daemon that fails at startup forever respawn-loops under
+  launchd's throttle (seconds apart, logs rotated at each start by
+  `rotate_logs`), a resource nuisance, never a release. `sigil stop` remains a
+  bootout, which KeepAlive does not resurrect. Interaction with RAM-only
+  lockdown noted as F2.
+- **The skill - accurate and safety-correct, one gap (F3).** Every taught verb
+  and flag was checked against `cli.rs`: `up`/`status`/`doctor`/`history`/
+  `pending`, `pair --relay`, `lease list|revoke`, `lockdown [--clear]`,
+  `ssh add-file --path --host` / `add-stored` (key on stdin) / `list` /
+  `remove` / `config --install`, `sshagent`, `shim add`, and the
+  `sigil-config` surface (`list`, `add --provider env`, `rule add --allow`
+  correctly described as a passthrough to avoid, `source env set --key|--stdin`
+  reading values from stdin only, `unset`, `remove`). The quoted ssh-sign log
+  format and `~/.sigil/logs/daemon.err.log` path match the code. The
+  secret-hygiene rules (human-run seal pipe, verify by structure, refuse pasted
+  secrets, no gated commands that print secrets into the transcript, no
+  `--dev-insecure`, no rule edits to bypass a gate) are consistent with
+  invariants 1-6 and give an agent no path to see a secret or weaken a gate.
+- **Probe/kickstart - no new capability.** `sigil up` kickstarts only when the
+  Status probe fails or the binary/plist changed; a locked-down but healthy
+  daemon answers Status and is NOT restarted. A restart at a chosen moment
+  zeroizes leases (RAM-only, deny-direction) and orphans pending approvals
+  (deny); it can never approve. A same-UID actor could always run `launchctl
+  kickstart` directly. The Mac app auto-ensure runs once per app launch and
+  never on a poll, so a Stop holds within an app session; a later app launch
+  or `sigil up` does resurrect the daemon, which is the intended always-on
+  contract but worth knowing about the Stop control's scope.
+
+### Findings (ranked; none HIGH or CRITICAL)
+
+- **F1 (MEDIUM, posture visibility, fix soon).** The `SIGIL_DEV_KEYSTORE` pin
+  is now self-perpetuating and invisible on the operator surface. `service.rs::
+  dev_keystore_pin` takes the installer env first, else carries forward the pin
+  in the existing plist; an empty env value is filtered out and falls back to
+  the plist, so there is NO CLI path that unpins: only hand-editing the plist,
+  which the skill (correctly, for daemon health) tells agents never to do. At
+  the same time the loud banner moved to once per daemon process
+  (`keystore.rs::warn_dev_keystore_once`) inside `daemon.err.log`, a file the
+  agent-operated model reads only during diagnosis, and neither `sigil up` nor
+  `status` nor `doctor` mentions the pin. Net: the plaintext-share posture
+  (`dev-keystore.json` holds the daemon identity and Mac share `m` in the
+  clear) is deliberate and honestly documented in
+  `docs/design/agent-operated-sigil.md` section 6, but its loudness contract
+  has quietly degraded to near-zero on the surfaces anyone actually looks at.
+  No attacker gain (same-UID could always write the plist). Fix: `sigil up`
+  should emit a visible note or action-needed style line whenever the rendered
+  plist carries the pin, until the planned keychain migration removes it.
+  Reviewer did not implement this (review-only role).
+- **F2 (LOW, residual).** Lockdown is a RAM-only `AtomicBool` and any daemon
+  exit clears it; this change set both automates restarts (up's kickstart, the
+  Mac app auto-ensure, unconditional KeepAlive) and converts the wedge into an
+  error exit (`8308fc8`), so a locked-down daemon that dies for any reason
+  comes back unlocked. The claims table never asserted lockdown survives
+  restart (section 8 asserts leases die on restart, which is the deny
+  direction), and post-restart every request still needs a phone approval, so
+  the exposure is a silent return from panic mode to normal gating, never a
+  release. The control-socket `Lockdown { clear }` was already unauthenticated
+  same-UID. Optional hardening: persist lockdown as a flag file honored at
+  startup, cleared only by an explicit `lockdown --clear`.
+- **F3 (LOW, skill gap).** `.claude/skills/sigil/SKILL.md` lists
+  `sigil lockdown [--clear]` in the surface map but the forbidden list
+  (`--allow` passthroughs, dev switches, rule edits) does not name lifting a
+  lockdown. An agent diagnosing "requests refused; locked down" could
+  helpfully clear the panic switch the human threw. Add lockdown clearing to
+  the human-decision-only list (the agent may run the command, but only when
+  the human explicitly asks).
+- **F4 (LOW, diagnostics blind spot, accepted).** `paths.rs::ShimStatus`'s new
+  second arm accepts a link resolving to `~/.sigil/bin/sigil` with no
+  freshness check, so `doctor` run from a build checkout no longer flags a
+  stale installed runtime (the old "shim points at a stale binary" catch).
+  Staleness detection moved to `sigil up`'s byte compare, which also fixes it
+  in the same run; the gate-relevant drifts (shim absent, real `op` winning on
+  PATH) are still caught, and `find_real` is unaffected. Acceptable given `up`
+  is now habit zero; noted so nobody mistakes ShimStatus for a tamper check.
+- **F5 (LOW, availability nit).** `service.rs::install_copy` is
+  unlink-then-copy, not copy-to-temp-plus-rename: a crash or a concurrent
+  launchd respawn inside the window can exec a missing or partially-written
+  binary. Both outcomes are a failed exec, daemon down, deny; `up` re-run
+  heals. Relatedly, an env-sourced pin value is embedded in the plist without
+  XML escaping; a malformed value yields a plist launchd refuses to load
+  (fail closed, and the value is operator-controlled). Suggest atomic rename
+  when convenient.
+- **F6 (INFO).** `ACCEPT_ERROR_BACKOFF` is awaited inline in the `select!`
+  arm, so a persistent accept-error condition on one listener also stalls the
+  other listener and ctrl-c by up to 200 ms per iteration. Availability-only
+  and bounded; fine for a personal daemon.
+- **F7 (INFO, residual).** The bounded teardown exits the process without
+  running drops on abandoned blocking tasks, so a `Zeroizing` buffer in flight
+  at that instant (a stored-key PEM mid-signature, a threshold partial) is not
+  wiped before exit. This is exactly the crash/SIGKILL case the model already
+  accepts: the kernel zeroes pages before reuse, and the swap residual
+  pre-exists. Already-spawned approved children keep running with their
+  injected env, identical to prior crash behavior; no unapproved path exists.
+
+### Needs on-device verification (cannot be settled statically)
+
+- Unconditional KeepAlive respawn behavior and launchd throttle pacing on a
+  daemon that error-exits repeatedly (log growth stays bounded by
+  `rotate_logs`).
+- The `up` reload path (bootout + bootstrap on a changed plist) and the
+  kickstart-then-reprobe heal loop against a genuinely wedged pid.
+- That the Mac app auto-ensure does not resurrect a deliberately stopped
+  daemon within an app session (and that Tom is comfortable that a fresh app
+  launch does).
+- The standing manual proofs carried forward from prior reviews (Touch ID
+  round trip, SE/keychain items) are unaffected by this set.
+
+**VERDICT: SOUND-WITH-RESIDUALS. No HIGH or CRITICAL findings; the gate is not
+weakened anywhere, fail-closed is preserved on every new path, the new log
+line is metadata-only, and the skill gives an agent no route to a secret. Act
+on F1 (surface the dev-keystore pin in `sigil up` output) ahead of the planned
+keychain migration, and fold F3's lockdown line into the skill.**
