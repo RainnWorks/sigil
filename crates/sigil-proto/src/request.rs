@@ -147,12 +147,43 @@ pub struct SecretRef {
     pub label: String,
 }
 
-/// An SSH signature challenge: the two things worth verifying before signing.
+/// How much the `host` field of an [`SshChallenge`] can be trusted. A STRUCTURED
+/// discriminator so the approver keys "destination unverified" on structure, not
+/// on parsing a sentinel string out of `host`.
+///
+/// The agent protocol carries no authenticated hostname (see the daemon's
+/// `derive_host`), so even a [`Named`](Self::Named) binding is advisory context,
+/// not a security boundary — a same-UID client can name any destination. This
+/// only tells the phone which of the three honest states produced `host`.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HostBinding {
+    /// The `session-bind` host key matched a name in `~/.ssh/known_hosts`; `host`
+    /// is that name.
+    Named,
+    /// A `session-bind` host key was captured but matched no known-hosts entry;
+    /// `host` is the host key's `SHA256:…` fingerprint.
+    Fingerprint,
+    /// No `session-bind` was sent, so the destination is unverified; `host` is a
+    /// plain marker only. The **default** so an older peer that omits the field
+    /// (or any absent discriminator) is treated as unverified — fail-safe.
+    #[default]
+    Unbound,
+}
+
+/// An SSH signature challenge: the things worth verifying before signing.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct SshChallenge {
     pub key_label: String,
+    /// Best-effort destination string. Its trust level is [`Self::binding`];
+    /// render "destination unverified" off that, never by parsing this string.
     pub host: String,
+    /// Structured host-binding state. Additive and optional (serde `default` =
+    /// [`HostBinding::Unbound`]) so an older phone that predates it ignores it and
+    /// still sees `host`, per the durable-pairing principle.
+    #[serde(default)]
+    pub binding: HostBinding,
     /// Challenge fingerprint, e.g. "SHA256:…".
     pub fingerprint: String,
 }
@@ -648,6 +679,28 @@ mod tests {
         assert!(!json.contains("\"reason\""));
         let back: ApprovalRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back, req);
+    }
+
+    #[test]
+    fn ssh_challenge_host_binding_is_additive_and_defaults_unbound() {
+        // A new challenge carries the structured discriminator on the wire.
+        let ch = SshChallenge {
+            key_label: "GitHub".into(),
+            host: "github.com".into(),
+            binding: HostBinding::Named,
+            fingerprint: "SHA256:abc".into(),
+        };
+        let json = serde_json::to_string(&ch).unwrap();
+        assert!(json.contains("\"binding\":\"named\""));
+        assert_eq!(serde_json::from_str::<SshChallenge>(&json).unwrap(), ch);
+
+        // An OLDER phone's message predates `binding`: it must still deserialize,
+        // defaulting to the fail-safe Unbound (durable-pairing principle).
+        let legacy =
+            r#"{"keyLabel":"GitHub","host":"(host not bound)","fingerprint":"SHA256:abc"}"#;
+        let back: SshChallenge = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.binding, HostBinding::Unbound);
+        assert_eq!(HostBinding::default(), HostBinding::Unbound);
     }
 
     #[test]

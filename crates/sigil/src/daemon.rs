@@ -610,6 +610,7 @@ impl SshBackend for Core {
         let challenge = SshChallenge {
             key_label: req.id.label.clone(),
             host: req.host.host.clone(),
+            binding: req.host.binding,
             fingerprint: data_fingerprint,
         };
         // A stored key carries its threshold challenge to the phone (the base point
@@ -3103,6 +3104,7 @@ mod tests {
 
         let host = sshagent::HostContext {
             host: "(host not bound)".into(),
+            binding: sigil_proto::HostBinding::Unbound,
         };
         let data = b"gated-file-sign";
         let sig_blob = core
@@ -4466,6 +4468,7 @@ mod tests {
 
         let host = sshagent::HostContext {
             host: "(host not bound)".into(),
+            binding: sigil_proto::HostBinding::Unbound,
         };
         let out = core.approve_and_sign(sshagent::SignRequest {
             id: &id,

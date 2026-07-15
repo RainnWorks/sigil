@@ -205,9 +205,14 @@ pub struct ServedIdentity {
 /// `session-bind` host key. Honest by construction: either a name we actually
 /// found in `~/.ssh/known_hosts`, or the host-key fingerprint — never a
 /// fabricated hostname (the agent protocol carries no hostname).
+///
+/// `binding` is the structured discriminator that says which of those three
+/// states produced `host`, so the approval screen keys "destination unverified"
+/// on structure rather than on parsing the string.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostContext {
     pub host: String,
+    pub binding: sigil_proto::HostBinding,
 }
 
 /// The daemon-side capability the listener needs, kept as a trait so the wire
@@ -441,16 +446,22 @@ fn extension(payload: &[u8], bound_hostkey: &mut Option<Vec<u8>>) -> Vec<u8> {
 /// fields. v2 (SE-resident keys) does not change this; it is inherent to the
 /// agent protocol carrying no authenticated hostname.
 fn derive_host(bound_hostkey: Option<&[u8]>) -> HostContext {
+    use sigil_proto::HostBinding;
     match bound_hostkey {
         None => HostContext {
             host: "(host not bound)".to_string(),
+            binding: HostBinding::Unbound,
         },
         Some(blob) => {
             if let Some(name) = known_hosts_lookup(blob, &known_hosts_path()) {
-                HostContext { host: name }
+                HostContext {
+                    host: name,
+                    binding: HostBinding::Named,
+                }
             } else {
                 HostContext {
                     host: hostkey_fingerprint(blob),
+                    binding: HostBinding::Fingerprint,
                 }
             }
         }
@@ -1018,6 +1029,12 @@ mod tests {
             Some("github.example.com")
         );
 
+        // A matched name derives to the structured Named binding, not a parsed
+        // string, so the approver can trust the discriminator.
+        let ctx = derive_host_with(Some(&host_blob), &kh);
+        assert_eq!(ctx.host, "github.example.com");
+        assert_eq!(ctx.binding, sigil_proto::HostBinding::Named);
+
         // The handler records the host key and hands the derived name to the sign.
         let backend = FakeBackend::new(true);
         let mut bound = None;
@@ -1060,6 +1077,8 @@ mod tests {
             ctx.host.starts_with("SHA256:"),
             "honest fingerprint, not a name"
         );
+        // The structured discriminator says fingerprint, not a verified name.
+        assert_eq!(ctx.binding, sigil_proto::HostBinding::Fingerprint);
         // It matches ssh-key's own fingerprint of the same key.
         assert_eq!(
             ctx.host,
@@ -1074,16 +1093,24 @@ mod tests {
     fn no_session_bind_yields_an_honest_unbound_marker() {
         let ctx = derive_host(None);
         assert_eq!(ctx.host, "(host not bound)");
+        // Unbound keys on structure so the approver renders "destination
+        // unverified" without parsing the marker string.
+        assert_eq!(ctx.binding, sigil_proto::HostBinding::Unbound);
     }
 
     /// Test seam: derive with an explicit known_hosts path (avoids env mutation).
     fn derive_host_with(bound_hostkey: Option<&[u8]>, kh: &Path) -> HostContext {
+        use sigil_proto::HostBinding;
         match bound_hostkey {
             None => derive_host(None),
             Some(blob) => match known_hosts_lookup(blob, kh) {
-                Some(name) => HostContext { host: name },
+                Some(name) => HostContext {
+                    host: name,
+                    binding: HostBinding::Named,
+                },
                 None => HostContext {
                     host: hostkey_fingerprint(blob),
+                    binding: HostBinding::Fingerprint,
                 },
             },
         }
