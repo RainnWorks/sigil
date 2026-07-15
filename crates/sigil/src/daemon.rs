@@ -22,7 +22,7 @@
 //! the same socket and mutate this shared state.
 
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -820,22 +820,38 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(200);
 /// Ready one accepted connection for its blocking handler: back to a std,
 /// blocking stream with the read timeout armed.
 ///
-/// An error here is a property of the ONE connection, never of the listener:
-/// macOS returns EINVAL from `setsockopt(SO_RCVTIMEO)` when the peer has
-/// already disconnected, and a connect-then-close liveness probe (the Mac
-/// app's `daemonRunning()`) races the daemon into exactly that. The caller
-/// logs and drops the connection and MUST keep accepting; propagating this
+/// An error here is a property of the ONE connection, never of the listener.
+/// The caller drops the connection and MUST keep accepting; propagating this
 /// out of the serve loop shipped as a daemon-killing bug (five probe races =
 /// five full daemon deaths in one day's log).
-fn ready_conn(stream: tokio::net::UnixStream) -> anyhow::Result<UnixStream> {
-    let std_stream = stream.into_std().context("into_std")?;
-    std_stream
-        .set_nonblocking(false)
-        .context("set_nonblocking")?;
-    std_stream
-        .set_read_timeout(Some(CONN_READ_TIMEOUT))
-        .context("set_read_timeout")?;
+fn ready_conn(stream: tokio::net::UnixStream) -> io::Result<UnixStream> {
+    ready_std_conn(stream.into_std()?)
+}
+
+/// The std half of [`ready_conn`], split out so the dead-peer behavior is
+/// directly testable without a tokio reactor.
+///
+/// On macOS, `setsockopt(SO_RCVTIMEO)` on a unix-stream socket whose peer has
+/// FULLY disconnected fails with EINVAL, deterministically: an empirical
+/// probe on macOS 26 measured 2000/2000 EINVAL for a closed peer, 0/2000 for
+/// a live peer, and 0/500 for a half-closed (shutdown-write) peer. EINVAL
+/// here is therefore a precise dead-peer detector, never a live client's
+/// error, and a dead peer's connection is worthless by definition. It is also
+/// ROUTINE traffic: the Mac app's `daemonRunning()` liveness probe and
+/// `sigil up`'s socket checks are connect-then-close by design, every few
+/// seconds. The caller treats EINVAL as a silent normal drop and logs
+/// anything else loudly.
+fn ready_std_conn(std_stream: UnixStream) -> io::Result<UnixStream> {
+    std_stream.set_nonblocking(false)?;
+    std_stream.set_read_timeout(Some(CONN_READ_TIMEOUT))?;
     Ok(std_stream)
+}
+
+/// True when a [`ready_conn`] failure is the deterministic dead-peer EINVAL
+/// (see [`ready_std_conn`]): the peer hung up before we could serve it, which
+/// liveness probes do by design. Silent drop; anything else deserves a log.
+fn is_dead_peer(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EINVAL)
 }
 
 async fn serve(
@@ -975,12 +991,14 @@ async fn serve(
                     );
                     continue; // dropping `stream` closes it
                 };
-                // A failed ready-up is the one connection's problem (usually a
-                // peer that already hung up); drop it and keep accepting.
+                // A failed ready-up is the one connection's problem; drop it
+                // and keep accepting. A dead-peer EINVAL is a liveness probe
+                // that already hung up (routine, every few seconds): silent.
                 let std_stream = match ready_conn(stream) {
                     Ok(s) => s,
+                    Err(e) if is_dead_peer(&e) => continue,
                     Err(e) => {
-                        eprintln!("sigil daemon: dropping a control connection: {e:#}");
+                        eprintln!("sigil daemon: dropping a control connection: {e}");
                         continue;
                     }
                 };
@@ -1012,8 +1030,9 @@ async fn serve(
                 };
                 let std_stream = match ready_conn(stream) {
                     Ok(s) => s,
+                    Err(e) if is_dead_peer(&e) => continue,
                     Err(e) => {
-                        eprintln!("sigil daemon: dropping an ssh-agent connection: {e:#}");
+                        eprintln!("sigil daemon: dropping an ssh-agent connection: {e}");
                         continue;
                     }
                 };
@@ -1889,6 +1908,78 @@ mod tests {
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    // --- per-connection ready-up: the dead-peer EINVAL must never kill serve ---
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_peer_that_hung_up_before_serving_reads_as_a_dead_peer() {
+        // macOS returns EINVAL from setsockopt(SO_RCVTIMEO) on a unix socket
+        // whose peer fully disconnected; deterministic (probe: 2000/2000).
+        // This is the exact shape the Mac app's connect-then-close liveness
+        // probe produces every few seconds, and the ?-propagation of it out of
+        // serve() shipped as a daemon-killing bug. It must classify as a
+        // dead peer (silent drop), never as an error worth ending anything.
+        let dir = std::env::temp_dir().join(format!("sigil-deadpeer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("probe.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        let client = UnixStream::connect(&sock).unwrap();
+        drop(client); // the peer is gone before we serve it
+        let (accepted, _) = listener.accept().unwrap();
+        let err = ready_std_conn(accepted).expect_err("a closed peer must fail ready-up");
+        assert!(is_dead_peer(&err), "EINVAL classifies as dead peer: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_live_peer_readies_cleanly_and_a_dead_peer_storm_does_not_starve_it() {
+        // The accept-loop pattern: dead peers are dropped, live clients are
+        // served. 50 connect-then-close probes (each one a potential EINVAL)
+        // followed by a real client must leave the real client fully served.
+        let dir = std::env::temp_dir().join(format!("sigil-conjstorm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("storm.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        let served = Arc::new(AtomicUsize::new(0));
+        let served2 = served.clone();
+        let acceptor = std::thread::spawn(move || {
+            // Serve until the live client's one byte has been echoed.
+            loop {
+                let (accepted, _) = listener.accept().unwrap();
+                let mut s = match ready_std_conn(accepted) {
+                    Ok(s) => s,
+                    Err(e) if is_dead_peer(&e) => continue, // the serve-loop pattern
+                    Err(e) => panic!("unexpected ready-up error: {e}"),
+                };
+                let mut buf = [0u8; 1];
+                match std::io::Read::read_exact(&mut s, &mut buf) {
+                    Ok(()) => {
+                        s.write_all(&buf).unwrap();
+                        served2.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
+                    // A probe that raced past ready-up but sent nothing.
+                    Err(_) => continue,
+                }
+            }
+        });
+
+        for _ in 0..50 {
+            let c = UnixStream::connect(&sock).unwrap();
+            drop(c);
+        }
+        let mut live = UnixStream::connect(&sock).unwrap();
+        live.write_all(b"x").unwrap();
+        let mut echo = [0u8; 1];
+        std::io::Read::read_exact(&mut live, &mut echo).unwrap();
+        assert_eq!(&echo, b"x", "the live client is served after the storm");
+        acceptor.join().unwrap();
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A minimal rule/source config that gates `op` to the 1Password provider

@@ -177,6 +177,72 @@ rendering of `ssh_signature` in the installed build (fix belongs in the phone
 redesign, task #75); sheet appears and approving still fails => response path,
 capture the phone error. Either way the daemon has done its part.
 
+CLOSED 2026-07-15: Tom's phone received and rendered a live sign request (the
+`ssh-add -T` fired during this work), so delivery AND rendering work on the
+installed build. The remaining untested leg is approve-to-signature (the
+phone's approval carrying back into an emitted SIGN_RESPONSE), which needs
+one approved `ssh-add -T` run: expect "Agent signature verified" wording from
+ssh-add on success.
+
+### The EINVAL root cause, pinned empirically
+
+`set_read_timeout: Invalid argument (os error 22)` is macOS returning EINVAL
+from `setsockopt(SO_RCVTIMEO)` on a unix-stream socket whose peer has FULLY
+disconnected. An empirical probe on this machine (macOS 26) measured:
+
+- peer closed before setsockopt: 2000/2000 EINVAL (deterministic);
+- peer alive: 0/2000 failures;
+- peer half-closed (shutdown of its write side): 0/500 failures.
+
+So EINVAL is a precise dead-peer detector; a LIVE ssh client can never hit
+it. Two consequences worth stating because the intuitive story is wrong:
+
+1. EINVAL never dropped `ssh-add -T`'s own connection. That connection stayed
+   alive through the whole gate wait (proven by the Broken pipe on the reply
+   write, which requires the same connection to have been held and served).
+   The way EINVAL broke SSH was indirect and worse: in the old code an EINVAL
+   from ANY connection (the Mac app probes connect-then-close every 3 s)
+   killed the entire serve loop, destroying every in-flight sign round trip,
+   and then the teardown wedge (section 3) kept the corpse alive.
+2. The `ssh-add -T` hang itself was the approval round trip running its
+   course: request deposited, phone leg pending, client gave up before the
+   120 s fail-closed deny. With delivery confirmed working, a hang now means
+   only "the human did not answer in time".
+
+Handling: a dead peer's connection is worthless by definition and dead-peer
+drops are ROUTINE traffic (liveness probes are connect-then-close by design),
+so the daemon drops them silently; any other per-connection ready-up failure
+is logged loudly. Deterministic regression tests pin the classification
+(`a_peer_that_hung_up_before_serving_reads_as_a_dead_peer`) and loop survival
+under a 50-probe storm with a live client still served
+(`a_live_peer_readies_cleanly_and_a_dead_peer_storm_does_not_starve_it`).
+
+### Policy: host-unbound signatures are allowed, labeled honestly
+
+`ssh-add -T` (and any pre-8.9 OpenSSH, and most non-OpenSSH agent clients:
+Go's x/crypto/ssh, libssh2, JGit) sends no `session-bind`, so the approval
+shows `(host not bound)`. Should Sigil warn harder, or deny unbound sign
+requests by default?
+
+Decision: ALLOW, with the honest label, unchanged. Reasoning:
+
+- `session-bind` is client-claimed and unverified (sshagent.rs documents
+  this): a malicious same-UID client can present any real host's public key
+  and look impeccably "bound" to github.com. Denying unbound requests
+  therefore adds ZERO security against the adversary it appears aimed at,
+  while breaking every honest older or non-OpenSSH client. A gate that only
+  inconveniences honest callers is theater.
+- The load-bearing consent fields are the key label, the data fingerprint,
+  and the human's situational awareness ("am I actually mid-ssh right
+  now?"). An unexpected sign request is the signal, bound or not.
+- What IS worth doing: the phone should render the unbound (and the
+  fingerprint-only) destination as visually suspicious rather than neutral,
+  e.g. "destination unverified". That is approval-screen copy in the phone
+  redesign (task #75), not daemon policy.
+
+Referred to the independent security reviewer for a second opinion, as an
+authorization-shape call.
+
 ## 5. The Sigil skill (`.claude/skills/sigil/`)
 
 A Claude Code skill that teaches any agent to operate Sigil. Shape:
