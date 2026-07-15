@@ -245,6 +245,17 @@ pub fn install_plist() -> Result<PathBuf> {
     Ok(plist_path)
 }
 
+/// The `SIGIL_DEV_KEYSTORE` pin the installed plist currently carries, if
+/// any. `sigil up` surfaces this in its report (sec-review F1): the pin is
+/// deliberately self-perpetuating (see [`dev_keystore_pin`]) and the daemon's
+/// own banner now prints once per process, so without this line the
+/// plaintext-share posture would be invisible on the surfaces anyone reads.
+pub fn installed_dev_keystore_pin() -> Option<String> {
+    let plist = paths::launch_agent_plist()?;
+    let body = std::fs::read_to_string(plist).ok()?;
+    plist_dev_keystore_pin(&body)
+}
+
 /// `gui/<uid>` domain target for launchctl.
 fn gui_domain() -> String {
     // SAFETY: getuid is a pure query with no failure mode.

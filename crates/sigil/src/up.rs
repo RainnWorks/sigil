@@ -268,6 +268,17 @@ pub fn ensure_up() -> Vec<Step> {
         steps.push(Step::action("pairing", "no phone paired; run: sigil pair"));
     }
 
+    // Posture note (sec-review F1): the dev-keystore pin is carried forward
+    // silently by design, and the daemon's own banner prints once per
+    // process, so this report is where the plaintext-share posture must stay
+    // visible. Ok-state (it is deliberate), but always shown.
+    if let Some(pin) = service::installed_dev_keystore_pin() {
+        steps.push(Step::ok(
+            "keystore",
+            format!("SIGIL_DEV_KEYSTORE={pin} is pinned in the plist: the Mac share and daemon identity are NOT hardware-protected"),
+        ));
+    }
+
     steps
 }
 
