@@ -4,9 +4,9 @@ import { Pressable, ScrollView, View } from "react-native";
 import { Sf } from "@/components/ui/sf";
 import { Mono, Sans } from "@/components/ui/text";
 import { Card, Hairline, SectionHeader, StatePill } from "@/components/ui/primitives";
-import { stateLabel, useTheme } from "@/theme/colors";
+import { stateColor, stateLabel, useTheme } from "@/theme/colors";
 import { space } from "@/theme/tokens";
-import { relativeTime, secretRefLabel } from "@/src/lib/format";
+import { relativeTime, secretRefLabel, sshLabel } from "@/src/lib/format";
 import { type PendingRequest } from "@/src/domain/types";
 import { pairedMacName, useAppState } from "@/src/state/store";
 
@@ -38,7 +38,7 @@ export default function HomeScreen() {
                 width: 7,
                 height: 7,
                 borderRadius: 99,
-                backgroundColor: linked ? p.ok : p.faint,
+                backgroundColor: linked ? stateColor(p, "armed") : p.faint,
               }}
             />
             <Mono size={12} tone="faint">
@@ -105,7 +105,7 @@ function PendingRow({ pending, onPress }: { pending: PendingRequest; onPress: ()
     r.secrets.length > 0
       ? r.secrets.map(secretRefLabel).join(", ")
       : r.ssh
-        ? `${r.ssh.keyLabel} → ${r.ssh.host}`
+        ? sshLabel(r.ssh)
         : r.command.join(" ") || r.provenance.machine;
   return (
     <Pressable

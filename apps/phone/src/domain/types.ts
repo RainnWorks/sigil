@@ -27,7 +27,7 @@ export interface PendingRequest {
 export interface HistoryEntry {
   id: string;
   kind: ApprovalRequest["kind"];
-  /** Display label: "Engineering/.env > graphql-api" or "github-deploy -> git@github.com". */
+  /** Display label: "Engineering/.env > graphql-api" or "github-deploy -> github.com". */
   label: string;
   /** The Mac this request came from (provenance.machine); searchable, provider-free. */
   origin: string;
@@ -66,13 +66,15 @@ export interface Settings {
 export type ConnectionRung = "lan" | "endpoint" | "relay" | "none";
 
 /**
- * The transport link, a quiet status dot only. Deliberately carries no machine
+ * The transport link, a quiet status dot only, fed live by the transport's
+ * drain results (see `store.noteTransport`). Deliberately carries no machine
  * name: the pairing pins keys, not hostnames, and a transport address (the
  * relay's, say) must never stand in for the paired Mac. The Mac's display name
  * comes from daemon-signed provenance (see `pairedMacName`).
  */
 export interface Connection {
   rung: ConnectionRung;
+  /** When the transport last drained successfully, unix ms; 0 = never. */
   lastSeenAt: number;
 }
 
@@ -82,6 +84,9 @@ export interface AppState {
   paired: boolean;
   arm: ArmState;
   connection: Connection;
+  /** When this pairing was pinned, unix ms; 0 = unpaired. Distinct from the
+   * connection's lastSeenAt, which moves on every successful drain. */
+  pairedAt: number;
   pending: PendingRequest[];
   history: HistoryEntry[];
   leases: Lease[];

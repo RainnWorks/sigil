@@ -1,6 +1,6 @@
 /**
- * Haptics for the moments that matter: a decision committing and a slide/hold
- * reaching its threshold. iOS only; a no-op elsewhere.
+ * Haptics for the moments that matter: a decision committing and a control
+ * engaging. iOS only; a no-op elsewhere.
  */
 import * as Haptics from "expo-haptics";
 
@@ -14,12 +14,6 @@ export async function hapticCommit(kind: "approved" | "denied"): Promise<void> {
       ? Haptics.NotificationFeedbackType.Success
       : Haptics.NotificationFeedbackType.Warning,
   );
-}
-
-/** A slide or hold crossed its arming threshold. */
-export async function hapticThreshold(): Promise<void> {
-  if (!onIos) return;
-  await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Rigid);
 }
 
 /** A light tick as a control engages. */

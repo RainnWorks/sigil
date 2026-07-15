@@ -152,7 +152,7 @@ function SshDestination({ ssh }: { ssh: SshChallenge }) {
         <Mono size={13} tone="faint">
           destination
         </Mono>
-        <Mono size={13} weight="medium" tone="deny">
+        <Mono size={13} weight="medium" tone="brass">
           unverified
         </Mono>
       </View>

@@ -98,7 +98,7 @@ export function demoThresholdRequest(): ApprovalRequest {
   });
 }
 
-/** A critical SSH signature to a production host: hold to approve. */
+/** An SSH signature to a known host: the destination is a known-hosts name. */
 export function demoSshRequest(): ApprovalRequest {
   return {
     requestId: crypto.randomUUID(),
@@ -107,7 +107,8 @@ export function demoSshRequest(): ApprovalRequest {
     secrets: [],
     ssh: {
       keyLabel: "github-deploy",
-      host: "git@github.com",
+      host: "github.com",
+      binding: "named",
       fingerprint: "SHA256:9Xk2p+Qm4rLt8vN0wYbZ3fJc1aDhEoRuS5iT7gUx6M",
     },
     provenance: {
@@ -119,6 +120,27 @@ export function demoSshRequest(): ApprovalRequest {
     reason: "Signature to a production host.",
     expiresAt: now + 90_000,
     timeoutMs: 90_000,
+  };
+}
+
+/**
+ * An SSH signature with no host binding: the client sent no session-bind, so
+ * the destination is unverified and the sheet must say so (F8). The `host`
+ * string mirrors the daemon's plain marker and must never be rendered.
+ */
+export function demoUnboundSshRequest(): ApprovalRequest {
+  const r = demoSshRequest();
+  return {
+    ...r,
+    requestId: crypto.randomUUID(),
+    command: ["ssh"],
+    ssh: {
+      keyLabel: "legacy-bastion",
+      host: "(host not bound)",
+      binding: "unbound",
+      fingerprint: "SHA256:2vJq8wXr5tZk1mBn7cYd4fLh9aGpEsRu3iToUx0KgN",
+    },
+    reason: undefined,
   };
 }
 
@@ -147,7 +169,7 @@ export const demoHistory: HistoryEntry[] = [
   {
     id: "h2",
     kind: "ssh_signature",
-    label: "github-deploy → git@github.com",
+    label: "github-deploy → github.com",
     origin: "studio.local",
     process: "ssh",
     cwd: "~/Projects/rowm",
@@ -201,6 +223,7 @@ export function emptyInitialState(): AppState {
     paired: false,
     arm: "idle",
     connection: { rung: "none", lastSeenAt: 0 },
+    pairedAt: 0,
     pending: [],
     history: [],
     leases: [],
@@ -215,6 +238,7 @@ export function demoInitialState(): AppState {
     paired: true,
     arm: "armed",
     connection: { rung: "lan", lastSeenAt: now - 12_000 },
+    pairedAt: now - 6 * 86_400_000,
     pending: [],
     history: demoHistory,
     leases: demoLeases,

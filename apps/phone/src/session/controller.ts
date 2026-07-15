@@ -69,6 +69,9 @@ export async function armLiveSession(): Promise<boolean> {
   const transport = new PhoneRelay({
     base: pairing.relayBase,
     mailbox: pairing.mailbox,
+    // Feed drain results into the store so the link dot reflects the last real
+    // exchange with the relay (transport status only, never a party).
+    onStatus: (connected) => store.noteTransport(connected),
   });
   const session = new SigilSession({
     sodium,
@@ -86,8 +89,11 @@ export async function armLiveSession(): Promise<boolean> {
   // never stand in for the Mac (see `pairedMacName` for where the name comes from).
   store.reflectPairing({
     ownFingerprint: ownFingerprint(sodium, pairing),
-    seenAt: pairing.pairedAt,
+    pairedAt: pairing.pairedAt,
   });
+  // Drain once right away so the link dot reflects reality within a moment of
+  // arming instead of waiting out the first backstop tick.
+  void transport.wake();
   return true;
 }
 

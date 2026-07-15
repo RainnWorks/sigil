@@ -45,6 +45,12 @@ export interface PhoneRelayConfig {
   mailbox: Uint8Array;
   /** Machine label for the status readout (display only). */
   machine?: string;
+  /**
+   * Called with each drain result: true when the relay answered, false when a
+   * drain failed. Transport liveness only, for the UI's link dot; it says
+   * nothing about the Mac on the far side.
+   */
+  onStatus?: (connected: boolean) => void;
 }
 
 type EnvelopeListener = (e: Envelope) => void;
@@ -130,6 +136,7 @@ export class PhoneRelay implements Transport {
         // A transient relay error just means the next backstop tick (or the
         // next push) tries again.
         this.connected = false;
+        this.cfg.onStatus?.(false);
       }
     })();
     this.inFlight = attempt;
@@ -149,6 +156,7 @@ export class PhoneRelay implements Transport {
   private async drainOnce(): Promise<void> {
     const batch = await this.mailbox.drain();
     this.connected = true;
+    this.cfg.onStatus?.(true);
     if (batch.length > 0) this.lastSeenAt = Date.now();
     for (const s of batch) {
       let env: Envelope;

@@ -6,7 +6,7 @@
 import { useSyncExternalStore } from "react";
 
 import { type ApprovalRequest, type Decision, type ResolutionStatus } from "@/src/protocol";
-import { secretRefLabel } from "@/src/lib/format";
+import { secretRefLabel, sshLabel } from "@/src/lib/format";
 import {
   type AppState,
   type HistoryEntry,
@@ -144,14 +144,31 @@ class Store {
    * armed (at boot from the keystore, or right after the pairing ceremony). Marks
    * the phone paired and arms it. Carries no machine name on purpose: the
    * pairing pins keys, and the paired Mac names itself through signed provenance
-   * (see {@link pairedMacName}), never through a transport address.
+   * (see {@link pairedMacName}), never through a transport address. The
+   * connection itself is deliberately untouched here: the link dot goes live
+   * only when a real drain succeeds ({@link noteTransport}), never on hope.
    */
-  reflectPairing(info: { ownFingerprint: string | null; seenAt: number }): void {
+  reflectPairing(info: { ownFingerprint: string | null; pairedAt: number }): void {
     this.patch({
       paired: true,
       arm: "armed",
       ownFingerprint: info.ownFingerprint,
-      connection: { rung: "relay", lastSeenAt: info.seenAt },
+      pairedAt: info.pairedAt,
+    });
+  }
+
+  /**
+   * The transport reported a drain result: a success means the relay answered
+   * just now (link), a failure means it did not (no link). This is the ONLY
+   * writer of the live connection state, so the link dot always reflects the
+   * last real exchange, not an assumption. Transport status only: it says
+   * nothing about the Mac, and nothing here names a host.
+   */
+  noteTransport(connected: boolean): void {
+    this.patch({
+      connection: connected
+        ? { rung: "relay", lastSeenAt: Date.now() }
+        : { ...this.state.connection, rung: "none" },
     });
   }
 
@@ -181,7 +198,7 @@ class Store {
       r.secrets.length > 0
         ? r.secrets.map(secretRefLabel).join(", ")
         : r.ssh
-          ? `${r.ssh.keyLabel} → ${r.ssh.host}`
+          ? sshLabel(r.ssh)
           : (r.command.join(" ") || r.provenance.machine);
     const entry: HistoryEntry = {
       id: r.requestId,

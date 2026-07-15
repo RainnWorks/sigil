@@ -4,7 +4,7 @@
  * SecretRef's display-only `segments` / `label`; it never parses the opaque
  * `reference`, which only the owning provider understands.
  */
-import { type SecretRef } from "@/src/protocol";
+import { type SecretRef, type SshChallenge } from "@/src/protocol";
 
 /** "just now", "12s ago", "4m ago", "2d ago" — the brief's terse register. */
 export function relativeTime(fromMs: number, nowMs: number = Date.now()): string {
@@ -81,4 +81,19 @@ export function durationWindow(totalSecs: number): string {
 /** Render a resolved process chain as "zsh -> claude -> op read". */
 export function processChain(chain: string[]): string {
   return chain.join(" → ");
+}
+
+/**
+ * A one-line label for an SSH request, e.g. "github-deploy → github.com".
+ * Keyed on the structured host binding (F8), never by parsing `host`: a named
+ * or fingerprint binding shows the host string (a known-hosts name or the host
+ * key's SHA256 fingerprint), and an unbound one says plainly that the
+ * destination is unverified rather than echoing the daemon's marker string.
+ */
+export function sshLabel(ssh: SshChallenge): string {
+  const dest =
+    ssh.binding === "named" || ssh.binding === "fingerprint"
+      ? ssh.host
+      : "destination unverified";
+  return `${ssh.keyLabel} → ${dest}`;
 }

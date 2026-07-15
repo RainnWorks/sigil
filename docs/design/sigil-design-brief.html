@@ -436,7 +436,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
     <div class="phone"><div class="screen">
       <div class="sheet-grab"></div>
       <div class="apr-head">
-        <span class="apr-acct">Rowm work</span>
+        <span class="apr-acct">studio.local</span>
         <span class="gauge">
           <svg width="52" height="52" viewBox="0 0 52 52">
             <circle cx="26" cy="26" r="22" fill="none" stroke="oklch(0.3 0.016 245)" stroke-width="3.5"/>
@@ -461,7 +461,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
       <div class="tapcap secondary">Keep approved for 15 min</div>
       <div class="denybtn">Deny</div>
     </div></div>
-    <p class="mock-cap">The approval sheet: brass gauge counting to expiry, the readout well leading with the reference label, provenance in mono, one tap to approve. A leasable rule additionally offers "approve for N minutes"; a run-once rule shows only the single tap. The well renders provider-supplied display segments; the phone never parses what the reference means.</p>
+    <p class="mock-cap">The approval sheet: the asking Mac in the header (the party, never the transport), brass gauge counting to expiry, the readout well leading with the reference label, provenance in mono, one tap to approve. A leasable rule additionally offers "approve for N minutes"; a run-once rule shows only the single tap. The well renders provider-supplied display segments; the phone never parses what the reference means.</p>
   </div>
   <div>
     <h3 style="margin-top:0">One tap; the rule sets what that tap may do</h3>
@@ -470,14 +470,13 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
       <div class="rung"><span class="lv" style="color:var(--cobalt)">run-once</span><span>The safe default. A fresh phone approval every invocation; a lease is never offered or granted</span><span class="act">tap to approve</span></div>
       <div class="rung"><span class="lv" style="color:var(--brass)">leasable</span><span>The rule opts in with a per-rule cap; the tap may open a session up to that cap (e.g. <code>gcloud</code> 15m)</span><span class="act">tap, or approve for N min</span></div>
     </div>
-    <p style="max-width:46ch">Run-once is enforced end to end: even if a compromised approver returns a lease, the daemon refuses it, and an over-long request is clamped down to the rule's cap. Every approve additionally passes Face ID: the Secure Enclave will not release the unwrap key without it, so a stolen unlocked phone still cannot approve. Long-press deny offers "Deny and block this process for 1 hour." An SSH request swaps the readout well for key label, host, and challenge fingerprint, the two things worth verifying.</p>
+    <p style="max-width:46ch">Run-once is enforced end to end: even if a compromised approver returns a lease, the daemon refuses it, and an over-long request is clamped down to the rule's cap. Every approve additionally passes Face ID: the Secure Enclave will not compute its share of the release without it, so a stolen unlocked phone still cannot approve. Long-press deny offers "Deny and block this process for 1 hour." An SSH request swaps the readout well for key label, destination, and challenge fingerprint, and the destination is shown only as verified as it truly is: a known-hosts name, an unrecognized host key's fingerprint, or a plain "destination unverified" when the client sent no host binding at all (an unbound signature works against any host, so the sheet never dresses one up as a destination).</p>
     <h4>The rest of the app <span class="badge shipped">shipped</span></h4>
     <div class="tblwrap"><table>
       <tr><td class="mono">home</td><td>this phone's own state at a glance: <span class="dim">Armed</span> or <span class="dim">Idle</span> with a quiet link dot, last decision. The transport is plumbing and is never named a party; the paired Mac's name comes only from what it says about itself in a daemon-signed request, never from a relay address.</td></tr>
       <tr><td class="mono">history</td><td>dense reverse-chron audit mirror; decision-colored rows; swipe to block a process; searchable. Never stores values.</td></tr>
-      <tr><td class="mono">accounts</td><td>credential health per account: <span class="dim">healthy &middot; rotate &middot; expires in 6d</span>, last used</td></tr>
-      <tr><td class="mono">devices</td><td>the paired Macs this phone approves for: which Mac, a link/no-link dot, when it was pinned, this phone's own fingerprint. The relay is never shown.</td></tr>
-      <tr><td class="mono">leases</td><td>active grants with live TTL countdowns, one-tap revoke: <span class="dim">launcher &middot; Engineering/.env, 41m left</span></td></tr>
+      <tr><td class="mono">devices</td><td>the paired Macs this phone approves for: which Mac, a link/no-link dot, when it was pinned, this phone's own fingerprint. The relay is never shown. The phone is provider-blind, so there is no account surface anywhere.</td></tr>
+      <tr><td class="mono">settings</td><td>active leases with live TTL countdowns and one-tap revoke (<span class="dim">launcher &middot; Engineering/.env, 41m left</span>), approval and notification preferences, default timeout, re-pair and reset</td></tr>
     </table></div>
   </div>
 </div>
@@ -599,7 +598,6 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
       <div class="mb"><span class="glyph" style="color:var(--faint)">&#9676;</span><div class="nm">Idle</div><div class="ds">daemon down or unpaired, dotted outline</div></div>
       <div class="mb"><span class="glyph" style="color:var(--cobalt)">&#9670;</span><div class="nm">Armed</div><div class="ds">solid latch, requests will route</div></div>
       <div class="mb"><span class="glyph" style="color:var(--brass)">&#9670;&middot;</span><div class="nm">Pending</div><div class="ds">brass corner dot, one gentle pulse</div></div>
-      <div class="mb"><span class="glyph" style="color:var(--deny)">&#8856;</span><div class="nm">Locked</div><div class="ds">barred silhouette until unsealed</div></div>
     </div>
   </div>
 </div>

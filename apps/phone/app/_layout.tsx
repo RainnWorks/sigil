@@ -20,6 +20,7 @@ import {
   demoRoutineRequest,
   demoSshRequest,
   demoThresholdRequest,
+  demoUnboundSshRequest,
 } from "@/src/state/demo";
 
 /**
@@ -59,6 +60,7 @@ export default function RootLayout() {
         demoReadRequest(),
         demoThresholdRequest(),
         demoSshRequest(),
+        demoUnboundSshRequest(),
         demoRoutineRequest(),
       ]);
     }

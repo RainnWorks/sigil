@@ -53,7 +53,7 @@ export default function DevicesScreen() {
                 </View>
               </View>
               <Mono size={12} tone="muted">
-                paired {relativeTime(s.connection.lastSeenAt)}
+                paired {relativeTime(s.pairedAt)}
               </Mono>
             </View>
           ) : (

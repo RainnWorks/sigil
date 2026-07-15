@@ -49,7 +49,7 @@ export default function KeysScreen() {
 
   async function confirmPairing(): Promise<void> {
     setStep("sealing");
-    const gate = await faceGate("Authorize pairing this phone");
+    const gate = await faceGate("Pair this phone");
     if (!gate.ok) {
       setStep("ready");
       return;

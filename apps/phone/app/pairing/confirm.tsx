@@ -99,7 +99,7 @@ export default function ConfirmScreen() {
         {phase === "handshaking" || phase === "completing" ? (
           <Sf name="dot.radiowaves.left.and.right" color={p.cobalt} size={36} />
         ) : (
-          <Sf name="checkmark.shield" color={p.cobalt} size={36} />
+          <Sf name="checkmark.seal" color={p.cobalt} size={36} />
         )}
         <Sans size={20} weight="semibold" style={{ textAlign: "center" }}>
           {phase === "handshaking"
