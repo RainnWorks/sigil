@@ -179,7 +179,16 @@ impl ShimStatus {
             .map(|l| l.symlink_metadata().is_ok())
             .unwrap_or(false);
         let link_target = link.as_ref().and_then(|l| l.canonicalize().ok());
-        let resolves_to_current = matches!((&link_target, &own), (Some(t), Some(o)) if t == o);
+        // Two acceptable targets: the running binary, or the install-stable
+        // runtime `sigil up` maintains at `<shim_dir>/sigil`. Without the
+        // second, a CLI run from a build checkout would flag the (correct)
+        // installed-runtime link as drift, and the launchd daemon running FROM
+        // the installed runtime is covered by the first arm anyway.
+        let installed_runtime = shim_dir
+            .as_ref()
+            .and_then(|d| d.join("sigil").canonicalize().ok());
+        let resolves_to_current = matches!((&link_target, &own), (Some(t), Some(o)) if t == o)
+            || matches!((&link_target, &installed_runtime), (Some(t), Some(i)) if t == i);
 
         let mut first_op_dir: Option<PathBuf> = None;
         let mut real_op: Option<PathBuf> = None;

@@ -31,6 +31,7 @@ pub fn run_gating() -> i32 {
     let json = extract_flag(&mut args, "--json");
     match args.first().map(String::as_str).unwrap_or("") {
         "" | "status" => cmd_status(),
+        "up" => crate::up::cmd_up(),
         "daemon" => cmd_daemon(&args[1..]),
         "doctor" => cmd_doctor(),
         "setup" => cmd_setup(&args[1..]),
@@ -120,6 +121,7 @@ pub fn is_reserved_verb(cmd: &str) -> bool {
     matches!(
         cmd,
         "" | "status"
+            | "up"
             | "daemon"
             | "doctor"
             | "setup"
@@ -207,6 +209,9 @@ usage: sigil <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
                     command is refused; configure one with: sigil-config add <cmd>
   run -- <cmd>      escape hatch: run <cmd> even if it collides with a verb
   status            instrument panel: daemon, shim, op, factor
+  up                ensure everything: install the binary and launchd agent,
+                    heal a dead or wedged daemon, wire the shim, check pairing.
+                    Idempotent; run it any time something looks off
   setup             guided first run: shim, PATH, launchd, then pair
   daemon [--dev-insecure]  run the approval daemon (foreground). Without a
                     paired phone or a hardware biometric it fails closed;
@@ -3619,7 +3624,7 @@ mod tests {
         // A runtime verb is reserved in the lean binary; a bare tool name (op,
         // gcloud) is not, so it falls through to the `sigil <cmd>` primitive.
         for v in [
-            "status", "daemon", "pair", "run", "ssh", "shim", "help", "version",
+            "status", "up", "daemon", "pair", "run", "ssh", "shim", "help", "version",
         ] {
             assert!(is_reserved_verb(v), "{v} must be a reserved verb");
         }

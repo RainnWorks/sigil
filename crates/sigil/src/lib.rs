@@ -41,6 +41,7 @@ pub mod sshagent;
 pub mod sshconfig;
 pub mod style;
 pub mod threshold;
+pub mod up;
 
 /// A process-wide lock serializing tests that mutate global environment
 /// variables (`SIGIL_HOME` in particular). Cargo runs a crate's tests in

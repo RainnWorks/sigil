@@ -26,15 +26,27 @@ pub fn install_shim() -> Result<(PathBuf, PathBuf)> {
 }
 
 /// Install a transparent shim alias for `cmd`: symlink `~/.sigil/bin/<cmd>` at
-/// the running binary so a bare `<cmd>` on PATH re-enters as `sigil <cmd>`,
+/// the Sigil runtime so a bare `<cmd>` on PATH re-enters as `sigil <cmd>`,
 /// replacing any stale link. Returns `(link, target)`. This generalizes the shim
 /// beyond `op` so `sigil shim add <cli>` can front any configured command for
 /// callers that cannot be modified.
+///
+/// The link targets the install-stable runtime (`~/.sigil/bin/sigil`, the copy
+/// `sigil up` maintains) when it exists, so aliases survive the build checkout
+/// moving; a bare checkout that has never run `up` falls back to the running
+/// binary, the historical behavior.
 pub fn install_shim_for(cmd: &str) -> Result<(PathBuf, PathBuf)> {
     let bindir = paths::shim_bin_dir().context("HOME is not set")?;
-    let target = std::env::current_exe()
-        .and_then(|p| p.canonicalize())
-        .context("resolving the sigil binary path")?;
+    let installed = bindir.join("sigil");
+    let target = if installed.is_file() {
+        installed
+            .canonicalize()
+            .with_context(|| format!("resolving {}", installed.display()))?
+    } else {
+        std::env::current_exe()
+            .and_then(|p| p.canonicalize())
+            .context("resolving the sigil binary path")?
+    };
     std::fs::create_dir_all(&bindir).with_context(|| format!("creating {}", bindir.display()))?;
     let link = bindir.join(cmd);
     if link.exists() || link.symlink_metadata().is_ok() {
