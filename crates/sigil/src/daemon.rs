@@ -626,6 +626,62 @@ impl Core {
         s
     }
 
+    /// The doctor checks, plus the one only the daemon can answer: whether the
+    /// sealed store it is serving from still matches the one on disk.
+    ///
+    /// This exists because the stale-armed-store bug was invisible from outside.
+    /// `sigil status` reads `threshold.db` fresh and said "1 sealed secret(s)"
+    /// while the running daemon held none, and the only symptom downstream was a
+    /// gated command quietly running with nothing injected. With
+    /// [`Self::reload_threshold`] wired into the watcher this state should not
+    /// occur, which is exactly what makes it a doctor check: it is the regression
+    /// alarm, not a routine condition.
+    fn doctor_report(&self) -> Vec<crate::json::CheckJson> {
+        let mut checks = crate::report::doctor(true);
+        let (ok, hint) = self.sealed_store_drift();
+        checks.push(crate::json::CheckJson {
+            label: "sealed store matches the armed daemon".to_string(),
+            ok,
+            hint,
+        });
+        checks
+    }
+
+    /// Compare the armed sealed records against `threshold.db`. Returns the check
+    /// verdict and its hint. An unreadable store is a failure, not a pass: the
+    /// daemon cannot tell whether it is serving stale records.
+    fn sealed_store_drift(&self) -> (bool, String) {
+        let armed = self.armed_sealed_fingerprint();
+        let disk = match crate::threshold::ThresholdStore::load() {
+            Ok(s) => s,
+            Err(e) => return (false, format!("the sealed store could not be read: {e}")),
+        };
+        let mut on_disk: Vec<(String, String)> = disk
+            .secrets
+            .iter()
+            .map(|r| (r.account_id.clone(), r.ephemeral_pub.clone()))
+            .collect();
+        on_disk.sort();
+        if armed == on_disk {
+            return (true, format!("{} sealed secret(s)", armed.len()));
+        }
+        let hint = if armed.len() != on_disk.len() {
+            format!(
+                "the daemon armed {} sealed secret(s); the store on disk holds {}. \
+                 Gated runs may inject nothing. Resync: sigil restart",
+                armed.len(),
+                on_disk.len()
+            )
+        } else {
+            format!(
+                "the daemon armed {} sealed secret(s) but they were re-sealed since. \
+                 Resync: sigil restart",
+                armed.len()
+            )
+        };
+        (false, hint)
+    }
+
     /// Reload the rule/source config from disk into the hot cell (#59).
     ///
     /// **Fail-closed by construction:** the swap ([`ConfigCell::store`]) is
@@ -700,6 +756,51 @@ impl Core {
             }
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    /// Reload the threshold-sealed store from disk into the hot cell.
+    ///
+    /// Without this the daemon read `threshold.db` exactly once, at arm time, and
+    /// never again: sealing a value into an inline `env` source while the daemon
+    /// was already up left the armed store empty, every gated run took the
+    /// degrade-to-plain-gate path in [`fulfill`], and nothing was injected until a
+    /// restart. config.json and ssh-keys.json already hot-reloaded; this closes
+    /// the third file.
+    ///
+    /// Fail-closed on the same terms as [`Self::reload_config`]: the swap is
+    /// reached ONLY on the `Ok` arm, so a malformed or half-written store leaves
+    /// the last-good records in force rather than silently dropping injection.
+    /// Returns the number of records now armed, for the caller's log line.
+    ///
+    /// No lease invalidation is needed here. A lease that caches values binds to
+    /// the ephemeral point `E` of the exact record they came from (see
+    /// [`lease::LeaseBinding::cached`]), which is fresh on every re-seal, so a
+    /// reload that replaces a record makes the lease lookup miss and the run
+    /// re-approves; a reload that drops one degrades the rule to a plain gate.
+    fn reload_threshold(&self) -> Result<usize, String> {
+        match crate::threshold::ThresholdStore::load() {
+            Ok(store) => {
+                let n = store.secrets.len();
+                *self.threshold.lock().expect("threshold store poisoned") = store;
+                Ok(n)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// The armed sealed records as `(id, ephemeral_pub)` pairs, sorted. The
+    /// ephemeral point is public and is what makes a re-seal visible: it is fresh
+    /// on every seal, so two stores with the same ids but different points are
+    /// genuinely different stores. Used only to compare against disk.
+    fn armed_sealed_fingerprint(&self) -> Vec<(String, String)> {
+        let store = self.threshold.lock().expect("threshold store poisoned");
+        let mut v: Vec<(String, String)> = store
+            .secrets
+            .iter()
+            .map(|r| (r.account_id.clone(), r.ephemeral_pub.clone()))
+            .collect();
+        v.sort();
+        v
     }
 
     /// The audit `via` label for a fresh grant under the resolved factor.
@@ -1323,6 +1424,11 @@ fn config_mtime(path: &Path) -> Option<SystemTime> {
 /// so a malformed or half-written file leaves the last-good rules in force and we
 /// log a warning here rather than downgrade gating.
 ///
+/// Two more files ride the same tick, on the same fail-closed terms:
+/// `ssh-keys.json` (so `sigil ssh add|remove` is served without a restart) and
+/// `threshold.db` (so sealing a value into an inline `env` source takes effect on
+/// the next request instead of on the next restart).
+///
 /// Runs on its own thread and exits when `shutdown` is set. Returns `None` (no
 /// thread) when there is no resolvable config path (no HOME), which only happens
 /// in degenerate environments.
@@ -1334,11 +1440,17 @@ fn spawn_config_watcher(
     // The SSH key store is watched on the same tick so `sigil ssh add|remove`
     // takes effect without a restart, mirroring the rule-config hot-reload.
     let ssh_path = sshagent::SshKeyConfig::path();
+    // And the sealed store, so `sigil-config source env set` applies live. The
+    // daemon-mediated seal already updates the armed store synchronously; this
+    // covers every other writer (a CLI-local seal against a stopped-then-started
+    // daemon, the Mac app, a restored backup).
+    let threshold_path = crate::threshold::ThresholdStore::path().ok();
     let handle = std::thread::Builder::new()
         .name("sigil-config-watcher".into())
         .spawn(move || {
             let mut last = config_mtime(&path);
             let mut last_ssh = ssh_path.as_deref().map(config_mtime);
+            let mut last_threshold = threshold_path.as_deref().map(config_mtime);
             while !shutdown.load(Ordering::SeqCst) {
                 std::thread::sleep(CONFIG_POLL_INTERVAL);
                 if shutdown.load(Ordering::SeqCst) {
@@ -1372,6 +1484,27 @@ fn spawn_config_watcher(
                             Err(e) => {
                                 eprintln!(
                                     "sigil daemon: SSH key reload failed, keeping last-good keys: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+                if let Some(threshold_path) = threshold_path.as_deref() {
+                    let current_threshold = Some(config_mtime(threshold_path));
+                    if current_threshold != last_threshold {
+                        last_threshold = current_threshold;
+                        match core.reload_threshold() {
+                            Ok(n) => {
+                                eprintln!(
+                                    "sigil daemon: reloaded the sealed store from {} \
+                                     ({n} sealed secret(s))",
+                                    threshold_path.display()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "sigil daemon: sealed store reload failed, \
+                                     keeping the last-good records: {e}"
                                 );
                             }
                         }
@@ -1493,7 +1626,7 @@ fn handle_conn(core: Arc<Core>, mut stream: UnixStream) -> anyhow::Result<()> {
             control_reply(n > 0, &format!("revoked {n} lease(s)"))
         }
         Frame::Status => json_reply(&core.status_report()),
-        Frame::Doctor => json_reply(&crate::report::doctor(true)),
+        Frame::Doctor => json_reply(&core.doctor_report()),
         Frame::LeaseList => json_reply(&leases_json(&core)),
         Frame::Pending => json_reply(&pending_json(&core)),
         Frame::History => {
@@ -1616,6 +1749,13 @@ fn handle_provision(
 /// unsigned CLI, so there is no code identity to demand. That is the same
 /// boundary every other CLI control verb has always had (a 0600 socket), and it
 /// is not weakened here: the values being sealed are supplied BY that caller.
+///
+/// The armed store is updated as part of the write, under the same lock, so a
+/// seal takes effect on the very next request rather than on the watcher's next
+/// tick. The lock is held across load, mutate, and save, which makes the whole
+/// read-modify-write atomic against every other reader of the armed store: no
+/// request can observe a store that was saved to disk but not yet armed, and a
+/// failed save leaves the armed store exactly as it was.
 fn handle_seal_threshold(
     core: &Core,
     stream: &mut UnixStream,
@@ -1642,6 +1782,9 @@ fn handle_seal_threshold(
         Err(e) => return fail(format!("the value could not be read: {e}")),
     };
 
+    // Taken before the load and held to the end: everything below is one
+    // read-modify-write against both disk and the armed store.
+    let mut armed = core.threshold.lock().expect("threshold store poisoned");
     let mut store = match crate::threshold::ThresholdStore::load() {
         Ok(s) => s,
         Err(e) => return fail(format!("loading the threshold store: {e}")),
@@ -1650,10 +1793,17 @@ fn handle_seal_threshold(
     if plaintext.is_empty() {
         store.remove(id);
         return match store.save() {
-            Ok(()) => Reply::Control {
-                ok: true,
-                lines: vec![format!("removed {id}")],
-            },
+            Ok(()) => {
+                *armed = store;
+                eprintln!(
+                    "sigil daemon: removed the sealed record for '{id}'; {} armed",
+                    armed.secrets.len()
+                );
+                Reply::Control {
+                    ok: true,
+                    lines: vec![format!("removed {id}")],
+                }
+            }
             Err(e) => fail(format!("saving the threshold store: {e}")),
         };
     }
@@ -1678,10 +1828,23 @@ fn handle_seal_threshold(
     drop(m);
     drop(plaintext);
     match store.save() {
-        Ok(()) => Reply::Control {
-            ok: true,
-            lines: vec![format!("sealed {id}")],
-        },
+        Ok(()) => {
+            // Live from here: the next gated run under a rule naming this source
+            // opens the record just sealed, with no restart and no watcher tick.
+            *armed = store;
+            // The arm line reports a sealed-secret count and this is the only
+            // thing that changes it mid-life, so it belongs in the same log. Its
+            // absence is what left the daemon's log showing "0 sealed secret(s)"
+            // with no record of the seal that had just happened.
+            eprintln!(
+                "sigil daemon: sealed '{id}'; {} sealed secret(s) armed",
+                armed.secrets.len()
+            );
+            Reply::Control {
+                ok: true,
+                lines: vec![format!("sealed {id}")],
+            }
+        }
         Err(e) => fail(format!("saving the threshold store: {e}")),
     }
 }
@@ -1992,6 +2155,44 @@ fn remote_pending_json(p: crate::remote::RemotePending) -> crate::json::PendingJ
     }
 }
 
+/// How long the degrade-to-plain-gate notice stays quiet for a given rule+source
+/// after it has been printed once. Long enough that a busy tool tree does not
+/// flood the log, short enough that a human who goes looking will see it again.
+const DEGRADED_NOTICE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// The one line that says a gate rule is injecting nothing, or `None` if the same
+/// rule+source was already announced within [`DEGRADED_NOTICE_INTERVAL`].
+///
+/// A rule that declares env keys whose source has no sealed record still gates
+/// (the approval happens) but injects nothing, and the tool then falls back to
+/// whatever auth it has of its own. That is the intended degrade, but doing it
+/// silently means the failure looks like "Sigil is fine and the tool is broken".
+/// This names both halves so the fix (`source env set`) is obvious.
+///
+/// Rate-limit state is process-global rather than a `Core` field: it is a log
+/// detail with no bearing on any decision, and every gated request funnels
+/// through one daemon process.
+fn degraded_gate_notice(rule: &str, source: &str) -> Option<String> {
+    static LAST_SEEN: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    let seen = LAST_SEEN.get_or_init(Default::default);
+    let key = format!("{rule}\u{1f}{source}");
+    let now = std::time::Instant::now();
+    let mut map = seen.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = map.get(&key) {
+        if now.duration_since(*at) < DEGRADED_NOTICE_INTERVAL {
+            return None;
+        }
+    }
+    map.insert(key, now);
+    Some(format!(
+        "sigil daemon: rule '{rule}' declares env keys but source '{source}' has no sealed \
+         record; running as a plain gate and injecting nothing. Seal it with: \
+         sigil-config source env set {source} --stdin"
+    ))
+}
+
 /// The gated fulfillment path for `sigil <cmd>` (and the shim alias / `sigil run`).
 /// Returns the exit code to mirror to the caller. Every failure path here fails
 /// closed (a non-zero code with a stderr line), so the caller behaves like a
@@ -2101,11 +2302,25 @@ fn fulfill(
             // be set) and routes the rest of dispatch down the plain-gate path.
             // config.json is untouched, so `source env set` re-seals it and
             // restores injection.
+            //
+            // It is also logged. Silence here is what turned a one-line
+            // misconfiguration into a long hunt: the command ran, exit code 0, and
+            // the only evidence that nothing had been injected was the tool
+            // falling back to its own auth.
             if let Some(provider) = core.providers.get(&action.provider) {
                 if provider.needs_sealed_env() {
                     let store = core.threshold.lock().expect("threshold store poisoned");
                     if store.get(&action.source_name).is_none() {
+                        let declared = !action.env_keys.is_empty();
                         action.env_keys.clear();
+                        drop(store);
+                        if declared {
+                            if let Some(line) =
+                                degraded_gate_notice(&action.rule, &action.source_name)
+                            {
+                                eprintln!("{line}");
+                            }
+                        }
                     }
                 }
             }
@@ -3897,6 +4112,284 @@ mod tests {
         let (r, w) = pipe();
         let code = fulfill(core, &argv, "", None, 0, None, Some(w), None);
         (code, read_all(r))
+    }
+
+    #[test]
+    fn sealing_while_the_daemon_is_armed_takes_effect_with_no_restart() {
+        // The live-fire bug. The daemon read threshold.db once, at arm time, and
+        // never again: a value sealed into an inline `env` source while it was
+        // already up never reached the armed store, so every gated run took the
+        // degrade-to-plain-gate path, injected nothing, and the tool fell back to
+        // its own auth. `sigil status` read the file fresh and disagreed with the
+        // running daemon. Only a restart fixed it.
+        //
+        // HomeGuard holds TEST_ENV_LOCK and points SIGIL_HOME at a temp dir, so
+        // ThresholdStore::save writes exactly where reload_threshold reads.
+        let _home = HomeGuard::new("seal-hot");
+        let dir = tmpdir("seal-hot");
+        let prev = fake_env_tool(&dir, "faketool");
+        let (core, _calls) = sealed_env_core(
+            "faketool",
+            &[("TOKEN", "sealed-after-arming")],
+            LeasePolicy::RunOnce,
+            Duration::from_secs(60),
+        );
+
+        // Reproduce the state the daemon was in: the record is on disk, the armed
+        // store is empty because the seal happened after arming.
+        {
+            let mut armed = core.threshold.lock().expect("threshold store");
+            let store = std::mem::take(&mut *armed);
+            store.save().expect("writing the sealed store to disk");
+        }
+
+        let (code, out) = run_sealed(&core, &[]);
+        assert_eq!(code, 0, "the stale daemon still gates and still runs");
+        assert_eq!(
+            out, "tok=[]",
+            "but injects nothing: the symptom that sent the tool to its own auth"
+        );
+
+        // One watcher tick, without the sleep.
+        assert_eq!(
+            core.reload_threshold().expect("a clean reload"),
+            1,
+            "the reload arms the record that was sealed after startup"
+        );
+
+        let (code, out) = run_sealed(&core, &[]);
+        restore_path(prev);
+        assert_eq!(code, 0);
+        assert_eq!(
+            out, "tok=[sealed-after-arming]",
+            "and the very next run injects, with no restart"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_malformed_sealed_store_keeps_the_last_good_records() {
+        // Fail-closed on the same terms as reload_config: a truncated or garbled
+        // threshold.db must not disarm a daemon that is serving fine.
+        let _home = HomeGuard::new("seal-badreload");
+        let dir = tmpdir("seal-badreload");
+        let (core, _calls) = sealed_env_core(
+            "faketool",
+            &[("TOKEN", "still-here")],
+            LeasePolicy::RunOnce,
+            Duration::from_secs(60),
+        );
+        let path = crate::threshold::ThresholdStore::path().expect("a store path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        assert!(
+            core.reload_threshold().is_err(),
+            "a malformed store is an error, not an empty store"
+        );
+        assert!(
+            core.threshold
+                .lock()
+                .expect("threshold store")
+                .get("faketool")
+                .is_some(),
+            "and the last-good record stays armed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A core that can serve `Frame::SealThreshold`: a v2 pairing (so there is a
+    /// phone share `F` to seal to) and this daemon's Mac share `m`, both held in a
+    /// `MemoryKeystore`. The caller must hold a `HomeGuard`, since the pairing and
+    /// the sealed store are written under `SIGIL_HOME`.
+    fn seal_ready_core(dir: &Path) -> Arc<Core> {
+        use sigil_proto::threshold::{EcdhAlgo, MacShare};
+        let (core, _) = test_core(
+            dir,
+            "tok",
+            "secret",
+            DevMode::Approve,
+            Duration::from_millis(50),
+        );
+        let ks = core.keystore.snapshot();
+        let f = MacShare::generate();
+        let daemon_id = DeviceIdentity::generate();
+        let daemon_pub = daemon_id.peer_identity();
+        let phone = DeviceIdentity::generate().peer_identity();
+        pairing_store::save(
+            ks.as_ref(),
+            &NewPairing {
+                daemon_identity: daemon_id,
+                phone,
+                relay_url: "ws://127.0.0.1:1".into(),
+                sas_words: sas_of(&daemon_pub, &phone),
+                paired_at: REMOTE_NOW,
+                phone_share: Some(crate::pairing_store::NewPhoneShare {
+                    se_key_id: "phone-se.v2".into(),
+                    f_x963: f.public_point().as_x963().to_vec(),
+                    ecdh_algo: EcdhAlgo::RawX,
+                }),
+            },
+        )
+        .expect("persisting the pairing");
+        crate::threshold::load_or_create_mac_share(ks.as_ref()).expect("a fresh Mac share");
+        core
+    }
+
+    #[test]
+    fn a_daemon_mediated_seal_arms_the_record_immediately() {
+        // Sealing routes through the daemon whenever one is listening, and that
+        // path wrote the file without touching the armed store: the seal was on
+        // disk and invisible to the very process that had just performed it. It
+        // must be live on return, not on the watcher's next tick.
+        let _home = HomeGuard::new("seal-mediated");
+        let dir = tmpdir("seal-mediated");
+        let core = seal_ready_core(&dir);
+
+        let pairs = vec![(
+            "TOKEN".to_string(),
+            zeroize::Zeroizing::new("mediated-value".to_string()),
+        )];
+        let payload = crate::provider::encode_env_pairs(&pairs);
+        let reply = control_round_trip(
+            &core,
+            &Frame::SealThreshold {
+                id: "prod".into(),
+                len: payload.len() as u64,
+            },
+            &payload,
+        );
+        assert!(control_ok(&reply), "{}", control_lines(&reply));
+        assert!(
+            core.threshold
+                .lock()
+                .expect("threshold store")
+                .get("prod")
+                .is_some(),
+            "the armed store holds it, so the next request injects"
+        );
+        assert!(
+            crate::threshold::ThresholdStore::load()
+                .unwrap()
+                .get("prod")
+                .is_some(),
+            "and so does disk"
+        );
+
+        // A removal is equally immediate: no window where the daemon keeps
+        // injecting values the human just deleted.
+        let reply = control_round_trip(
+            &core,
+            &Frame::SealThreshold {
+                id: "prod".into(),
+                len: 0,
+            },
+            b"",
+        );
+        assert!(control_ok(&reply), "{}", control_lines(&reply));
+        assert!(core
+            .threshold
+            .lock()
+            .expect("threshold store")
+            .get("prod")
+            .is_none());
+        assert!(crate::threshold::ThresholdStore::load()
+            .unwrap()
+            .get("prod")
+            .is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_degrade_to_a_plain_gate_announces_itself_once_per_window() {
+        // The silence is what made this a long hunt: a rule declaring env keys
+        // whose source has no sealed record gated, ran, exited 0, and injected
+        // nothing, with not one line to say so. The notice names both halves and
+        // the fix, and repeats at most once per window so a busy tool tree cannot
+        // drown the log.
+        let first = degraded_gate_notice("rule-alpha", "src-alpha")
+            .expect("the first degraded run is announced");
+        assert!(first.contains("rule-alpha"), "{first}");
+        assert!(first.contains("src-alpha"), "{first}");
+        assert!(first.contains("injecting nothing"), "{first}");
+        assert!(
+            first.contains("sigil-config source env set src-alpha"),
+            "and says how to fix it: {first}"
+        );
+        assert!(
+            degraded_gate_notice("rule-alpha", "src-alpha").is_none(),
+            "a burst of gated runs does not repeat it"
+        );
+        assert!(
+            degraded_gate_notice("rule-alpha", "src-beta").is_some(),
+            "but a different source is its own notice"
+        );
+    }
+
+    /// The doctor check that compares the armed sealed store against disk.
+    fn drift_check(core: &Arc<Core>) -> crate::json::CheckJson {
+        let checks: Vec<crate::json::CheckJson> =
+            serde_json::from_str(&json_body(query_reply(core.clone(), Frame::Doctor))).unwrap();
+        checks
+            .into_iter()
+            .find(|c| c.label == "sealed store matches the armed daemon")
+            .expect("the drift check is in the doctor report")
+    }
+
+    #[test]
+    fn doctor_catches_a_daemon_armed_with_a_stale_sealed_store() {
+        // With the hot reload in place this state should be unreachable, which is
+        // precisely why it belongs in doctor: it is the regression alarm for the
+        // one condition nothing else could see.
+        let _home = HomeGuard::new("doctor-drift");
+        let dir = tmpdir("doctor-drift");
+        let (core, _calls) = sealed_env_core(
+            "faketool",
+            &[("TOKEN", "v")],
+            LeasePolicy::RunOnce,
+            Duration::from_secs(60),
+        );
+
+        // Armed with one record, nothing on disk: a count mismatch either way is
+        // the same bug, and the hint has to name the fix.
+        let drift = drift_check(&core);
+        assert!(!drift.ok, "a count mismatch fails the check");
+        assert!(drift.hint.contains("sigil restart"), "{}", drift.hint);
+
+        // Agreement passes, and says how many records are armed.
+        core.threshold
+            .lock()
+            .expect("threshold store")
+            .save()
+            .expect("writing the armed store to disk");
+        let agreed = drift_check(&core);
+        assert!(agreed.ok, "{}", agreed.hint);
+        assert!(agreed.hint.contains('1'), "{}", agreed.hint);
+
+        // A re-seal keeps the count and changes the record. Comparing ids alone
+        // would call that agreement, so the fingerprint carries the ephemeral
+        // point, which is fresh on every seal. (A second core seals the same
+        // source name afresh; only its store is used here.)
+        let (resealed, _) = sealed_env_core(
+            "faketool",
+            &[("TOKEN", "v")],
+            LeasePolicy::RunOnce,
+            Duration::from_secs(60),
+        );
+        resealed
+            .threshold
+            .lock()
+            .expect("threshold store")
+            .save()
+            .expect("writing the re-sealed store");
+        let resealed_check = drift_check(&core);
+        assert!(!resealed_check.ok, "a re-seal is drift too");
+        assert!(
+            resealed_check.hint.contains("re-sealed"),
+            "{}",
+            resealed_check.hint
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

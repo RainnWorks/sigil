@@ -295,7 +295,7 @@ usage: sigil-config <cmd> [args...]   author rules/sources, manage accounts
 
 --json is for the CLI-only mutation commands the Mac app shells out for
 (source/rule/list/export/import, account, settings, wipe, mac-approvals).
-Re-run `sigil restart` to apply a config change."
+A running daemon picks up config, sealed values, and SSH keys on its own."
     );
 }
 
@@ -3019,6 +3019,15 @@ fn config_source_env_set(args: &[String], json: bool) -> i32 {
     if !seal_env_pairs(cfg, &name, &pairs) {
         return 1;
     }
+    if !json {
+        // Said out loud because it used not to be true: a seal into a daemon that
+        // was already running went to disk and nowhere else, and every gated run
+        // after it injected nothing until a restart.
+        println!(
+            "  {}",
+            Style::stdout().faint("in effect on the next gated run; no restart needed")
+        );
+    }
     print_config_result(
         &ControlResult::line(true, format!("sealed {count} value(s) on {name}")),
         json,
@@ -3139,13 +3148,39 @@ fn lease_flag(args: &[String]) -> Result<sigil_proto::LeasePolicy, i32> {
     Ok(sigil_proto::LeasePolicy::Leasable { max_secs })
 }
 
+/// Normalize a rule-matcher flag name to the form it must have to ever match.
+///
+/// `--flag-eq account=x` is an easy and natural thing to type, and it stored the
+/// flag as `account`: a rule that reads correctly in `sigil-config list`, gates
+/// nothing, and gives no hint why. The matcher compares whole argv tokens, so a
+/// name with no leading dash can only match a bare positional word (which is what
+/// `--argv-contains` is for). A bare name is therefore taken to mean `--name`,
+/// and the substitution is printed rather than made silently. Anything already
+/// starting with `-` is left exactly as typed, so a short `-a` still works.
+/// An empty name is refused: there is nothing to guess at.
+fn normalize_match_flag(flag: &str) -> Result<String, i32> {
+    if flag.is_empty() {
+        eprintln!("sigil: an empty flag name cannot match anything");
+        return Err(2);
+    }
+    if flag.starts_with('-') {
+        return Ok(flag.to_string());
+    }
+    let dashed = format!("--{flag}");
+    eprintln!(
+        "sigil: matching '{dashed}' (a bare '{flag}' would never match an argv token; \
+         use --argv-contains to match a positional word)"
+    );
+    Ok(dashed)
+}
+
 /// Build a [`Match`](crate::config::Match) from the rule-matcher flags.
 fn build_match(args: &[String]) -> Result<crate::config::Match, i32> {
     let flag_equals = flag_values(args, "--flag-eq")
         .into_iter()
         .map(|fe| match fe.split_once('=') {
             Some((f, v)) => Ok(crate::config::FlagEq {
-                flag: f.to_string(),
+                flag: normalize_match_flag(f)?,
                 value: v.to_string(),
             }),
             None => {
@@ -3154,11 +3189,15 @@ fn build_match(args: &[String]) -> Result<crate::config::Match, i32> {
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let flag_present = flag_values(args, "--flag")
+        .iter()
+        .map(|f| normalize_match_flag(f))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(crate::config::Match {
         command: flag_value(args, "--command").map(str::to_string),
         subcommand: flag_value(args, "--subcommand").map(str::to_string),
         argv_contains: flag_values(args, "--argv-contains"),
-        flag_present: flag_values(args, "--flag"),
+        flag_present,
         flag_equals,
         arg_regex: flag_value(args, "--regex").map(str::to_string),
     })
@@ -3252,9 +3291,11 @@ fn config_rule_add(args: &[String], json: bool) -> i32 {
     }
     let s = Style::stdout();
     if !json {
+        // config.json hot-reloads (#59), so telling the human to restart is both
+        // unnecessary and, worse, teaches that a restart is how changes land.
         println!(
             "  {}",
-            s.faint("restart the daemon to apply, then: sigil <cmd> <args>")
+            s.faint("the running daemon applies it within a couple of seconds: sigil <cmd> <args>")
         );
     }
     print_config_result(
@@ -3299,6 +3340,18 @@ fn config_rule_list(json: bool) -> i32 {
             pad(&target, 22),
             s.dim(&format!("{} \u{b7} {}", policy, describe_match(&r.match_)))
         );
+        // A rule authored before flag normalization can hold a flag with no
+        // leading dash, which never matches. It reads as a working rule on the
+        // line above, so say plainly that it is not one.
+        for dead in r.match_.dead_flags() {
+            println!(
+                "  {}",
+                s.brass(&format!(
+                    "\u{2717} flag '{dead}' has no leading dashes and never matches; \
+                     re-add the rule with '--{dead}'"
+                ))
+            );
+        }
     }
     0
 }
@@ -3562,7 +3615,8 @@ fn config_add(args: &[String], json: bool) -> i32 {
     println!(
         "  {}",
         s.faint(&format!(
-            "restart the daemon to apply, then: sigil {cmd} <args>  (or: sigil shim add {cmd})"
+            "the running daemon applies it within a couple of seconds, then: sigil {cmd} <args>  \
+             (or: sigil shim add {cmd})"
         ))
     );
     0
@@ -3880,6 +3934,60 @@ fn pad(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_bare_matcher_flag_is_normalized_to_the_form_that_can_match() {
+        // `rule add --flag-eq account=x` stored the flag as "account", which can
+        // never equal an argv token like "--account=x". The rule then read
+        // correctly in `list` and gated nothing. A bare name now means "--name".
+        let m = build_match(&argv(&[
+            "--flag-eq",
+            "account=rowmhq.1password.eu",
+            "--flag",
+            "no-input",
+        ]))
+        .expect("a normalizable match");
+        assert_eq!(m.flag_equals[0].flag, "--account");
+        assert_eq!(m.flag_equals[0].value, "rowmhq.1password.eu");
+        assert_eq!(m.flag_present, vec!["--no-input".to_string()]);
+        assert!(m.dead_flags().is_empty(), "nothing dead survives authoring");
+
+        // And the normalized rule matches the argv it was written for.
+        assert!(m.matches(&argv(&[
+            "op",
+            "--account",
+            "rowmhq.1password.eu",
+            "--no-input"
+        ])));
+        assert!(m.matches(&argv(&[
+            "op",
+            "--account=rowmhq.1password.eu",
+            "--no-input=1"
+        ])));
+    }
+
+    #[test]
+    fn an_already_dashed_flag_is_left_exactly_as_typed() {
+        let m = build_match(&argv(&["--flag", "-4", "--flag-eq", "--account=x"]))
+            .expect("a valid match");
+        assert_eq!(
+            m.flag_present,
+            vec!["-4".to_string()],
+            "a short flag survives"
+        );
+        assert_eq!(m.flag_equals[0].flag, "--account");
+    }
+
+    #[test]
+    fn an_empty_matcher_flag_is_refused() {
+        // Nothing to guess at, so this is an error rather than a silent "--".
+        assert_eq!(build_match(&argv(&["--flag-eq", "=x"])).unwrap_err(), 2);
+        assert_eq!(build_match(&argv(&["--flag", ""])).unwrap_err(), 2);
+    }
 
     /// A status shape with the keystore fields set, everything else inert.
     fn status_with_keystore(sealed: Option<bool>, provisioned: Option<bool>) -> json::StatusJson {

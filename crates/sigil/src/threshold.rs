@@ -262,6 +262,15 @@ impl ThresholdStore {
     /// Persist the store 0600, creating the parent dir 0700. Enforces the R4
     /// invariant (all ephemeral bases distinct) before writing, so a store that
     /// would break the "one captured partial ⇒ one secret" claim is never saved.
+    ///
+    /// The write goes to a sibling temp file and is renamed into place, so a
+    /// reader never sees a truncated store. The daemon now stat-polls this file
+    /// and reloads it (`daemon::Core::reload_threshold`); a torn read there would
+    /// be a parse error, and the daemon would keep serving the previous records
+    /// until something else touched the file. `rename` within the same directory
+    /// removes that window entirely. Permissions are set on the temp file BEFORE
+    /// the rename, so the store is never briefly world-readable under its real
+    /// name.
     pub fn save(&self) -> Result<(), ThresholdStoreError> {
         use std::os::unix::fs::PermissionsExt;
         if !all_ephemerals_unique(&self.secrets) {
@@ -273,8 +282,13 @@ impl ThresholdStore {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
         let json = serde_json::to_vec_pretty(self)?;
-        std::fs::write(&path, json)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let tmp = path.with_extension(format!("db.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, json)?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 

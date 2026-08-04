@@ -137,6 +137,24 @@ impl Match {
         true
     }
 
+    /// Flag names in this match that can never match anything, i.e. those written
+    /// without a leading dash.
+    ///
+    /// [`flag_present`] and [`flag_equals`] compare against whole argv tokens, so
+    /// a flag stored as `account` would have to appear in argv as the bare word
+    /// `account`, never as `--account` or `--account=x`. A rule authored that way
+    /// renders correctly in `sigil-config list` and is dead on arrival, which is
+    /// exactly the kind of quiet nothing this tool must not produce. `rule add`
+    /// normalizes at authoring time; this reports the ones already on disk.
+    pub fn dead_flags(&self) -> Vec<&str> {
+        self.flag_present
+            .iter()
+            .map(String::as_str)
+            .chain(self.flag_equals.iter().map(|fe| fe.flag.as_str()))
+            .filter(|f| !f.starts_with('-'))
+            .collect()
+    }
+
     /// Whether this match carries no conditions at all.
     pub fn is_empty(&self) -> bool {
         self.command.is_none()
@@ -605,6 +623,50 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_flag_with_no_leading_dash_is_reported_as_dead() {
+        // Rules authored before normalization can hold one. It cannot match any
+        // real argv, so `rule list` has to say so rather than render it as
+        // working config.
+        let m = Match {
+            command: Some("op".into()),
+            flag_present: vec!["no-input".into(), "--quiet".into()],
+            flag_equals: vec![
+                FlagEq {
+                    flag: "account".into(),
+                    value: "rowmhq.1password.eu".into(),
+                },
+                FlagEq {
+                    flag: "--vault".into(),
+                    value: "Engineering".into(),
+                },
+            ],
+            ..Match::default()
+        };
+        assert_eq!(m.dead_flags(), vec!["no-input", "account"]);
+        assert!(
+            !m.matches(&argv(&[
+                "op",
+                "--no-input",
+                "--quiet",
+                "--account=rowmhq.1password.eu",
+                "--vault=Engineering"
+            ])),
+            "and it really does not match, which is the whole problem"
+        );
+
+        let fixed = Match {
+            flag_present: vec!["--quiet".into()],
+            flag_equals: vec![FlagEq {
+                flag: "--vault".into(),
+                value: "Engineering".into(),
+            }],
+            ..m
+        };
+        assert!(fixed.dead_flags().is_empty());
+        assert!(fixed.matches(&argv(&["op", "--quiet", "--vault=Engineering"])));
     }
 
     /// Unwrap a resolution as a gate action, panicking on an allow (the common
