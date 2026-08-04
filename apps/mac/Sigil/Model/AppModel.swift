@@ -42,6 +42,11 @@ final class AppModel {
     /// control), never on a poll observing the daemon down: a human who
     /// pressed Stop stays stopped.
     private var autoEnsured = false
+    /// The Secure Enclave wrapping of the daemon's keystore file: whether it is
+    /// sealed, and whether this daemon has been handed the material for this run.
+    /// The app owns this because the daemon cannot: it is unsigned and portable,
+    /// so it has no Enclave of its own.
+    let keystore: KeystoreCoordinator
     /// Whether the first secondary load (config, history, settings) has completed.
     /// The Rules screen gates its teaching empty state on this so it never flashes
     /// before the load or on a pane re-select.
@@ -55,8 +60,13 @@ final class AppModel {
     private var pollTask: Task<Void, Never>?
     private var pendingTask: Task<Void, Never>?
 
-    init(daemon: DaemonClient) {
+    private var keystoreTask: Task<Void, Never>?
+
+    init(daemon: DaemonClient, keystore: KeystoreCoordinator? = nil) {
         self.daemon = daemon
+        self.keystore = keystore ?? (daemon.isFixtureClient
+            ? KeystoreCoordinator(previewState: .sealed(path: "~/.sigil/keystore.json"))
+            : KeystoreCoordinator())
     }
 
     /// The coarse arm state that drives the menubar glyph and the header word.
@@ -74,6 +84,19 @@ final class AppModel {
             guard let self, !self.autoEnsured else { return }
             self.autoEnsured = true
             await self.ensureUp()
+            // Only once the daemon is actually up: provisioning is a socket call,
+            // and a keystore this app cannot hand over is exactly the fail-closed
+            // state the Status pane has to report rather than retry blindly.
+            await self.keystore.sync(daemon: self.daemon)
+        }
+        // The keystore channel, live for the whole session. It carries three
+        // things: each successful connection (which is how a daemon restart is
+        // noticed, since the daemon accepts a provision once per lifetime), the
+        // de-adoption requests `sigil keystore unwrap` cannot prompt for itself,
+        // and the write-back a pairing triggers.
+        keystoreTask = Task { [weak self] in
+            guard let self else { return }
+            await self.keystore.watchKeystoreEvents(daemon: self.daemon)
         }
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -95,6 +118,7 @@ final class AppModel {
     func stop() {
         pollTask?.cancel(); pollTask = nil
         pendingTask?.cancel(); pendingTask = nil
+        keystoreTask?.cancel(); keystoreTask = nil
     }
 
     func refresh() async {
@@ -177,6 +201,21 @@ final class AppModel {
 
     func installShim() async {
         await performControl { try await self.daemon.installShim() }
+    }
+
+    /// Re-run the keystore sync behind the Status pane's Retry control: read the
+    /// file, unwrap it, hand it to the daemon again. Idempotent, like `ensureUp`.
+    /// Nothing retries this on a timer; a refusal is surfaced and left for the
+    /// human, because the reasons a daemon refuses material do not heal by
+    /// themselves.
+    func syncKeystore() async {
+        await keystore.sync(daemon: daemon)
+    }
+
+    /// Re-wrap after a downgrade was detected. Deliberately its own verb: this is
+    /// the human answering an alarm, not routine upkeep.
+    func rewrapKeystore() async {
+        await keystore.rewrapAfterDowngrade(daemon: daemon)
     }
 
     // MARK: daemon lifecycle (start / stop / restart / install)

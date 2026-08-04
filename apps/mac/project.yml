@@ -54,3 +54,22 @@ targets:
         CODE_SIGN_STYLE: Automatic
         ASSETCATALOG_COMPILER_APPICON_NAME: ""
         ENABLE_PREVIEWS: YES
+      configs:
+        # Release hardening is part of the keystore security contract, not a
+        # checklist item. The Secure Enclave wrap key is bound to this app's code
+        # signature: anything that lets another process borrow that identity makes
+        # the wrap decorative, because the attacker simply asks the Enclave to
+        # decrypt for them.
+        #
+        #   library validation  only Apple-signed or same-team code may load into
+        #                       the app, so no injected dylib inherits the
+        #                       keychain-access-group entitlement.
+        #   get-task-allow off  no debugger may attach and drive the Enclave calls
+        #                       from inside the process. Xcode injects this
+        #                       entitlement for Debug builds; turning the
+        #                       injection off is what keeps it out of Release.
+        #   hardened runtime    the umbrella both of the above live under.
+        Release:
+          ENABLE_HARDENED_RUNTIME: YES
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+          OTHER_CODE_SIGN_FLAGS: "-o runtime,library"

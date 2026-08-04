@@ -35,6 +35,12 @@ enum DaemonError: LocalizedError {
 /// The full surface the configurator and menubar drive. All async; a real
 /// implementation shells out or opens the unix socket, a mock returns fixtures.
 protocol DaemonClient: Sendable {
+    /// True only for the fixture client. The app asks so that previews and the
+    /// fixtures build never reach for the real keystore file or this Mac's Secure
+    /// Enclave: a preview that minted an Enclave key would be a preview with side
+    /// effects on the developer's machine.
+    var isFixtureClient: Bool { get }
+
     // Status / diagnostics
     func status() async throws -> StatusReport
     /// The doctor's ordered checks, each a (label, ok, hint) triple.
@@ -150,6 +156,24 @@ protocol DaemonClient: Sendable {
     /// not installed). Read directly for the "View block" affordance.
     func generatedSshConfig() async -> String?
 
+    // Keystore wrapping (Mac only; see KeystoreCoordinator). The daemon cannot
+    // hold a Secure Enclave key, so the signed app wraps the keystore file and
+    // hands the material back over the socket. These three verbs are the whole
+    // channel.
+    /// `keystore_provision`: a JSON header naming a byte count, then that many raw
+    /// material bytes. No digest rides along; the daemon recomputes over what it
+    /// received and compares against the v2 file it read at startup. RAM-only on
+    /// the daemon side, accepted once per daemon lifetime, and a mismatch is a
+    /// refusal rather than a silent acceptance.
+    func provisionKeystore(material: Data) async throws -> ControlResult
+    /// `subscribe_keystore`: the long-lived channel the daemon relays de-adoption
+    /// requests on. Also reports each successful (re)connection, which is how a
+    /// daemon restart is detected. Yields nothing on clients with no push channel.
+    func subscribeKeystoreEvents() -> AsyncStream<KeystoreEvent>
+    /// `keystore_unwrap_done`: how the waiting CLI learns whether the Touch ID
+    /// was given and the file actually went back to plaintext.
+    func reportKeystoreUnwrap(nonce: String, ok: Bool, reason: String) async throws -> ControlResult
+
     // Shim
     func installShim() async throws -> ControlResult
 
@@ -159,7 +183,44 @@ protocol DaemonClient: Sendable {
     func wipe() async throws -> ControlResult
 }
 
+/// What arrives on the `subscribe_keystore` stream. The nonce is echoed back so
+/// the daemon can match an answer to the invocation waiting on it.
+enum KeystoreEvent: Equatable, Sendable {
+    /// The subscription connected. Synthesized by the client, not sent by the
+    /// daemon: it means "this is a daemon that has not been provisioned yet",
+    /// which after a restart is exactly true.
+    case connected
+    /// `sigil keystore unwrap` is asking for de-adoption. Touch ID, then rewrite.
+    ///
+    /// There is deliberately no `commit` case. A write-back was designed for the
+    /// day the daemon mutates the keystore itself, but the production daemon never
+    /// writes it: every mutation is CLI-side, and while the store is wrapped those
+    /// are refused up front with "unwrap first". The generic re-wrap that a commit
+    /// would use still exists (`KeystoreWrapper.wrap` takes arbitrary material and
+    /// is what adoption already calls), so wiring one later is a stream case and a
+    /// fetch verb, not a redesign.
+    case unwrap(nonce: String)
+}
+
 extension DaemonClient {
+    var isFixtureClient: Bool { false }
+
+    // The keystore channel exists only over the control socket. The CLI half and
+    // the mock answer honestly rather than pretending: a client with no socket
+    // cannot provision, and saying so leaves the coordinator in an explicit
+    // unprovisioned state instead of a falsely sealed one.
+    func provisionKeystore(material: Data) async throws -> ControlResult {
+        throw DaemonError.notImplemented("keystore provisioning needs the daemon control socket")
+    }
+
+    func subscribeKeystoreEvents() -> AsyncStream<KeystoreEvent> {
+        AsyncStream { $0.finish() }
+    }
+
+    func reportKeystoreUnwrap(nonce: String, ok: Bool, reason: String) async throws -> ControlResult {
+        throw DaemonError.notImplemented("keystore unwrap needs the daemon control socket")
+    }
+
     /// Fallback pending feed for clients without a push channel: poll `pending()`
     /// on a short interval. SocketDaemonClient overrides this with the daemon's
     /// live event stream. Iterating stops the poll (via onTermination).

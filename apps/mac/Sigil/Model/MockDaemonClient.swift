@@ -18,6 +18,10 @@ enum MockScenario: Sendable {
 }
 
 actor MockDaemonClient: DaemonClient {
+    /// Fixtures: the app must not read the real keystore or mint a real Secure
+    /// Enclave key behind a preview.
+    nonisolated var isFixtureClient: Bool { true }
+
     private var scenario: MockScenario
     private var leasesStore: [Lease]
     private var historyStore: [HistoryEntry]
@@ -195,7 +199,10 @@ actor MockDaemonClient: DaemonClient {
         if lease {
             leasesStore.insert(.init(grantHex: String(UUID().uuidString.prefix(12)).lowercased(),
                                      caller: req.provenance.processChain.last ?? "op",
-                                     account: "Rowm work", scope: req.title,
+                                     // The daemon scopes the lease to the matched
+                                     // rule; the fixture rules are named after the
+                                     // command they gate, so stand in with that.
+                                     account: "Rowm work", scope: req.command.first ?? "rule",
                                      grantedAt: Date(), expiresAt: Date().addingTimeInterval(900)), at: 0)
         }
         return .ok(lines: ["approved\(lease ? " (session lease)" : "")"])
@@ -317,11 +324,12 @@ actor MockDaemonClient: DaemonClient {
 
 enum Fixtures {
     static let leases: [Lease] = [
+        // `scope` is a rule name (see Fixtures.config), never a command line.
         Lease(grantHex: "9f3c1a77be20", caller: "claude", account: "Rowm work",
-              scope: "Engineering/.env", grantedAt: Date().addingTimeInterval(-300),
+              scope: "op", grantedAt: Date().addingTimeInterval(-300),
               expiresAt: Date().addingTimeInterval(600)),
         Lease(grantHex: "2b8ee410c9d1", caller: "rowm launcher", account: "Rowm work",
-              scope: "op read op://Engineering/graphql-api/credential",
+              scope: "gcloud",
               grantedAt: Date().addingTimeInterval(-90), expiresAt: Date().addingTimeInterval(90)),
     ]
 

@@ -14,6 +14,7 @@ struct MenubarContent: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             if let error = model.lastError { errorStrip(error) }
+            if model.keystore.state.blocksDaemon || model.keystore.state.isAlarm { keystoreStrip }
             Divider()
             content
             Divider()
@@ -33,6 +34,42 @@ struct MenubarContent: View {
         HStack(alignment: .top, spacing: 6) {
             Image(systemName: "exclamationmark.triangle").foregroundStyle(Palette.brass).font(.system(size: 10))
             Text(message).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 6)
+    }
+
+    /// The at-rest layer, but only in the states that earn a line here: the
+    /// daemon cannot work, or the protection was removed by something other than
+    /// the sanctioned unwrap. Silence in the first case would leave the popover
+    /// looking idle while nothing could possibly run; silence in the second would
+    /// hide the only evidence that the file was replaced.
+    ///
+    /// Three states reach this strip, so it branches three ways. Two of them are
+    /// sealed-and-unusable and could-not-be-opened, which are different facts with
+    /// different fixes; collapsing them told a person with an unreadable keystore
+    /// to go and provision it.
+    ///
+    /// The glyph is never `exclamationmark.triangle`: `errorStrip` above already
+    /// owns that shape in brass, and two triangles in different colors stacked in
+    /// one popover read as one thing shouting twice. These carry lock shapes,
+    /// which differ from each other and from the triangle without relying on color.
+    private var keystoreStrip: some View {
+        let (glyph, headline, action): (String, String, String) = switch model.keystore.state {
+        case .downgraded:
+            ("lock.open", "Keystore protection was removed outside Sigil.", "Open Sigil to see what happened.")
+        case .failed:
+            ("xmark.octagon", "The keystore could not be opened.", "Open Sigil for the reason.")
+        default:
+            // Sealed but not open. Nothing else reaches this strip: it renders
+            // only for the states that block the daemon or raise the alarm.
+            ("lock", "Keystore sealed, not open. The daemon does not hold it.", "Open Sigil to provision it.")
+        }
+        return HStack(alignment: .top, spacing: 6) {
+            Image(systemName: glyph).foregroundStyle(Palette.rust).font(.system(size: 10))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(headline).font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(action).font(.system(size: 10)).foregroundStyle(.tertiary)
+            }
         }
         .padding(.horizontal, 12).padding(.vertical, 6)
     }
@@ -166,6 +203,18 @@ private struct PendingCard: View {
 #Preview("Menubar pending") {
     MenubarContent(openConfigurator: {})
         .environment(AppModel(daemon: MockDaemonClient(scenario: .pendingRequests)))
+        .frame(width: 320)
+}
+
+#Preview("Menubar keystore sealed") {
+    // The daemon is up but holds no keystore material, so nothing can run. The
+    // popover has to say why rather than look merely idle.
+    MenubarContent(openConfigurator: {})
+        .environment(AppModel(
+            daemon: MockDaemonClient(scenario: .armedIdle),
+            keystore: KeystoreCoordinator(previewState: .sealedUnprovisioned(
+                path: "/Users/you/.sigil/keystore.json",
+                reason: "The daemon refused the keystore material: digest mismatch."))))
         .frame(width: 320)
 }
 

@@ -69,6 +69,14 @@ struct StatusReport: Equatable, Sendable {
     /// Present only when a pairing names a relay; nil means "not applicable".
     var relayReachable: Bool?
     var relayURL: String?
+    /// The daemon's own view of keystore wrapping: whether the file it read was
+    /// the wrapped v2 shape, and whether it currently holds provisioned material.
+    /// Both nil from a daemon build that predates the fields, in which case the
+    /// app falls back to what it knows from its own launch. The pair is the only
+    /// honest source for "sealed on disk but this daemon has nothing", which no
+    /// amount of app-side inspection can determine.
+    var keystoreSealed: Bool?
+    var keystoreProvisioned: Bool?
 
     /// The coarse arm state that drives the menubar and the header word.
     var armState: ArmState {
@@ -100,6 +108,9 @@ struct Lease: Identifiable, Equatable, Sendable {
     let grantHex: String
     var caller: String
     var account: String
+    /// The matched RULE's name, not a command line. The lease covers any command
+    /// that rule matches for the caller chain that opened it, so every renderer
+    /// has to show that breadth alongside the name.
     var scope: String
     var grantedAt: Date
     var expiresAt: Date

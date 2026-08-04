@@ -134,6 +134,99 @@ struct SocketDaemonClient: DaemonClient {
         }
     }
 
+    // MARK: - Keystore wrapping (the app's Secure Enclave half)
+    //
+    // Material never rides inside JSON. Every frame that carries it is a JSON
+    // header line naming a byte count, followed immediately by exactly that many
+    // raw bytes on the same connection. Base64 in a JSON string would put the
+    // daemon's key material into a `String` that is never zeroized and that any
+    // Debug or error path could print; raw bytes in a Data at least stay in one
+    // buffer the caller can overwrite.
+
+    /// Hand the material to the daemon. No digest travels with it: the daemon
+    /// recomputes over the bytes it received and compares, in constant time,
+    /// against the digest in the v2 file it read at startup. A caller-supplied
+    /// digest would only ever agree with itself.
+    func provisionKeystore(material: Data) async throws -> ControlResult {
+        await materialRoundTrip(header: ["kind": "keystore_provision", "len": material.count],
+                                material: material)
+    }
+
+    func reportKeystoreUnwrap(nonce: String, ok: Bool, reason: String) async throws -> ControlResult {
+        await control(.keystoreUnwrapDone(nonce: nonce, ok: ok, reason: reason))
+    }
+
+    /// The de-adoption channel: one long-lived `subscribe_keystore` connection,
+    /// resubscribing across daemon restarts exactly like the pending stream.
+    ///
+    /// It emits `.connected` on every successful (re)subscribe, and that is the
+    /// restart signal the whole provisioning flow hangs on. The daemon accepts a
+    /// provision once per lifetime, so "has the daemon restarted" has to be
+    /// answered by the connection itself rather than by polling status: a daemon
+    /// that died and came back is precisely a connection that dropped and was
+    /// remade. A dropped connection emits nothing else, because an unwrap must
+    /// only ever come from the daemon relaying a real request.
+    func subscribeKeystoreEvents() -> AsyncStream<KeystoreEvent> {
+        let path = socketPath
+        return AsyncStream { continuation in
+            let cancel = CancelBox()
+            continuation.onTermination = { _ in cancel.cancel() }
+            Thread.detachNewThread {
+                var backoff: TimeInterval = 1
+                while !cancel.isCancelled {
+                    do {
+                        let conn = try UnixSocketConnection(path: path)
+                        try conn.writeLine(Self.encodeFrame(.subscribeKeystore))
+                        backoff = 1
+                        continuation.yield(.connected)
+                        while !cancel.isCancelled, let line = try conn.readLine() {
+                            if let event = Self.decodeKeystoreEvent(line) {
+                                continuation.yield(event)
+                            }
+                        }
+                    } catch {
+                        // Daemon down: nothing to report, just wait and retry.
+                    }
+                    guard !cancel.isCancelled else { break }
+                    Thread.sleep(forTimeInterval: backoff)
+                    backoff = min(backoff * 2, 30)
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    /// One connection: JSON header line, the raw material straight after it, then
+    /// a single control reply.
+    private func materialRoundTrip(header: [String: Any], material: Data) async -> ControlResult {
+        let path = socketPath
+        let headerData = (try? JSONSerialization.data(withJSONObject: header)) ?? Data("{}".utf8)
+        return await withCheckedContinuation { cont in
+            Self.ioQueue.async {
+                do {
+                    let conn = try UnixSocketConnection(path: path)
+                    try conn.writeLine(headerData)
+                    try conn.writeRaw(material)
+                    guard let line = try conn.readLine() else {
+                        throw SocketError.io("daemon closed the connection without a reply")
+                    }
+                    let reply = try Self.decode(ReplyEnvelope.self, line)
+                    guard reply.kind == "control" else {
+                        cont.resume(returning: .failed(lines: ["unexpected reply: \(reply.kind)"]))
+                        return
+                    }
+                    cont.resume(returning: (reply.ok ?? false)
+                        ? .ok(lines: reply.lines ?? [])
+                        : .failed(lines: reply.lines ?? ["refused"]))
+                } catch let error as SocketError {
+                    cont.resume(returning: .failed(lines: ["daemon not running", error.detail]))
+                } catch {
+                    cont.resume(returning: .failed(lines: [String(describing: error)]))
+                }
+            }
+        }
+    }
+
     // MARK: - Shelled out to `sigil … --json` (keystore / config mutations)
 
     func config() async throws -> SigilConfig { try await cli.config() }
@@ -253,6 +346,8 @@ struct SocketDaemonClient: DaemonClient {
         case leaseRevoke(prefix: String)
         case approve(id: String, lease: Bool)
         case deny(id: String)
+        case subscribeKeystore
+        case keystoreUnwrapDone(nonce: String, ok: Bool, reason: String)
     }
 
     private static func encodeFrame(_ frame: Frame) -> Data {
@@ -267,6 +362,12 @@ struct SocketDaemonClient: DaemonClient {
         case .leaseRevoke(let prefix): object = ["kind": "lease_revoke", "prefix": prefix]
         case .approve(let id, let lease): object = ["kind": "approve", "id": id, "lease": lease]
         case .deny(let id): object = ["kind": "deny", "id": id]
+        // snake_case, like every other kind: the daemon's Frame enum is derived
+        // with `rename_all = "snake_case"`, so a hyphenated verb would not
+        // deserialize even though the contract prose spells it that way.
+        case .subscribeKeystore: object = ["kind": "subscribe_keystore"]
+        case .keystoreUnwrapDone(let nonce, let ok, let reason):
+            object = ["kind": "keystore_unwrap_done", "nonce": nonce, "ok": ok, "reason": reason]
         }
         // The keys are fixed and JSON-safe; serialization cannot realistically fail.
         return (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
@@ -288,6 +389,20 @@ struct SocketDaemonClient: DaemonClient {
             throw SocketError.io("expected a json reply, got \(reply.kind)")
         }
         return Data(body.utf8)
+    }
+
+    /// Parse one keystore event: `{"kind":"event","body":"{\"kind\":\"unwrap\",
+    /// \"nonce\":\"…\"}"}`. An unrecognized kind is dropped rather than guessed
+    /// at, so a verb this app does not implement (a `commit`, were the deferred
+    /// write-back ever switched on daemon-side) cannot be answered as if it were
+    /// an unwrap.
+    private static func decodeKeystoreEvent(_ line: Data) -> KeystoreEvent? {
+        struct Body: Decodable { let kind: String; let nonce: String }
+        guard let reply = try? decode(ReplyEnvelope.self, line),
+              reply.kind == "event", let body = reply.body,
+              let request = try? decode(Body.self, Data(body.utf8)) else { return nil }
+        guard request.kind == "unwrap" else { return nil }
+        return .unwrap(nonce: request.nonce)
     }
 
     /// Parse one `{"kind":"event","body":"[PendingJson]"}` snapshot. Non-event
@@ -434,6 +549,57 @@ private final class UnixSocketConnection {
                 throw SocketError.io("read(): \(String(cString: strerror(errno)))")
             }
         }
+    }
+
+    /// Write bytes with no trailing newline: the material half of a length
+    /// -prefixed frame, which follows its JSON header immediately on the same
+    /// stream. Deliberately not routed through `writeLine`, since a newline
+    /// appended to binary material would corrupt it.
+    func writeRaw(_ data: Data) throws {
+        try data.withUnsafeBytes { raw in
+            guard var cursor = raw.baseAddress else { return }
+            var remaining = raw.count
+            while remaining > 0 {
+                let n = Darwin.write(fd, cursor, remaining)
+                if n > 0 {
+                    cursor = cursor.advanced(by: n)
+                    remaining -= n
+                } else if n < 0 && errno == EINTR {
+                    continue
+                } else {
+                    throw SocketError.io("write(): \(String(cString: strerror(errno)))")
+                }
+            }
+        }
+    }
+
+    /// Read exactly `count` bytes. Drains whatever the last `readLine` buffered
+    /// past its newline FIRST: the header line and the first material bytes
+    /// usually arrive in one read, so ignoring the carry would drop them and then
+    /// block forever waiting for bytes already in hand.
+    func readExactly(_ count: Int) throws -> Data {
+        guard count >= 0 else { throw SocketError.io("negative length") }
+        var out = Data(capacity: count)
+        if !carry.isEmpty {
+            let take = min(count, carry.count)
+            out.append(contentsOf: carry[0..<take])
+            carry.removeFirst(take)
+        }
+        var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+        while out.count < count {
+            let want = min(chunk.count, count - out.count)
+            let n = chunk.withUnsafeMutableBytes { buf in Darwin.read(fd, buf.baseAddress, want) }
+            if n > 0 {
+                out.append(contentsOf: chunk[0..<n])
+            } else if n == 0 {
+                throw SocketError.io("daemon closed the connection mid-frame")
+            } else if errno == EINTR {
+                continue
+            } else {
+                throw SocketError.io("read(): \(String(cString: strerror(errno)))")
+            }
+        }
+        return out
     }
 }
 

@@ -79,15 +79,15 @@ struct CLIDaemonClient: DaemonClient {
         self.configBinaryURL = CLIDaemonClient.resolveSigilConfig(besideSigil: sigil)
     }
 
-    /// Environment for every `sigil` invocation. `SIGIL_DEV_KEYSTORE=file` is
-    /// temporary: until the Secure Enclave keystore is wired into the daemon
-    /// (task #24), the real keystore (which stores the daemon identity key and
-    /// the Mac threshold share) dies with "secure enclave path not yet verified
-    /// on hardware", so pairing needs the dev file-backed keystore to run at all.
+    /// Environment for every `sigil` invocation. Deliberately bare: the file
+    /// keystore at `~/.sigil/keystore.json` is the default now, so nothing here
+    /// pins a backend. The old `SIGIL_DEV_KEYSTORE=file` pin is gone with the
+    /// mismatch it used to paper over, where an app-launched CLI and the daemon
+    /// could disagree about which store held the pairing and report a false
+    /// "re-pair needed".
     private static func env() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         env["NO_COLOR"] = "1"
-        env["SIGIL_DEV_KEYSTORE"] = "file"
         return env
     }
 
@@ -520,6 +520,10 @@ struct StatusDTO: Decodable {
     let factor: FactorDTO
     let relay_reachable: Bool?
     let relay_url: String?
+    // Optional on purpose: a daemon built before keystore wrapping omits them
+    // entirely, and the app must still decode its status.
+    let keystore_sealed: Bool?
+    let keystore_provisioned: Bool?
 
     func model() -> StatusReport {
         let shimKind: ShimState.Kind = switch shim.kind {
@@ -534,7 +538,9 @@ struct StatusDTO: Decodable {
         return StatusReport(daemonUp: daemon_up, socketPath: socket,
                             shim: ShimState(kind: shimKind, path: shim.path, issue: shim.issue),
                             opFound: op.found, opPath: op.path,
-                            factor: f, relayReachable: relay_reachable, relayURL: relay_url)
+                            factor: f, relayReachable: relay_reachable, relayURL: relay_url,
+                            keystoreSealed: keystore_sealed,
+                            keystoreProvisioned: keystore_provisioned)
     }
 }
 
