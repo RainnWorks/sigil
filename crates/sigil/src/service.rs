@@ -56,28 +56,18 @@ fn plist_path_value(shim_dir: &Path) -> String {
 /// daemon is respawned after ANY exit (crash, error exit, or a stray clean
 /// exit), which is what always-on means. Stopping deliberately still works:
 /// `sigil stop` is a bootout (unload), which KeepAlive does not resurrect.
-pub fn render_plist(
-    sigil_bin: &Path,
-    logs_dir: &Path,
-    shim_dir: &Path,
-    dev_keystore: Option<&str>,
-) -> String {
+pub fn render_plist(sigil_bin: &Path, logs_dir: &Path, shim_dir: &Path) -> String {
     let program = sigil_bin.display();
     let out_log = logs_dir.join("daemon.out.log");
     let err_log = logs_dir.join("daemon.err.log");
     let path_value = plist_path_value(shim_dir);
-    // Carry the dev keystore mode into the launchd environment when the installer
-    // is running in dev (`SIGIL_DEV_KEYSTORE` set). Without this the launchd-spawned
-    // daemon would default to the real Secure Enclave keystore even though the rest
-    // of the dev loop uses the file keystore, so pairing/approval would break. In a
-    // production install the variable is unset, so nothing is pinned and the daemon
-    // uses the hardware keystore.
-    let keystore_env = match dev_keystore {
-        Some(mode) => {
-            format!("\n        <key>SIGIL_DEV_KEYSTORE</key>\n        <string>{mode}</string>")
-        }
-        None => String::new(),
-    };
+    // No keystore variable is pinned here, deliberately. The daemon and the CLI
+    // both default to the on-disk store with no environment at all, so there is
+    // nothing to keep in sync; pinning one was exactly how a launchd daemon and a
+    // plain shell ended up disagreeing about where the pairing lived. An older
+    // plist that still carries the pin is simply rewritten without it on the next
+    // `sigil up` (the bodies differ, so the file is replaced), and the pin remains
+    // harmless in the meantime because it names the same store as the default.
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -93,7 +83,7 @@ pub fn render_plist(
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>{path_value}</string>{keystore_env}
+        <string>{path_value}</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -188,10 +178,10 @@ fn install_copy(src: &Path, dst: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Extract the `SIGIL_DEV_KEYSTORE` pin from an existing plist body, so a
-/// re-render from a clean shell carries the pin forward instead of silently
-/// stripping it (which would orphan the daemon identity the dev keystore
-/// holds). Pure string surgery over a file we rendered ourselves.
+/// Extract a `SIGIL_DEV_KEYSTORE` pin from an existing plist body. Kept only to
+/// RECOGNIZE a plist written by an older build (which pinned the store into the
+/// launchd environment); nothing writes the pin anymore. Pure string surgery over
+/// a file we rendered ourselves.
 fn plist_dev_keystore_pin(body: &str) -> Option<String> {
     let key_at = body.find("<key>SIGIL_DEV_KEYSTORE</key>")?;
     let rest = &body[key_at..];
@@ -199,17 +189,6 @@ fn plist_dev_keystore_pin(body: &str) -> Option<String> {
     let close = rest[open..].find("</string>")?;
     let value = &rest[open..open + close];
     (!value.is_empty()).then(|| value.to_string())
-}
-
-/// The dev-keystore mode to pin into a fresh plist render: the installer's own
-/// environment wins; otherwise any pin already present in `existing_plist` is
-/// carried forward. A production install (no env, no prior pin) pins nothing
-/// and the daemon uses the hardware keystore.
-fn dev_keystore_pin(existing_plist: Option<&str>) -> Option<String> {
-    std::env::var("SIGIL_DEV_KEYSTORE")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| existing_plist.and_then(plist_dev_keystore_pin))
 }
 
 /// Write the plist to `~/Library/LaunchAgents/works.rainn.sigil.plist` for a
@@ -226,8 +205,7 @@ pub fn install_plist_for(sigil_bin: &Path) -> Result<(PathBuf, bool)> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let existing = std::fs::read_to_string(&plist_path).ok();
-    let dev_keystore = dev_keystore_pin(existing.as_deref());
-    let body = render_plist(sigil_bin, &logs, &shim_dir, dev_keystore.as_deref());
+    let body = render_plist(sigil_bin, &logs, &shim_dir);
     if existing.as_deref() == Some(body.as_str()) {
         return Ok((plist_path, false));
     }
@@ -245,11 +223,10 @@ pub fn install_plist() -> Result<PathBuf> {
     Ok(plist_path)
 }
 
-/// The `SIGIL_DEV_KEYSTORE` pin the installed plist currently carries, if
-/// any. `sigil up` surfaces this in its report (sec-review F1): the pin is
-/// deliberately self-perpetuating (see [`dev_keystore_pin`]) and the daemon's
-/// own banner now prints once per process, so without this line the
-/// plaintext-share posture would be invisible on the surfaces anyone reads.
+/// The stale `SIGIL_DEV_KEYSTORE` pin an installed plist still carries, if any.
+/// Only a leftover from an older build now: `sigil up` rewrites the plist without
+/// it. Surfaced so the report can say the daemon was re-rendered rather than
+/// leaving a mystery environment entry in a file the human may read.
 pub fn installed_dev_keystore_pin() -> Option<String> {
     let plist = paths::launch_agent_plist()?;
     let body = std::fs::read_to_string(plist).ok()?;
@@ -384,7 +361,6 @@ mod tests {
             Path::new("/Users/tom/.cargo/bin/sigil"),
             Path::new("/Users/tom/.sigil/logs"),
             Path::new("/Users/tom/.sigil/bin"),
-            None,
         );
         assert!(plist.contains("<string>works.rainn.sigil</string>"));
         assert!(plist.contains("<string>/Users/tom/.cargo/bin/sigil</string>"));
@@ -398,45 +374,55 @@ mod tests {
         assert!(plist.contains("<string>/Users/tom/.sigil/bin:/opt/homebrew/bin"));
         assert!(plist.contains("daemon.out.log"));
         assert!(plist.contains("daemon.err.log"));
-        // A production install pins no dev keystore, so the daemon uses hardware.
+        // No keystore variable is pinned at all now: daemon and CLI share one
+        // default, so there is nothing to keep in sync through launchd.
         assert!(!plist.contains("SIGIL_DEV_KEYSTORE"));
+        assert!(!plist.contains("SIGIL_KEYSTORE"));
     }
 
     #[test]
-    fn plist_pins_the_dev_keystore_when_the_installer_is_in_dev() {
-        // A dev install (SIGIL_DEV_KEYSTORE set) must bake the mode into the
-        // launchd environment, else the launchd-spawned daemon would default to
-        // the Secure Enclave keystore and break the file-keystore dev loop.
+    fn a_render_never_pins_a_keystore_even_in_a_dev_shell() {
+        // The installer's own environment used to leak into the plist. It must
+        // not anymore: a developer with the variable set in their shell should
+        // still install a plist that behaves like everyone else's.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("SIGIL_DEV_KEYSTORE");
+        std::env::set_var("SIGIL_DEV_KEYSTORE", "memory");
         let plist = render_plist(
             Path::new("/Users/tom/.sigil/bin/sigil"),
             Path::new("/Users/tom/.sigil/logs"),
             Path::new("/Users/tom/.sigil/bin"),
-            Some("file"),
         );
-        assert!(plist.contains("<key>SIGIL_DEV_KEYSTORE</key>"));
-        assert!(plist.contains("<string>file</string>"));
+        match prev {
+            Some(v) => std::env::set_var("SIGIL_DEV_KEYSTORE", v),
+            None => std::env::remove_var("SIGIL_DEV_KEYSTORE"),
+        }
+        assert!(!plist.contains("SIGIL_DEV_KEYSTORE"));
+        assert!(!plist.contains("<key>SIGIL_KEYSTORE</key>"));
     }
 
     #[test]
-    fn dev_keystore_pin_is_parsed_out_of_an_existing_plist() {
-        // A re-render from a clean shell must carry an existing pin forward,
-        // never silently strip it (the dev keystore holds the daemon identity;
-        // losing the pin orphans the pairing until someone notices).
-        let pinned = render_plist(
+    fn an_old_plist_that_still_pins_the_store_is_recognized_and_replaced() {
+        // Tolerance for what is already installed: an older plist carrying the
+        // pin still parses (so `up` can say it was rewritten), and the body we
+        // now render differs from it, which is what replaces the file.
+        let fresh = render_plist(
             Path::new("/Users/tom/.sigil/bin/sigil"),
             Path::new("/Users/tom/.sigil/logs"),
             Path::new("/Users/tom/.sigil/bin"),
-            Some("file"),
         );
-        assert_eq!(plist_dev_keystore_pin(&pinned).as_deref(), Some("file"));
-
-        let unpinned = render_plist(
-            Path::new("/Users/tom/.sigil/bin/sigil"),
-            Path::new("/Users/tom/.sigil/logs"),
-            Path::new("/Users/tom/.sigil/bin"),
-            None,
+        let old = fresh.replace(
+            "<key>PATH</key>",
+            "<key>SIGIL_DEV_KEYSTORE</key>\n        <string>file</string>\n        <key>PATH</key>",
         );
-        assert_eq!(plist_dev_keystore_pin(&unpinned), None);
+        assert_eq!(plist_dev_keystore_pin(&old).as_deref(), Some("file"));
+        assert_ne!(
+            old, fresh,
+            "an old plist must not compare equal, so it is rewritten"
+        );
+        assert_eq!(plist_dev_keystore_pin(&fresh), None);
         // Not fooled by unrelated content or truncation.
         assert_eq!(plist_dev_keystore_pin(""), None);
         assert_eq!(

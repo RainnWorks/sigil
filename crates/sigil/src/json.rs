@@ -80,6 +80,17 @@ pub struct StatusJson {
     pub relay_reachable: Option<bool>,
     pub relay_url: Option<String>,
     pub locked_down: bool,
+    /// True when the keystore file is Secure-Enclave wrapped. **Optional on the
+    /// wire**: absent means an older daemon that predates wrapping, which a
+    /// client must read as "unknown", never as `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keystore_sealed: Option<bool>,
+    /// True when the Sigil app has handed this daemon the material for a wrapped
+    /// keystore. Meaningless (and absent) unless `keystore_sealed` is true. A
+    /// sealed-but-unprovisioned daemon serves nothing; that state is the one a UI
+    /// must explain as "the app must be running", never as a missing pairing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keystore_provisioned: Option<bool>,
 }
 
 // --- doctor ----------------------------------------------------------------
@@ -120,6 +131,10 @@ pub struct LeaseJson {
     /// caller provenance that derived it (gap).
     pub caller: String,
     pub account: String,
+    /// The matched RULE's name, which is what the lease covers: any command that
+    /// rule matches, run by the caller chain that opened it, until it expires.
+    /// Not the command line that opened it (that is in the audit log). Any UI
+    /// showing this must not imply it covers only one command.
     pub scope: String,
     pub granted_ms: u64,
     pub expires_ms: u64,
@@ -357,6 +372,8 @@ mod tests {
             relay_reachable: Some(true),
             relay_url: Some("https://relay.example".into()),
             locked_down: false,
+            keystore_sealed: Some(false),
+            keystore_provisioned: None,
         };
         let v: serde_json::Value = serde_json::from_str(&to_line(&s)).unwrap();
         assert_eq!(v["daemon_up"], true);

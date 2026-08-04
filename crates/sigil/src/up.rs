@@ -13,8 +13,8 @@
 //!    `~/.sigil/bin/sigil` when the bytes differ, so launchd never depends on
 //!    a build checkout path surviving.
 //! 2. **plist**: the LaunchAgent plist is re-rendered against the stable
-//!    binary (unconditional KeepAlive, shim-first PATH, dev-keystore pin
-//!    carried forward) and rewritten only when it differs.
+//!    binary (unconditional KeepAlive, shim-first PATH, and no keystore pin:
+//!    daemon and CLI share one default) and rewritten only when it differs.
 //! 3. **loaded**: the agent is bootstrapped into the GUI domain; a changed
 //!    plist is re-bootstrapped (bootout + bootstrap) so launchd reads it.
 //! 4. **daemon**: a real `Status` control round trip must answer, bounded by
@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use crate::local::{self, Frame, Reply};
 use crate::style::Style;
-use crate::{paths, service, setup, sshagent};
+use crate::{keystore, paths, service, setup, sshagent};
 
 /// How one step of the chain ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,17 +268,41 @@ pub fn ensure_up() -> Vec<Step> {
         steps.push(Step::action("pairing", "no phone paired; run: sigil pair"));
     }
 
-    // Posture note: the keystore pin is carried forward silently by design, so
-    // this report is where the active store stays visible. Stated plainly, not
-    // as a problem: under the threshold posture the file store holds no
-    // standalone data-decryption secret (`m` is inert without the phone's
-    // per-request partial), so it is the correct at-rest store for a portable,
-    // unsigned daemon. The honest residual (F9): a file reader gets the daemon
-    // identity AND `m` together, so a phished approval could decrypt off-box.
-    if let Some(pin) = service::installed_dev_keystore_pin() {
-        steps.push(Step::ok(
+    // Posture note, always shown: where the daemon's blobs live is something the
+    // human should be able to read off one screen. Stated plainly, not as a
+    // problem. Under the threshold posture the on-disk store holds no standalone
+    // data-decryption secret (`m` is inert without the phone's per-request
+    // partial), which is what makes it the right at-rest store for a portable,
+    // unsigned daemon. The honest residual (F9) is kept in the same breath: a
+    // file reader gets the daemon identity AND `m` together, so a phished
+    // approval could decrypt off-box.
+    let ks = keystore::for_host();
+    steps.push(match ks.backend() {
+        "file" => Step::ok(
             "keystore",
-            format!("SIGIL_DEV_KEYSTORE={pin}: portable on-disk store (daemon identity + inert Mac share; no standalone data-decryption secret, but a file reader gets both, so guard the file and unexpected approvals)"),
+            format!(
+                "portable on-disk store, threshold-protected: {} ({})",
+                keystore::file_keystore_residual(),
+                keystore::file_keystore_path().display()
+            ),
+        ),
+        other => Step::ok(
+            "keystore",
+            format!("SIGIL_KEYSTORE={other} is overriding the default on-disk store; keep it set for every sigil process or unset it everywhere"),
+        ),
+    });
+    // A pairing stranded in the login keychain by an older build is worth one
+    // line here: nothing is moved automatically, and silence would read as "your
+    // pairing is gone".
+    if let Some(note) = keystore::legacy_keychain_notice(ks.as_ref()) {
+        steps.push(Step::action("keystore (legacy)", note));
+    }
+    // An older plist pinned the store into launchd. `up` has just rewritten it
+    // without the pin; say so rather than leaving a mystery entry behind.
+    if service::installed_dev_keystore_pin().is_some() {
+        steps.push(Step::ok(
+            "keystore (plist)",
+            "removed a leftover keystore pin from the launchd plist; the daemon and the CLI now share one default",
         ));
     }
 

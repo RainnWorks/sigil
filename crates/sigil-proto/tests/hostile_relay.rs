@@ -9,9 +9,9 @@
 //! product's core promise is broken.
 
 use sigil_proto::{
-    DeliveryReceipt, DeviceIdentity, Envelope, OpenError, PeerIdentity, PushRegister, ReplayError,
-    ReplayGuard, ResolutionBroadcast, ResolutionStatus, ToDaemonMessage, ToPhoneMessage,
-    REPLAY_WINDOW_MS,
+    ApprovalResponse, DeliveryReceipt, DeviceIdentity, Envelope, InstallLease, OpenError,
+    PeerIdentity, PushRegister, ReplayError, ReplayGuard, ResolutionBroadcast, ResolutionStatus,
+    ToDaemonMessage, ToPhoneMessage, REPLAY_WINDOW_MS,
 };
 
 /// A paired sender (phone) and recipient (daemon), plus the honest replay guard
@@ -516,4 +516,125 @@ fn dropping_an_envelope_changes_no_state() {
     // opens on its own merit (the counter no longer gates it). Delivery order and
     // gaps do not poison the guard.
     assert_eq!(fx.open(&dropped).unwrap(), "never delivered");
+}
+
+// ===========================================================================
+// The lease grant (security review F8).
+//
+// A lease response is the highest-value message on this wire: it does not settle
+// one command, it opens a window, and since the RAM-cache path landed that window
+// can hold unsealed credential values. So the relay's ability to touch a lease
+// deserves its own proofs rather than resting on "it rides inside an envelope".
+//
+// The daemon remains the sole lease authority regardless of what arrives here
+// (`daemon.rs::fulfill` clamps every ttl through the matched rule's policy, and a
+// run-once rule yields no lease at all). These tests cover the transport half:
+// the relay can withhold a grant, and can do nothing else to it.
+// ===========================================================================
+
+/// Seal an approve-with-lease from the phone, as the daemon would receive it.
+fn open_response(fx: &mut Fixture, env: &Envelope) -> Result<ApprovalResponse, OpenError> {
+    env.open(
+        &fx.sender.peer_identity(),
+        &fx.recipient.agreement,
+        &mut fx.guard,
+    )
+}
+
+fn seal_lease_response(fx: &Fixture, counter: u64, ttl_ms: u64) -> Envelope {
+    let resp =
+        ApprovalResponse::approve_gate("req-lease-1", 1_000).with_lease(InstallLease { ttl_ms });
+    Envelope::seal(
+        &resp,
+        fx.pairing_id,
+        counter,
+        &fx.sender.signing,
+        &fx.recipient.peer_identity(),
+    )
+    .expect("seal")
+}
+
+#[test]
+fn relay_cannot_forge_a_lease_grant() {
+    // The attack that would matter most: manufacture an approve carrying a
+    // window for a request the human never saw. Forgery needs the phone's
+    // signing key, which the relay does not have.
+    let mut fx = Fixture::new();
+    let forger = DeviceIdentity::generate();
+    let resp = ApprovalResponse::approve_gate("req-lease-1", 1_000)
+        .with_lease(InstallLease { ttl_ms: 900_000 });
+    let forged = Envelope::seal(
+        &resp,
+        fx.pairing_id,
+        1,
+        &forger.signing,
+        &fx.recipient.peer_identity(),
+    )
+    .expect("seal");
+    assert_eq!(
+        open_response(&mut fx, &forged),
+        Err(OpenError::BadSignature),
+        "a lease grant not signed by the paired phone must never open"
+    );
+}
+
+#[test]
+fn relay_cannot_lengthen_a_lease_window() {
+    // The subtler attack: take a genuine 60s grant and stretch it. The ttl rides
+    // inside the signed ciphertext, so any edit is a signature failure; the relay
+    // cannot reach the field at all.
+    let mut fx = Fixture::new();
+    let honest = seal_lease_response(&fx, 1, 60_000);
+    let stretched = MaliciousRelay::flip_ciphertext(&honest);
+    assert_eq!(
+        open_response(&mut fx, &stretched),
+        Err(OpenError::BadSignature),
+        "editing the ttl breaks the signature"
+    );
+
+    // And the honest one still opens with exactly the ttl the phone chose.
+    let got = open_response(&mut fx, &honest).expect("open");
+    assert_eq!(got.lease.expect("a lease grant").ttl_ms, 60_000);
+}
+
+#[test]
+fn relay_cannot_attach_a_lease_to_a_deny() {
+    // A deny and an approve-with-window are different authorizations. The relay
+    // holds a real deny and wants it to become a window; it cannot re-seal.
+    let mut fx = Fixture::new();
+    let deny = ApprovalResponse::deny("req-lease-1", 1_000);
+    let sealed = Envelope::seal(
+        &deny,
+        fx.pairing_id,
+        1,
+        &fx.sender.signing,
+        &fx.recipient.peer_identity(),
+    )
+    .expect("seal");
+    // Substituting the payload wholesale is the same signature failure.
+    let swapped = MaliciousRelay::flip_ciphertext(&sealed);
+    assert_eq!(
+        open_response(&mut fx, &swapped),
+        Err(OpenError::BadSignature)
+    );
+    // Delivered honestly it is still a deny, carrying no window.
+    let got = open_response(&mut fx, &sealed).expect("open");
+    assert!(got.lease.is_none(), "a deny never carries a lease");
+}
+
+#[test]
+fn a_lease_grant_cannot_be_replayed_to_reopen_an_expired_window() {
+    // The replay that would silently re-arm a window after it lapsed: keep the
+    // approve that opened it and re-deliver it later. Single-use request ids stop
+    // it, so re-opening always costs a fresh human approval.
+    let mut fx = Fixture::new();
+    let env = seal_lease_response(&fx, 1, 900_000);
+    let first = open_response(&mut fx, &env).expect("the genuine grant opens once");
+    assert_eq!(first.lease.expect("a lease grant").ttl_ms, 900_000);
+
+    assert_eq!(
+        open_response(&mut fx, &env),
+        Err(OpenError::Replay(ReplayError::DuplicateRequest)),
+        "re-delivering a lease grant must never re-open the window"
+    );
 }

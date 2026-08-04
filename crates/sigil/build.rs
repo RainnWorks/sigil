@@ -9,9 +9,16 @@ fn main() {
     #[cfg(target_os = "macos")]
     {
         println!("cargo:rerun-if-changed=src/presence.m");
+        println!("cargo:rerun-if-changed=src/peercode.m");
         let mut build = cc::Build::new();
         build
             .file("src/presence.m")
+            // The peer code-identity check behind the keystore contract: it asks
+            // the kernel what the process on the other end of the socket is, so
+            // "only the signed Sigil app may provision" is enforced rather than
+            // asserted. Plain C against Security.framework, no ARC needed, but it
+            // shares this build for one archive.
+            .file("src/peercode.m")
             .flag("-fobjc-arc")
             .flag("-Wno-unused-parameter");
         // Pin Apple's ar. A dev machine may have GNU binutils `ar` ahead of
@@ -23,5 +30,7 @@ fn main() {
         build.compile("sigil_presence");
         println!("cargo:rustc-link-lib=framework=LocalAuthentication");
         println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=Security");
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
     }
 }

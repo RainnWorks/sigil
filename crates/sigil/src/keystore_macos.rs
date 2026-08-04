@@ -60,6 +60,10 @@ impl MacKeystore {
 }
 
 impl Keystore for MacKeystore {
+    fn backend(&self) -> &'static str {
+        "keychain"
+    }
+
     fn store_blob(&self, label: &str, data: &[u8]) -> Result<(), KeystoreError> {
         set_generic_password(&self.service, label, data)
             .map_err(|e| KeystoreError::Backend(e.to_string()))

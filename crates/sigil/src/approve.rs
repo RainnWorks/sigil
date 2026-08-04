@@ -91,11 +91,14 @@ pub struct ApprovalContext {
     /// uuidv7, the address for a local approve/deny round trip.
     pub id: String,
     pub account: String,
-    /// The scope string used for lease bookkeeping and local display, e.g.
-    /// `read op://Engineering/.env`. Internal; the remote request carries the
-    /// generic [`command`](Self::command)/[`secret_refs`](Self::secret_refs).
+    /// This request's own arguments, for local display and the audit line, e.g.
+    /// `read op://Engineering/.env`. Always the ACTUAL command, never the rule a
+    /// lease is filed under. Internal; the remote request carries the generic
+    /// [`command`](Self::command)/[`secret_refs`](Self::secret_refs).
     pub scope: String,
-    /// Grant-key hex, for correlating with `sigil lease list`.
+    /// Grant-key hex, for correlating with `sigil lease list`. For a command
+    /// request this is the rule-wide lease key, so an approval that opens a
+    /// window is findable (and revocable) by the key it will be filed under.
     pub grant_hex: String,
     /// Human process chain, e.g. `zsh → claude → op`.
     pub provenance: String,

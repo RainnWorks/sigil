@@ -21,11 +21,13 @@ pub mod json;
 pub mod keystore;
 #[cfg(target_os = "macos")]
 pub mod keystore_macos;
+pub mod keystore_seal;
 pub mod lease;
 pub mod local;
 pub mod pair;
 pub mod pairing_store;
 pub mod paths;
+pub mod peercode;
 pub mod provider;
 pub mod proxy;
 pub mod push_store;

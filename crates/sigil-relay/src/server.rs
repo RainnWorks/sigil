@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -45,6 +46,12 @@ pub struct Config {
     /// Overridable so tests can shrink the long-poll window; production uses
     /// [`p::LONG_POLL_MS`].
     pub long_poll_ms: u64,
+    /// How many trusted reverse proxies stand in front of this relay, which is
+    /// what decides whether `X-Forwarded-For` is read at all when stamping a
+    /// deposit's [`p::Origin`]. `0` (the default) reads only the socket peer.
+    /// See [`p::client_ip`] for the indexing rule and the misconfiguration
+    /// hazard; in the `deploy/gcp/` layout the correct value is `2`.
+    pub trusted_proxy_hops: usize,
 }
 
 /// The whole shared server state.
@@ -144,6 +151,7 @@ struct VersionBody {
 /// connection in a way a client would read as anything but its status code.
 pub async fn handle(
     state: Arc<AppState>,
+    peer: SocketAddr,
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let method = req.method().clone();
@@ -165,7 +173,7 @@ pub async fn handle(
             Some(id) if p::valid_id(id) => {
                 let id = id.to_string();
                 let verb = parts.get(2).copied().unwrap_or("");
-                mailbox(&state, &id, verb, method, req).await
+                mailbox(&state, &id, verb, method, peer, req).await
             }
             _ => err(StatusCode::BAD_REQUEST, "bad_mailbox"),
         },
@@ -179,6 +187,7 @@ async fn mailbox(
     id: &str,
     verb: &str,
     method: hyper::Method,
+    peer: SocketAddr,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
     let Some(mb) = state.get_box(id) else {
@@ -203,7 +212,7 @@ async fn mailbox(
 
     match method {
         hyper::Method::GET => poll(state, &mb, slot).await,
-        hyper::Method::POST => deposit(state, &mb, id, slot, req).await,
+        hyper::Method::POST => deposit(state, &mb, id, slot, peer, req).await,
         _ => {
             let mut g = lock(&mb);
             if !p::rate_ok(&mut g, p::now_ms()) {
@@ -242,15 +251,15 @@ async fn poll(
             let mut oldest = waiters.remove(0);
             oldest.offer(&[]);
         }
-        let (tx, rx) = oneshot::channel::<Vec<String>>();
+        let (tx, rx) = oneshot::channel::<Vec<p::Delivery>>();
         let mut tx = Some(tx);
         waiters.push(p::Waiter::new(
             id,
-            Box::new(move |blobs| match tx.take() {
+            Box::new(move |items| match tx.take() {
                 // send() Ok  => the receiver is live: this is the accept.
                 // send() Err => the receiver was dropped (client gone / timed
                 // out): reject, so `wake` leaves the item queued (offer-then-drain).
-                Some(s) => s.send(blobs.to_vec()).is_ok(),
+                Some(s) => s.send(items.to_vec()).is_ok(),
                 None => false,
             }),
         ));
@@ -306,12 +315,14 @@ impl Drop for WaiterGuard {
 }
 
 /// POST a slot: enqueue an opaque envelope and wake a waiter; for `to-phone`,
-/// fire the configured doorbell (direct APNs / upstream knock) if a token rode along.
+/// stamp the observed origin and fire the configured doorbell (direct APNs /
+/// upstream knock) if a token rode along.
 async fn deposit(
     state: &Arc<AppState>,
     mb: &Arc<Mutex<Mailbox>>,
     id: &str,
     slot: Slot,
+    peer: SocketAddr,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
     // Rate check first (matches the TS order), before reading the body.
@@ -328,6 +339,29 @@ async fn deposit(
             return err(StatusCode::PAYLOAD_TOO_LARGE, "too_large");
         }
     }
+    // Read the forwarded chain before the body consumes the request. Only the
+    // to-phone direction is stamped: the daemon has no use for the phone's
+    // address, so none is ever taken on to-daemon. See [`p::Origin`].
+    let origin = match slot {
+        Slot::ToPhone => {
+            // Repeated header lines are one logical list, so join before parsing.
+            let lines: Vec<&str> = req
+                .headers()
+                .get_all("x-forwarded-for")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect();
+            let forwarded = (!lines.is_empty()).then(|| lines.join(","));
+            p::client_ip(
+                forwarded.as_deref(),
+                peer.ip(),
+                state.config.trusted_proxy_hops,
+            )
+            .map(|ip| p::Origin::new(ip, p::now_ms()))
+        }
+        Slot::ToDaemon => None,
+    };
+
     let Some(body) = read_body(req).await else {
         return err(StatusCode::PAYLOAD_TOO_LARGE, "too_large");
     };
@@ -353,7 +387,7 @@ async fn deposit(
         let now = p::now_ms();
         {
             let (list, _) = slot.parts(&mut g);
-            match p::enqueue(list, env, now) {
+            match p::enqueue(list, env, origin, now) {
                 p::EnqueueResult::TooLarge => {
                     return err(StatusCode::PAYLOAD_TOO_LARGE, "too_large")
                 }

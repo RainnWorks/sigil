@@ -158,6 +158,53 @@ pub enum Frame {
     /// carrying the current `[PendingJson]` immediately and again on every
     /// change, until the client disconnects. Drives the live menubar.
     SubscribePending,
+
+    // --- the Secure-Enclave-wrapped keystore contract -----------------------
+    //
+    // These four are callable ONLY by the signed Sigil app: the daemon checks
+    // the peer's code identity (`crate::peercode`) before acting. They are the
+    // only way a wrapped keystore's material reaches the daemon, and the only
+    // way it goes back to plaintext.
+    //
+    // NOTE on secret bytes: no variant here CARRIES material. The material rides
+    // as raw bytes immediately after the header frame on the same stream, read
+    // straight into a `Zeroizing` buffer by [`recv_frame_with_tail`]. That is
+    // deliberate: a serde-deserialized `String`/`Vec` inside a `Debug`-derived
+    // enum is one stray `{:?}` away from printing a secret into a log.
+    /// The app hands over the material for a wrapped keystore: this header, then
+    /// exactly `len` raw bytes. The daemon digests what it received and compares
+    /// (constant time) against the expectation it read at startup. Accepted once
+    /// per daemon lifetime; a REJECTED attempt does not latch, so a bad frame
+    /// cannot wedge the daemon into never being provisionable.
+    KeystoreProvision { len: u64 },
+    /// Subscribe to keystore ceremony events. The daemon emits a [`Reply::Event`]
+    /// when a de-adoption has been requested, and the app answers by unwrapping
+    /// and reporting [`Frame::KeystoreUnwrapDone`].
+    SubscribeKeystore,
+    /// A human asked (via `sigil keystore unwrap --confirm`) to return the
+    /// keystore to plaintext. The daemon raises the request on
+    /// [`Frame::SubscribeKeystore`] and blocks until the app answers or the wait
+    /// runs out. Same-UID gated like every other CLI verb: it cannot itself
+    /// unwrap anything, it can only ask the app to, and the app is what holds the
+    /// key.
+    KeystoreUnwrapRequest,
+    /// The app reports the outcome of an unwrap it was asked to perform.
+    KeystoreUnwrapDone {
+        nonce: String,
+        ok: bool,
+        #[serde(default)]
+        reason: String,
+    },
+    /// Seal `len` raw bytes (following this header) into the threshold store
+    /// under `id`, using the material the daemon holds. `len == 0` removes the
+    /// record instead. This is how the CLI seals when it cannot read the keystore
+    /// itself, which under a wrapped store is always.
+    ///
+    /// Peer gating is same-UID only, NOT the app-identity gate: the caller is
+    /// `sigil-config`, an unsigned CLI. That is the same trust boundary every
+    /// other CLI control verb already has (the socket is 0600), and it is stated
+    /// here so nobody mistakes this for an app-only verb.
+    SealThreshold { id: String, len: u64 },
 }
 
 /// The daemon's reply.
@@ -195,7 +242,29 @@ pub fn send_frame(stream: &UnixStream, frame: &Frame, fds: &[RawFd]) -> io::Resu
 /// sending anything (e.g. a `status` probe), which the caller treats as a
 /// quiet no-op.
 pub fn recv_frame(stream: &UnixStream) -> io::Result<(Frame, Vec<OwnedFd>)> {
-    let mut buf = vec![0u8; 64 * 1024];
+    let (frame, fds, _tail) = recv_frame_with_tail(stream)?;
+    Ok((frame, fds))
+}
+
+/// [`recv_frame`], plus whatever arrived after the frame's newline.
+///
+/// The header-then-raw-bytes verbs need this. One `recvmsg` can return the JSON
+/// header AND the first chunk of the payload behind it, so a reader that keeps
+/// only the first line silently eats secret bytes; the caller must be handed
+/// them. The buffer is `Zeroizing` because those bytes are exactly the material
+/// the whole wrapped-keystore design exists to protect: a plain `Vec` would
+/// leave 64 KiB of keystore plaintext in a freed allocation.
+///
+/// Scope of that guarantee, precisely: the TRANSPORT buffers here are
+/// `Zeroizing`. What a caller then parses the bytes into is its own business, and
+/// today the JSON and base64 products downstream (`serde_json` Strings, decoded
+/// blob maps) are NOT zeroized. That is a known residual, conceded rather than
+/// papered over, and it sits inside the same-UID RAM reading this design already
+/// admits it cannot stop.
+pub fn recv_frame_with_tail(
+    stream: &UnixStream,
+) -> io::Result<(Frame, Vec<OwnedFd>, zeroize::Zeroizing<Vec<u8>>)> {
+    let mut buf = zeroize::Zeroizing::new(vec![0u8; 64 * 1024]);
     // Up to three descriptors ride a Run frame: the caller's stdin, stdout, and
     // stderr, spliced straight to the tool child (never read by the daemon).
     let (n, fds) = recv_with_fds(stream.as_raw_fd(), &mut buf, 3)?;
@@ -204,7 +273,72 @@ pub fn recv_frame(stream: &UnixStream) -> io::Result<(Frame, Vec<OwnedFd>)> {
     }
     let end = buf[..n].iter().position(|&b| b == b'\n').unwrap_or(n);
     let frame = serde_json::from_slice(&buf[..end]).map_err(invalid_data)?;
-    Ok((frame, fds))
+    // Everything past the newline is payload, not protocol.
+    let tail_start = (end + 1).min(n);
+    let tail = zeroize::Zeroizing::new(buf[tail_start..n].to_vec());
+    Ok((frame, fds, tail))
+}
+
+/// Read exactly `len` payload bytes for a header-then-bytes verb: whatever
+/// already arrived with the header, plus the rest off the stream.
+///
+/// Refuses absurd lengths rather than pre-allocating whatever a caller claims,
+/// and refuses a short stream rather than handing back a truncated secret (which
+/// would fail a digest check anyway, but should fail as "truncated", not as
+/// "wrong material"). Everything lands in one `Zeroizing` buffer.
+pub fn read_payload(
+    stream: &mut UnixStream,
+    tail: zeroize::Zeroizing<Vec<u8>>,
+    len: u64,
+) -> io::Result<zeroize::Zeroizing<Vec<u8>>> {
+    /// A keystore's material is a few hundred bytes; a megabyte is already
+    /// absurd. The cap exists so a bogus header cannot ask us to allocate.
+    const MAX_PAYLOAD: u64 = 1 << 20;
+    if len > MAX_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("payload of {len} bytes is implausible (max {MAX_PAYLOAD})"),
+        ));
+    }
+    let len = len as usize;
+    if tail.len() >= len {
+        let mut out = tail;
+        out.truncate(len);
+        return Ok(out);
+    }
+    // Pre-size to the FULL payload before copying anything in. Growing a Vec
+    // reallocates and copies, and the old allocation is freed without
+    // `Zeroizing` ever seeing it: for a provision that arrived in one recvmsg,
+    // that abandoned copy is the entire keystore material.
+    let mut out = zeroize::Zeroizing::new(Vec::with_capacity(len));
+    out.extend_from_slice(&tail);
+    drop(tail); // wiped here
+    let mut chunk = zeroize::Zeroizing::new(vec![0u8; 8192]);
+    while out.len() < len {
+        let want = (len - out.len()).min(chunk.len());
+        let n = stream.read(&mut chunk[..want])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "payload ended early",
+            ));
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+    Ok(out)
+}
+
+/// Write a header frame followed immediately by raw payload bytes, the sending
+/// half of the header-then-bytes verbs.
+pub fn send_frame_with_payload(
+    stream: &UnixStream,
+    frame: &Frame,
+    payload: &[u8],
+) -> io::Result<()> {
+    let mut line = serde_json::to_vec(frame).map_err(invalid_data)?;
+    line.push(b'\n');
+    send_with_fds(stream.as_raw_fd(), &line, &[])?;
+    (&*stream).write_all(payload)
 }
 
 /// Write the reply line.

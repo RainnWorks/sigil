@@ -3,6 +3,7 @@
 
 use std::io::Read;
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
 use sigil_proto::DeviceIdentity;
 use zeroize::Zeroizing;
@@ -40,6 +41,7 @@ pub fn run_gating() -> i32 {
         "unpair" => cmd_unpair(json),
         "start" | "stop" | "restart" => cmd_service(&args[0]),
         "lease" => cmd_lease(&args[1..]),
+        "keystore" => cmd_keystore(&args[1..]),
         "approve" => cmd_approve(&args[1..]),
         "deny" => cmd_deny(&args[1..]),
         "history" => cmd_history(),
@@ -131,6 +133,7 @@ pub fn is_reserved_verb(cmd: &str) -> bool {
             | "stop"
             | "restart"
             | "lease"
+            | "keystore"
             | "approve"
             | "deny"
             | "history"
@@ -228,6 +231,8 @@ usage: sigil <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
   start|stop|restart   control the launchd daemon agent
   lease list        list active session leases with countdowns
   lease revoke <p>  revoke leases whose grant-key hex starts with <p>
+  keystore status   whether the on-disk keystore is sealed to the Sigil app
+  keystore unwrap --confirm   ask the app to return the keystore to plaintext
   approve --local --id <id> [--lease]  approve a pending request at the Mac
   deny --local --id <id>               deny a pending request at the Mac
   history           the decision audit log (names and metadata only)
@@ -306,6 +311,13 @@ fn fetch_status() -> json::StatusJson {
     crate::report::status(false)
 }
 
+/// The two columns every `status` row shares. Padding happens BEFORE styling, so
+/// the ANSI escapes never count toward a width; hand-spacing each row is how the
+/// name column drifted between 8, 9, and 11 in the first place. `STATE_COL` fits
+/// the longest state label ("Sealed, not open") so no row pushes its note right.
+const NAME_COL: usize = 10;
+const STATE_COL: usize = 16;
+
 fn cmd_status() -> i32 {
     let s = Style::stdout();
     let st = fetch_status();
@@ -326,7 +338,11 @@ fn cmd_status() -> i32 {
     } else {
         (s.deny("\u{2717}"), "down", s.dim("socket not listening"))
     };
-    println!("  {}  {glyph} {}  {note}", s.dim("daemon"), pad(label, 13));
+    println!(
+        "  {} {glyph} {}  {note}",
+        s.dim(&pad("daemon", NAME_COL)),
+        pad(label, STATE_COL)
+    );
 
     // shim (with drift detection)
     let (glyph, label, note) = match st.shim.kind.as_str() {
@@ -347,7 +363,11 @@ fn cmd_status() -> i32 {
         ),
         _ => (s.brass("\u{2717}"), "unknown", s.dim("")),
     };
-    println!("  {}    {glyph} {}  {note}", s.dim("shim"), pad(label, 13));
+    println!(
+        "  {} {glyph} {}  {note}",
+        s.dim(&pad("shim", NAME_COL)),
+        pad(label, STATE_COL)
+    );
 
     // op
     let (glyph, label, note) = if st.op.found {
@@ -359,7 +379,11 @@ fn cmd_status() -> i32 {
     } else {
         (s.deny("\u{2717}"), "missing", s.dim("no `op` on PATH"))
     };
-    println!("  {}      {glyph} {}  {note}", s.dim("op"), pad(label, 13));
+    println!(
+        "  {} {glyph} {}  {note}",
+        s.dim(&pad("op", NAME_COL)),
+        pad(label, STATE_COL)
+    );
 
     // accounts
     let (glyph, label, note) = if st.accounts > 0 {
@@ -377,8 +401,8 @@ fn cmd_status() -> i32 {
     };
     println!(
         "  {} {glyph} {}  {note}",
-        s.dim("sealed env"),
-        pad(label, 13)
+        s.dim(&pad("sealed env", NAME_COL)),
+        pad(label, STATE_COL)
     );
 
     // factor
@@ -402,7 +426,29 @@ fn cmd_status() -> i32 {
             s.brass("no factor; run: sigil pair"),
         ),
     };
-    println!("  {}   {glyph} {}  {note}", s.dim("factor"), pad(label, 13));
+    println!(
+        "  {} {glyph} {}  {note}",
+        s.dim(&pad("factor", NAME_COL)),
+        pad(label, STATE_COL)
+    );
+
+    // keystore: shown only when the daemon says the store is wrapped, since a
+    // plaintext store is the unremarkable default and needs no row. The
+    // unprovisioned state is the one that must read unmistakably as "the app is
+    // not running", never as anything a human could mistake for a lost pairing.
+    if let Some(row) = keystore_row(&st) {
+        let (glyph, note) = match row.tone {
+            RowTone::Fine => (s.ok(row.glyph), s.dim(row.note)),
+            // Rust, not brass: nothing here is pending, every gated command is
+            // being refused right now.
+            RowTone::Denied => (s.deny(row.glyph), s.deny(row.note)),
+        };
+        println!(
+            "  {} {glyph} {}  {note}",
+            s.dim(&pad("keystore", NAME_COL)),
+            pad(row.label, STATE_COL)
+        );
+    }
 
     // ssh agent: how many keys it would serve (a local CLI convenience row; the
     // count is not part of the machine status shape).
@@ -424,7 +470,11 @@ fn cmd_status() -> i32 {
             s.dim("add one: sigil ssh add-file --path <key>"),
         )
     };
-    println!("  {}     {glyph} {}  {note}", s.dim("ssh"), pad(label, 13));
+    println!(
+        "  {} {glyph} {}  {note}",
+        s.dim(&pad("ssh", NAME_COL)),
+        pad(label, STATE_COL)
+    );
 
     println!();
     println!(
@@ -434,9 +484,141 @@ fn cmd_status() -> i32 {
     0
 }
 
+/// How a status row should be coloured. Returned WITH the row rather than
+/// derived from its label: colour is semantics (this row means "everything is
+/// fine" or "this is failing closed"), and deriving it by matching the display
+/// string means editing copy silently flips the meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowTone {
+    Fine,
+    /// Failing closed right now. Rust, not brass: brass says "needs attention
+    /// soon", and this state means every gated command is being refused.
+    Denied,
+}
+
+/// One `status` row's content: tone, glyph, state label, and the detail note.
+struct Row {
+    tone: RowTone,
+    glyph: &'static str,
+    label: &'static str,
+    note: &'static str,
+}
+
+/// The `status` keystore row, or `None` when there is nothing worth a row (a
+/// plaintext store, or a daemon too old to say).
+///
+/// The wording of the not-open case is load-bearing. What has actually happened
+/// is that the Sigil app is not running; what a careless message would imply is
+/// that the pairing is gone, and a human acting on that would re-pair and destroy
+/// a perfectly good pairing to fix an app that just needed launching. So the note
+/// names the app and says the pairing is intact.
+fn keystore_row(st: &json::StatusJson) -> Option<Row> {
+    match (st.keystore_sealed, st.keystore_provisioned) {
+        // Older daemon (field absent): say nothing rather than guess.
+        (None, _) | (Some(false), _) => None,
+        (Some(true), Some(true)) => Some(Row {
+            tone: RowTone::Fine,
+            glyph: "\u{25cf}",
+            label: crate::keystore_seal::STATE_OPEN,
+            note: "wrapped to the Sigil app's Secure Enclave; opened for this session",
+        }),
+        (Some(true), _) => Some(Row {
+            tone: RowTone::Denied,
+            glyph: "\u{2717}",
+            label: crate::keystore_seal::STATE_NOT_OPEN,
+            note: "start the Sigil app to open it \u{b7} your pairing is intact, this is not a re-pair",
+        }),
+    }
+}
+
+/// `sigil keystore <status|unwrap>`: read the seal state, or ask the Sigil app to
+/// return the store to plaintext.
+///
+/// De-adoption is deliberately a two-party ceremony. The daemon cannot unwrap
+/// (it has no key), and the CLI cannot either; only the app's Secure Enclave can.
+/// So this asks the daemon to raise a request, the app answers it, and the daemon
+/// clears the adoption marker only once the app reports the plaintext is written
+/// and fsynced. If the app never answers, nothing changes and the store stays
+/// wrapped, which is the safe direction.
+fn cmd_keystore(args: &[String]) -> i32 {
+    let s = Style::stdout();
+    match args.first().map(String::as_str) {
+        Some("status") | None => {
+            // One shape for every state: a glyph and the state name, then exactly
+            // one faint line of detail. Uniform shape is what lets someone read
+            // the state at a glance instead of parsing a paragraph.
+            let st = fetch_status();
+            let (glyph, state, detail) = match (st.keystore_sealed, st.keystore_provisioned) {
+                (Some(true), Some(true)) => (
+                    s.ok("\u{2713}"),
+                    crate::keystore_seal::STATE_OPEN.to_string(),
+                    "offline copies of the keystore file are useless without this Mac's enclave"
+                        .to_string(),
+                ),
+                (Some(true), _) => (
+                    s.deny("\u{2717}"),
+                    crate::keystore_seal::STATE_NOT_OPEN.to_string(),
+                    "start the Sigil app to open it \u{b7} your pairing is intact, this is not a re-pair"
+                        .to_string(),
+                ),
+                (Some(false), _) => (
+                    s.dim("\u{25cb}"),
+                    "Plaintext".to_string(),
+                    format!(
+                        "{} \u{b7} {}",
+                        crate::keystore::file_keystore_path().display(),
+                        crate::keystore::file_keystore_residual()
+                    ),
+                ),
+                (None, _) => (
+                    s.dim("\u{25cb}"),
+                    "Unknown".to_string(),
+                    "the daemon did not report a keystore state".to_string(),
+                ),
+            };
+            println!("  {glyph} {state}");
+            println!("  {}", s.faint(&detail));
+            0
+        }
+        Some("unwrap") => {
+            if !has_flag(args, "--confirm") {
+                eprintln!(
+                    "sigil: this returns the keystore to plaintext on disk, undoing the \
+                     Secure Enclave wrapping.\n  \
+                     Offline copies (backups, snapshots, a stolen disk) become useful to a \
+                     reader again.\n  \
+                     Re-run with --confirm if that is what you want: sigil keystore unwrap --confirm"
+                );
+                return 2;
+            }
+            print_control(send_control_with_timeout(
+                &Frame::KeystoreUnwrapRequest,
+                // The app has to do real work (an enclave decrypt, a durable
+                // write) and a human may have to bring it to the front, so this
+                // waits longer than an ordinary control round trip.
+                Duration::from_secs(90),
+            ))
+        }
+        _ => {
+            eprintln!("usage: sigil keystore <status|unwrap --confirm>");
+            2
+        }
+    }
+}
+
 /// Connect to the daemon, send one control frame, and return its reply.
 fn send_control(frame: &Frame) -> std::io::Result<Reply> {
     let mut stream = UnixStream::connect(local::socket_path())?;
+    local::send_frame(&stream, frame, &[])?;
+    local::recv_reply(&mut stream)
+}
+
+/// [`send_control`] with a read deadline, for the verbs whose answer depends on
+/// another party doing real work (the keystore ceremonies wait on the Sigil app).
+/// Without this the CLI would block forever on an app that never answers.
+fn send_control_with_timeout(frame: &Frame, timeout: Duration) -> std::io::Result<Reply> {
+    let mut stream = UnixStream::connect(local::socket_path())?;
+    stream.set_read_timeout(Some(timeout))?;
     local::send_frame(&stream, frame, &[])?;
     local::recv_reply(&mut stream)
 }
@@ -526,17 +708,13 @@ fn cmd_lease(args: &[String]) -> i32 {
                 return 0;
             }
             let now = sigil_proto::now_ms();
+            // The account column only earns its width when some lease names one
+            // (a plain gate carries none), so it never renders as a blank gutter.
+            let with_account = leases.iter().any(|l| !l.account.is_empty());
             println!("{}", s.cobalt("leases"));
             println!();
             for l in &leases {
-                let left = l.expires_ms.saturating_sub(now) / 1000;
-                println!(
-                    "  {}  {}  {}  {}",
-                    s.dim(&l.grant_hex[..12.min(l.grant_hex.len())]),
-                    pad(&l.account, 14),
-                    l.scope,
-                    s.faint(&format!("{left}s left"))
-                );
+                println!("{}", lease_row(s, l, now, with_account));
             }
             0
         }
@@ -554,6 +732,29 @@ fn cmd_lease(args: &[String]) -> i32 {
             2
         }
     }
+}
+
+/// One `sigil lease list` row: grant-key prefix (what `lease revoke` takes), the
+/// account when there is one, the RULE the lease covers, and the countdown.
+///
+/// A lease is rule-wide: it auto-approves anything that rule matches for the
+/// caller chain that opened it, not only the command that did. The row says so
+/// outright rather than leaving the rule name to be read as a command.
+fn lease_row(s: Style, l: &json::LeaseJson, now: u64, with_account: bool) -> String {
+    let left = l.expires_ms.saturating_sub(now) / 1000;
+    let account = if with_account {
+        format!("{}  ", pad(&l.account, 14))
+    } else {
+        String::new()
+    };
+    format!(
+        "  {}  {}{}  {}  {}",
+        s.dim(&l.grant_hex[..12.min(l.grant_hex.len())]),
+        account,
+        pad(&l.scope, 30),
+        s.faint("\u{b7} any matching command"),
+        s.faint(&format!("{left}s left"))
+    )
 }
 
 fn cmd_approve(args: &[String]) -> i32 {
@@ -2636,7 +2837,7 @@ fn load_env_source(name: &str) -> Option<crate::config::Config> {
 /// seals but never reads env values back (opening needs the phone), so a `set`
 /// replaces the source's whole sealed set. Returns false (printed) on failure.
 fn seal_env_pairs(
-    mut cfg: crate::config::Config,
+    cfg: crate::config::Config,
     name: &str,
     pairs: &[(String, Zeroizing<String>)],
 ) -> bool {
@@ -2647,6 +2848,20 @@ fn seal_env_pairs(
             return false;
         }
     };
+    // Under a wrapped keystore this process cannot read the Mac share it would
+    // seal with; the daemon holds the opened material and does it instead. Try
+    // that route first whenever the daemon can do it, so the behaviour is the
+    // same whether or not the store happens to be wrapped, and only fall back to
+    // sealing here when there is no daemon AND nothing is sealed to begin with.
+    match seal_via_daemon(name, pairs) {
+        DaemonSeal::Done => return sync_source_keys(cfg, name, pairs),
+        DaemonSeal::Failed(why) => {
+            eprintln!("sigil: {why}");
+            return false;
+        }
+        DaemonSeal::NoDaemon => {}
+    }
+
     if pairs.is_empty() {
         store.remove(name);
     } else {
@@ -2689,8 +2904,17 @@ fn seal_env_pairs(
         eprintln!("sigil: saving the threshold store: {e}");
         return false;
     }
-    // Sync the public KEY names onto the source (sorted+unique for a stable
-    // export), never the values.
+    sync_source_keys(cfg, name, pairs)
+}
+
+/// Record the public KEY names on the source (sorted+unique for a stable export)
+/// and persist the config. Names only; the values live sealed in the threshold
+/// store and are never written here.
+fn sync_source_keys(
+    mut cfg: crate::config::Config,
+    name: &str,
+    pairs: &[(String, Zeroizing<String>)],
+) -> bool {
     let mut keys: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
     keys.sort();
     keys.dedup();
@@ -2698,6 +2922,54 @@ fn seal_env_pairs(
         src.keys = keys;
     }
     save_config(&cfg)
+}
+
+/// What happened when we asked the daemon to seal for us.
+enum DaemonSeal {
+    /// The daemon sealed it (or removed it).
+    Done,
+    /// The daemon answered, and the answer was no. The string is for the human.
+    Failed(String),
+    /// No daemon is listening, so the caller may seal locally if it can.
+    NoDaemon,
+}
+
+/// Ask the daemon to seal `pairs` under `id`, because it holds material this
+/// process may not be able to read.
+///
+/// The values cross the control socket as raw bytes after the header, never
+/// inside a JSON frame: a serde-deserialized field sitting in a `Debug` enum is
+/// one stray format string away from a secret in a log. The socket is the same
+/// 0600 same-UID channel every other CLI verb uses.
+fn seal_via_daemon(id: &str, pairs: &[(String, Zeroizing<String>)]) -> DaemonSeal {
+    let payload: Zeroizing<Vec<u8>> = if pairs.is_empty() {
+        Zeroizing::new(Vec::new())
+    } else {
+        crate::provider::encode_env_pairs(pairs)
+    };
+    let stream = match UnixStream::connect(local::socket_path()) {
+        Ok(s) => s,
+        Err(_) => return DaemonSeal::NoDaemon,
+    };
+    let frame = Frame::SealThreshold {
+        id: id.to_string(),
+        len: payload.len() as u64,
+    };
+    if local::send_frame_with_payload(&stream, &frame, &payload).is_err() {
+        return DaemonSeal::NoDaemon;
+    }
+    let mut stream = stream;
+    match local::recv_reply(&mut stream) {
+        Ok(Reply::Control { ok: true, .. }) => DaemonSeal::Done,
+        Ok(Reply::Control { lines, .. }) => DaemonSeal::Failed(
+            lines
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "the daemon refused to seal".into()),
+        ),
+        Ok(_) => DaemonSeal::Failed("the daemon gave an unexpected answer".into()),
+        Err(e) => DaemonSeal::Failed(format!("the daemon did not answer: {e}")),
+    }
 }
 
 fn config_source_env_set(args: &[String], json: bool) -> i32 {
@@ -3566,7 +3838,8 @@ fn cmd_wipe(args: &[String], json: bool) -> i32 {
             ("config", home.join("config.json")),
             ("legacy command config", home.join("commands.json")),
             ("settings", home.join("settings.json")),
-            ("keystore file", home.join("dev-keystore.json")),
+            ("keystore file", home.join("keystore.json")),
+            ("legacy keystore file", home.join("dev-keystore.json")),
             ("history", home.join("history.jsonl")),
         ] {
             match std::fs::remove_file(&path) {
@@ -3607,6 +3880,117 @@ fn pad(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A status shape with the keystore fields set, everything else inert.
+    fn status_with_keystore(sealed: Option<bool>, provisioned: Option<bool>) -> json::StatusJson {
+        json::StatusJson {
+            daemon_up: true,
+            socket: String::new(),
+            shim: json::ShimJson {
+                kind: "healthy".into(),
+                path: None,
+                issue: None,
+            },
+            op: json::OpJson {
+                found: true,
+                path: None,
+            },
+            accounts: 0,
+            factor: json::FactorJson {
+                kind: "phone".into(),
+                relay: None,
+            },
+            relay_reachable: None,
+            relay_url: None,
+            locked_down: false,
+            keystore_sealed: sealed,
+            keystore_provisioned: provisioned,
+        }
+    }
+
+    #[test]
+    fn the_keystore_row_carries_its_own_tone_and_the_shared_state_words() {
+        // Tone travels WITH the row, never derived from the label, so editing
+        // copy cannot silently flip a failing-closed row to a warning colour.
+        let not_open = keystore_row(&status_with_keystore(Some(true), Some(false)))
+            .expect("a sealed store gets a row");
+        assert_eq!(
+            not_open.tone,
+            RowTone::Denied,
+            "not-open fails every gated command closed, so it is denied, not pending"
+        );
+        assert_eq!(not_open.label, crate::keystore_seal::STATE_NOT_OPEN);
+        assert!(not_open.note.contains("Sigil app"));
+        assert!(
+            !not_open.note.to_lowercase().contains("no pairing"),
+            "must never read as a lost pairing: {}",
+            not_open.note
+        );
+
+        let open =
+            keystore_row(&status_with_keystore(Some(true), Some(true))).expect("open gets a row");
+        assert_eq!(open.tone, RowTone::Fine);
+        assert_eq!(open.label, crate::keystore_seal::STATE_OPEN);
+
+        // A plaintext store is the unremarkable default and earns no row; an
+        // older daemon that cannot say gets no row either, rather than a guess.
+        assert!(keystore_row(&status_with_keystore(Some(false), None)).is_none());
+        assert!(keystore_row(&status_with_keystore(None, None)).is_none());
+    }
+
+    #[test]
+    fn the_state_labels_fit_the_column_they_are_printed_in() {
+        // The vocabulary is shared with the Mac surface, so it can change there
+        // and land here. If it outgrows the column, every note on that row shifts
+        // right and the block goes ragged; catch that here rather than on screen.
+        for label in [
+            crate::keystore_seal::STATE_OPEN,
+            crate::keystore_seal::STATE_NOT_OPEN,
+        ] {
+            assert!(
+                label.len() <= STATE_COL,
+                "'{label}' ({}) does not fit the {STATE_COL}-wide state column",
+                label.len()
+            );
+        }
+        // And the two states stay distinguishable at a glance: one says open, the
+        // other says not open, in the same words.
+        assert!(crate::keystore_seal::STATE_OPEN.starts_with("Sealed"));
+        assert!(crate::keystore_seal::STATE_NOT_OPEN.starts_with("Sealed"));
+        assert_ne!(
+            crate::keystore_seal::STATE_OPEN,
+            crate::keystore_seal::STATE_NOT_OPEN
+        );
+    }
+
+    #[test]
+    fn a_lease_row_names_its_rule_and_says_how_wide_it_is() {
+        // Display honesty: the middle column is a RULE, and the row must not let
+        // it read as "the one command that was approved".
+        let s = Style::with_color(false);
+        let l = json::LeaseJson {
+            grant_hex: "a1b2c3d4e5f60718293a4b5c6d7e8f90".into(),
+            caller: String::new(),
+            account: String::new(),
+            scope: "op-account-rowmhq-1password-eu".into(),
+            granted_ms: 1_000,
+            expires_ms: 121_000,
+        };
+        let row = lease_row(s, &l, 1_000, false);
+        // Revoke prefix first, then the rule: with no account anywhere, the row
+        // spends no width on an empty column.
+        assert!(
+            row.starts_with("  a1b2c3d4e5f6  op-account-rowmhq-1password-eu"),
+            "{row}"
+        );
+        assert!(row.contains("\u{b7} any matching command"), "{row}");
+        assert!(row.ends_with("120s left"), "{row}");
+
+        // An account, when there is one, keeps its own aligned column.
+        let mut with = l.clone();
+        with.account = "Rowm".into();
+        assert!(lease_row(s, &with, 1_000, true).contains("Rowm"));
+    }
 
     #[test]
     fn reserved_verbs_take_precedence_over_command_dispatch() {

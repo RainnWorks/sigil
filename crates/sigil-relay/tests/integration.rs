@@ -21,6 +21,16 @@ fn test_config() -> Config {
         apns_identity: sigil_relay::push::ApnsIdentity::default(),
         apns_host: "http://127.0.0.1:0".to_string(),
         long_poll_ms: LONG_POLL_MS,
+        trusted_proxy_hops: 0,
+    }
+}
+
+/// A relay configured to believe `hops` trusted proxies sit in front of it, so
+/// the forwarded-header path can be driven end to end.
+fn config_behind_proxies(hops: usize) -> Config {
+    Config {
+        trusted_proxy_hops: hops,
+        ..test_config()
     }
 }
 
@@ -75,6 +85,40 @@ async fn get(c: &reqwest::Client, base: &str, id: &str, verb: &str) -> reqwest::
         .send()
         .await
         .expect("get")
+}
+
+/// POST a to-phone deposit wearing a forwarded chain, the way a reverse proxy
+/// (or a client trying to forge one) would present it.
+async fn to_phone_forwarded(
+    c: &reqwest::Client,
+    base: &str,
+    id: &str,
+    body: serde_json::Value,
+    forwarded_for: &str,
+) -> reqwest::Response {
+    c.post(format!("{base}/mailbox/{id}/to-phone"))
+        .header("x-forwarded-for", forwarded_for)
+        .json(&body)
+        .send()
+        .await
+        .expect("to-phone post")
+}
+
+async fn drain_body(resp: reqwest::Response) -> serde_json::Value {
+    resp.json().await.expect("json")
+}
+
+/// The `origins[i]` entry of a drain body, or `None` when the relay recorded
+/// nothing (the whole key is omitted in that case).
+fn origin_at(body: &serde_json::Value, i: usize) -> Option<serde_json::Value> {
+    body.get("origins")?.as_array()?.get(i).cloned()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64
 }
 
 async fn envelopes(resp: reqwest::Response) -> Vec<String> {
@@ -436,4 +480,181 @@ async fn a_flood_is_rate_limited_429() {
         }
     }
     assert!(saw_limit);
+}
+
+// ---- origin stamping ----
+//
+// The relay notes the address it saw a to-phone deposit arrive from and hands
+// it to the phone alongside the envelope, as a display-only hint. These check
+// the wire shape, the forwarded-header gate, and that the envelope bytes are
+// untouched by any of it. Whether the hint is trustworthy is not a question the
+// relay answers: it cannot be, and the phone must treat it as unverified.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_to_phone_delivery_carries_the_observed_origin() {
+    let base = spawn(test_config()).await;
+    let c = client();
+    let id = mailbox_id();
+    let before = now_ms();
+    to_phone(&c, &base, &id, serde_json::json!({ "env": "sealed" })).await;
+
+    let body = drain_body(get(&c, &base, &id, "to-phone").await).await;
+    assert_eq!(
+        body.get("envelopes").unwrap(),
+        &serde_json::json!(["sealed"])
+    );
+    let origin = origin_at(&body, 0).expect("an origin for a loopback deposit");
+    assert_eq!(origin.get("ip").and_then(|v| v.as_str()), Some("127.0.0.1"));
+    let at_ms = origin.get("at_ms").and_then(|v| v.as_u64()).expect("at_ms");
+    assert!(at_ms >= before && at_ms <= now_ms());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_to_daemon_direction_is_never_stamped() {
+    let base = spawn(test_config()).await;
+    let c = client();
+    let id = mailbox_id();
+    to_daemon(&c, &base, &id, serde_json::json!({ "env": "reply" })).await;
+
+    let body = drain_body(get(&c, &base, &id, "to-daemon").await).await;
+    assert_eq!(
+        body.get("envelopes").unwrap(),
+        &serde_json::json!(["reply"])
+    );
+    // Not null-filled: the key is absent entirely.
+    assert!(body.get("origins").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forwarded_header_is_ignored_when_no_proxy_is_trusted() {
+    let base = spawn(test_config()).await; // trusted_proxy_hops: 0
+    let c = client();
+    let id = mailbox_id();
+    to_phone_forwarded(
+        &c,
+        &base,
+        &id,
+        serde_json::json!({ "env": "sealed" }),
+        "203.0.113.7",
+    )
+    .await;
+
+    let body = drain_body(get(&c, &base, &id, "to-phone").await).await;
+    let origin = origin_at(&body, 0).expect("origin");
+    // The forged claim is not what the phone is shown; the socket peer is.
+    assert_eq!(origin.get("ip").and_then(|v| v.as_str()), Some("127.0.0.1"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forwarded_header_is_read_when_a_proxy_is_trusted() {
+    let base = spawn(config_behind_proxies(1)).await;
+    let c = client();
+    let id = mailbox_id();
+    to_phone_forwarded(
+        &c,
+        &base,
+        &id,
+        serde_json::json!({ "env": "sealed" }),
+        "203.0.113.7",
+    )
+    .await;
+
+    let body = drain_body(get(&c, &base, &id, "to-phone").await).await;
+    let origin = origin_at(&body, 0).expect("origin");
+    assert_eq!(
+        origin.get("ip").and_then(|v| v.as_str()),
+        Some("203.0.113.7")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chain_shorter_than_the_trusted_hops_yields_no_origin() {
+    // Configured for the two-hop deploy/gcp chain but reached directly: rather
+    // than reach left into whatever the client wrote, the relay says nothing.
+    let base = spawn(config_behind_proxies(2)).await;
+    let c = client();
+    let id = mailbox_id();
+    to_phone_forwarded(
+        &c,
+        &base,
+        &id,
+        serde_json::json!({ "env": "sealed" }),
+        "1.2.3.4",
+    )
+    .await;
+
+    let body = drain_body(get(&c, &base, &id, "to-phone").await).await;
+    assert_eq!(
+        body.get("envelopes").unwrap(),
+        &serde_json::json!(["sealed"])
+    );
+    assert!(body.get("origins").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_envelope_bytes_are_untouched_with_or_without_an_origin() {
+    let opaque = "\\x00{\"not\":parsed}\n\t\"quote\"\u{2601} \u{7f} raw";
+    let c = client();
+
+    // Stamped (loopback peer, no proxies trusted).
+    let stamped = spawn(test_config()).await;
+    let id = mailbox_id();
+    to_phone(&c, &stamped, &id, serde_json::json!({ "env": opaque })).await;
+    let with_origin = drain_body(get(&c, &stamped, &id, "to-phone").await).await;
+    assert!(origin_at(&with_origin, 0).is_some());
+
+    // Unstamped (the chain is shorter than the configured trust, so unknown).
+    let unstamped = spawn(config_behind_proxies(2)).await;
+    let id2 = mailbox_id();
+    to_phone(&c, &unstamped, &id2, serde_json::json!({ "env": opaque })).await;
+    let without_origin = drain_body(get(&c, &unstamped, &id2, "to-phone").await).await;
+    assert!(without_origin.get("origins").is_none());
+
+    // Byte-identical to the deposit either way: nothing about provenance
+    // touches the sealed bytes.
+    assert_eq!(
+        with_origin.get("envelopes").unwrap(),
+        &serde_json::json!([opaque])
+    );
+    assert_eq!(
+        without_origin.get("envelopes").unwrap(),
+        with_origin.get("envelopes").unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_origin_is_dropped_with_the_entry_it_belongs_to() {
+    let base = spawn(test_config()).await;
+    let c = client();
+    let id = mailbox_id();
+    to_phone(&c, &base, &id, serde_json::json!({ "env": "sealed" })).await;
+
+    // Drain-on-read takes the envelope and its origin together.
+    assert!(origin_at(&drain_body(get(&c, &base, &id, "to-phone").await).await, 0).is_some());
+    let after = drain_body(get(&c, &base, &id, "to-phone").await).await;
+    assert_eq!(after.get("envelopes").unwrap(), &serde_json::json!([]));
+    assert!(after.get("origins").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_origin_reaches_a_waiting_long_poll() {
+    let base = spawn(test_config()).await;
+    let c = client();
+    let id = mailbox_id();
+    let held = {
+        let c = c.clone();
+        let base = base.clone();
+        let id = id.clone();
+        tokio::spawn(async move { drain_body(get(&c, &base, &id, "to-phone").await).await })
+    };
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    to_phone(&c, &base, &id, serde_json::json!({ "env": "woke-it-up" })).await;
+
+    let body = held.await.unwrap();
+    assert_eq!(
+        body.get("envelopes").unwrap(),
+        &serde_json::json!(["woke-it-up"])
+    );
+    let origin = origin_at(&body, 0).expect("origin on the woken delivery");
+    assert_eq!(origin.get("ip").and_then(|v| v.as_str()), Some("127.0.0.1"));
 }

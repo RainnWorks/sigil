@@ -70,6 +70,12 @@ pub fn status(daemon_up: bool) -> StatusJson {
         // Lockdown was removed; the field stays on the wire (always false) so an
         // older Mac app that still decodes `locked_down` keeps working.
         locked_down: false,
+        // Filled by the daemon, which is the only party that knows: it read the
+        // keystore once at startup and holds whether it was provisioned. A CLI
+        // computing this locally would be guessing from a file it may not be able
+        // to read, so the local path leaves it absent (= unknown).
+        keystore_sealed: None,
+        keystore_provisioned: None,
     }
 }
 
