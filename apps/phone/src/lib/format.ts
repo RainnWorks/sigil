@@ -6,7 +6,7 @@
  */
 import { type SecretRef, type SshChallenge } from "@/src/protocol";
 
-/** "just now", "12s ago", "4m ago", "2d ago" — the brief's terse register. */
+/** "just now", "12s ago", "4m ago", "2d ago": the brief's terse register. */
 export function relativeTime(fromMs: number, nowMs: number = Date.now()): string {
   const s = Math.max(0, Math.round((nowMs - fromMs) / 1000));
   if (s < 3) return "just now";
@@ -36,8 +36,8 @@ export interface RefSegment {
 /**
  * Segment a SecretRef for the well: its `segments`, most-general first, joined
  * by dim separators, with the item (the segment equal to `label`) brightest. If
- * no segment matches the label, the last — the most specific, meaningful
- * segment — is brightened instead.
+ * no segment matches the label, the last (the most specific, meaningful
+ * segment) is brightened instead.
  */
 export function segmentSecretRef(ref: SecretRef): RefSegment[] {
   const out: RefSegment[] = [];
@@ -76,6 +76,22 @@ export function durationWindow(totalSecs: number): string {
   if (m < 60) return `${m} minute${m === 1 ? "" : "s"}`;
   const h = Math.round(m / 60);
   return `${h} hour${h === 1 ? "" : "s"}`;
+}
+
+/**
+ * The bare command word from an intercepted argv: "op" from
+ * ["/usr/local/bin/op", "read", ...]. Display only, and provider-blind: this is
+ * whatever binary the shim intercepted, never a provider or account name. It is
+ * argv[0] and may differ from the process chain's leaf, which the daemon resolves
+ * separately. Returns null for an empty or blank argv so callers phrase
+ * generically instead of naming a command that isn't there.
+ */
+export function commandWord(command: string[]): string | null {
+  const argv0 = command[0]?.trim();
+  if (!argv0) return null;
+  // Last non-empty path segment, so a trailing slash cannot yield an empty word.
+  const base = argv0.split("/").filter((seg) => seg.length > 0).pop();
+  return base ?? null;
 }
 
 /** Render a resolved process chain as "zsh -> claude -> op read". */

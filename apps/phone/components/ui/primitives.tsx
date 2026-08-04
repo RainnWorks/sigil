@@ -43,8 +43,14 @@ export function Card({
   );
 }
 
-export function SectionHeader({ children }: { children: ReactNode }) {
-  return (
+/**
+ * A section label, with an optional trailing state word mirroring the design
+ * brief's badges ("Planned"). The badge is faint and set apart on the right: a
+ * section that is not wired to anything yet must say so where the human reads
+ * the section, not in a footnote.
+ */
+export function SectionHeader({ children, badge }: { children: ReactNode; badge?: string }) {
+  const label = (
     <Sans
       size={12}
       weight="semibold"
@@ -58,6 +64,27 @@ export function SectionHeader({ children }: { children: ReactNode }) {
     >
       {children}
     </Sans>
+  );
+  if (badge === undefined) return label;
+  return (
+    <View
+      style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}
+    >
+      {label}
+      <Sans
+        size={12}
+        weight="semibold"
+        tone="faint"
+        style={{
+          textTransform: "uppercase",
+          letterSpacing: 0.6,
+          marginBottom: space.sm,
+          marginRight: space.xs,
+        }}
+      >
+        {badge}
+      </Sans>
+    </View>
   );
 }
 

@@ -5,7 +5,12 @@
  * directly for pure-UI iteration.
  */
 import { type ApprovalRequest } from "@/src/protocol";
-import { type AppState, type HistoryEntry, type Lease } from "@/src/domain/types";
+import {
+  type AppState,
+  type HistoryEntry,
+  type Lease,
+  type RelayOrigin,
+} from "@/src/domain/types";
 
 const now = Date.now();
 
@@ -144,11 +149,21 @@ export function demoUnboundSshRequest(): ApprovalRequest {
   };
 }
 
+/**
+ * A stand-in for the relay's origin hint, so the sheet's `network` row is
+ * reachable in a demo build. A documentation-range address (RFC 5737), never a
+ * real one. Demo only: a live pairing shows this row solely when the relay
+ * actually sent a claim that passed validation.
+ */
+export const demoRelayOrigin: RelayOrigin = { ip: "203.0.113.7", atMs: now };
+
 export const demoLeases: Lease[] = [
   {
     id: "l1",
     caller: "rowm launcher",
-    scope: "Engineering/.env",
+    // A rule name, not a secret path: the lease covers every command that rule
+    // matches for this caller until it lapses.
+    scope: "op-eu",
     grantedAt: now - 19 * 60_000,
     expiresAt: now + 41 * 60_000,
   },

@@ -5,12 +5,16 @@
  * optional heads-up dot, and the gesture itself is never made harder. Deny is
  * likewise a single tap, so refusing is never heavier than allowing.
  *
- * Two variants let the sheet offer, when a request is leasable, an "Approve
- * once" primary beside a "Keep approved for <window>" secondary:
+ * Two variants let the sheet offer, when a request is leasable, a "Keep approved
+ * for <window>" primary above an "Approve once" secondary:
  *   primary   -> solid cobalt Liquid Glass capsule
  *   secondary -> cobalt outline capsule
- * `busy` freezes the control while the gate is up; if the gate fails the parent
- * flips `busy` off and the control is live again.
+ * Both are the same single tap behind the same Face ID gate; the variant sets
+ * emphasis only, never how hard the gesture is.
+ * `busy` freezes every capsule while the gate is up and `committing` marks the
+ * one that was tapped, so "Approving…" names which authorization is in flight
+ * rather than lighting up both. If the gate fails the parent clears both and the
+ * controls are live again.
  */
 import { Pressable, StyleSheet } from "react-native";
 
@@ -22,12 +26,25 @@ import { hapticTick } from "@/src/lib/haptics";
 
 interface Props {
   label: string;
+  /** An approve is in flight: every capsule freezes, whichever was tapped. */
   busy: boolean;
+  /**
+   * THIS capsule is the one that was tapped, so it alone says "Approving…" and
+   * stays lit while the others dim. The two capsules authorize different things
+   * (one invocation vs a window), so the in-flight state must name which.
+   */
+  committing?: boolean;
   onApprove: () => void;
   variant?: "primary" | "secondary";
 }
 
-export function ApproveControl({ label, busy, onApprove, variant = "primary" }: Props) {
+export function ApproveControl({
+  label,
+  busy,
+  committing = false,
+  onApprove,
+  variant = "primary",
+}: Props) {
   const p = useTheme();
   const secondary = variant === "secondary";
   return (
@@ -45,7 +62,9 @@ export function ApproveControl({ label, busy, onApprove, variant = "primary" }: 
         justifyContent: "center",
         borderWidth: secondary ? 1.5 : 0,
         borderColor: secondary ? p.cobalt : "transparent",
-        opacity: busy ? 0.6 : 1,
+        // The committing capsule stays lit (it is the one reporting); any other
+        // dims out of the way rather than looking equally in flight.
+        opacity: !busy ? 1 : committing ? 1 : 0.4,
       }}
     >
       {/* iOS 26 Liquid Glass, tinted cobalt; falls back to a solid cobalt capsule.
@@ -63,7 +82,7 @@ export function ApproveControl({ label, busy, onApprove, variant = "primary" }: 
         weight="semibold"
         style={{ color: secondary ? p.cobalt : p.cobaltInk }}
       >
-        {busy ? "Approving…" : label}
+        {committing ? "Approving…" : label}
       </Sans>
     </Pressable>
   );

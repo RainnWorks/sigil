@@ -8,7 +8,7 @@
  * the contract they fill.
  */
 import { type Envelope } from "@/src/protocol";
-import { type ConnectionRung } from "@/src/domain/types";
+import { type ConnectionRung, type RelayOrigin } from "@/src/domain/types";
 
 export interface TransportStatus {
   rung: ConnectionRung;
@@ -17,12 +17,24 @@ export interface TransportStatus {
   lastSeenAt: number;
 }
 
+/**
+ * An inbound sealed envelope, plus the transport's own unverified note about
+ * where it came from.
+ *
+ * The two arguments are separate on purpose, and the second is optional so a
+ * rung that has no such note (LAN/direct: no relay in the path) and a listener
+ * that does not care both stay correct. `relayOrigin` is NEVER part of the envelope:
+ * the envelope is signed and sealed by the daemon, this is hearsay from the
+ * carrier, and the type system should keep anyone from confusing the two.
+ */
+export type EnvelopeListener = (e: Envelope, relayOrigin?: RelayOrigin) => void;
+
 export interface Transport {
   start(): Promise<void>;
   stop(): void;
   status(): TransportStatus;
   /** Subscribe to inbound sealed envelopes (requests from the daemon). */
-  onEnvelope(cb: (e: Envelope) => void): () => void;
+  onEnvelope(cb: EnvelopeListener): () => void;
   /** Send a sealed envelope (our response) toward the daemon. */
   send(e: Envelope): Promise<void>;
 }

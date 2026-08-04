@@ -21,7 +21,7 @@ import {
   signingSecretKey,
 } from "@/src/protocol";
 import { type ApprovalResponse } from "@/src/protocol";
-import { type Transport, type TransportStatus } from "./transport";
+import { type EnvelopeListener, type Transport, type TransportStatus } from "./transport";
 
 export interface MockTransportConfig {
   sodium: Sodium;
@@ -32,8 +32,6 @@ export interface MockTransportConfig {
   /** Shared routing mailbox id. */
   pairingId: Uint8Array;
 }
-
-type EnvelopeListener = (e: Envelope) => void;
 
 export class MockTransport implements Transport {
   private readonly listeners = new Set<EnvelopeListener>();

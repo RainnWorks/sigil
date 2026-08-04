@@ -23,6 +23,7 @@ import {
   signingSecretKey,
 } from "@/src/protocol";
 import { store } from "@/src/state/store";
+import { type RelayOrigin } from "@/src/domain/types";
 import { type Transport } from "@/src/transport/transport";
 
 export interface SessionConfig {
@@ -50,7 +51,9 @@ export class SigilSession {
 
   async start(): Promise<void> {
     await this.cfg.transport.start();
-    this.unsubscribe = this.cfg.transport.onEnvelope((e) => this.handleInbound(e));
+    this.unsubscribe = this.cfg.transport.onEnvelope((e, relayOrigin) =>
+      this.handleInbound(e, relayOrigin),
+    );
   }
 
   stop(): void {
@@ -59,7 +62,13 @@ export class SigilSession {
     this.cfg.transport.stop();
   }
 
-  private handleInbound(envelope: Envelope): void {
+  /**
+   * `relayOrigin` is the carrier's unverified claim about where this envelope was
+   * deposited from. It plays no part in opening, verifying, or demuxing below:
+   * the crypto decides everything, and the hint is only handed to the store for
+   * the sheet to show. A forged or missing one changes nothing here.
+   */
+  private handleInbound(envelope: Envelope, relayOrigin?: RelayOrigin): void {
     let payload: unknown;
     try {
       // Open once to a raw payload; the crypto (signature, replay, decryption) is
@@ -89,7 +98,7 @@ export class SigilSession {
       return;
     }
     const request = msg.request;
-    store.receive(request);
+    store.receive(request, relayOrigin);
     // Task #41: acknowledge receipt so the daemon can advance the requester's
     // UI Sent -> Delivered. Best-effort and non-blocking: a failed ack leaves
     // the daemon to fall back to "couldn't confirm"; it never gates display or

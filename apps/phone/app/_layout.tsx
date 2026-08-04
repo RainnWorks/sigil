@@ -16,6 +16,7 @@ import {
   watchPushTokenRotation,
 } from "@/src/lib/push";
 import {
+  demoRelayOrigin,
   demoReadRequest,
   demoRoutineRequest,
   demoSshRequest,
@@ -56,13 +57,18 @@ export default function RootLayout() {
     // Demo seed is OFF unless the explicit dev flag is set, so no Release build
     // ever shows canned pending requests. Exercises the same crypto path as real.
     if (DEMO && store.getState().pending.length === 0) {
-      store.seedPending([
-        demoReadRequest(),
-        demoThresholdRequest(),
-        demoSshRequest(),
-        demoUnboundSshRequest(),
-        demoRoutineRequest(),
-      ]);
+      store.seedPending(
+        [
+          demoReadRequest(),
+          demoThresholdRequest(),
+          demoSshRequest(),
+          demoUnboundSshRequest(),
+          demoRoutineRequest(),
+        ],
+        // Stands in for the relay's origin hint so the sheet's `network` row is
+        // reachable without a relay. Demo builds only.
+        demoRelayOrigin,
+      );
     }
   }, []);
 

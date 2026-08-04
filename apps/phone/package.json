@@ -8,6 +8,7 @@
     "ios": "expo run:ios",
     "android": "expo run:android",
     "typecheck": "tsc --noEmit",
+    "format:selftest": "bun run src/lib/format.selftest.ts",
     "proto:selftest": "bun run src/protocol/self-test.ts",
     "proto:vectors": "bun run src/protocol/verify-vectors.ts",
     "relay:selftest": "bun run src/transport/relay-http.selftest.ts",

@@ -11,6 +11,7 @@ import {
   type AppState,
   type HistoryEntry,
   type PendingRequest,
+  type RelayOrigin,
   type RequestState,
 } from "@/src/domain/types";
 import { demoInitialState, emptyInitialState } from "./demo";
@@ -48,8 +49,17 @@ class Store {
     this.set({ ...this.state, ...p });
   }
 
-  /** A new request arrived. Identical grant keys coalesce behind the pending one. */
-  receive(request: ApprovalRequest): void {
+  /**
+   * A new request arrived. Identical grant keys coalesce behind the pending one.
+   *
+   * `relayOrigin` is the transport's unverified note about where the delivery came
+   * from (absent off the relay, or when it failed validation). It is held beside
+   * the request for the sheet to show and is never written to history: history
+   * is the audit mirror, and an unsigned relay claim has no business in it. On a
+   * coalesce the first origin is kept rather than overwritten, so the row keeps
+   * describing the delivery the human is actually looking at.
+   */
+  receive(request: ApprovalRequest, relayOrigin?: RelayOrigin): void {
     const key = grantKey(request);
     const existing = this.state.pending.find(
       (p) => p.state !== "approved" && p.state !== "denied" && grantKey(p.request) === key,
@@ -67,6 +77,7 @@ class Store {
       state: "fresh",
       receivedAt: Date.now(),
       coalesced: 0,
+      ...(relayOrigin ? { relayOrigin } : {}),
     };
     this.patch({ pending: [entry, ...this.state.pending] });
   }
@@ -127,6 +138,14 @@ class Store {
     this.remove(requestId);
   }
 
+  /**
+   * PHONE-LOCAL ONLY, and deliberately not called by any screen (security review
+   * F7). This drops a row from this phone's array; it sends no envelope, so the
+   * daemon's `LeaseStore` keeps honoring the window for the rest of its TTL. Do
+   * NOT put a "Revoke" control behind this: a control that says a window closed
+   * when it did not is worse than no control. Wire a real revoke message first,
+   * then restore the affordance in the settings screen.
+   */
   revokeLease(id: string): void {
     this.patch({ leases: this.state.leases.filter((l) => l.id !== id) });
   }
@@ -215,9 +234,13 @@ class Store {
     this.patch({ history: [entry, ...this.state.history] });
   }
 
-  /** Test/dev helper: seed pending requests directly. */
-  seedPending(requests: ApprovalRequest[]): void {
-    for (const r of requests) this.receive(r);
+  /**
+   * Test/dev helper: seed pending requests directly. `relayOrigin` stands in for the
+   * relay's hint so the network row is reachable in a demo build; it is applied
+   * to every seeded request and never reaches a live pairing.
+   */
+  seedPending(requests: ApprovalRequest[], relayOrigin?: RelayOrigin): void {
+    for (const r of requests) this.receive(r, relayOrigin);
   }
 
   reset(): void {
