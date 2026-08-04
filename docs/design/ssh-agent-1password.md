@@ -50,7 +50,9 @@ Shipped and green in `crates/sigil`:
 * The generic engine: `config.rs` `Config {sources, rules}` with per-rule
   `LeasePolicy {RunOnce | Leasable{max_secs}}`, hot reload (`ConfigCell` +
   2s watcher), `LeaseStore` (grant key = BLAKE2b over the kernel-verified
-  caller ancestry chain + project root + scope; triple-scoped RAM-only
+  caller ancestry chain + project root + scope, and the command path now
+  passes an empty root plus the matched RULE's name as the scope, so a
+  command lease is rule-wide rather than argv-wide; triple-scoped RAM-only
   tokens; TTL purge; lockdown clears). The op fulfillment path consults
   `leases.token_for` before gating and grants on `Decision::Lease(ttl)`
   clamped by the rule's policy, which the daemon enforces as sole authority.

@@ -5,7 +5,7 @@ Companion to `docs/design/secret-model.md` (gate, do not broker) and the design
 brief. This document covers: the operating model, the `sigil up` keystone, the
 daemon reliability fixes it depends on (with the root-cause diagnosis of this
 week's outages), the SSH sign-path diagnosis, the Sigil skill, and the
-dev-keystore-to-keychain decision.
+keystore-default decision.
 
 ## 1. The operating model: three roles
 
@@ -44,13 +44,13 @@ true), `fixed` (made true), or `action needed` (needs the human):
    Explicit contract: the binary you run `sigil up` from becomes the installed
    runtime. (Dev flow: `cargo build --release && target/release/sigil up`.)
 2. **launchd plist current**. The rendered plist (stable program path,
-   `RunAtLoad`, unconditional `KeepAlive` true, shim-first `PATH`, and any
-   dev-keystore pin carried forward, see below) is compared byte-for-byte with
-   `~/Library/LaunchAgents/works.rainn.sigil.plist`; a differing or missing
-   file is written and the agent re-bootstrapped (bootout + bootstrap).
-   The `SIGIL_DEV_KEYSTORE` pin is preserved from the environment or, when the
-   environment is silent, from the existing plist, so an `up` run from a clean
-   shell can never silently strip the pin and orphan the daemon identity.
+   `RunAtLoad`, unconditional `KeepAlive` true, shim-first `PATH`) is compared
+   byte-for-byte with `~/Library/LaunchAgents/works.rainn.sigil.plist`; a
+   differing or missing file is written and the agent re-bootstrapped (bootout +
+   bootstrap). No keystore variable is pinned: the daemon and the CLI both
+   default to the on-disk store with no environment at all, so there is nothing
+   to keep in sync. An older plist that still carries a `SIGIL_DEV_KEYSTORE`
+   pin is simply rewritten without it (and `up` says so).
 3. **agent loaded**. `launchctl print gui/<uid>/works.rainn.sigil` succeeds,
    else bootstrap.
 4. **daemon healthy**. A real `Status` control round trip (bounded by socket
@@ -270,32 +270,43 @@ plaintext.** Concretely:
 The skill treats the phone as provider-blind and the daemon as inert at rest;
 it never proposes weakening a gate to make automation smoother.
 
-## 6. Dev keystore vs login keychain: decision
+## 6. Keystore: the on-disk store is the default (settled 2026-08-04)
 
-Current state: the daemon identity and Mac threshold share `m` live only in
-`~/.sigil/dev-keystore.json`, so the launchd plist must pin
-`SIGIL_DEV_KEYSTORE=file` forever (and the loud warning is honest: those bytes
-sit on disk unprotected).
+The daemon identity and the Mac threshold share `m` live in
+`~/.sigil/keystore.json`, a 0600 JSON file, on every platform, with no
+environment variable involved. An install carrying the older
+`~/.sigil/dev-keystore.json` is renamed in place the first time the new name is
+opened, so the pairing survives the upgrade untouched.
 
-Recommendation (NOT executed in this change): migrate the two blobs into the
-login-keychain generic-password store (`MacKeystore` blob storage), which works
-from the unsigned binary with no entitlement (see `docs/design/secret-model.md`
-"What stays"). Sketch, honoring the durable-pairing principle (identities and
-`m` survive; no re-pair):
+Why the file and not the login keychain: under the threshold posture neither
+blob is a standalone decryption secret (`m` is inert without the phone's
+per-request partial), the store must work identically from an unsigned daemon
+and an unsigned CLI, and it must not depend on a code signature or a keychain
+prompt. The honest residual is unchanged and stated wherever the store is named:
+a reader of the file gets the identity key AND `m` together, so a phished
+approval could decrypt off-box.
 
-1. `sigil up` (a future step) detects dev-keystore blobs + a working keychain,
-   copies `pairing.daemon-identity.v1` and `threshold.mac-share.v2` into the
-   keychain store, verifies a read-back, then renames `dev-keystore.json` to a
-   `.migrated` backup and rewrites the plist without the pin.
-2. Rollback is trivial (restore the file, re-pin) and the phone never notices.
+What killed the previous arrangement was not the storage but the *gating*: the
+file store was selected by `SIGIL_DEV_KEYSTORE=file`, pinned into the launchd
+plist, and therefore invisible to any CLI run from a plain shell. The two halves
+disagreed about where the pairing lived, and the resulting error advised a
+re-pair that would have destroyed a healthy pairing. One default, resolvable
+with no environment, is the fix.
 
-Why not now: the keychain blob path on this machine is exercised only by
-tests, not by the live pairing; switching the live identity store and the
-always-on rework in one change violates "do not break the working setup
-without a migration path". It needs its own change with an on-device
-verification pass (keychain prompts under launchd are the known risk) and an
-independent security review. Until then the plist pin is preserved verbatim by
-`sigil up`.
+Overrides remain, spelled `SIGIL_KEYSTORE=file|memory|keychain`
+(`SIGIL_DEV_KEYSTORE` still works and logs a deprecation line). `memory` is for
+tests; `keychain` reaches the login-keychain store, which is also where an
+identity from an older build may still be sitting. That case is reported, never
+migrated automatically: a keychain read can raise a system prompt, and a daemon
+that blocks on a dialog at startup is not a daemon.
+
+Two consequences worth naming. The pairing-authorization Touch ID gate (#48) was
+attached to the keychain store; it now asks the HOST instead
+(`keystore::presence_plan`), because `LAContext.evaluatePolicy` never needed the
+keychain and the gate must not vanish when storage moves. And `Factor::Biometric`
+is now reachable only under the keychain override, so an unpaired daemon on the
+default store reports "no factor: fails closed" rather than claiming a hardware
+factor that has no approve path.
 
 ## 7. What changed where (implementation map)
 
