@@ -2672,7 +2672,7 @@ fn config_source_add(args: &[String], json: bool) -> i32 {
 }
 
 fn config_source_list(json: bool) -> i32 {
-    let cfg = match load_config() {
+    let cfg = match sources_for_display() {
         Some(c) => c,
         None => return 1,
     };
@@ -2720,11 +2720,31 @@ fn config_source_list(json: bool) -> i32 {
     0
 }
 
+/// The config as `list` must show it: loaded, then reconciled against the
+/// threshold store so a DECLARED key with no sealed record is not presented as
+/// one.
+///
+/// `config.json` records that a value was declared, never that one exists. The
+/// two diverge whenever a value was never sealed or a migration dropped it, and
+/// the honest rendering of that state is the one `export` already takes: drop the
+/// phantom keys and show the source as the plain gate it actually behaves as.
+/// Reusing [`reconcile_unsealed_env_sources`] rather than inventing a second
+/// notion of "sealed" is the point; a parallel sealed/unsealed badge would be a
+/// "needs values" state, and an unsealed declared key is dead config, not a
+/// pending one.
+fn sources_for_display() -> Option<crate::config::Config> {
+    let mut cfg = load_config()?;
+    reconcile_unsealed_env_sources(&mut cfg);
+    Some(cfg)
+}
+
 /// The trailing descriptor on a source's `list` line.
 ///
 /// For the inline `env` source that is the sealed KEY names (never values, which
 /// are not in the config at all), labelled `sealed` so it can never be mistaken
-/// for the `plain KEY=value` lines below it. For others, the account label or the
+/// for the `plain KEY=value` lines below it. It runs on a config that
+/// [`sources_for_display`] has already reconciled, so a name reaching the
+/// `sealed` label has a record behind it. For others, the account label or the
 /// env-file path.
 fn source_extra(src: &crate::config::Source) -> String {
     if src.provider != crate::provider::EnvProvider::ID {
@@ -4166,6 +4186,79 @@ mod tests {
             source_extra(&sealed),
             " \u{b7} sealed OP_SERVICE_ACCOUNT_TOKEN"
         );
+    }
+
+    #[test]
+    fn list_never_calls_a_declared_but_unsealed_key_sealed() {
+        // `config.json` records that a key was DECLARED, never that a value
+        // exists. Rendering the declaration as "sealed" told the human Sigil was
+        // protecting a value it had never been given: the `op` source below
+        // carries an inherited key name and has never been sealed, yet read
+        // identically to the source that had. `list` now reconciles against the
+        // threshold store exactly as `export` does, so a phantom key is simply
+        // not shown; it is dead config that degrades to a plain gate, not a
+        // pending state deserving a badge.
+        use sigil_proto::threshold::{EcdhAlgo, MacShare, ThresholdRecord};
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("sigil-listseal-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var_os("SIGIL_HOME");
+        std::env::set_var("SIGIL_HOME", &dir);
+
+        let mut cfg = crate::config::Config::default();
+        for name in ["real", "phantom"] {
+            cfg.sources
+                .push(env_source_named(name, &["OP_SERVICE_ACCOUNT_TOKEN"]));
+        }
+        cfg.save().unwrap();
+
+        // Only `real` has a record. It is a genuine seal (a throwaway stand-in
+        // for the phone's pinned share) because the store refuses to persist a
+        // record whose ephemeral point is not on the curve; nothing here is ever
+        // opened, since the rendering decision turns on the record existing.
+        let m = MacShare::generate();
+        let phone_f = MacShare::generate().public_point();
+        let mut store = crate::threshold::ThresholdStore::default();
+        store.secrets.push(
+            ThresholdRecord::seal("real", &m, &phone_f, EcdhAlgo::X963Sha256, "k", b"v").unwrap(),
+        );
+        store.save().unwrap();
+
+        let shown = sources_for_display().expect("the display config loads");
+        let extra = |name: &str| {
+            source_extra(
+                shown
+                    .sources
+                    .iter()
+                    .find(|s| s.name == name)
+                    .expect("source present"),
+            )
+        };
+        assert_eq!(extra("real"), " \u{b7} sealed OP_SERVICE_ACCOUNT_TOKEN");
+        assert_eq!(
+            extra("phantom"),
+            " \u{b7} (nothing set)",
+            "a declared key with no record claims nothing"
+        );
+        assert!(
+            !extra("phantom").contains("OP_SERVICE_ACCOUNT_TOKEN"),
+            "and the phantom key is not named at all"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("SIGIL_HOME", v),
+            None => std::env::remove_var("SIGIL_HOME"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn env_source_named(name: &str, keys: &[&str]) -> crate::config::Source {
+        let mut src = env_source(keys, &[]);
+        src.name = name.to_string();
+        src
     }
 
     #[test]
