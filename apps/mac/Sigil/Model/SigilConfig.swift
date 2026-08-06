@@ -41,18 +41,24 @@ struct SourceConfig: Codable, Sendable, Equatable, Identifiable {
     /// with no sealed record in the threshold store is inert: `export` drops its
     /// keys, so it presents here as a plain gate (empty), never as "set".
     var keys: [String] = []
+    /// NON-SECRET env vars the source injects, in cleartext (core's
+    /// `Source.plain`). Not editable here yet, but carried through decode and
+    /// encode so a save from this app cannot silently delete config the CLI
+    /// authored with `sigil-config source env set-plain`.
+    var plain: [String: String] = [:]
 
     var id: String { name }
 
-    enum CodingKeys: String, CodingKey { case name, provider, account, path, keys }
+    enum CodingKeys: String, CodingKey { case name, provider, account, path, keys, plain }
 
     init(name: String, provider: String, account: String? = nil,
-         path: String? = nil, keys: [String] = []) {
+         path: String? = nil, keys: [String] = [], plain: [String: String] = [:]) {
         self.name = name
         self.provider = provider
         self.account = account
         self.path = path
         self.keys = keys
+        self.plain = plain
     }
 
     init(from decoder: Decoder) throws {
@@ -62,6 +68,7 @@ struct SourceConfig: Codable, Sendable, Equatable, Identifiable {
         account = try c.decodeIfPresent(String.self, forKey: .account)
         path = try c.decodeIfPresent(String.self, forKey: .path)
         keys = try c.decodeIfPresent([String].self, forKey: .keys) ?? []
+        plain = try c.decodeIfPresent([String: String].self, forKey: .plain) ?? [:]
     }
 
     func encode(to encoder: Encoder) throws {
@@ -71,6 +78,7 @@ struct SourceConfig: Codable, Sendable, Equatable, Identifiable {
         try c.encodeIfPresent(account, forKey: .account)
         try c.encodeIfPresent(path, forKey: .path)
         if !keys.isEmpty { try c.encode(keys, forKey: .keys) }
+        if !plain.isEmpty { try c.encode(plain, forKey: .plain) }
     }
 }
 

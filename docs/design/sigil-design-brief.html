@@ -500,6 +500,11 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
 </table></div>
 
 <div class="prose">
+  <p><strong>Plain vars sit next to sealed ones, and the difference is never blurred.</strong> A source can also carry <em>non-secret</em> environment variables, stored in cleartext in <code>config.json</code> and injected into the gated child alongside whatever its provider resolves. They exist because a gated tool can have an ambient authentication fallback of its own that overrides the credential Sigil injects: <code>op</code>, handed a valid <code>OP_SERVICE_ACCOUNT_TOKEN</code>, still opened a caller channel to the 1Password desktop app and blocked in <code>open()</code> forever, because the daemon is not an authorized CLI caller of that app. <code>OP_BIOMETRIC_UNLOCK_ENABLED=false</code> is the fix, and it is not a secret. The rule of thumb is one line: if leaking it would matter, seal it; plain is for behavior switches like turning off a tool's interactive fallback, pointing at a scratch config directory, or setting a throwaway <code>HOME</code>.</p>
+  <p><code>sigil-config source env set-plain &lt;src&gt; --key K --value V</code> takes the value on the command line precisely because it is not a secret, and refuses a name that <em>looks</em> like one (<code>TOKEN</code>, <code>SECRET</code>, <code>PASSWORD</code>, <code>KEY</code>, <code>CREDENTIAL</code>, <code>PAT</code>, <code>APIKEY</code>) unless you pass <code>--force-plain</code>, which says so out loud each time it is used. A sealed value always wins a name collision, and the shadowed plain var is named in <code>list</code> and in the daemon log rather than quietly dropped. Sealed keys render as names only and plain vars render as <code>KEY=value</code>, so a reader can tell at a glance which values Sigil is protecting and which it is merely setting. A source carrying only plain vars and nothing sealed is a legitimate configuration, not dead config: a phone gate plus an environment tweak.</p>
+</div>
+
+<div class="prose">
   <p>"Sigil for 1Password" is a use-case page, not the product. The provider registry and a second reference provider are the concrete next step: a second live provider is what turns "the seam is designed" into "the seam is proven." Until then, 1Password is the sole shipping provider and the trait is exercised only by it plus test fakes.</p>
 </div>
 

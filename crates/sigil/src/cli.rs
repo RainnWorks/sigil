@@ -275,6 +275,13 @@ usage: sigil-config <cmd> [args...]   author rules/sources, manage accounts
                     lines instead. source env unset <name> --key <KEY> removes
                     one. Values are AES-256-GCM at rest; list/export show only
                     KEY names
+  source env set-plain <name> --key <K> --value <V> [--force-plain]
+                    attach a NON-SECRET env var to a source, stored in cleartext
+                    in config.json and injected alongside the sealed values (a
+                    sealed value of the same name wins). For behavior switches
+                    like OP_BIOMETRIC_UNLOCK_ENABLED=false, not for credentials;
+                    if leaking it would matter, use `source env set` instead.
+                    also: source env unset-plain <name> --key <K>
   rule add <name> --source <s> [--command <c>] [--subcommand <s>]
                     [--argv-contains <str>...] [--flag <f>...] [--flag-eq <f>=<v>...]
                     [--leasable [--lease-max <secs>]] [--timeout <sec>]
@@ -2644,6 +2651,7 @@ fn config_source_add(args: &[String], json: bool) -> i32 {
         // The inline `env` source starts with no keys; values are added securely
         // via `source env set` (which reads them from stdin, never argv).
         keys: Vec::new(),
+        plain: Default::default(),
     };
     if let Err(e) = cfg.add_source(src) {
         eprintln!("sigil: {e}");
@@ -2683,29 +2691,57 @@ fn config_source_list(json: bool) -> i32 {
     println!("{}", s.cobalt("sources"));
     println!();
     for src in &cfg.sources {
-        // For the inline `env` source, show the KEY names (never values, which
-        // are not here at all). For others, the account label or env-file path.
-        let extra = if src.provider == crate::provider::EnvProvider::ID {
-            if src.keys.is_empty() {
-                " \u{b7} (no keys set)".to_string()
-            } else {
-                format!(" \u{b7} {}", src.keys.join(", "))
-            }
-        } else {
-            src.account
-                .as_deref()
-                .or(src.path.as_deref())
-                .map(|x| format!(" \u{b7} {x}"))
-                .unwrap_or_default()
-        };
         println!(
             "  {}  {}{}",
             pad(&src.name, 16),
             s.dim(&src.provider),
-            s.dim(&extra)
+            s.dim(&source_extra(src))
         );
+        // Plain vars show their VALUES, on their own lines, labelled `plain`. The
+        // distinction from a sealed key (name only, above) has to survive a
+        // glance: it is the difference between what Sigil is protecting and what
+        // it is merely setting.
+        for (k, v) in &src.plain {
+            let line = format!("plain {k}={v}");
+            if src.keys.contains(k) {
+                // Listed, but inert: the sealed value of the same name is what the
+                // child will get. Saying so here is the difference between config
+                // a human can trust and config they have to test.
+                println!(
+                    "  {}  {}",
+                    pad("", 16),
+                    s.brass(&format!("{line}  (shadowed by the sealed value)"))
+                );
+            } else {
+                println!("  {}  {}", pad("", 16), s.faint(&line));
+            }
+        }
     }
     0
+}
+
+/// The trailing descriptor on a source's `list` line.
+///
+/// For the inline `env` source that is the sealed KEY names (never values, which
+/// are not in the config at all), labelled `sealed` so it can never be mistaken
+/// for the `plain KEY=value` lines below it. For others, the account label or the
+/// env-file path.
+fn source_extra(src: &crate::config::Source) -> String {
+    if src.provider != crate::provider::EnvProvider::ID {
+        return src
+            .account
+            .as_deref()
+            .or(src.path.as_deref())
+            .map(|x| format!(" \u{b7} {x}"))
+            .unwrap_or_default();
+    }
+    match (src.keys.is_empty(), src.plain.is_empty()) {
+        (false, _) => format!(" \u{b7} sealed {}", src.keys.join(", ")),
+        // Not dead config: a gate that injects only non-secret vars, which are
+        // listed underneath.
+        (true, false) => " \u{b7} no sealed values".to_string(),
+        (true, true) => " \u{b7} (nothing set)".to_string(),
+    }
 }
 
 fn config_source_remove(name: Option<&str>, json: bool) -> i32 {
@@ -2794,12 +2830,17 @@ fn cmd_config_source_env(args: &[String], json: bool) -> i32 {
     match args.first().map(String::as_str) {
         Some("set") => config_source_env_set(&args[1..], json),
         Some("unset") => config_source_env_unset(&args[1..], json),
+        Some("set-plain") => config_source_env_set_plain(&args[1..], json),
+        Some("unset-plain") => config_source_env_unset_plain(&args[1..], json),
         _ => {
             eprintln!(
                 "usage: sigil-config source env <set <name> --stdin | set <name> --key <KEY> | \
-                 unset <name>>\n  \
+                 unset <name> | set-plain <name> --key <KEY> --value <V> | \
+                 unset-plain <name> --key <KEY>>\n  \
                  (set replaces the source's whole sealed set; values are write-only: sealed under \
-                 threshold and openable only with the phone, so they are never read back here)"
+                 threshold and openable only with the phone, so they are never read back here.\n   \
+                 set-plain stores a NON-SECRET value in cleartext in config.json, for behavior \
+                 switches like turning off a tool's interactive fallback)"
             );
             2
         }
@@ -3060,6 +3101,152 @@ fn config_source_env_unset(args: &[String], json: bool) -> i32 {
         &ControlResult::line(true, format!("cleared all sealed values on {name}")),
         json,
     )
+}
+
+/// Load the config and confirm `name` names an existing source of ANY provider.
+///
+/// The `env` verb group is about environment variables, not about the inline
+/// `env` provider: `set`/`unset` seal values (inline-env only, hence the stricter
+/// [`load_env_source`]), while `set-plain`/`unset-plain` attach cleartext vars to
+/// any source, because a plain gate (`1password`, `env-file`) is exactly where a
+/// behavior switch like `OP_BIOMETRIC_UNLOCK_ENABLED=false` belongs.
+fn load_plain_source(name: &str) -> Option<crate::config::Config> {
+    let cfg = load_config()?;
+    if cfg.source(name).is_none() {
+        eprintln!(
+            "sigil: no source named {name}; create one first: \
+             sigil-config source add {name} --provider <id>"
+        );
+        return None;
+    }
+    Some(cfg)
+}
+
+/// `source env set-plain <name> --key K --value V`: store ONE non-secret env var
+/// on a source, in cleartext.
+///
+/// The value on the command line is deliberate and correct here: these are not
+/// secrets, so keeping them out of `ps` buys nothing and the round trip through
+/// stdin would only make the everyday case (`--value false`) awkward. The
+/// name-shape guardrail is what keeps that from becoming a way to smuggle a
+/// credential into `config.json`.
+fn config_source_env_set_plain(args: &[String], json: bool) -> i32 {
+    let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
+        eprintln!(
+            "usage: sigil-config source env set-plain <name> --key <KEY> --value <VALUE> [--force-plain]\n  \
+             the VALUE is stored in cleartext in config.json and is fine on the command line: \
+             plain vars are NON-SECRET behavior switches (OP_BIOMETRIC_UNLOCK_ENABLED=false, \
+             OP_CONFIG_DIR=..., a scratch HOME).\n  \
+             never pipe a credential in here; seal it instead: sigil-config source env set <name> --key <KEY>"
+        );
+        return 2;
+    };
+    // The lead-in spelling `set-plain <name> --unset-plain K` removes one, so the
+    // pair reads the way the flags do.
+    if let Some(key) = flag_value(args, "--unset-plain").map(str::to_string) {
+        return remove_plain_key(&name, &key, json);
+    }
+    let Some(key) = flag_value(args, "--key").map(str::to_string) else {
+        eprintln!("sigil: --key <KEY> is required");
+        return 2;
+    };
+    let Some(value) = flag_value(args, "--value").map(str::to_string) else {
+        eprintln!(
+            "sigil: --value <VALUE> is required (plain vars are not secrets, so the value goes \
+             on the command line)"
+        );
+        return 2;
+    };
+    if !valid_env_key(&key) {
+        eprintln!("sigil: '{key}' is not a valid environment variable name");
+        return 2;
+    }
+    let forced = has_flag(args, "--force-plain");
+    if let Some(token) = crate::config::secret_looking_name(&key) {
+        if !forced {
+            eprintln!(
+                "sigil: '{key}' looks like a secret (it contains '{token}') and a plain value is \
+                 stored in cleartext in config.json.\n       \
+                 seal it instead: sigil-config source env set {name} --key {key}\n       \
+                 if it really is not a secret: re-run with --force-plain"
+            );
+            return 2;
+        }
+        // Said out loud, every time: the override is the one path by which a
+        // credential-shaped name reaches cleartext on disk, so it leaves a trace
+        // in the terminal the human is looking at.
+        eprintln!(
+            "sigil: storing '{key}' in cleartext at your explicit request (--force-plain); \
+             it contains '{token}'"
+        );
+    }
+
+    let mut cfg = match load_plain_source(&name) {
+        Some(c) => c,
+        None => return 1,
+    };
+    // A name that is also sealed on this source is not refused (the sealed value
+    // may be added or dropped later), but it will not take effect while both
+    // exist, and dead config that reads as live is the thing this tool is against.
+    let shadowed = cfg
+        .source(&name)
+        .is_some_and(|s| s.keys.iter().any(|k| k == &key));
+    let replaced = match cfg.sources.iter_mut().find(|s| s.name == name) {
+        Some(src) => src.plain.insert(key.clone(), value.clone()).is_some(),
+        None => return 1,
+    };
+    if !save_config(&cfg) {
+        return 1;
+    }
+    if shadowed && !json {
+        println!(
+            "  {}",
+            Style::stdout().brass(&format!(
+                "\u{2717} {key} is also a sealed value on {name}; the sealed value wins and this \
+                 plain one is not injected"
+            ))
+        );
+    }
+    let verb = if replaced { "updated" } else { "set" };
+    print_config_result(
+        &ControlResult::line(true, format!("{verb} plain {key}={value} on {name}")),
+        json,
+    )
+}
+
+/// `source env unset-plain <name> --key K`: drop one non-secret env var.
+fn config_source_env_unset_plain(args: &[String], json: bool) -> i32 {
+    let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
+        eprintln!("usage: sigil-config source env unset-plain <name> --key <KEY>");
+        return 2;
+    };
+    let Some(key) = flag_value(args, "--key").map(str::to_string) else {
+        eprintln!("sigil: --key <KEY> is required");
+        return 2;
+    };
+    remove_plain_key(&name, &key, json)
+}
+
+/// Drop the plain var `key` from source `name`, persisting the config.
+fn remove_plain_key(name: &str, key: &str, json: bool) -> i32 {
+    let mut cfg = match load_plain_source(name) {
+        Some(c) => c,
+        None => return 1,
+    };
+    let removed = cfg
+        .sources
+        .iter_mut()
+        .find(|s| s.name == name)
+        .is_some_and(|s| s.plain.remove(key).is_some());
+    if removed && !save_config(&cfg) {
+        return 1;
+    }
+    let result = if removed {
+        ControlResult::line(true, format!("removed plain {key} from {name}"))
+    } else {
+        ControlResult::line(false, format!("{name} has no plain {key}"))
+    };
+    print_config_result(&result, json)
 }
 
 /// Read `KEY=VALUE` lines from stdin into wiped buffers for a bulk env set. Blank
@@ -3480,6 +3667,21 @@ fn config_import(json: bool) -> i32 {
             return 2;
         }
     }
+    // Plain vars arrive here in cleartext, so an import is the one path that can
+    // write a credential-shaped name into config.json without passing the
+    // `set-plain` guardrail. It is NOT refused (that would make a config with a
+    // legitimately `--force-plain`ed name un-round-trippable), but it is named.
+    for src in &cfg.sources {
+        for key in src.plain.keys() {
+            if let Some(token) = crate::config::secret_looking_name(key) {
+                eprintln!(
+                    "sigil: source {} has plain '{key}' (contains '{token}'), stored in cleartext; \
+                     seal it instead if it is a secret: sigil-config source env set {} --key {key}",
+                    src.name, src.name
+                );
+            }
+        }
+    }
     if !save_config(&cfg) {
         return 1;
     }
@@ -3573,6 +3775,7 @@ fn config_add(args: &[String], json: bool) -> i32 {
         account,
         path: path.clone(),
         keys: Vec::new(),
+        plain: Default::default(),
     };
     if let Err(e) = cfg.add_source(src) {
         eprintln!("sigil: {e}");
@@ -3937,6 +4140,41 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn env_source(keys: &[&str], plain: &[(&str, &str)]) -> crate::config::Source {
+        crate::config::Source {
+            name: "s".into(),
+            provider: crate::provider::EnvProvider::ID.into(),
+            account: None,
+            path: None,
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+            plain: plain
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn list_labels_sealed_keys_and_never_shows_their_values() {
+        // The distinction a reader must be able to make at a glance: sealed keys
+        // are names only (Sigil is protecting the value), plain vars carry their
+        // values (Sigil is only setting them).
+        let sealed = env_source(&["OP_SERVICE_ACCOUNT_TOKEN"], &[]);
+        assert_eq!(
+            source_extra(&sealed),
+            " \u{b7} sealed OP_SERVICE_ACCOUNT_TOKEN"
+        );
+    }
+
+    #[test]
+    fn list_calls_a_plain_only_source_configured_not_empty() {
+        // Requirement of the degrade path: gate plus plain env injection is a
+        // legitimate configuration, so `list` must not render it as dead config.
+        let plain_only = env_source(&[], &[("OP_BIOMETRIC_UNLOCK_ENABLED", "false")]);
+        assert_eq!(source_extra(&plain_only), " \u{b7} no sealed values");
+        assert_eq!(source_extra(&env_source(&[], &[])), " \u{b7} (nothing set)");
     }
 
     #[test]

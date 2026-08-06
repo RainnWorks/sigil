@@ -2172,25 +2172,89 @@ const DEGRADED_NOTICE_INTERVAL: Duration = Duration::from_secs(300);
 /// Rate-limit state is process-global rather than a `Core` field: it is a log
 /// detail with no bearing on any decision, and every gated request funnels
 /// through one daemon process.
-fn degraded_gate_notice(rule: &str, source: &str) -> Option<String> {
+fn degraded_gate_notice(rule: &str, source: &str, plain_count: usize) -> Option<String> {
+    if !notice_due(&format!("degraded\u{1f}{rule}\u{1f}{source}")) {
+        return None;
+    }
+    // A source can legitimately carry non-secret vars and no sealed value at all;
+    // when it does, "injecting nothing" would be the wrong alarm, so say what is
+    // actually still being injected.
+    let injecting = match plain_count {
+        0 => "injecting nothing".to_string(),
+        1 => "injecting only its 1 plain env var".to_string(),
+        n => format!("injecting only its {n} plain env vars"),
+    };
+    Some(format!(
+        "sigil daemon: rule '{rule}' declares env keys but source '{source}' has no sealed \
+         record; running as a plain gate and {injecting}. Seal it with: \
+         sigil-config source env set {source} --stdin"
+    ))
+}
+
+/// The one line naming plain env vars a sealed value of the same name will
+/// override, or `None` if this rule+source was already announced within
+/// [`DEGRADED_NOTICE_INTERVAL`].
+///
+/// A shadowed plain var is config that looks live in `sigil-config list` and does
+/// nothing at run time. Sealed winning is the right precedence (the protected
+/// value is the one the human deliberately sealed), but taking it silently is how
+/// a one-line misconfiguration turns into an afternoon.
+fn shadowed_plain_notice(rule: &str, source: &str, shadowed: &[String]) -> Option<String> {
+    if !notice_due(&format!("shadowed\u{1f}{rule}\u{1f}{source}")) {
+        return None;
+    }
+    Some(format!(
+        "sigil daemon: rule '{rule}' source '{source}' sets {} as both a sealed value and a \
+         plain env var; the sealed value wins and the plain one is not injected. Drop it with: \
+         sigil-config source env unset-plain {source} --key {}",
+        shadowed.join(", "),
+        shadowed[0]
+    ))
+}
+
+/// Whether a rate-limited daemon notice keyed by `key` is due, i.e. it has not
+/// been emitted within [`DEGRADED_NOTICE_INTERVAL`]. Records the emission.
+///
+/// State is process-global rather than a `Core` field: these are log details with
+/// no bearing on any decision, and every gated request funnels through one daemon
+/// process.
+fn notice_due(key: &str) -> bool {
     static LAST_SEEN: std::sync::OnceLock<
         Mutex<std::collections::HashMap<String, std::time::Instant>>,
     > = std::sync::OnceLock::new();
     let seen = LAST_SEEN.get_or_init(Default::default);
-    let key = format!("{rule}\u{1f}{source}");
     let now = std::time::Instant::now();
     let mut map = seen.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(at) = map.get(&key) {
+    if let Some(at) = map.get(key) {
         if now.duration_since(*at) < DEGRADED_NOTICE_INTERVAL {
-            return None;
+            return false;
         }
     }
-    map.insert(key, now);
-    Some(format!(
-        "sigil daemon: rule '{rule}' declares env keys but source '{source}' has no sealed \
-         record; running as a plain gate and injecting nothing. Seal it with: \
-         sigil-config source env set {source} --stdin"
-    ))
+    map.insert(key.to_string(), now);
+    true
+}
+
+/// Split a source's plain env vars into the ones to inject and the NAMES a sealed
+/// value of the same name will set instead.
+///
+/// Sealed wins: the human sealed that name deliberately, and a cleartext entry
+/// must never be able to override a protected one. The caller announces what it
+/// dropped.
+fn split_shadowed_plain(
+    plain: &[(String, String)],
+    sealed_keys: &[String],
+) -> (Vec<(String, String)>, Vec<String>) {
+    let sealed: std::collections::BTreeSet<&str> = sealed_keys.iter().map(String::as_str).collect();
+    let mut inject = Vec::with_capacity(plain.len());
+    let mut shadowed = Vec::new();
+    for (k, v) in plain {
+        if sealed.contains(k.as_str()) {
+            shadowed.push(k.clone());
+        } else {
+            inject.push((k.clone(), v.clone()));
+        }
+    }
+    (inject, shadowed)
 }
 
 /// The gated fulfillment path for `sigil <cmd>` (and the shim alias / `sigil run`).
@@ -2290,6 +2354,10 @@ fn fulfill(
                 stderr,
                 proxy_depth: child_depth,
                 env: None,
+                // An allow rule names no source, so there is nothing configured
+                // to inject: a passthrough runs the command as the user's shell
+                // would have.
+                plain: &[],
             });
         }
         Some(crate::config::Resolution::Gate(mut action)) => {
@@ -2315,9 +2383,11 @@ fn fulfill(
                         action.env_keys.clear();
                         drop(store);
                         if declared {
-                            if let Some(line) =
-                                degraded_gate_notice(&action.rule, &action.source_name)
-                            {
+                            if let Some(line) = degraded_gate_notice(
+                                &action.rule,
+                                &action.source_name,
+                                action.plain_env.len(),
+                            ) {
                                 eprintln!("{line}");
                             }
                         }
@@ -2337,6 +2407,16 @@ fn fulfill(
         );
     };
     let source = action.source_path.as_deref().unwrap_or("");
+    // The source's NON-SECRET vars, minus any name a sealed value will also set.
+    // Computed after the degrade above, so a source whose values were never sealed
+    // still injects its plain vars: gate plus plain env is a legitimate
+    // configuration, not dead config.
+    let (plain_env, shadowed) = split_shadowed_plain(&action.plain_env, &action.env_keys);
+    if !shadowed.is_empty() {
+        if let Some(line) = shadowed_plain_notice(&action.rule, &action.source_name, &shadowed) {
+            eprintln!("{line}");
+        }
+    }
     // An env provider only needs a sealed open when it still has keys to inject;
     // an unsealed env source had its keys cleared above and behaves as a plain
     // gate.
@@ -2471,6 +2551,7 @@ fn fulfill(
                         stderr,
                         proxy_depth: child_depth,
                         env: leased.as_ref(),
+                        plain: &plain_env,
                     },
                 );
                 drop(leased); // zeroized here (EnvVars is Zeroizing)
@@ -2655,6 +2736,7 @@ fn fulfill(
             stderr,
             proxy_depth: child_depth,
             env: sealed_env.as_ref(),
+            plain: &plain_env,
         },
     );
     drop(sealed_env); // zeroized here (EnvVars is Zeroizing) when present
@@ -2921,6 +3003,7 @@ mod tests {
             account: None,
             path: None,
             keys: Vec::new(),
+            plain: Default::default(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -2962,6 +3045,7 @@ mod tests {
             account: None,
             path: Some(path.into()),
             keys: Vec::new(),
+            plain: Default::default(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -3432,6 +3516,7 @@ mod tests {
             account: None,
             path: None,
             keys: Vec::new(),
+            plain: Default::default(),
         })
         .unwrap();
         for sub in ["read", "item"] {
@@ -3889,6 +3974,7 @@ mod tests {
             account: None,
             path: None,
             keys: keys.iter().map(|k| k.to_string()).collect(),
+            plain: Default::default(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -3990,6 +4076,89 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn a_gate_with_only_plain_vars_injects_them_end_to_end() {
+        // The configuration this feature exists for: nothing sealed, but the gated
+        // tool is handed the non-secret switches that stop it falling back to an
+        // ambient auth channel the daemon cannot open. It must run as a live gate
+        // (approve, inject, exec), not as the dead config an unsealed declared key
+        // would be.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("envinline-plainonly");
+        let bindir = dir.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = bindir.join("faketool");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\nprintf 'bio=[%s] tok=[%s]' \"$OP_BIOMETRIC_UNLOCK_ENABLED\" \"$TOKEN\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut cfg = env_inline_config("faketool", &[]);
+        cfg.sources[0].plain.insert(
+            "OP_BIOMETRIC_UNLOCK_ENABLED".to_string(),
+            "false".to_string(),
+        );
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let pending = Arc::new(PendingRegistry::new());
+        let approver = LocalApprover::new(pending.clone())
+            .with_dev(DevMode::Approve)
+            .with_control_socket(true);
+        let core = Arc::new(Core {
+            remote: Vec::new(),
+            keystore: KeystoreCell::new(keystore),
+            threshold: Mutex::new(Default::default()),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(approver)),
+            pending,
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::with_defaults(),
+            config: cfg.into(),
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::DevInsecure,
+            ssh_signers: SshSignersCell::new(Vec::new()),
+            audit: None,
+            seal: crate::keystore_seal::SealState::Plain,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
+        });
+
+        std::env::remove_var("TOKEN");
+        std::env::remove_var("OP_BIOMETRIC_UNLOCK_ENABLED");
+        let prev = std::env::var_os("PATH");
+        let mut search = vec![bindir.clone()];
+        if let Some(p) = &prev {
+            search.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
+        let (read_end, write_end) = pipe();
+        let code = fulfill(
+            &core,
+            &["faketool".into()],
+            "",
+            None,
+            0,
+            None,
+            Some(write_end),
+            None,
+        );
+        match prev {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert_eq!(code, 0, "a plain-only source is a live gate");
+        assert_eq!(
+            read_all(read_end),
+            "bio=[false] tok=[]",
+            "the plain var is injected and nothing else is"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A daemon wired to a REAL sealed inline `env` source, with a software
     /// stand-in for the phone: the values are threshold-sealed under a fresh Mac
     /// share and a software SE key, and the approver returns the matching partial
@@ -4037,6 +4206,7 @@ mod tests {
                 account: None,
                 path: None,
                 keys: keys.iter().map(|(k, _)| (*k).to_string()).collect(),
+                plain: Default::default(),
             })
             .unwrap();
         config
@@ -4307,7 +4477,7 @@ mod tests {
         // nothing, with not one line to say so. The notice names both halves and
         // the fix, and repeats at most once per window so a busy tool tree cannot
         // drown the log.
-        let first = degraded_gate_notice("rule-alpha", "src-alpha")
+        let first = degraded_gate_notice("rule-alpha", "src-alpha", 0)
             .expect("the first degraded run is announced");
         assert!(first.contains("rule-alpha"), "{first}");
         assert!(first.contains("src-alpha"), "{first}");
@@ -4317,13 +4487,67 @@ mod tests {
             "and says how to fix it: {first}"
         );
         assert!(
-            degraded_gate_notice("rule-alpha", "src-alpha").is_none(),
+            degraded_gate_notice("rule-alpha", "src-alpha", 0).is_none(),
             "a burst of gated runs does not repeat it"
         );
         assert!(
-            degraded_gate_notice("rule-alpha", "src-beta").is_some(),
+            degraded_gate_notice("rule-alpha", "src-beta", 0).is_some(),
             "but a different source is its own notice"
         );
+    }
+
+    #[test]
+    fn the_degrade_notice_says_what_is_still_being_injected() {
+        // "injecting nothing" would be a lie for a source that carries non-secret
+        // vars, and a lie in the one line a human reads while debugging is worse
+        // than silence.
+        let line = degraded_gate_notice("rule-plain", "src-plain", 2)
+            .expect("the first degraded run is announced");
+        assert!(
+            line.contains("injecting only its 2 plain env vars"),
+            "{line}"
+        );
+        let one = degraded_gate_notice("rule-plain-1", "src-plain-1", 1).unwrap();
+        assert!(one.contains("injecting only its 1 plain env var"), "{one}");
+    }
+
+    #[test]
+    fn a_plain_var_shadowed_by_a_sealed_key_is_dropped_and_announced() {
+        // Sealed wins, because the human sealed that name deliberately and
+        // cleartext config must never override a protected value. The dropped
+        // entry is named, because config that reads as live and does nothing is
+        // the failure mode this whole area is built against.
+        let plain = vec![
+            ("TOKEN".to_string(), "cleartext".to_string()),
+            ("OP_CONFIG_DIR".to_string(), "/tmp/x".to_string()),
+        ];
+        let (inject, shadowed) = split_shadowed_plain(&plain, &["TOKEN".to_string()]);
+        assert_eq!(
+            inject,
+            vec![("OP_CONFIG_DIR".to_string(), "/tmp/x".to_string())]
+        );
+        assert_eq!(shadowed, vec!["TOKEN".to_string()]);
+
+        let line = shadowed_plain_notice("rule-s", "src-s", &shadowed)
+            .expect("the first shadowed run is announced");
+        assert!(line.contains("TOKEN"), "{line}");
+        assert!(line.contains("the sealed value wins"), "{line}");
+        assert!(
+            line.contains("sigil-config source env unset-plain src-s --key TOKEN"),
+            "and says how to fix it: {line}"
+        );
+        assert!(
+            shadowed_plain_notice("rule-s", "src-s", &shadowed).is_none(),
+            "a burst of gated runs does not repeat it"
+        );
+    }
+
+    #[test]
+    fn nothing_is_shadowed_when_the_names_do_not_collide() {
+        let plain = vec![("OP_CONFIG_DIR".to_string(), "/tmp/x".to_string())];
+        let (inject, shadowed) = split_shadowed_plain(&plain, &["TOKEN".to_string()]);
+        assert_eq!(inject, plain);
+        assert!(shadowed.is_empty());
     }
 
     /// The doctor check that compares the armed sealed store against disk.
@@ -4630,6 +4854,7 @@ mod tests {
                 account: None,
                 path: None,
                 keys: vec!["TOKEN".into()],
+                plain: Default::default(),
             })
             .unwrap();
         swapped
@@ -4740,6 +4965,7 @@ mod tests {
                 account: None,
                 path: None,
                 keys: Vec::new(),
+                plain: Default::default(),
             })
             .unwrap();
             cfg.add_rule(Rule {
@@ -4846,6 +5072,7 @@ mod tests {
                 account: None,
                 path: None,
                 keys: vec!["TOKEN".into()],
+                plain: Default::default(),
             })
             .unwrap();
         config

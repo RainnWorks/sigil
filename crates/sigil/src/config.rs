@@ -21,6 +21,7 @@
 //!
 //! See `docs/design/config-rule-engine.md` for the full design and migration.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 
@@ -61,6 +62,73 @@ pub struct Source {
     /// by the CLI so `export`/`list` render deterministically.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<String>,
+    /// NON-SECRET environment variables injected into the gated child verbatim,
+    /// stored here in **cleartext** because they are explicitly not secrets:
+    /// behavior switches for the gated tool (`OP_BIOMETRIC_UNLOCK_ENABLED=false`,
+    /// `OP_CONFIG_DIR=…`, a scratch `HOME`). Sealed values ([`keys`](Self::keys))
+    /// win on a key collision; see [`Config::resolve`].
+    ///
+    /// This hangs off the SOURCE rather than the rule because the source is
+    /// already the "what environment does this inject" unit: the sealed key names
+    /// live here, so collision resolution is a local read of one struct rather
+    /// than a join, and several rules pointing at one source get one consistent
+    /// environment instead of drifting per-rule copies. A rule stays what it has
+    /// always been: a match plus which source to inject and how to lease it.
+    ///
+    /// A `BTreeMap` so the on-disk order is the sorted order (a stable
+    /// `export`/diff) and a name can appear only once.
+    ///
+    /// The motivating case: a gated tool with its own ambient auth fallback that
+    /// overrides the credential Sigil injects. `op` handed a valid
+    /// `OP_SERVICE_ACCOUNT_TOKEN` still opened a caller channel to the 1Password
+    /// desktop app and blocked in `open()` forever, because the daemon is not an
+    /// authorized caller of that app. The fix is a plain var that turns the
+    /// fallback off, and a plain var is the honest shape for it: sealing a value
+    /// whose leak costs nothing would say Sigil is protecting something it is not.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plain: BTreeMap<String, String>,
+}
+
+impl Source {
+    /// The plain vars as an ordered `(name, value)` list for injection. Sorted by
+    /// name (the map's own order) so a spawn env is built deterministically.
+    pub fn plain_pairs(&self) -> Vec<(String, String)> {
+        self.plain
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+}
+
+/// Substrings that make an environment variable NAME look like a secret. Matched
+/// case-insensitively anywhere in the name, so `GH_TOKEN`, `apikey_prod` and
+/// `MY_PASSWORD_FILE` all trip it.
+const SECRET_LOOKING: &[&str] = &["TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL", "APIKEY"];
+
+/// Secret-looking ACRONYMS, matched as a whole `_`/punctuation-delimited segment
+/// rather than a substring. `PAT` as a substring would condemn `PATH`, which is
+/// both the most ordinary env var there is and one of the plain vars this feature
+/// exists to set; as a segment it still catches `GH_PAT` and `PAT_GITHUB`.
+const SECRET_LOOKING_SEGMENTS: &[&str] = &["PAT"];
+
+/// The secret-looking token in `name`, if any.
+///
+/// A plain var is stored in cleartext in `config.json`, so writing a credential
+/// into one is a silent downgrade from "Sigil is protecting this" to "Sigil is
+/// publishing this" with no visible difference at the call site. Name-shape is a
+/// blunt instrument and it will have false positives (`OP_CONFIG_KEYRING`,
+/// `SSH_KEY_PATH`), which is why the CLI offers an explicit override rather than
+/// a hard ban.
+pub fn secret_looking_name(name: &str) -> Option<&'static str> {
+    let upper = name.to_ascii_uppercase();
+    if let Some(t) = SECRET_LOOKING.iter().copied().find(|t| upper.contains(t)) {
+        return Some(t);
+    }
+    SECRET_LOOKING_SEGMENTS.iter().copied().find(|t| {
+        upper
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|seg| seg == *t)
+    })
 }
 
 /// One `{flag, value}` equality condition, e.g. `--project=prod`.
@@ -286,6 +354,12 @@ pub struct ResolvedAction {
     /// The inline `env` provider's KEY names (for `describe`); empty otherwise.
     /// Names only, never values (values are sealed in the account store).
     pub env_keys: Vec<String>,
+    /// The source's NON-SECRET `(name, value)` env vars, injected verbatim into
+    /// the child alongside whatever the provider resolves. Cleartext by
+    /// construction (see [`Source::plain`]), so unlike `env_keys` these carry
+    /// their values. A sealed key of the same name wins; the daemon drops the
+    /// shadowed entry here and says so once.
+    pub plain_env: Vec<(String, String)>,
     /// The rule's lease policy: whether an approval may open an auto-approve
     /// window and its cap. The daemon consults this as the sole authority when
     /// deciding whether to grant (and how long to grant) a lease.
@@ -381,6 +455,7 @@ impl Config {
                 account: c.account,
                 path: c.source,
                 keys: Vec::new(),
+                plain: Default::default(),
             });
             cfg.rules.push(Rule {
                 name: c.command.clone(),
@@ -412,6 +487,7 @@ impl Config {
             account: None,
             path: None,
             keys: Vec::new(),
+            plain: Default::default(),
         });
         self.rules.push(Rule {
             name: "op".to_string(),
@@ -502,6 +578,7 @@ impl Config {
                 source_path: src.path.clone(),
                 account: src.account.clone(),
                 env_keys: src.keys.clone(),
+                plain_env: src.plain_pairs(),
                 lease: rule.action.lease,
                 timeout_sec: rule.action.timeout_sec,
             }));
@@ -749,6 +826,7 @@ mod tests {
             account: Some("Rowm".into()),
             path: None,
             keys: Vec::new(),
+            plain: Default::default(),
         })
         .unwrap();
         cfg.add_source(Source {
@@ -757,6 +835,7 @@ mod tests {
             account: None,
             path: Some("/x/.env".into()),
             keys: Vec::new(),
+            plain: Default::default(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -814,6 +893,7 @@ mod tests {
             account: None,
             path: None,
             keys: vec!["TOKEN".into(), "REGION".into()],
+            plain: Default::default(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -845,6 +925,141 @@ mod tests {
         assert_eq!(back.sources, cfg.sources);
     }
 
+    /// A source plus a rule matching `command == <name>`, for the plain-var tests.
+    fn one_source_cfg(provider: &str, keys: &[&str], plain: &[(&str, &str)]) -> Config {
+        let mut cfg = Config::default();
+        cfg.add_source(Source {
+            name: "s".into(),
+            provider: provider.into(),
+            account: None,
+            path: None,
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+            plain: plain
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        })
+        .unwrap();
+        cfg.add_rule(Rule {
+            name: "r".into(),
+            match_: Match {
+                command: Some("tool".into()),
+                ..Match::default()
+            },
+            action: Action {
+                mode: RuleMode::Gate,
+                source: "s".into(),
+                lease: LeasePolicy::RunOnce,
+                timeout_sec: None,
+            },
+        })
+        .unwrap();
+        cfg
+    }
+
+    #[test]
+    fn resolve_carries_the_sources_plain_vars_sorted() {
+        let cfg = one_source_cfg(
+            crate::provider::EnvProvider::ID,
+            &["OP_SERVICE_ACCOUNT_TOKEN"],
+            &[
+                ("OP_CONFIG_DIR", "/tmp/scratch"),
+                ("OP_BIOMETRIC_UNLOCK_ENABLED", "false"),
+            ],
+        );
+        let r = gate(cfg.resolve(&argv(&["tool", "run"])).unwrap());
+        assert_eq!(
+            r.plain_env,
+            vec![
+                (
+                    "OP_BIOMETRIC_UNLOCK_ENABLED".to_string(),
+                    "false".to_string()
+                ),
+                ("OP_CONFIG_DIR".to_string(), "/tmp/scratch".to_string()),
+            ],
+            "sorted by name, so a spawn env is built the same way every time"
+        );
+        // Sealed and plain are different kinds of thing and stay separable at the
+        // resolution boundary: names only on one side, values on the other.
+        assert_eq!(r.env_keys, vec!["OP_SERVICE_ACCOUNT_TOKEN".to_string()]);
+    }
+
+    #[test]
+    fn a_source_with_only_plain_vars_resolves_as_a_live_gate() {
+        // Gate plus plain env injection, no sealed value anywhere: a legitimate
+        // configuration, not the dead config an unsealed declared key would be.
+        let cfg = one_source_cfg(
+            crate::provider::EnvProvider::ID,
+            &[],
+            &[("OP_BIOMETRIC_UNLOCK_ENABLED", "false")],
+        );
+        let r = gate(cfg.resolve(&argv(&["tool", "run"])).unwrap());
+        assert!(r.env_keys.is_empty());
+        assert_eq!(r.plain_env.len(), 1);
+    }
+
+    #[test]
+    fn plain_vars_round_trip_through_config_json_in_cleartext() {
+        // Cleartext is the point: they are not secrets, and a reader of
+        // config.json must be able to see exactly which values Sigil is NOT
+        // protecting.
+        let cfg = one_source_cfg(
+            "1password",
+            &[],
+            &[("OP_BIOMETRIC_UNLOCK_ENABLED", "false")],
+        );
+        let json = serde_json::to_string_pretty(&cfg).unwrap();
+        assert!(json.contains("\"plain\""), "{json}");
+        assert!(json.contains("\"false\""), "the value is stored: {json}");
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sources, cfg.sources);
+
+        // And a source with none omits the field entirely, so an existing
+        // config.json is byte-identical after a round trip.
+        let bare = one_source_cfg("1password", &[], &[]);
+        assert!(!serde_json::to_string(&bare).unwrap().contains("plain"));
+        // A config written before this field loads with an empty map.
+        let old: Config =
+            serde_json::from_str(r#"{"version":1,"sources":[{"name":"s","provider":"env"}]}"#)
+                .unwrap();
+        assert!(old.sources[0].plain.is_empty());
+    }
+
+    #[test]
+    fn secret_looking_names_are_flagged_and_ordinary_ones_are_not() {
+        for name in [
+            "GITHUB_TOKEN",
+            "aws_secret_access_key",
+            "MY_PASSWORD_FILE",
+            "OP_SERVICE_ACCOUNT_TOKEN",
+            "SSH_KEY_PATH",
+            "GCP_CREDENTIALS",
+            "apikey_prod",
+            "GH_PAT",
+            "PAT_GITHUB",
+        ] {
+            assert!(
+                secret_looking_name(name).is_some(),
+                "{name} should trip the guardrail"
+            );
+        }
+        for name in [
+            "OP_BIOMETRIC_UNLOCK_ENABLED",
+            "OP_CONFIG_DIR",
+            "HOME",
+            "PATH",
+            "NO_COLOR",
+            "AWS_REGION",
+            "COMPATIBILITY_MODE",
+        ] {
+            assert_eq!(
+                secret_looking_name(name),
+                None,
+                "{name} is an ordinary behavior switch and must not be refused"
+            );
+        }
+    }
+
     #[test]
     fn gates_command_is_command_keyed() {
         let mut cfg = Config::default();
@@ -854,6 +1069,7 @@ mod tests {
             account: None,
             path: Some("/x".into()),
             keys: Vec::new(),
+            plain: Default::default(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -906,6 +1122,7 @@ mod tests {
                 account: None,
                 path: Some("/x/.env".into()),
                 keys: Vec::new(),
+                plain: Default::default(),
             }],
             rules: vec![
                 Rule {
@@ -975,6 +1192,7 @@ mod tests {
             account: None,
             path: Some("/x".into()),
             keys: Vec::new(),
+            plain: Default::default(),
         })
         .unwrap();
         assert!(
@@ -1002,6 +1220,7 @@ mod tests {
             account: None,
             path: Some("/x".into()),
             keys: Vec::new(),
+            plain: Default::default(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -1065,6 +1284,7 @@ mod tests {
             account: Some("Rowm".into()),
             path: None,
             keys: Vec::new(),
+            plain: Default::default(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -1114,6 +1334,7 @@ mod tests {
             account: Some("Rowm".into()),
             path: None,
             keys: Vec::new(),
+            plain: Default::default(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -1150,6 +1371,7 @@ mod tests {
             account: None,
             path: None,
             keys: Vec::new(),
+            plain: Default::default(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -1213,6 +1435,7 @@ mod tests {
             account: None,
             path: Some("/x".into()),
             keys: Vec::new(),
+            plain: Default::default(),
         })
         .unwrap();
         // An allow rule that names a source is rejected (it injects nothing).

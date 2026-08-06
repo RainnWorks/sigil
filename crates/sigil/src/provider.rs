@@ -78,6 +78,16 @@ pub struct ProviderRun<'a> {
     /// live only in this borrowed, zeroize-on-drop buffer for the spawn instant
     /// (see the module memory note and `EnvProvider`).
     pub env: Option<&'a EnvVars>,
+    /// The source's NON-SECRET `(name, value)` env vars
+    /// ([`Source::plain`](crate::config::Source::plain)), injected into the child
+    /// verbatim by EVERY provider, including the plain gates that inject no
+    /// credential at all. Cleartext by construction: they are behavior switches
+    /// for the gated tool, not secrets, so they are plain `String`s and are never
+    /// zeroized (there is nothing to wipe that `config.json` does not already
+    /// hold in the clear). Written to the child BEFORE any resolved secret, so a
+    /// sealed value of the same name wins; the daemon has already dropped the
+    /// shadowed entries and logged them, so a collision cannot reach here silently.
+    pub plain: &'a [(String, String)],
 }
 
 /// The provider-specific slice of a source's config passed to
@@ -239,9 +249,16 @@ impl SecretProvider for OpProvider {
         if !run.cwd.is_empty() {
             cmd.current_dir(run.cwd);
         }
+        // A plain gate injects no credential, but it still injects the source's
+        // non-secret vars: they exist precisely to steer a tool like `op` away
+        // from an ambient auth fallback the daemon cannot use.
+        for (k, v) in run.plain.iter() {
+            cmd.env(k, v);
+        }
         // The proxy recursion fuse: the child (and anything it re-invokes through
         // a Sigil alias) carries the incremented depth so the alias's own guard
-        // can bound a runaway loop. Harmless to a non-proxied tool.
+        // can bound a runaway loop. Harmless to a non-proxied tool. Set last, so
+        // no configured var can shadow it.
         cmd.env(crate::proxy::DEPTH_ENV, run.proxy_depth.to_string());
         // Splice the caller's fds to the child. An ABSENT fd defaults to
         // Stdio::null(), never inherit: the daemon's own stdio (a same-UID
@@ -452,12 +469,21 @@ fn spawn_with_env(run: ProviderRun, vars: &[(String, Zeroizing<String>)]) -> i32
     if !run.cwd.is_empty() {
         cmd.current_dir(run.cwd);
     }
+    // Non-secret vars first, resolved secrets second: last write wins in
+    // `Command`'s env map, so a sealed value always beats a plain one of the same
+    // name. The daemon drops shadowed plain entries before we get here (and says
+    // so), which makes this ordering the belt to that braces rather than the only
+    // guard.
+    for (k, v) in run.plain.iter() {
+        cmd.env(k, v);
+    }
     for (k, v) in vars.iter() {
         cmd.env(k, v.as_str());
     }
     // The proxy recursion fuse: the child (and anything it re-invokes through
     // a Sigil alias) carries the incremented depth so the alias's own guard
-    // can bound a runaway loop. Harmless to a non-proxied tool.
+    // can bound a runaway loop. Harmless to a non-proxied tool. Set last, so no
+    // configured var can shadow it.
     cmd.env(crate::proxy::DEPTH_ENV, run.proxy_depth.to_string());
     // Splice the caller's fds to the child. An ABSENT fd defaults to
     // Stdio::null(), never inherit: the daemon's own stdio (a same-UID
@@ -717,6 +743,7 @@ mod tests {
             cwd: "",
             source: "",
             env: None,
+            plain: &[],
             proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
@@ -725,6 +752,39 @@ mod tests {
         assert_eq!(code, 0);
         // The gated op ran (prefix present) and Sigil injected no marker var.
         assert_eq!(read_all(read_end), "ran:");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn op_still_injects_the_sources_plain_vars() {
+        // A plain gate injects no CREDENTIAL, which is not the same as injecting
+        // nothing: the source's non-secret vars are how the gated tool is told to
+        // stop reaching for an ambient auth channel the daemon cannot open.
+        let dir = std::env::temp_dir().join(format!("sigil-provplain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let op = dir.join("op");
+        std::fs::write(
+            &op,
+            "#!/bin/sh\nprintf 'biometric=%s' \"$OP_BIOMETRIC_UNLOCK_ENABLED\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (read_end, write_end) = pipe();
+        let vars = plain(&[("OP_BIOMETRIC_UNLOCK_ENABLED", "false")]);
+        let code = OpProvider::with_binary(op).run(ProviderRun {
+            command: &["op".into(), "read".into()],
+            cwd: "",
+            source: "",
+            env: None,
+            plain: &vars,
+            proxy_depth: 1,
+            stdin: None,
+            stdout: Some(write_end),
+            stderr: None,
+        });
+        assert_eq!(code, 0);
+        assert_eq!(read_all(read_end), "biometric=false");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -771,6 +831,7 @@ mod tests {
             cwd: "",
             source: env_path.to_str().unwrap(),
             env: None,
+            plain: &[],
             proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
@@ -821,6 +882,7 @@ mod tests {
             cwd: "",
             source: env_path.to_str().unwrap(),
             env: None,
+            plain: &[],
             proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
@@ -941,6 +1003,7 @@ mod tests {
             stdout: Some(write_end),
             stderr: None,
             env: Some(&vars),
+            plain: &[],
         });
 
         match prev {
@@ -950,6 +1013,112 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(read_all(read_end), "key=sealed-42 region=us");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Run `script` as `faketool` on a scoped PATH with the given plain vars and
+    /// sealed pairs, returning what it printed. Shared by the plain-injection
+    /// tests so each one is about the environment, not the scaffolding.
+    fn run_faketool(
+        tag: &str,
+        script: &str,
+        plain: &[(String, String)],
+        sealed: Option<&EnvVars>,
+    ) -> String {
+        let dir = std::env::temp_dir().join(format!("sigil-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bindir = dir.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = bindir.join("faketool");
+        std::fs::write(&tool, script).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("PATH");
+        let mut search = vec![bindir.clone()];
+        if let Some(p) = &prev {
+            search.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
+
+        let (read_end, write_end) = pipe();
+        let run = ProviderRun {
+            command: &["faketool".into()],
+            cwd: "",
+            source: "",
+            proxy_depth: 1,
+            stdin: None,
+            stdout: Some(write_end),
+            stderr: None,
+            env: sealed,
+            plain,
+        };
+        let code = match sealed {
+            Some(_) => EnvProvider.run(run),
+            None => run_passthrough(run),
+        };
+
+        match prev {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        assert_eq!(code, 0);
+        let out = read_all(read_end);
+        std::fs::remove_dir_all(&dir).ok();
+        out
+    }
+
+    fn plain(kv: &[(&str, &str)]) -> Vec<(String, String)> {
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_sealed_value_wins_over_a_plain_var_of_the_same_name() {
+        // The ordering that makes cleartext config unable to override a protected
+        // value. The daemon drops the shadowed entry before it reaches a provider
+        // and says so; this is the belt to that braces, so it passes the collision
+        // through deliberately.
+        let vars: EnvVars = Zeroizing::new(pairs(&[("API_KEY", "sealed-42")]));
+        let out = run_faketool(
+            "plaincollide",
+            "#!/bin/sh\nprintf 'key=%s switch=%s' \"$API_KEY\" \"$TOOL_FALLBACK\"\n",
+            &plain(&[("API_KEY", "plain-should-lose"), ("TOOL_FALLBACK", "false")]),
+            Some(&vars),
+        );
+        assert_eq!(out, "key=sealed-42 switch=false");
+    }
+
+    #[test]
+    fn a_plain_var_cannot_shadow_the_proxy_depth_fuse() {
+        // The recursion fuse is written last, after everything configured, so no
+        // config edit can unbound a runaway alias loop.
+        let out = run_faketool(
+            "plaindepth",
+            "#!/bin/sh\nprintf 'depth=%s' \"$SIGIL_PROXY_DEPTH\"\n",
+            &plain(&[(crate::proxy::DEPTH_ENV, "0")]),
+            None,
+        );
+        assert_eq!(out, "depth=1");
+    }
+
+    #[test]
+    fn a_gate_with_only_plain_vars_still_injects_them() {
+        // The degrade-to-plain-gate path: nothing sealed, but the source's
+        // non-secret vars are exactly what the tool needs to stop reaching for its
+        // own ambient auth. This must be a working configuration, not dead config.
+        let out = run_faketool(
+            "plainonly",
+            "#!/bin/sh\nprintf 'biometric=%s dir=%s' \"$OP_BIOMETRIC_UNLOCK_ENABLED\" \"$OP_CONFIG_DIR\"\n",
+            &plain(&[
+                ("OP_BIOMETRIC_UNLOCK_ENABLED", "false"),
+                ("OP_CONFIG_DIR", "/tmp/scratch-op"),
+            ]),
+            None,
+        );
+        assert_eq!(out, "biometric=false dir=/tmp/scratch-op");
     }
 
     #[test]
@@ -964,6 +1133,7 @@ mod tests {
             stdout: None,
             stderr: None,
             env: None,
+            plain: &[],
         });
         assert_eq!(code, 1, "no sealed values must fail closed");
     }

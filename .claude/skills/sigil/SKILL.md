@@ -55,6 +55,15 @@ them: approve on the phone, and type secret values.
   command is refused, never silently allowed.
 - **The phone is provider-blind.** Never describe it as a "1Password
   approver"; it approves opaque requests for any CLI.
+- **Sealed vs plain.** A source can also carry NON-SECRET env vars, stored in
+  cleartext in `config.json` and injected alongside the sealed ones. The rule
+  of thumb: if leaking it would matter, seal it; plain is for behavior
+  switches, e.g. turning off a tool's interactive/desktop-app fallback
+  (`OP_BIOMETRIC_UNLOCK_ENABLED=false`), pointing at a scratch config dir, or
+  a throwaway `HOME`. Plain values go on the command line (they are not
+  secrets, so the never-see-a-secret rule does not apply and YOU may run
+  these); a name that looks like a credential is refused unless the human
+  passes `--force-plain`. A sealed value of the same name always wins.
 
 ## Habit zero: `sigil up`
 
@@ -96,6 +105,8 @@ sigil-config add <cmd> --provider env         # gate <cmd> with an inline env so
 sigil-config rule add <name> ...              # fine-grained rule authoring
 sigil-config source env set <name> --stdin    # HUMAN-run seal (see the rule above)
 sigil-config source env unset <name> --key K  # drop one sealed key
+sigil-config source env set-plain <name> --key K --value V   # NON-SECRET var
+sigil-config source env unset-plain <name> --key K           # drop one
 sigil-config remove <name>
 ```
 
@@ -141,8 +152,28 @@ transparent alias so the bare name routes through Sigil:
    the rule is leasable).
 
 An env source with declared keys but no sealed value degrades to a plain
-gate (still phone-gated, injects nothing). That is dead config: either have
-the human seal the value or remove the keys; never build around "unsealed".
+gate (still phone-gated, injects no secret). That is dead config for those
+keys: either have the human seal the value or remove the keys; never build
+around "unsealed". A source whose ONLY content is plain vars is a different
+thing and is legitimate: gate plus a non-secret env tweak, nothing missing.
+
+### Inject a non-secret env var (a behavior switch)
+
+When a gated tool has its own ambient auth fallback that overrides what
+Sigil injects. The live case: `op`, given a correct
+`OP_SERVICE_ACCOUNT_TOKEN`, still tried to open a caller channel to the
+1Password desktop app and blocked in `open()` forever, because the daemon is
+not an authorized CLI caller of that app.
+
+```sh
+sigil-config source env set-plain deploytool --key OP_BIOMETRIC_UNLOCK_ENABLED --value false
+sigil-config list   # plain vars show KEY=value; sealed keys show names only
+```
+
+You may run this yourself: the value is not a secret. If the guardrail
+refuses the name, that is the signal to seal it instead, not to reach for
+`--force-plain`; only the human decides that a credential-shaped name is
+genuinely not a credential.
 
 ### 1Password (or any provider CLI)
 
