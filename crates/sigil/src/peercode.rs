@@ -76,6 +76,44 @@ extern "C" {
         token_len: libc::size_t,
         requirement: *const libc::c_char,
     ) -> libc::c_int;
+
+    fn sigil_cdhash_for_path(
+        path: *const libc::c_char,
+        out: *mut u8,
+        out_len: libc::size_t,
+    ) -> libc::c_int;
+}
+
+/// The platform code identity of the executable at `path`: its cdhash, the
+/// digest of the CodeDirectory the signature commits to.
+///
+/// `None` means "this binary has no platform identity to report": unsigned,
+/// ad-hoc signed (a signature with no signer says nothing a content hash does
+/// not), not a code object, or unreadable. A caller must treat that as a
+/// different KIND of measurement rather than as a hash of nothing; see
+/// [`crate::lease::IdentityMeasure`].
+///
+/// This is a measurement, never an authorization. It answers "what does the
+/// platform call this file", not "may this file do anything"; the gate that
+/// authorizes is [`require_sigil_app`], and it is a different question.
+#[cfg(target_os = "macos")]
+pub fn cdhash_for_path(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // A cdhash is 20 bytes today (SHA-1-sized truncation of the CodeDirectory
+    // hash); the buffer is oversized so a longer future hash returns a length
+    // rather than -4.
+    let mut buf = [0u8; 64];
+    // SAFETY: the shim reads the NUL-terminated path and writes at most
+    // `buf.len()` bytes into `buf`, returning the count written or a negative
+    // code. Both borrows outlive the call.
+    let n = unsafe { sigil_cdhash_for_path(c_path.as_ptr(), buf.as_mut_ptr(), buf.len()) };
+    (n > 0).then(|| buf[..n as usize].to_vec())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn cdhash_for_path(_path: &std::path::Path) -> Option<Vec<u8>> {
+    None
 }
 
 /// The peer's `audit_token_t` (8 words) from a connected unix socket.
@@ -261,6 +299,45 @@ mod tests {
         assert_eq!(
             require_sigil_app(devnull.as_raw_fd()),
             Err(PeerCodeError::NoPeer)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_signed_binary_yields_a_cdhash_and_an_ad_hoc_one_does_not() {
+        // The measurement primitive behind the lease grant key. A platform
+        // binary has a real signature, so it answers with a cdhash (20 bytes
+        // today). This test binary is linker/ad-hoc signed, a signature with no
+        // signer, so it must answer with nothing rather than with a cdhash that
+        // would read as a platform identity it does not have.
+        let sh = cdhash_for_path(std::path::Path::new("/bin/sh")).expect("a signed system binary");
+        assert!(!sh.is_empty(), "a cdhash is not empty");
+        assert_eq!(
+            sh,
+            cdhash_for_path(std::path::Path::new("/bin/sh")).unwrap(),
+            "the same binary answers the same cdhash"
+        );
+        assert_ne!(
+            sh,
+            cdhash_for_path(std::path::Path::new("/bin/ls")).expect("also signed"),
+            "two binaries, two cdhashes"
+        );
+
+        let me = std::env::current_exe().expect("current exe");
+        assert_eq!(
+            cdhash_for_path(&me),
+            None,
+            "an ad-hoc signature must not be reported as a platform identity"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_path_that_is_not_code_yields_no_identity() {
+        assert_eq!(cdhash_for_path(std::path::Path::new("/dev/null")), None);
+        assert_eq!(
+            cdhash_for_path(std::path::Path::new("/nonexistent/sigil-test")),
+            None
         );
     }
 

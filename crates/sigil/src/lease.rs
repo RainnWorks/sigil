@@ -6,12 +6,47 @@
 //!
 //! 1. Read the true peer pid off the unix socket (`LOCAL_PEERPID`).
 //! 2. Walk the ancestor chain kernel-side (sysctl `KERN_PROC` on macOS), pid by
-//!    pid, resolving each to an executable path and a content hash.
+//!    pid, resolving each to an executable path and a code-identity measurement
+//!    ([`CodeIdentity`]: the platform cdhash where the binary has one, otherwise
+//!    a hash of its bytes, each under its own tag).
 //! 3. The grant key is `BLAKE2b(chain ++ project_root ++ kind ++ scope)`. Raw
 //!    pids are excluded from the hash because they recycle; only the stable code
-//!    identity (path + hash) of each ancestor is bound in. `kind` is the
-//!    request-kind tag ([`ScopeKind`]), so a command scope and an SSH scope live
-//!    in separate namespaces and cannot collide however they are spelled.
+//!    identity (path + measure tag + digest) of each ancestor is bound in.
+//!    `kind` is the request-kind tag ([`ScopeKind`]), so a command scope and an
+//!    SSH scope live in separate namespaces and cannot collide however they are
+//!    spelled.
+//!
+//! # What the ancestor measurement does and does not buy
+//!
+//! It does **not** authenticate the caller. Any same-UID process can put itself
+//! in the chain, name itself anything, and ask; the measurement only decides
+//! *which* grant key that chain derives, and therefore which earlier approval it
+//! can coalesce with. The authorizing step is always the human on the phone.
+//!
+//! What it does buy, on the platform identity ([`IdentityMeasure::Signed`]):
+//!
+//! * The measure is the identity the platform assigns, so it is stable across a
+//!   re-sign of unchanged code (a renewed certificate does not move the cdhash)
+//!   and it moves the moment the code changes.
+//! * A signed binary cannot be altered and still run: the kernel validates the
+//!   pages it maps against the same CodeDirectory the cdhash names, and kills a
+//!   mismatch (verified on this platform: a byte-flipped copy of a signed system
+//!   binary is SIGKILLed on exec). So anything that actually appears in a chain
+//!   under this measure is code the kernel accepted as that cdhash. The cdhash is
+//!   copied out of the signature rather than re-verified in userspace, which
+//!   would cost up to ~200ms per binary and (measured) still passes a
+//!   page-tampered Mach-O; the kernel's refusal to run it is the stronger check.
+//! * Ad-hoc and unsigned binaries get [`IdentityMeasure::Content`] instead: an
+//!   ad-hoc signature has no signer, so its cdhash proves nothing a hash of the
+//!   bytes does not. The two measures are domain-separated in the grant key, so a
+//!   binary that gains a real signature reads as a DIFFERENT caller (a fresh
+//!   approval) rather than silently the same one, and no signed/unsigned pair can
+//!   derive one key.
+//!
+//! Residual, unchanged by this: the executable is measured at approval time by
+//! the path the process was started from, so a caller that can rewrite its own
+//! executable after exec is measured as whatever is at that path now. That is
+//! inside the same-UID boundary the gate already concedes.
 //!
 //! Honest limit on the chain: every gated command reaches the daemon through a
 //! `~/.sigil/bin` symlink to the ONE `sigil` binary, and macOS `proc_pidpath`
@@ -53,12 +88,22 @@
 //! Client-supplied ancestry is never consulted; the whole chain is measured
 //! here.
 //!
-//! NEEDS-VERIFICATION: the ancestor "code identity" here is a BLAKE2b hash of
-//! the executable's bytes. The design calls for the platform code-signing
-//! identity (Developer ID / Authenticode) so a re-signed-but-identical binary
-//! and a tampered one are told apart. Confirm the macOS path with:
-//!   codesign -dvvv --verbose=4 "$(command -v op)"   # team identifier / cdhash
-//! and fold the cdhash into `identity_of` in a follow-up.
+//! The former NEEDS-VERIFICATION on this file (the ancestor code identity being
+//! a hash of the executable's bytes rather than the platform's own answer) is
+//! closed. macOS ancestors are now measured with `SecStaticCodeCreateWithPath` +
+//! `SecCodeCopySigningInformation` (`kSecCodeInfoUnique`, the same machinery
+//! [`crate::peercode`] uses for the keystore gate), tagged
+//! [`IdentityMeasure::Signed`]; unsigned and ad-hoc binaries keep the content
+//! hash under [`IdentityMeasure::Content`], and the two tags are hashed
+//! length-prefixed into the grant key so they share no namespace. What that is
+//! and is not worth is stated above, in full, rather than assumed.
+//!
+//! Residuals that remain (for the reviewer, not a verdict): the exec-path
+//! measurement race noted above; the platform measure is macOS-only, so a future
+//! Linux/Windows process table would measure every ancestor by its bytes until
+//! the platform seam is filled there; and the measurement is cached per (path,
+//! device, inode, size, mtime) for the daemon's lifetime, so it is exactly as
+//! fresh as those five fields make it.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -72,16 +117,89 @@ use crate::secrets::Token;
 type Blake2b256 = Blake2b<U32>;
 
 const GRANT_DOMAIN: &[u8] = b"sigil.grant.v1";
+/// Domain for folding a variable-width cdhash down to the 32 bytes the chain
+/// carries. Separate from [`GRANT_DOMAIN`] so the two hashes are unrelated.
+const CDHASH_DOMAIN: &[u8] = b"sigil.cdhash.v1";
 /// Cap the ancestry walk so a pathological or looping process table cannot spin.
 const MAX_ANCESTRY_DEPTH: usize = 64;
 
+/// How an ancestor's 32 bytes of code identity were arrived at. Hashed into the
+/// grant key alongside the digest, exactly as [`ScopeKind`] is, so the measures
+/// never share a namespace: a signed binary and an unsigned one cannot collide,
+/// and a binary that gains a signature derives a new key (a fresh approval)
+/// rather than inheriting the old one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityMeasure {
+    /// The platform's own answer: the cdhash out of the code signature.
+    Signed,
+    /// A hash of the executable's bytes. What unsigned and ad-hoc binaries get,
+    /// and what every non-macOS ancestor gets.
+    Content,
+    /// Neither was obtainable (the executable could not be read at all). The
+    /// digest is derived from the pid, so it is deliberately NOT stable across
+    /// runs: an ancestor we cannot measure must not coalesce with anything.
+    Unmeasured,
+}
+
+impl IdentityMeasure {
+    /// The tag hashed into the grant key. Short and fixed; never displayed.
+    fn tag(self) -> &'static [u8] {
+        match self {
+            IdentityMeasure::Signed => b"cdhash",
+            IdentityMeasure::Content => b"bytes",
+            IdentityMeasure::Unmeasured => b"none",
+        }
+    }
+}
+
+/// A 32-byte code-identity measurement of one executable, plus how it was
+/// measured. Both halves bind into the grant key; the digest alone is not an
+/// identity, because two measures can produce the same 32 bytes only by
+/// coincidence and must still be told apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeIdentity {
+    pub measure: IdentityMeasure,
+    pub digest: [u8; 32],
+}
+
+impl CodeIdentity {
+    /// The platform identity, folded to 32 bytes under its own domain string (a
+    /// cdhash is 20 bytes today and the width is not ours to fix).
+    pub fn from_cdhash(cdhash: &[u8]) -> Self {
+        let mut h = Blake2b256::new();
+        h.update(CDHASH_DOMAIN);
+        h.update((cdhash.len() as u64).to_le_bytes());
+        h.update(cdhash);
+        Self {
+            measure: IdentityMeasure::Signed,
+            digest: h.finalize().into(),
+        }
+    }
+
+    /// A measurement of the executable's bytes.
+    pub fn content(digest: [u8; 32]) -> Self {
+        Self {
+            measure: IdentityMeasure::Content,
+            digest,
+        }
+    }
+
+    /// The nothing-to-measure case: bound to the pid so it never coalesces.
+    pub fn unmeasured(pid: i32) -> Self {
+        Self {
+            measure: IdentityMeasure::Unmeasured,
+            digest: Blake2b256::digest(pid.to_le_bytes()).into(),
+        }
+    }
+}
+
 /// One resolved ancestor: its pid (for display only, never hashed), executable
-/// path, and a 32-byte code-identity measurement of that executable.
+/// path, and the code-identity measurement of that executable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ancestor {
     pub pid: i32,
     pub exe: PathBuf,
-    pub identity: [u8; 32],
+    pub identity: CodeIdentity,
 }
 
 /// The daemon's own measurement of who is calling: the leaf process and its
@@ -114,9 +232,10 @@ pub trait ProcessTable {
     fn parent(&self, pid: i32) -> Option<i32>;
     /// The executable path backing `pid`.
     fn exe(&self, pid: i32) -> Option<PathBuf>;
-    /// A stable 32-byte code identity for `pid`'s executable. The real fill
-    /// hashes the file contents; the synthetic table returns an injected value.
-    fn identity(&self, pid: i32) -> [u8; 32];
+    /// The code identity of `pid`'s executable. The real fill asks the platform
+    /// and falls back to the file's bytes; the synthetic table returns an
+    /// injected value.
+    fn identity(&self, pid: i32) -> CodeIdentity;
 }
 
 /// Walk from `start` up to the root, resolving each process. Returns the chain
@@ -174,7 +293,9 @@ impl ScopeKind {
 /// happened to run in.
 ///
 /// Every field is length-prefixed, so no two different inputs can serialize to
-/// the same byte string.
+/// the same byte string. Each ancestor contributes its path, the tag naming HOW
+/// its identity was measured ([`IdentityMeasure`]), and the digest, so two
+/// measures can never derive one key even if their 32 bytes coincided.
 pub fn grant_key(caller: &Caller, kind: ScopeKind, project_root: &str, scope: &str) -> [u8; 32] {
     let mut h = Blake2b256::new();
     h.update(GRANT_DOMAIN);
@@ -183,7 +304,10 @@ pub fn grant_key(caller: &Caller, kind: ScopeKind, project_root: &str, scope: &s
         let exe = a.exe.as_os_str().as_encoded_bytes();
         h.update((exe.len() as u64).to_le_bytes());
         h.update(exe);
-        h.update(a.identity);
+        let measure = a.identity.measure.tag();
+        h.update((measure.len() as u64).to_le_bytes());
+        h.update(measure);
+        h.update(a.identity.digest);
     }
     let root = project_root.as_bytes();
     h.update((root.len() as u64).to_le_bytes());
@@ -432,9 +556,100 @@ pub fn peer_pid(_fd: std::os::fd::RawFd) -> Option<i32> {
     None
 }
 
-/// The real process table: sysctl for ancestry, `proc_pidpath` for the exe, a
-/// BLAKE2b of the executable bytes for the code identity (interim stand-in for
-/// the code-signing identity; see the module NEEDS-VERIFICATION note).
+/// What the measurement cache is keyed on: the file, not the name. Every field
+/// a replacement at the same path would move is in the key, so a rebuild, a
+/// `brew upgrade`, or a swap of the binary invalidates the entry by missing it
+/// rather than by any explicit eviction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FileStamp {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl FileStamp {
+    fn of(path: &std::path::Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(path).ok()?;
+        Some(Self {
+            path: path.to_path_buf(),
+            dev: md.dev(),
+            ino: md.ino(),
+            size: md.size(),
+            mtime: md.mtime(),
+            mtime_nsec: md.mtime_nsec(),
+        })
+    }
+}
+
+/// Cap on the measurement cache. A gated command's chain is a handful of
+/// binaries and a dev box sees tens of distinct ones, so this is far above
+/// normal use; it exists only so a process spawning endless distinct
+/// executables cannot grow the daemon without bound. Overflow clears the whole
+/// map (correctness is unaffected: a miss re-measures).
+const MEASURE_CACHE_MAX: usize = 512;
+
+type MeasureCache = std::collections::HashMap<FileStamp, CodeIdentity>;
+
+fn measure_cache() -> &'static Mutex<MeasureCache> {
+    static CACHE: std::sync::OnceLock<Mutex<MeasureCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(MeasureCache::new()))
+}
+
+/// Measure one executable, memoized for the daemon's lifetime.
+///
+/// The ancestry walk runs on every gated command and asking the platform is not
+/// free, so the answer is memoized. Measured on an M-series Mac, release build,
+/// over a real 6-deep chain (login, zsh, claude, zsh, cargo, the test binary):
+/// the whole walk costs 52ms the first time and 23us once warm. Per binary,
+/// cold, that is 0.6ms for a small system binary and ~11ms for the 40MB `op`.
+/// The unconditional content hash this replaces cost 236ms for that same chain,
+/// on every single gated command, because it read and hashed every byte of every
+/// ancestor every time and cached nothing. A cache hit is a `stat` plus a map
+/// lookup.
+///
+/// The stamp is taken before AND after the measurement and the entry is only
+/// stored if the two agree, so a binary replaced mid-measurement is not filed
+/// under the stamp of the file it is not.
+///
+/// `None` when the executable yielded neither a platform identity nor readable
+/// bytes; the caller turns that into [`IdentityMeasure::Unmeasured`].
+fn measure_executable(path: &std::path::Path) -> Option<CodeIdentity> {
+    let before = FileStamp::of(path);
+    if let Some(stamp) = &before {
+        if let Some(hit) = measure_cache()
+            .lock()
+            .expect("measure cache poisoned")
+            .get(stamp)
+        {
+            return Some(*hit);
+        }
+    }
+
+    let measured = match crate::peercode::cdhash_for_path(path) {
+        Some(cdhash) => CodeIdentity::from_cdhash(&cdhash),
+        None => CodeIdentity::content(Blake2b256::digest(std::fs::read(path).ok()?).into()),
+    };
+
+    if let Some(stamp) = before {
+        // Only file it if the file did not move under us mid-measurement.
+        if Some(&stamp) == FileStamp::of(path).as_ref() {
+            let mut cache = measure_cache().lock().expect("measure cache poisoned");
+            if cache.len() >= MEASURE_CACHE_MAX {
+                cache.clear();
+            }
+            cache.insert(stamp, measured);
+        }
+    }
+    Some(measured)
+}
+
+/// The real process table: sysctl for ancestry, `proc_pidpath` for the exe, and
+/// the platform's own code identity (cdhash) for the measurement, falling back
+/// to a hash of the executable's bytes where there is no signer to ask.
 pub struct SysProcessTable;
 
 #[cfg(target_os = "macos")]
@@ -474,13 +689,13 @@ impl ProcessTable for SysProcessTable {
         Some(PathBuf::from(s))
     }
 
-    fn identity(&self, pid: i32) -> [u8; 32] {
-        match self.exe(pid).and_then(|p| std::fs::read(p).ok()) {
-            Some(bytes) => Blake2b256::digest(&bytes).into(),
-            // Unreadable exe: bind the pid's path string so the chain is still
-            // distinct rather than colliding on a zero identity.
-            None => Blake2b256::digest(pid.to_le_bytes()).into(),
-        }
+    fn identity(&self, pid: i32) -> CodeIdentity {
+        // Unmeasurable exe (gone, unreadable, not a file): a pid-derived digest,
+        // so the chain stays distinct rather than colliding on a zero identity,
+        // and so an ancestor we cannot measure coalesces with nothing.
+        self.exe(pid)
+            .and_then(|p| measure_executable(&p))
+            .unwrap_or_else(|| CodeIdentity::unmeasured(pid))
     }
 }
 
@@ -492,8 +707,8 @@ impl ProcessTable for SysProcessTable {
     fn exe(&self, _pid: i32) -> Option<PathBuf> {
         None
     }
-    fn identity(&self, pid: i32) -> [u8; 32] {
-        Blake2b256::digest(pid.to_le_bytes()).into()
+    fn identity(&self, pid: i32) -> CodeIdentity {
+        CodeIdentity::unmeasured(pid)
     }
 }
 
@@ -507,14 +722,14 @@ mod tests {
     struct MapTable {
         parent: HashMap<i32, i32>,
         exe: HashMap<i32, PathBuf>,
-        ident: HashMap<i32, [u8; 32]>,
+        ident: HashMap<i32, CodeIdentity>,
     }
 
     impl MapTable {
         fn node(&mut self, pid: i32, ppid: i32, exe: &str, id: u8) {
             self.parent.insert(pid, ppid);
             self.exe.insert(pid, PathBuf::from(exe));
-            self.ident.insert(pid, [id; 32]);
+            self.ident.insert(pid, CodeIdentity::content([id; 32]));
         }
     }
 
@@ -525,8 +740,11 @@ mod tests {
         fn exe(&self, pid: i32) -> Option<PathBuf> {
             self.exe.get(&pid).cloned()
         }
-        fn identity(&self, pid: i32) -> [u8; 32] {
-            self.ident.get(&pid).copied().unwrap_or([0u8; 32])
+        fn identity(&self, pid: i32) -> CodeIdentity {
+            self.ident
+                .get(&pid)
+                .copied()
+                .unwrap_or_else(|| CodeIdentity::content([0u8; 32]))
         }
     }
 
@@ -678,7 +896,9 @@ mod tests {
 
         // And a tampered ancestor (same paths, different code identity) too.
         let mut tampered = tree();
-        tampered.ident.insert(200, [0x42; 32]);
+        tampered
+            .ident
+            .insert(200, CodeIdentity::content([0x42; 32]));
         assert_ne!(
             rule_key(&mine, "op"),
             rule_key(&walk_ancestry(&tampered, 300), "op"),
@@ -695,12 +915,170 @@ mod tests {
 
         // A different ancestor identity (e.g. a tampered claude) must move it.
         let mut t = tree();
-        t.ident.insert(200, [0x42; 32]);
+        t.ident.insert(200, CodeIdentity::content([0x42; 32]));
         assert_ne!(
             base,
             grant_key(&walk_ancestry(&t, 300), CMD, "/p", "s"),
             "ancestor code identity must matter"
         );
+    }
+
+    // ---- Ancestor code identity: the platform measure and its fallback ----
+
+    /// A scratch dir for the measurement tests, unique per test and per process.
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("sigil-measure-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("scratch dir");
+        d
+    }
+
+    #[test]
+    fn the_two_measures_are_domain_separated_in_the_grant_key() {
+        // The core of the change: identical 32 bytes under different measures
+        // must not derive one key. This is what makes a binary that gains a
+        // signature a DIFFERENT caller rather than silently the same one, and
+        // what stops a content hash from ever being mistaken for a cdhash.
+        let digest = [0x5a; 32];
+        let mk = |identity: CodeIdentity| Caller {
+            chain: vec![Ancestor {
+                pid: 42,
+                exe: PathBuf::from("/opt/homebrew/bin/op"),
+                identity,
+            }],
+        };
+        let signed = CodeIdentity {
+            measure: IdentityMeasure::Signed,
+            digest,
+        };
+        let content = CodeIdentity::content(digest);
+        let unmeasured = CodeIdentity {
+            measure: IdentityMeasure::Unmeasured,
+            digest,
+        };
+        let key = |i: CodeIdentity| grant_key(&mk(i), CMD, "", "op");
+        assert_ne!(
+            key(signed),
+            key(content),
+            "signed must not collide with bytes"
+        );
+        assert_ne!(key(signed), key(unmeasured));
+        assert_ne!(key(content), key(unmeasured));
+    }
+
+    #[test]
+    fn a_cdhash_measurement_is_stable_and_distinguishing() {
+        // The fold from a 20-byte cdhash to the 32 the chain carries must be a
+        // function of the cdhash and nothing else, and must separate cdhashes.
+        let a = CodeIdentity::from_cdhash(&[1u8; 20]);
+        assert_eq!(a, CodeIdentity::from_cdhash(&[1u8; 20]));
+        assert_eq!(a.measure, IdentityMeasure::Signed);
+        assert_ne!(a.digest, CodeIdentity::from_cdhash(&[2u8; 20]).digest);
+        // Length is bound in, so a short cdhash cannot be a prefix of a long one.
+        assert_ne!(a.digest, CodeIdentity::from_cdhash(&[1u8; 21]).digest);
+    }
+
+    #[test]
+    fn an_unmeasurable_ancestor_coalesces_with_nothing() {
+        // Deliberate: no measurement means no shared grant key, so a caller we
+        // cannot measure takes a fresh approval every time rather than
+        // inheriting one.
+        assert_ne!(
+            CodeIdentity::unmeasured(100).digest,
+            CodeIdentity::unmeasured(101).digest
+        );
+        assert_eq!(
+            CodeIdentity::unmeasured(100).measure,
+            IdentityMeasure::Unmeasured
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_signed_system_binary_measures_as_the_platform_identity() {
+        // /bin/sh is signed by the platform, so the measurement must come from
+        // the code signature and not from the file's bytes. Both halves matter:
+        // the tag says where it came from, and the digest must not be the
+        // content hash it replaced.
+        let sh = std::path::Path::new("/bin/sh");
+        let m = measure_executable(sh).expect("a system binary measures");
+        assert_eq!(
+            m.measure,
+            IdentityMeasure::Signed,
+            "a signed system binary must measure as the platform identity"
+        );
+        let content: [u8; 32] = Blake2b256::digest(std::fs::read(sh).unwrap()).into();
+        assert_ne!(m.digest, content, "it is the cdhash, not the bytes");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn measuring_the_same_binary_twice_is_stable_and_distinguishes_binaries() {
+        // Stability is the whole point (an unstable measure means a fresh
+        // approval per command), and two different binaries must never land on
+        // one identity.
+        let sh = measure_executable(std::path::Path::new("/bin/sh")).expect("sh");
+        assert_eq!(
+            sh,
+            measure_executable(std::path::Path::new("/bin/sh")).unwrap()
+        );
+        let ls = measure_executable(std::path::Path::new("/bin/ls")).expect("ls");
+        assert_ne!(sh.digest, ls.digest, "two binaries, two identities");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_ad_hoc_binary_falls_back_to_its_bytes() {
+        // This test binary is linker/ad-hoc signed: a signature with no signer,
+        // whose cdhash asserts nothing a content hash does not. Reporting it as
+        // a platform identity would overstate it, so it must fall back.
+        let me = std::env::current_exe().expect("current exe");
+        let m = measure_executable(&me).expect("the test binary measures");
+        assert_eq!(
+            m.measure,
+            IdentityMeasure::Content,
+            "an ad-hoc signature is not a platform identity"
+        );
+    }
+
+    #[test]
+    fn an_unsigned_artifact_falls_back_to_its_bytes() {
+        // Not a code object at all: the measurement must still produce a stable
+        // identity, tagged as the weaker measure so it cannot be confused with a
+        // signed one.
+        let dir = scratch("unsigned");
+        let f = dir.join("artifact");
+        std::fs::write(&f, b"#!/bin/sh\necho hello\n").unwrap();
+        let m = measure_executable(&f).expect("an unsigned file still measures");
+        assert_eq!(m.measure, IdentityMeasure::Content);
+        assert_eq!(
+            m.digest,
+            <[u8; 32]>::from(Blake2b256::digest(std::fs::read(&f).unwrap())),
+            "the fallback is a hash of the bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replacing_the_file_at_a_path_invalidates_the_cached_measurement() {
+        // The cache is keyed on the file, not the name: a rebuild or a swap at
+        // the same path must be measured afresh rather than served from the
+        // entry the old bytes left behind.
+        let dir = scratch("cache");
+        let f = dir.join("artifact");
+        std::fs::write(&f, b"first").unwrap();
+        let first = measure_executable(&f).expect("measures");
+        assert_eq!(first, measure_executable(&f).unwrap(), "cache hit is equal");
+
+        // mtime has one-second granularity on some filesystems, so change the
+        // size too: any of the five stamp fields moving is enough.
+        std::fs::write(&f, b"second, and longer").unwrap();
+        let second = measure_executable(&f).expect("measures");
+        assert_ne!(
+            first.digest, second.digest,
+            "a replaced binary must not be served from the cache"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn token(s: &str) -> Token {

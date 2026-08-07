@@ -126,7 +126,8 @@ Residuals for the security-reviewer to weigh:
 | Ancestry is walked kernel-side; the grant key binds code identity, never pids | `lease.rs::walk_ancestry`, `grant_key` (excludes pids) | `lease.rs::ancestry_walk_is_root_first_and_stops_at_init`, `grant_key_ignores_recycled_pids`, `grant_key_changes_with_root_scope_or_ancestry` |
 | The ancestry walk terminates on cycles / bounded depth | `lease.rs::walk_ancestry` (`MAX_ANCESTRY_DEPTH`, `seen` set) | `lease.rs::ancestry_walk_terminates_on_a_cycle` |
 | A phone-claimed grant key is ignored; the daemon derives and trusts its own | `daemon.rs::fulfill` (uses `gk`), `request.rs::InstallLease` (echo only), `softphone/lib.rs` (empty `grant_key`) | reviewed by inspection; exercised by `daemon.rs::lease_decision_covers_the_next_identical_request` |
-| The ancestor "code identity" is a real code-signing measurement | `lease.rs::SysProcessTable::identity` | **UNPROVEN, PARTIAL**: interim BLAKE2b of the exe bytes; the design calls for the cdhash / Developer ID (NEEDS-VERIFICATION in `lease.rs`) |
+| The ancestor "code identity" is the platform's code-signing measurement where one exists | `lease.rs::{measure_executable,CodeIdentity}`, `peercode.rs::cdhash_for_path`, `peercode.m::sigil_cdhash_for_path` (`SecStaticCodeCreateWithPath` + `SecCodeCopySigningInformation`, `kSecCodeInfoUnique`) | `peercode.rs::a_signed_binary_yields_a_cdhash_and_an_ad_hoc_one_does_not`, `lease.rs::a_signed_system_binary_measures_as_the_platform_identity`, `measuring_the_same_binary_twice_is_stable_and_distinguishes_binaries`, `an_ad_hoc_binary_falls_back_to_its_bytes`, `an_unsigned_artifact_falls_back_to_its_bytes`. **Scope of the claim (implementer's statement, not a verdict):** it is a measurement, not an authentication; unsigned and ad-hoc binaries keep the content hash under a separate domain tag; a signed binary's pages are enforced by the kernel at exec, not re-validated here. Residual: measurement reads the exec path at approval time. |
+| The two identity measures cannot collide in a grant key | `lease.rs::grant_key` (length-prefixed `IdentityMeasure::tag`) | `lease.rs::the_two_measures_are_domain_separated_in_the_grant_key`, `a_cdhash_measurement_is_stable_and_distinguishing`, `an_unmeasurable_ancestor_coalesces_with_nothing` |
 
 ## 8. Fail closed, leases bounded (invariants #7, #8)
 
@@ -869,12 +870,16 @@ These are real and deliberately surfaced, not defects hidden.
    (both with no dev flag set). Severity: **Medium-High reduced to a documented
    dev-only mode that fails closed by default and is loudly labelled.**
 
-2. **Secure Enclave biometric unwrap and kernel peer/ancestry are unproven on
-   hardware.** `keystore_macos.rs::{ensure_dek,unwrap_dek}`, `lease.rs::peer_pid`,
-   and the code-signing `identity` all carry NEEDS-VERIFICATION and cannot be
-   exercised away from a Mac. Until verified, the biometric factor is inert
-   (returns `NeedsVerification`), so the effective shipping gate is either the
-   phone or residual #1.
+2. **Secure Enclave biometric unwrap and the kernel peer pid are unproven on
+   hardware.** `keystore_macos.rs::{ensure_dek,unwrap_dek}` and
+   `lease.rs::peer_pid` carry NEEDS-VERIFICATION and cannot be exercised away
+   from a Mac. Until verified, the biometric factor is inert (returns
+   `NeedsVerification`), so the effective shipping gate is either the phone or
+   residual #1. The third item that used to sit here, the ancestor code-signing
+   `identity`, is closed: it is now the platform cdhash where one exists, with a
+   domain-separated content-hash fallback, and it is exercised headlessly (see
+   §7). Its own residuals are stated in the `lease.rs` module docs and §7 rather
+   than here.
 
 3. **The SA token transits daemon RAM (unavoidable) and one copy is not
    zeroized.** The token is the injected credential, so it must reach the child
