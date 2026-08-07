@@ -458,7 +458,7 @@ pub struct LeaseInfo {
     /// lease covers any command that rule matches, not the one that opened it.
     pub scope: String,
     /// What that rule matches, in the daemon's own words (`op read`,
-    /// `op with --account rowmhq.1password.eu`, …): the same string the approver
+    /// `op with --account "rowmhq.1password.eu"`, …): the same string the approver
     /// consented to, so the CLI states the breadth instead of gesturing at it.
     /// Empty when the daemon rendered none.
     pub covers: String,
