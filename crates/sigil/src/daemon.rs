@@ -2897,8 +2897,8 @@ mod tests {
         fn exe(&self, _pid: i32) -> Option<PathBuf> {
             None
         }
-        fn identity(&self, _pid: i32) -> [u8; 32] {
-            [0u8; 32]
+        fn identity(&self, _pid: i32) -> lease::CodeIdentity {
+            lease::CodeIdentity::content([0u8; 32])
         }
     }
 

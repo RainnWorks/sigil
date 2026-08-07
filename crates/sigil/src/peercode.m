@@ -19,6 +19,8 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>
+#include <stdint.h>
+#include <string.h>
 
 // Same check, but keyed on the peer's AUDIT TOKEN rather than its pid. An audit
 // token identifies a specific process instance and is never reused, so unlike a
@@ -77,6 +79,96 @@ int sigil_audit_satisfies_requirement(const void *token, size_t token_len,
     CFRelease(code);
     CFRelease(req);
     return (st == errSecSuccess) ? 0 : 1;
+}
+
+// The platform code identity of the executable at `path`: its cdhash
+// (kSecCodeInfoUnique), the digest of the CodeDirectory that the signature
+// commits to and that the kernel enforces against the pages it maps.
+//
+// This is a MEASUREMENT, not an authorization: nothing here decides whether a
+// binary may do anything. It exists so the lease grant key names an ancestor by
+// what the platform says it is rather than by a hash we compute ourselves.
+//
+// Only a signature with a signer yields one. An ad-hoc signature (flags &
+// kSecCodeSignatureAdhoc) has no signer at all: its cdhash is a digest of the
+// binary and nothing more, exactly as strong as the caller's own content hash
+// and no stronger, so calling it a signing identity would overstate it. Ad-hoc
+// is reported as absent and the caller falls back to (and separately tags) its
+// own hash. A platform binary carries no certificate chain either, but the
+// kernel's trust cache vouches for it, so it counts.
+//
+// Deliberately does NOT call SecStaticCodeCheckValidity: on this platform it
+// costs up to ~200ms on a large signed binary, and (measured) it still returns
+// success for a Mach-O whose text pages were altered under an intact
+// CodeDirectory. The tamper-evidence comes from the kernel refusing to execute
+// such a binary at all, not from a userspace re-check. See the Rust caller's
+// docs for the honest statement of what that does and does not buy.
+//
+// >0 = number of cdhash bytes written to `out`
+//  0 = no platform identity (unsigned, ad-hoc, or no cdhash in the signature)
+// -1 = bad arguments
+// -2 = the path is not a code object
+// -3 = signing information unavailable
+// -4 = `out` is too small for the cdhash
+int sigil_cdhash_for_path(const char *path, unsigned char *out, size_t out_len) {
+    if (path == NULL || out == NULL) {
+        return -1;
+    }
+    CFStringRef path_str = CFStringCreateWithCString(NULL, path, kCFStringEncodingUTF8);
+    if (path_str == NULL) {
+        return -1;
+    }
+    CFURLRef url = CFURLCreateWithFileSystemPath(NULL, path_str, kCFURLPOSIXPathStyle, false);
+    CFRelease(path_str);
+    if (url == NULL) {
+        return -1;
+    }
+
+    SecStaticCodeRef code = NULL;
+    OSStatus st = SecStaticCodeCreateWithPath(url, kSecCSDefaultFlags, &code);
+    CFRelease(url);
+    if (st != errSecSuccess || code == NULL) {
+        if (code != NULL) {
+            CFRelease(code);
+        }
+        return -2;
+    }
+
+    CFDictionaryRef info = NULL;
+    st = SecCodeCopySigningInformation(code, kSecCSDefaultFlags, &info);
+    CFRelease(code);
+    if (st != errSecSuccess || info == NULL) {
+        if (info != NULL) {
+            CFRelease(info);
+        }
+        // An unsigned binary answers here rather than erroring; either way there
+        // is no platform identity to report.
+        return (st == errSecCSUnsigned) ? 0 : -3;
+    }
+
+    uint32_t flags = 0;
+    CFNumberRef flags_num = (CFNumberRef)CFDictionaryGetValue(info, kSecCodeInfoFlags);
+    if (flags_num != NULL) {
+        CFNumberGetValue(flags_num, kCFNumberSInt32Type, &flags);
+    }
+    CFDataRef unique = (CFDataRef)CFDictionaryGetValue(info, kSecCodeInfoUnique);
+    if (unique == NULL || (flags & kSecCodeSignatureAdhoc) != 0) {
+        CFRelease(info);
+        return 0;
+    }
+
+    CFIndex len = CFDataGetLength(unique);
+    if (len <= 0) {
+        CFRelease(info);
+        return 0;
+    }
+    if ((size_t)len > out_len) {
+        CFRelease(info);
+        return -4;
+    }
+    memcpy(out, CFDataGetBytePtr(unique), (size_t)len);
+    CFRelease(info);
+    return (int)len;
 }
 
 // 0  = the peer satisfies the requirement
