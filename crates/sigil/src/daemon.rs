@@ -638,6 +638,17 @@ impl Core {
     /// alarm, not a routine condition.
     fn doctor_report(&self) -> Vec<crate::json::CheckJson> {
         let mut checks = crate::report::doctor(true);
+        if let Some(row) = unmeasured_ancestor_row(&lease::live_unmeasured_notes()) {
+            // Before the ssh-agent row, which the renderer treats as the trailing
+            // informational one. This row is informational too, but only one can
+            // be last, and the ssh-agent row carries its text in the hint while
+            // this one carries it in the label.
+            let at = checks
+                .iter()
+                .position(|c| c.label == "ssh-agent socket")
+                .unwrap_or(checks.len());
+            checks.insert(at, row);
+        }
         let (ok, hint) = self.sealed_store_drift();
         checks.push(crate::json::CheckJson {
             label: "sealed store matches the armed daemon".to_string(),
@@ -2471,13 +2482,15 @@ fn fulfill(
     let coalesce_key = lease::grant_key(&caller, lease::ScopeKind::Command, cwd, &scope);
 
     // Whether this caller may touch a LEASE at all, which is a stricter question
-    // than whether it may be gated. A lease is the one thing that releases a
-    // later request with no human in the loop, so it requires an identity the
-    // daemon actually established: if any ancestor could not be measured (its
-    // image is gone, or the platform refuses to vouch for it because the file at
-    // its path was replaced after exec), this run still goes to the phone like
-    // any other, but it neither rides nor opens a window.
-    let may_lease = caller.fully_measured();
+    // than whether it may be gated. A lease releases a later request with no
+    // human in the loop, so it needs an identity the daemon established itself.
+    // The disqualifier is having none at all: an empty chain (no peer pid, or a
+    // pid resolving to nothing) would put every unidentifiable caller on ONE
+    // grant key. Such a run is still gated and still shown to the human; only the
+    // window is withheld. An ancestor that could not be measured is keyed to its
+    // process instance instead, which is weaker than code identity and is logged
+    // and reported (see `lease::note_unmeasured` and the doctor row).
+    let may_lease = caller.may_lease();
 
     // For the inline `env` provider, fetch its threshold-sealed record now. The
     // record is public (ciphertext plus the base point E), safe to hold across the
@@ -2895,6 +2908,44 @@ fn log_ssh_sign_request(label: &str, host: &str, data_fingerprint: &str, peer: O
 }
 
 /// Log request metadata: argv (item names, not secret values), cwd, peer pid.
+/// The doctor row for ancestors the platform would not describe, or `None` when
+/// there are none (the normal case, and no row is better than a row saying
+/// nothing happened).
+///
+/// It answers one question a human would otherwise have no way to ask: why did
+/// approvals come back for a session that had been running on one? Informational
+/// rather than a failure, because the usual cause is a tool that updated itself
+/// and deleted the binary it was running from, and because leases still work
+/// under it; what changed is what the window is keyed to. The whole sentence
+/// lives in the label, since the doctor renderer only prints a hint for the
+/// trailing row.
+fn unmeasured_ancestor_row(notes: &[lease::UnmeasuredNote]) -> Option<crate::json::CheckJson> {
+    if notes.is_empty() {
+        return None;
+    }
+    // Name the first few; a long tail is a count, not a wall of text.
+    const NAMED: usize = 3;
+    let mut named: Vec<String> = notes
+        .iter()
+        .take(NAMED)
+        .map(|n| format!("{} ({})", n.name(), n.reason.explain()))
+        .collect();
+    if notes.len() > NAMED {
+        named.push(format!("and {} more", notes.len() - NAMED));
+    }
+    let count = notes.len();
+    let plural = if count == 1 { "" } else { "s" };
+    Some(crate::json::CheckJson {
+        label: format!(
+            "{count} caller ancestor{plural} could not be measured: {}; \
+             leases under them are keyed to the process, not to its code",
+            named.join(", ")
+        ),
+        ok: true,
+        hint: String::new(),
+    })
+}
+
 fn log_request(argv: &[String], cwd: &str, peer: Option<i32>) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3127,6 +3178,28 @@ mod tests {
         timeout: Duration,
         config: Config,
     ) -> (Arc<Core>, Arc<PendingRegistry>) {
+        test_core_with_table(
+            dir,
+            token,
+            secret,
+            dev,
+            timeout,
+            config,
+            Box::new(StubTable),
+        )
+    }
+
+    /// [`test_core_with_config`] but with an explicit process table, so a test
+    /// can put a caller the platform could not measure in front of the gate.
+    fn test_core_with_table(
+        dir: &Path,
+        token: &str,
+        secret: &str,
+        dev: DevMode,
+        timeout: Duration,
+        config: Config,
+        proc_table: Box<dyn ProcessTable + Send + Sync>,
+    ) -> (Arc<Core>, Arc<PendingRegistry>) {
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let _ = (token, secret);
 
@@ -3144,7 +3217,7 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending: pending.clone(),
-            proc_table: Box::new(StubTable),
+            proc_table,
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
             ))]),
@@ -3772,6 +3845,162 @@ mod tests {
         );
         assert_eq!(read_all(r2), "secret-A");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A caller the platform would not describe: one ancestor, unmeasured, keyed
+    /// to a process instance. What a self-updating tool that deleted its own
+    /// binary mid-session looks like to the daemon.
+    struct UnmeasuredTable;
+    impl ProcessTable for UnmeasuredTable {
+        fn parent(&self, _pid: i32) -> Option<i32> {
+            None
+        }
+        fn resolve(&self, pid: i32) -> Option<(PathBuf, lease::CodeIdentity)> {
+            Some((
+                PathBuf::from("/test/vanished"),
+                lease::CodeIdentity::unmeasured(
+                    pid,
+                    lease::ProcessStart {
+                        sec: 1_770_000_000,
+                        usec: 7,
+                    },
+                ),
+            ))
+        }
+    }
+
+    #[test]
+    fn an_unmeasured_ancestor_still_opens_and_rides_a_window() {
+        // The product half of the caller-identity work. An ancestor the platform
+        // will not describe (its binary was deleted under it, the common case
+        // being a tool that updated itself) must NOT silently revert the session
+        // to a phone tap per command: it is keyed to that process instance and
+        // leases normally. The security half is that the key is an instance
+        // nobody else can present, which `lease.rs` pins.
+        let dir = tmpdir("unmeasured-lease");
+        let (core, _) = test_core_with_table(
+            &dir,
+            "tok-abc",
+            "secret-A",
+            DevMode::Lease(Duration::from_secs(60)),
+            Duration::from_millis(50),
+            op_config(),
+            Box::new(UnmeasuredTable),
+        );
+
+        let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
+        let (r1, w1) = pipe();
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
+        assert_eq!(read_all(r1), "secret-A");
+        assert_eq!(
+            core.leases.active(),
+            1,
+            "an unmeasurable ancestor must not cost the session its window"
+        );
+
+        let (r2, w2) = pipe();
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w2), None),
+            0
+        );
+        assert_eq!(read_all(r2), "secret-A", "and the window is ridden");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_caller_with_no_identity_at_all_gets_no_window() {
+        // The one shape that is refused a lease: a chain the daemon could not
+        // put a single process in. Every such caller derives one grant key, so a
+        // window would be shared by callers with nothing in common. The request
+        // still runs and still reaches the human; only the auto-release is gone.
+        struct NothingTable;
+        impl ProcessTable for NothingTable {
+            fn parent(&self, _pid: i32) -> Option<i32> {
+                None
+            }
+            fn resolve(&self, _pid: i32) -> Option<(PathBuf, lease::CodeIdentity)> {
+                None
+            }
+        }
+        let dir = tmpdir("no-identity");
+        let (core, _) = test_core_with_table(
+            &dir,
+            "tok-abc",
+            "secret-A",
+            DevMode::Lease(Duration::from_secs(60)),
+            Duration::from_millis(50),
+            op_config(),
+            Box::new(NothingTable),
+        );
+
+        let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
+        let (r1, w1) = pipe();
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w1), None),
+            0,
+            "the run is gated and served as normal"
+        );
+        assert_eq!(read_all(r1), "secret-A");
+        assert_eq!(
+            core.leases.active(),
+            0,
+            "but an unidentifiable caller opens no window"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_doctor_explains_an_unmeasurable_ancestor_and_stays_quiet_otherwise() {
+        // The question this row exists to answer: why did approvals come back?
+        assert!(
+            unmeasured_ancestor_row(&[]).is_none(),
+            "no row at all in the normal case"
+        );
+
+        let note = |name: &str, reason| lease::UnmeasuredNote {
+            pid: 4242,
+            started: lease::ProcessStart {
+                sec: 1_770_000_000,
+                usec: 7,
+            },
+            exe: PathBuf::from(format!("/opt/tools/{name}")),
+            reason,
+        };
+        let row = unmeasured_ancestor_row(&[
+            note("claude", crate::peercode::GuestFailure::NoLiveImage),
+            note("node", crate::peercode::GuestFailure::ImageNotVouched),
+        ])
+        .expect("a row once something could not be measured");
+        assert!(
+            row.ok,
+            "informational: leases still work, keyed differently"
+        );
+        assert!(row.label.contains("claude"), "it names the ancestor");
+        assert!(row.label.contains("node"));
+        assert!(
+            row.label
+                .contains("its executable is gone or it has exited"),
+            "and why: {}",
+            row.label
+        );
+        assert!(
+            row.label.contains("keyed to the process, not to its code"),
+            "and what it cost: {}",
+            row.label
+        );
+
+        // The row is inserted ahead of the ssh-agent row, which the doctor
+        // renderer treats as the trailing informational one; if that label ever
+        // moves, the insertion silently appends and the ssh row loses its hint.
+        assert!(
+            crate::report::doctor(true)
+                .iter()
+                .any(|c| c.label == "ssh-agent socket"),
+            "the insertion anchor still exists"
+        );
     }
 
     #[test]

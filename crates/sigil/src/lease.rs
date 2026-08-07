@@ -31,11 +31,11 @@
 //! ([`crate::peercode::measure_guest`]). Properties that follow:
 //!
 //! * The measure names the RUNNING image, not a file. Rewriting the file at an
-//!   ancestor's path after exec does not change what that ancestor measures as:
-//!   the platform answers `-67034 errSecCSStaticCodeChanged` for that process
-//!   (verified here for in-place overwrite and for rename-over) and the ancestor
-//!   becomes [`IdentityMeasure::Unmeasured`], which declines to lease at all.
-//!   That is a refusal to measure, not detection of a live tamper.
+//!   ancestor's path after exec does not hand the caller the identity it put
+//!   there: the platform answers `-67034 errSecCSStaticCodeChanged` for that
+//!   process (verified here for in-place overwrite and for rename-over) and the
+//!   ancestor drops to [`IdentityMeasure::Unmeasured`], keyed to its own process
+//!   instance. That is a refusal to measure, not detection of a live tamper.
 //! * It is stable across a re-sign of unchanged code (a renewed certificate does
 //!   not move the cdhash) and it moves the moment the code moves.
 //! * An ad-hoc signature has no signer, so its cdhash asserts nothing a hash of
@@ -68,6 +68,42 @@
 //!   can spawn UNDER the honest ones and run the genuine gated command, and the
 //!   chain then matches by construction. The measure's value is telling honest
 //!   tool trees apart.
+//!
+//! # When the platform will not describe an ancestor
+//!
+//! Sometimes it will not answer at all. The overwhelmingly common cause is
+//! benign and is not an attack: a tool that updates itself deletes the binary it
+//! is running from, and from that moment the platform has no image to describe
+//! for a process that is still perfectly healthy. The swap case above lands here
+//! too.
+//!
+//! Such an ancestor is [`IdentityMeasure::Unmeasured`], and its digest is the
+//! **process instance**: the pid plus the kernel's start time for it
+//! ([`CodeIdentity::unmeasured`]). It keeps its own measure tag, so it can never
+//! be confused with a measured one, and the chain still leases.
+//!
+//! This branch is weaker than the measured ones and it is accepted deliberately:
+//!
+//! * **What it asserts** is continuity of one process, not identity of code. It
+//!   says "the same live process that was here before", and nothing about what
+//!   that process is running. A window under it therefore keeps serving while
+//!   that process lives, whatever it went on to do.
+//! * **What it costs an attacker** is nothing they did not already have. To
+//!   collide with a victim's key they would have to BE a descendant of the
+//!   victim's ancestors at that pid and that microsecond, which is the honest
+//!   chain; and spawning under the honest ancestors was always the dominant
+//!   residual above. Neither half is caller-supplied: the daemon reads the pid
+//!   off the socket and the start time from the kernel.
+//! * **Why not fail closed instead.** Refusing to lease an unmeasured chain was
+//!   the first cut and it is the wrong trade for this product. It turns a
+//!   background auto-update into a silent return to one phone tap per command,
+//!   with a cause no user could diagnose, and per-command approval is the exact
+//!   problem leases exist to solve. The narrower rule is what remains: a caller
+//!   the daemon could not put a single process behind gets no window at all
+//!   ([`Caller::may_lease`]), because every such caller would share one key.
+//! * **It is never silent.** The daemon logs each unmeasurable ancestor once per
+//!   process instance, naming it and why, and `sigil doctor` carries a row for
+//!   as long as any are outstanding ([`unmeasured_notes`]).
 //!
 //! Honest limit on the chain: every gated command reaches the daemon through a
 //! `~/.sigil/bin` symlink to the ONE `sigil` binary, and macOS `proc_pidpath`
@@ -118,12 +154,14 @@
 //! the request goes on to spawn).
 //!
 //! Residuals that remain (for the reviewer, not a verdict): the caller-chain
-//! imitation class above; the measure is macOS-only, so a future Linux/Windows
-//! process table has to fill the seam or every ancestor there is unmeasured; and
-//! the walk resolves ancestors by pid, so a pid recycled between the parent
-//! lookup and the measurement pairs one process's chain position with another's
-//! identity. That last one fails closed (the mismatched pair derives a key nobody
-//! holds, so the run takes a fresh approval) and cannot widen a grant.
+//! imitation class above; the process-instance branch, which asserts continuity
+//! of a process rather than identity of code and is stated in full in its own
+//! section; the measure is macOS-only, so a future Linux/Windows process table
+//! has to fill the seam or every ancestor there is unmeasured; and the walk
+//! resolves ancestors by pid, so a pid recycled between the parent lookup and
+//! the measurement pairs one process's chain position with another's identity.
+//! That last one fails closed (the mismatched pair derives a key nobody holds,
+//! so the run takes a fresh approval) and cannot widen a grant.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -140,6 +178,9 @@ const GRANT_DOMAIN: &[u8] = b"sigil.grant.v1";
 /// Domain for folding a variable-width cdhash down to the 32 bytes the chain
 /// carries. Separate from [`GRANT_DOMAIN`] so the two hashes are unrelated.
 const CDHASH_DOMAIN: &[u8] = b"sigil.cdhash.v1";
+/// Domain for the process-instance digest an unmeasurable ancestor gets. Its own
+/// string so it can never coincide with a cdhash fold.
+const UNMEASURED_DOMAIN: &[u8] = b"sigil.unmeasured.v1";
 /// Cap the ancestry walk so a pathological or looping process table cannot spin.
 const MAX_ANCESTRY_DEPTH: usize = 64;
 
@@ -166,9 +207,13 @@ pub enum IdentityMeasure {
     Content,
     /// No measurement was obtainable: the pid does not resolve to a live guest,
     /// or the platform declined to vouch for the image (which is what a
-    /// post-exec swap of the executable looks like). Fails closed twice over:
-    /// the digest is derived from the pid so it is not stable across runs, and
-    /// [`Caller::fully_measured`] refuses to lease a chain containing one.
+    /// post-exec swap of the executable looks like).
+    ///
+    /// This is the one measure that names a PROCESS rather than code: the digest
+    /// is derived from the pid and the kernel's start time for it, so it holds
+    /// for the life of that one process instance and no other. It is weaker than
+    /// the measures above and deliberately so; see the module docs for what it
+    /// buys and what it costs.
     Unmeasured,
 }
 
@@ -182,6 +227,16 @@ impl IdentityMeasure {
             IdentityMeasure::Unmeasured => b"none",
         }
     }
+}
+
+/// The kernel's start time for a process: seconds and microseconds since the
+/// epoch, as `proc_pidinfo` reports them. Together with a pid it names one
+/// process instance, which is the strongest thing available about a process
+/// whose code the platform will not describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessStart {
+    pub sec: u64,
+    pub usec: u32,
 }
 
 /// A 32-byte code-identity measurement of one executable, plus how it was
@@ -223,15 +278,26 @@ impl CodeIdentity {
         }
     }
 
-    /// The nothing-to-measure case. The digest is derived from the pid so two
-    /// unmeasurable ancestors are not silently one identity; it is NOT a claim
-    /// that this coalesces with nothing, because the same pid at the same path
-    /// derives the same 32 bytes. The fail-closed part is
-    /// [`Caller::fully_measured`]: a chain holding one of these never leases.
-    pub fn unmeasured(pid: i32) -> Self {
+    /// The nothing-to-measure case, keyed to one process INSTANCE: the pid plus
+    /// the kernel's start time for it.
+    ///
+    /// Both halves are load-bearing. The pid alone recycles, and a recycled pid
+    /// inheriting the previous process's window would be a real widening; the
+    /// start time (microsecond resolution, kernel-supplied, not settable by the
+    /// process) is what makes a new process a new identity. Neither is
+    /// caller-supplied: the daemon reads the pid off the socket and walks the
+    /// ancestry itself, so a caller cannot present a victim's pid and start time
+    /// without actually being that process's descendant, which is the honest
+    /// chain anyway.
+    pub fn unmeasured(pid: i32, started: ProcessStart) -> Self {
+        let mut h = Blake2b256::new();
+        h.update(UNMEASURED_DOMAIN);
+        h.update(pid.to_le_bytes());
+        h.update(started.sec.to_le_bytes());
+        h.update(started.usec.to_le_bytes());
         Self {
             measure: IdentityMeasure::Unmeasured,
-            digest: Blake2b256::digest(pid.to_le_bytes()).into(),
+            digest: h.finalize().into(),
         }
     }
 }
@@ -267,22 +333,32 @@ impl Caller {
             .join(" \u{2192} ")
     }
 
-    /// Whether every ancestor in the chain was actually measured.
+    /// Whether this caller may touch a lease at all.
     ///
-    /// False means the platform would not tell us what some ancestor is running:
-    /// it exited mid-walk, its image is gone, or the file at its path was
-    /// replaced after exec (which answers `errSecCSStaticCodeChanged`). A chain
-    /// like that still gets an approval like any other request, and the human
-    /// still sees it; what it must not do is open or ride a LEASE, because a
-    /// lease is the one thing that releases a later request with no human in the
-    /// loop, and the identity that would key it is the one thing we could not
-    /// establish. Fail closed: no measurement, no window.
-    pub fn fully_measured(&self) -> bool {
+    /// The one disqualifier is having no identity whatsoever: an empty chain
+    /// means the daemon could not name a single process behind the request (no
+    /// peer pid, or a pid that resolves to nothing), and every such caller would
+    /// derive the SAME grant key. That is the one shape where a window could be
+    /// shared by callers with nothing in common, so it gets no window. Such a
+    /// request is still gated and still shown to the human; only the auto-release
+    /// is withheld.
+    ///
+    /// An ancestor that could not be MEASURED does not disqualify the chain; it
+    /// is keyed to that process instance instead ([`CodeIdentity::unmeasured`]).
+    /// See [`Caller::unmeasured`] for what that is worth.
+    pub fn may_lease(&self) -> bool {
         !self.chain.is_empty()
-            && self
-                .chain
-                .iter()
-                .all(|a| a.identity.measure != IdentityMeasure::Unmeasured)
+    }
+
+    /// The ancestors the platform would not describe, if any. Empty in the
+    /// normal case; non-empty means this caller's window is keyed partly to a
+    /// process instance rather than wholly to code, which the daemon logs and
+    /// `sigil doctor` reports so the state is visible rather than mysterious.
+    pub fn unmeasured(&self) -> Vec<&Ancestor> {
+        self.chain
+            .iter()
+            .filter(|a| a.identity.measure == IdentityMeasure::Unmeasured)
+            .collect()
     }
 }
 
@@ -658,12 +734,11 @@ pub struct SysProcessTable;
 /// Measure the image running as `pid`: its executable path and its code
 /// identity, both off the one guest code object the platform vouched for.
 ///
-/// `None` when the platform will not answer for that pid at all (it exited, its
+/// `Err` when the platform will not answer for that pid at all (it exited, its
 /// image is gone) or will not vouch for the image (the file at its path was
 /// replaced after exec, `-67034 errSecCSStaticCodeChanged`). The caller keeps
-/// the process in the chain for the human to see, under
-/// [`IdentityMeasure::Unmeasured`], and [`Caller::fully_measured`] then refuses
-/// to lease it.
+/// the process in the chain, under [`IdentityMeasure::Unmeasured`] and keyed to
+/// the process instance, and says so out loud.
 ///
 /// Cost, measured on an M-series Mac (release build, no cache anywhere): 0.15ms
 /// for an ad-hoc Homebrew binary, 0.47ms for `/bin/zsh`, 1.2-2.1ms for a large
@@ -673,54 +748,188 @@ pub struct SysProcessTable;
 /// `op --version` alone, more for a real read) and two below the 236ms the
 /// original unconditional content hash cost on the same chain.
 #[cfg(target_os = "macos")]
-fn measure_running_image(pid: i32) -> Option<(PathBuf, CodeIdentity)> {
+fn measure_running_image(
+    pid: i32,
+) -> Result<(PathBuf, CodeIdentity), crate::peercode::GuestFailure> {
     let m = crate::peercode::measure_guest(pid)?;
-    Some((m.exe, CodeIdentity::from_cdhash(&m.cdhash, m.adhoc)))
+    Ok((m.exe, CodeIdentity::from_cdhash(&m.cdhash, m.adhoc)))
+}
+
+/// One ancestor the platform would not describe, remembered so a human can find
+/// out why their approvals came back.
+///
+/// Non-secret by construction: a pid, a start time, an executable path and a
+/// fixed reason string. It never leaves the machine (`sigil doctor` reads it
+/// over the local control socket) and it holds nothing about the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmeasuredNote {
+    pub pid: i32,
+    pub started: ProcessStart,
+    pub exe: PathBuf,
+    pub reason: crate::peercode::GuestFailure,
+}
+
+impl UnmeasuredNote {
+    /// The ancestor's short name, for a one-line report.
+    pub fn name(&self) -> String {
+        self.exe
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.pid.to_string())
+    }
+}
+
+/// Cap on remembered notes. A handful of ancestors go unmeasurable in a long
+/// session; this exists only so a process churning through unmeasurable
+/// executables cannot grow the daemon. The oldest is evicted, which at worst
+/// costs a repeated log line later.
+const UNMEASURED_NOTES_MAX: usize = 64;
+
+fn unmeasured_registry() -> &'static Mutex<Vec<UnmeasuredNote>> {
+    static NOTES: std::sync::OnceLock<Mutex<Vec<UnmeasuredNote>>> = std::sync::OnceLock::new();
+    NOTES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Every ancestor this daemon has failed to measure, oldest first.
+pub fn unmeasured_notes() -> Vec<UnmeasuredNote> {
+    unmeasured_registry()
+        .lock()
+        .expect("unmeasured registry poisoned")
+        .clone()
+}
+
+/// The unmeasurable ancestors that are still running, for a report about the
+/// state a human is in RIGHT NOW rather than about everything that ever
+/// happened. The process instance is checked, not just the pid: a recycled pid
+/// is a different process and its predecessor's note is history, not news.
+pub fn live_unmeasured_notes() -> Vec<UnmeasuredNote> {
+    unmeasured_notes()
+        .into_iter()
+        .filter(still_running)
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn still_running(note: &UnmeasuredNote) -> bool {
+    start_time(note.pid) == Some(note.started)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn still_running(_note: &UnmeasuredNote) -> bool {
+    false
+}
+
+/// Record an unmeasurable ancestor and log it ONCE per process instance.
+///
+/// Once, not once per command: a gated command walks the same chain every time,
+/// and an ancestor that will not measure now will not measure for the rest of
+/// its life, so per-command logging would bury the daemon log in a repetition
+/// that says nothing new. The dedup key is the process instance (pid plus start
+/// time) and its path, so a genuinely new occurrence still speaks up.
+fn note_unmeasured(note: UnmeasuredNote) {
+    let mut notes = unmeasured_registry()
+        .lock()
+        .expect("unmeasured registry poisoned");
+    if notes.contains(&note) {
+        return;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    eprintln!(
+        "sigil daemon: [{ts}] caller ancestor not measurable \u{b7} {} \u{b7} pid {} \u{b7} {} \u{b7} \
+         leases under it are keyed to this process, not to its code",
+        note.exe.display(),
+        note.pid,
+        note.reason.explain(),
+    );
+    if notes.len() >= UNMEASURED_NOTES_MAX {
+        notes.remove(0);
+    }
+    notes.push(note);
+}
+
+/// The kernel's BSD info for `pid`: parent, start time, and the rest.
+#[cfg(target_os = "macos")]
+fn bsdinfo(pid: i32) -> Option<libc::proc_bsdinfo> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info` and returns
+    // the count written, or <= 0 on failure.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    (n >= size).then_some(info)
+}
+
+/// The executable path `proc_pidpath` reports for `pid`. Used only where the
+/// platform would not describe the image: the measured path always comes off the
+/// guest object instead.
+#[cfg(target_os = "macos")]
+fn proc_path(pid: i32) -> Option<PathBuf> {
+    let mut buf = [0u8; 4096];
+    // SAFETY: proc_pidpath writes at most buf.len() bytes and returns the
+    // length written, or <= 0 on failure.
+    let n =
+        unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    let s = std::str::from_utf8(&buf[..n as usize]).ok()?;
+    Some(PathBuf::from(s))
 }
 
 #[cfg(target_os = "macos")]
 impl ProcessTable for SysProcessTable {
     fn parent(&self, pid: i32) -> Option<i32> {
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        // SAFETY: proc_pidinfo writes at most `size` bytes into `info` and
-        // returns the count written, or <= 0 on failure.
-        let n = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                &mut info as *mut _ as *mut libc::c_void,
-                size,
-            )
-        };
-        if n < size {
-            return None;
-        }
-        let ppid = info.pbi_ppid as i32;
+        let ppid = bsdinfo(pid)?.pbi_ppid as i32;
         (ppid > 0).then_some(ppid)
     }
 
     fn resolve(&self, pid: i32) -> Option<(PathBuf, CodeIdentity)> {
-        if let Some(resolved) = measure_running_image(pid) {
-            return Some(resolved);
-        }
-        // The platform would not vouch for this process's image. It still gets a
-        // name in the chain, because the human on the phone should see the whole
-        // tree that reached the daemon, but it is explicitly unmeasured and so
-        // cannot open or ride a lease. `proc_pidpath` is display only here.
-        let mut buf = [0u8; 4096];
-        // SAFETY: proc_pidpath writes at most buf.len() bytes and returns the
-        // length written, or <= 0 on failure.
-        let n = unsafe {
-            libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32)
+        let failure = match measure_running_image(pid) {
+            Ok(resolved) => return Some(resolved),
+            Err(failure) => failure,
         };
-        if n <= 0 {
-            return None;
-        }
-        let s = std::str::from_utf8(&buf[..n as usize]).ok()?;
-        Some((PathBuf::from(s), CodeIdentity::unmeasured(pid)))
+        // The platform would not describe this process's image. It still gets a
+        // name in the chain, because the human on the phone should see the whole
+        // tree that reached the daemon, and it still gets an identity, because a
+        // self-updating tool that deletes its own binary mid-session is the
+        // common cause and must not silently cost the session its leases. That
+        // identity is the process INSTANCE (pid plus kernel start time), so it
+        // holds while this process lives and no new process can inherit it.
+        //
+        // Both halves have to come from the kernel. Without a start time there is
+        // no instance to key on, so the walk truncates here rather than keying on
+        // a pid that recycles; a shorter chain is a different grant key, never a
+        // wider one.
+        let started = start_time(pid)?;
+        let exe = proc_path(pid)?;
+        note_unmeasured(UnmeasuredNote {
+            pid,
+            started,
+            exe: exe.clone(),
+            reason: failure,
+        });
+        Some((exe, CodeIdentity::unmeasured(pid, started)))
     }
+}
+
+/// The kernel's start time for `pid`.
+#[cfg(target_os = "macos")]
+fn start_time(pid: i32) -> Option<ProcessStart> {
+    let info = bsdinfo(pid)?;
+    Some(ProcessStart {
+        sec: info.pbi_start_tvsec,
+        usec: info.pbi_start_tvusec as u32,
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1011,22 +1220,43 @@ mod tests {
     }
 
     #[test]
-    fn an_unmeasured_ancestor_refuses_to_lease() {
-        // The fail-closed rule, and the reason the pid-derived digest is not
-        // load-bearing: an unmeasured ancestor anywhere in the chain means the
-        // chain may not open or ride a window at all. It does NOT mean "this
-        // coalesces with nothing" -- the same pid derives the same 32 bytes, so
-        // the refusal has to come from here, not from the digest.
+    fn an_unmeasured_ancestor_is_keyed_to_one_process_instance() {
+        // The weaker branch, and exactly how weak. An ancestor the platform will
+        // not describe is keyed to the process instance: the same live process
+        // keeps its window (the point -- a tool that deleted its own binary
+        // mid-session must not silently cost the session its leases), while a
+        // recycled pid must NOT inherit it, which is what the start time is for.
+        let start = ProcessStart {
+            sec: 1_770_000_000,
+            usec: 123_456,
+        };
+        let later = ProcessStart {
+            usec: start.usec + 1,
+            ..start
+        };
         assert_eq!(
-            CodeIdentity::unmeasured(100).digest,
-            CodeIdentity::unmeasured(100).digest,
-            "same pid, same digest: the digest alone does not isolate anything"
+            CodeIdentity::unmeasured(100, start).digest,
+            CodeIdentity::unmeasured(100, start).digest,
+            "one process instance keeps one identity while it lives"
         );
         assert_ne!(
-            CodeIdentity::unmeasured(100).digest,
-            CodeIdentity::unmeasured(101).digest
+            CodeIdentity::unmeasured(100, start).digest,
+            CodeIdentity::unmeasured(100, later).digest,
+            "a recycled pid must not inherit the previous process's window"
+        );
+        assert_ne!(
+            CodeIdentity::unmeasured(100, start).digest,
+            CodeIdentity::unmeasured(101, start).digest,
+            "and a different pid is a different instance"
+        );
+        assert_eq!(
+            CodeIdentity::unmeasured(100, start).measure,
+            IdentityMeasure::Unmeasured,
+            "it keeps its own measure tag, never Signed and never AdHoc"
         );
 
+        // Such a chain may still lease. The only caller that may not is one with
+        // no identity at all, because every one of those derives the same key.
         let ancestor = |identity| Ancestor {
             pid: 7,
             exe: PathBuf::from("/bin/zsh"),
@@ -1038,17 +1268,22 @@ mod tests {
                 ancestor(CodeIdentity::from_cdhash(&[8u8; 20], true)),
             ],
         };
-        assert!(measured.fully_measured());
+        assert!(measured.may_lease());
+        assert!(measured.unmeasured().is_empty());
 
         let mut mixed = measured.clone();
-        mixed.chain.push(ancestor(CodeIdentity::unmeasured(7)));
-        assert!(
-            !mixed.fully_measured(),
-            "one unmeasured ancestor is enough to refuse the window"
+        mixed
+            .chain
+            .push(ancestor(CodeIdentity::unmeasured(7, start)));
+        assert!(mixed.may_lease(), "an unmeasured ancestor still leases");
+        assert_eq!(
+            mixed.unmeasured().len(),
+            1,
+            "but it is reported, so the state is visible rather than mysterious"
         );
         assert!(
-            !Caller { chain: vec![] }.fully_measured(),
-            "and an empty chain is not a measured caller either"
+            !Caller { chain: vec![] }.may_lease(),
+            "a caller with no identity at all gets no window"
         );
     }
 
@@ -1141,7 +1376,7 @@ mod tests {
         // identity.
         assert_eq!(
             measure_running_image(sleeper.pid()).map(|(_, i)| i),
-            Some(id),
+            Ok(id),
             "the same process measures the same way twice"
         );
         let other = Running::spawn(std::path::Path::new("/usr/bin/yes"));
@@ -1167,25 +1402,29 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_pid_with_no_live_image_is_unmeasured_and_never_leases() {
-        // Fail closed: a pid that names no live guest measures as nothing, and
-        // the process table hands back `Unmeasured` (or truncates the walk)
-        // rather than any identity a caller could ride.
-        assert_eq!(measure_running_image(0), None);
+    fn a_pid_that_names_no_process_yields_no_identity_at_all() {
+        // A pid that names nothing is not "unmeasured", it is nothing: there is
+        // no process instance to key on, so the walk truncates rather than
+        // inventing an identity, and a caller with an empty chain gets no window.
+        assert_eq!(
+            measure_running_image(0),
+            Err(crate::peercode::GuestFailure::NoLiveImage)
+        );
         assert_eq!(SysProcessTable.resolve(0), None);
         assert!(
-            !walk_ancestry(&SysProcessTable, 0).fully_measured(),
-            "an empty chain is not a measured caller"
+            !walk_ancestry(&SysProcessTable, 0).may_lease(),
+            "a caller with no identity at all gets no window"
         );
 
-        // The daemon's own chain, on the other hand, is measurable end to end:
-        // this is the shape a real gated command arrives in, and if it were not
-        // fully measured, leases would silently never open.
+        // The daemon's own chain, on the other hand, measures end to end: this is
+        // the shape a real gated command arrives in, and it is what keeps the
+        // unmeasured branch rare rather than routine.
         let me = walk_ancestry(&SysProcessTable, std::process::id() as i32);
         assert!(!me.chain.is_empty(), "this process has ancestors");
+        assert!(me.may_lease());
         assert!(
-            me.fully_measured(),
-            "a normal live chain must measure end to end: {}",
+            me.unmeasured().is_empty(),
+            "a normal live chain measures end to end: {}",
             me.provenance()
         );
     }
@@ -1198,8 +1437,9 @@ mod tests {
         // path used to be able to choose that ancestor's identity, victim's
         // cdhash included, by replacing the file after exec: the static read
         // reported the SUBSTITUTED binary. Measured on the live image instead,
-        // the platform refuses (-67034 errSecCSStaticCodeChanged), the ancestor
-        // becomes `Unmeasured`, and the chain stops being leasable.
+        // the platform refuses (-67034 errSecCSStaticCodeChanged) and the
+        // ancestor drops to an identity of its own process instance, which is
+        // nobody else's and is nothing the attacker chose.
         let dir = scratch("swap");
         let victim = dir.join("victim");
         let running = Running::sleeper_at(&victim);
@@ -1225,9 +1465,9 @@ mod tests {
         std::fs::copy("/bin/ls", &decoy).expect("stage the substitute");
         std::fs::rename(&decoy, &victim).expect("rename the substitute over the exec path");
 
-        let after = measure_running_image(running.pid());
         assert_eq!(
-            after, None,
+            measure_running_image(running.pid()),
+            Err(crate::peercode::GuestFailure::ImageNotVouched),
             "the platform must refuse to vouch for a swapped image"
         );
         let (path, id) = SysProcessTable
@@ -1241,18 +1481,47 @@ mod tests {
         );
         assert_ne!(
             id.digest, before.digest,
-            "and it certainly does not keep the pre-swap identity"
+            "so a window opened before the swap does not survive it"
         );
+        // What it drops to is this process instance and nothing else: the
+        // attacker gets an identity nobody holds, not the victim's.
+        let started = start_time(running.pid()).expect("a live process has a start time");
+        assert_eq!(id, CodeIdentity::unmeasured(running.pid(), started));
+        assert_ne!(
+            id.digest,
+            CodeIdentity::unmeasured(
+                running.pid(),
+                ProcessStart {
+                    usec: started.usec.wrapping_add(1),
+                    ..started
+                }
+            )
+            .digest,
+            "and it is the instance, not the pid, that fixes it"
+        );
+
+        // The daemon says so out loud rather than degrading silently, and while
+        // the process lives it is reported as the state the human is in now.
+        let note = live_unmeasured_notes()
+            .into_iter()
+            .find(|n| n.pid == running.pid())
+            .expect("the unmeasurable ancestor is recorded for `sigil doctor`");
+        assert_eq!(note.reason, crate::peercode::GuestFailure::ImageNotVouched);
+        assert_eq!(note.exe, victim);
+        assert_eq!(note.started, started);
+
+        // A note about a process that has since exited is history, not news.
+        let stale = UnmeasuredNote {
+            pid: running.pid(),
+            started: ProcessStart {
+                usec: started.usec.wrapping_add(1),
+                ..started
+            },
+            ..note
+        };
         assert!(
-            !Caller {
-                chain: vec![Ancestor {
-                    pid: running.pid(),
-                    exe: path,
-                    identity: id,
-                }],
-            }
-            .fully_measured(),
-            "a chain holding it must not lease"
+            !still_running(&stale),
+            "a recycled pid must not keep its predecessor's note alive"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1326,12 +1595,15 @@ mod tests {
             "every field the old cache keyed on is restored: this is the forgery"
         );
 
-        // Either the platform refuses to vouch for the patched image, or the
-        // process is already gone; both are `Unmeasured`. What must never happen
-        // is being handed the pre-patch identity again.
-        let after = measure_running_image(running.pid());
+        // Either the platform refuses to vouch for the rewritten image, or the
+        // process is already gone; both leave the ancestor unmeasured. What must
+        // never happen is being handed the pre-rewrite identity again.
+        let served_old = match measure_running_image(running.pid()) {
+            Ok((_, id)) => id.digest == before.digest,
+            Err(_) => false,
+        };
         assert!(
-            after.is_none_or(|(_, id)| id.digest != before.digest),
+            !served_old,
             "different bytes must not be served the old measurement"
         );
         let _ = std::fs::remove_dir_all(&dir);

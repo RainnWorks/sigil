@@ -101,23 +101,52 @@ pub struct GuestMeasure {
     pub adhoc: bool,
 }
 
+/// Why the platform would not measure a pid. Carried rather than collapsed to
+/// `None` because the daemon says this out loud: a human whose approvals came
+/// back should be told which ancestor stopped being measurable and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestFailure {
+    /// The pid does not resolve to a live code object: it exited, or its
+    /// executable is gone from disk (a self-update that deleted the old binary
+    /// under a running process lands here).
+    NoLiveImage,
+    /// The pid resolves, but the platform will not vouch for the image: the file
+    /// at its path changed after it started (`-67034 errSecCSStaticCodeChanged`),
+    /// or the signature is not one it will validate.
+    ImageNotVouched,
+    /// The image validated but reports no cdhash, or the code-identity machinery
+    /// failed or is absent (every non-macOS build).
+    NoIdentity,
+}
+
+impl GuestFailure {
+    /// One clause, for a log line or a `sigil doctor` row. Never a status code.
+    pub fn explain(self) -> &'static str {
+        match self {
+            GuestFailure::NoLiveImage => "its executable is gone or it has exited",
+            GuestFailure::ImageNotVouched => "its executable changed after it started",
+            GuestFailure::NoIdentity => "the platform reports no code identity for it",
+        }
+    }
+}
+
 /// Measure the image running as `pid`: what the platform calls the code the
 /// kernel is executing, not what happens to sit at that process's path now.
 ///
-/// `None` is the honest "could not measure": the pid does not resolve to a live
-/// guest, or the platform refuses to vouch for the image. The refusal is the
-/// point. The cdhash in a signature is reported without any validity check, so a
-/// caller who rewrites the file under a running process gets the substituted
-/// binary's cdhash out of a static read; here the validity check on the guest
-/// answers `-67034 errSecCSStaticCodeChanged` for exactly that case (verified on
-/// this platform, both in-place overwrite and rename-over), and this function
-/// returns `None` rather than a chosen identity.
+/// An `Err` is the honest "could not measure", carrying which way it failed. The
+/// refusal is the point. The cdhash in a signature is reported without any
+/// validity check, so a caller who rewrites the file under a running process
+/// gets the substituted binary's cdhash out of a static read; here the validity
+/// check on the guest answers `-67034 errSecCSStaticCodeChanged` for exactly that
+/// case (verified on this platform, both in-place overwrite and rename-over),
+/// and this returns [`GuestFailure::ImageNotVouched`] rather than a chosen
+/// identity.
 ///
 /// This is a measurement, never an authorization. It answers "what is that pid
 /// running", not "may it do anything"; the gate that authorizes is
 /// [`require_sigil_app`], and it is a different question.
 #[cfg(target_os = "macos")]
-pub fn measure_guest(pid: i32) -> Option<GuestMeasure> {
+pub fn measure_guest(pid: i32) -> Result<GuestMeasure, GuestFailure> {
     use std::os::unix::ffi::OsStringExt;
     // A cdhash is 20 bytes today (a truncation of the CodeDirectory hash); the
     // buffer is oversized so a longer future hash returns a length rather than
@@ -140,7 +169,11 @@ pub fn measure_guest(pid: i32) -> Option<GuestMeasure> {
         )
     };
     if n <= 0 {
-        return None;
+        return Err(match n {
+            -2 => GuestFailure::NoLiveImage,
+            -5 => GuestFailure::ImageNotVouched,
+            _ => GuestFailure::NoIdentity,
+        });
     }
     let bytes: Vec<u8> = path
         .iter()
@@ -148,9 +181,9 @@ pub fn measure_guest(pid: i32) -> Option<GuestMeasure> {
         .map(|c| *c as u8)
         .collect();
     if bytes.is_empty() {
-        return None;
+        return Err(GuestFailure::NoIdentity);
     }
-    Some(GuestMeasure {
+    Ok(GuestMeasure {
         exe: std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes)),
         cdhash: buf[..n as usize].to_vec(),
         adhoc: adhoc != 0,
@@ -158,8 +191,8 @@ pub fn measure_guest(pid: i32) -> Option<GuestMeasure> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn measure_guest(_pid: i32) -> Option<GuestMeasure> {
-    None
+pub fn measure_guest(_pid: i32) -> Result<GuestMeasure, GuestFailure> {
+    Err(GuestFailure::NoIdentity)
 }
 
 /// The peer's `audit_token_t` (8 words) from a connected unix socket.
@@ -397,7 +430,7 @@ mod tests {
         );
         assert_eq!(
             measure_guest(sleeper.pid()).map(|m| m.cdhash),
-            Some(m.cdhash.clone()),
+            Ok(m.cdhash.clone()),
             "the same process measures the same way twice"
         );
 
@@ -425,9 +458,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_pid_that_is_not_a_live_process_measures_as_nothing() {
-        // Fail closed: "cannot measure" is never a measurement. pid 0 is not a
-        // resolvable guest, and neither is a pid that has exited.
-        assert_eq!(measure_guest(0), None);
+        // Fail closed: "cannot measure" is never a measurement, and the reason
+        // is carried rather than collapsed, because the daemon reports it. pid 0
+        // is not a resolvable guest, and neither is a pid that has exited.
+        assert_eq!(measure_guest(0), Err(GuestFailure::NoLiveImage));
         let dead = {
             let sleeper = Running::spawn("/bin/sleep");
             sleeper.pid()
@@ -436,7 +470,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(
             measure_guest(dead),
-            None,
+            Err(GuestFailure::NoLiveImage),
             "an exited pid measures as nothing"
         );
     }
