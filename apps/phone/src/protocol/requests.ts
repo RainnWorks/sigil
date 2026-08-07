@@ -61,7 +61,34 @@ export interface LeasePolicy {
   kind: "leasable";
   /** The longest lease window the daemon will honor for this grant, in seconds. */
   maxSecs: number;
+  /**
+   * The daemon's own one-line description of how wide the window is, e.g.
+   * `"op read"`, `"op with --account rowmhq.1password.eu"`, or
+   * `"any command with the subcommand read"`. Rendered by the daemon from the
+   * user's rule match conditions, so the phone can state the breadth exactly
+   * instead of guessing it from argv.
+   *
+   * DISPLAY ONLY, and strictly so: render it, never parse it, never branch
+   * behavior on it. It is never an argv, never a secret reference, and never
+   * client-supplied; it arrives inside the sealed, signed request like every
+   * other display field.
+   *
+   * Absent on run-once and omitted when empty. Absent/empty means the sheet has
+   * no daemon-stated breadth to show (an older daemon), never that the window is
+   * narrow. The daemon guarantees at most `COVERS_MAX_CHARS` characters, no
+   * control characters or newlines, whitespace already collapsed, and a single
+   * "…" for any elision; `coverageLabel` (src/lib/format.ts) re-applies that
+   * bound for layout rather than trusting it.
+   */
+  covers?: string;
 }
+
+/**
+ * The longest coverage label the daemon will send, mirroring proto
+ * `COVERS_MAX_CHARS`. The phone treats it as a layout bound it re-applies, not
+ * as a promise it depends on.
+ */
+export const COVERS_MAX_CHARS = 72;
 
 /**
  * The trust level of an SSH challenge's `host`, mirroring proto `HostBinding`

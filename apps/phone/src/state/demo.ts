@@ -56,8 +56,11 @@ export function demoRoutineRequest(): ApprovalRequest {
     ],
     reason: undefined,
     // Leasable grant: the sheet offers approve-once vs keep-approved-for-a-window
-    // (task #57). Run-once demos omit this and show approve-once only.
-    leasePolicy: { kind: "leasable", maxSecs: 900 },
+    // (task #57). Run-once demos omit this and show approve-once only. `covers`
+    // is the daemon's own description of the matched rule, which the caption
+    // states verbatim; real ones range from a bare "op" to a full phrase like
+    // "op read with --vault, containing \"prod\"", so exercise a middle shape.
+    leasePolicy: { kind: "leasable", maxSecs: 900, covers: "op read with --vault" },
     provenance: {
       processChain: ["zsh", "claude", "op read"],
       cwd: "~/Projects/rowm",

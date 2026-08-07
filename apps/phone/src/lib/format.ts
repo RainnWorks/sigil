@@ -4,7 +4,7 @@
  * SecretRef's display-only `segments` / `label`; it never parses the opaque
  * `reference`, which only the owning provider understands.
  */
-import { type SecretRef, type SshChallenge } from "@/src/protocol";
+import { COVERS_MAX_CHARS, type SecretRef, type SshChallenge } from "@/src/protocol";
 
 /** "just now", "12s ago", "4m ago", "2d ago": the brief's terse register. */
 export function relativeTime(fromMs: number, nowMs: number = Date.now()): string {
@@ -79,12 +79,46 @@ export function durationWindow(totalSecs: number): string {
 }
 
 /**
+ * The daemon's lease coverage label, made safe to lay out: `"op read"`,
+ * `"op with --account rowmhq.1password.eu"`, `"any command with the subcommand
+ * read"`. Returns null when there is nothing to show, and the caller then shows
+ * NO coverage clause rather than inventing one.
+ *
+ * This is hygiene, not interpretation. The label is display only: it is never
+ * parsed, nothing branches on its contents, and the words in it are the daemon's
+ * (rendered from the user's own rule), not the phone's. The daemon already
+ * collapses whitespace, strips control characters and bounds the length; this
+ * repeats the bound so a violated guarantee costs a clipped caption instead of a
+ * broken sheet.
+ */
+export function coverageLabel(covers: string | undefined): string | null {
+  if (!covers) return null;
+  // Control characters (including newlines and the separators) become spaces,
+  // then runs of whitespace collapse: a caption is one line either way.
+  const flat = covers
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!flat) return null;
+  // Count code points, not UTF-16 units, so an over-long label is clipped at the
+  // same place the daemon would have clipped it.
+  const chars = Array.from(flat);
+  if (chars.length <= COVERS_MAX_CHARS) return flat;
+  return `${chars.slice(0, COVERS_MAX_CHARS - 1).join("")}…`;
+}
+
+/**
  * The bare command word from an intercepted argv: "op" from
  * ["/usr/local/bin/op", "read", ...]. Display only, and provider-blind: this is
  * whatever binary the shim intercepted, never a provider or account name. It is
  * argv[0] and may differ from the process chain's leaf, which the daemon resolves
  * separately. Returns null for an empty or blank argv so callers phrase
  * generically instead of naming a command that isn't there.
+ *
+ * It names the ACTOR on the deny control ("Deny and block op for 1h"), which is
+ * its only remaining caller. It no longer describes lease breadth: the sheet's
+ * coverage caption states {@link coverageLabel}, the daemon's rendering of the
+ * user's rule, because argv[0] never knew how wide the rule was.
  */
 export function commandWord(command: string[]): string | null {
   const argv0 = command[0]?.trim();
