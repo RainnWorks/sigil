@@ -126,8 +126,10 @@ Residuals for the security-reviewer to weigh:
 | Ancestry is walked kernel-side; the grant key binds code identity, never pids | `lease.rs::walk_ancestry`, `grant_key` (excludes pids) | `lease.rs::ancestry_walk_is_root_first_and_stops_at_init`, `grant_key_ignores_recycled_pids`, `grant_key_changes_with_root_scope_or_ancestry` |
 | The ancestry walk terminates on cycles / bounded depth | `lease.rs::walk_ancestry` (`MAX_ANCESTRY_DEPTH`, `seen` set) | `lease.rs::ancestry_walk_terminates_on_a_cycle` |
 | A phone-claimed grant key is ignored; the daemon derives and trusts its own | `daemon.rs::fulfill` (uses `gk`), `request.rs::InstallLease` (echo only), `softphone/lib.rs` (empty `grant_key`) | reviewed by inspection; exercised by `daemon.rs::lease_decision_covers_the_next_identical_request` |
-| The ancestor "code identity" is the platform's code-signing measurement where one exists | `lease.rs::{measure_executable,CodeIdentity}`, `peercode.rs::cdhash_for_path`, `peercode.m::sigil_cdhash_for_path` (`SecStaticCodeCreateWithPath` + `SecCodeCopySigningInformation`, `kSecCodeInfoUnique`) | `peercode.rs::a_signed_binary_yields_a_cdhash_and_an_ad_hoc_one_does_not`, `lease.rs::a_signed_system_binary_measures_as_the_platform_identity`, `measuring_the_same_binary_twice_is_stable_and_distinguishes_binaries`, `an_ad_hoc_binary_falls_back_to_its_bytes`, `an_unsigned_artifact_falls_back_to_its_bytes`. **Scope of the claim (implementer's statement, not a verdict):** it is a measurement, not an authentication; unsigned and ad-hoc binaries keep the content hash under a separate domain tag; a signed binary's pages are enforced by the kernel at exec, not re-validated here. Residual: measurement reads the exec path at approval time. |
-| The two identity measures cannot collide in a grant key | `lease.rs::grant_key` (length-prefixed `IdentityMeasure::tag`) | `lease.rs::the_two_measures_are_domain_separated_in_the_grant_key`, `a_cdhash_measurement_is_stable_and_distinguishing`, `an_unmeasurable_ancestor_coalesces_with_nothing` |
+| The ancestor "code identity" is the platform's measurement of the image that ancestor is RUNNING | `lease.rs::{measure_running_image,CodeIdentity,SysProcessTable::resolve}`, `peercode.rs::measure_guest`, `peercode.m::sigil_guest_measure` (`SecCodeCopyGuestWithAttributes` by pid + `SecCodeCheckValidityWithErrors` + `kSecCodeInfoUnique`, all off one guest object) | `peercode.rs::{a_running_signed_binary_measures_as_itself_and_names_its_own_path,an_ad_hoc_signature_is_reported_as_having_no_signer,a_pid_that_is_not_a_live_process_measures_as_nothing}`, `lease.rs::{a_running_signed_binary_measures_as_the_platform_identity,an_ad_hoc_process_measures_under_its_own_tag,a_pid_with_no_live_image_is_unmeasured_and_never_leases,swapping_the_file_under_a_running_process_does_not_change_what_it_measures_as}`. **Scope of the claim (implementer's statement, not a verdict):** it is a measurement, not an authentication, and it is **not tamper-evidence** and must not be described as such. It answers "what does the platform say this live pid is running", nothing more: it says nothing about what that process later loaded or, for an interpreter, what script it is running. The validity check is what makes the answer about the running image rather than about a file: a post-exec swap of the executable answers `-67034` and the ancestor becomes `Unmeasured`, which refuses to lease (`Caller::fully_measured`). It catches SUBSTITUTION, not page tampering: measured here, patching bytes under an intact CodeDirectory does not move the cdhash and the check still succeeds (the identity did not move; the kernel is what refuses to run a page-tampered image). Residual, unchanged and dominant: an attacker who can run code as this user spawns UNDER the honest ancestors instead, and that chain matches by construction. **Reviewer qualification (round 3, R3-F1), against the superseded static-path measure this replaced: "the measure names the FILE AT THE PATH, not the running image, and a same-UID caller can make it say anything by rewriting that path after exec (demonstrated) [...] Treat this row as UNPROVEN for any adversary who can write an ancestor's exec path until the measurement moves to the guest code object."** The measurement has moved to the guest code object; the row awaits an independent re-review on those terms. |
+| Nothing about the measurement is cached | `lease.rs::{SysProcessTable,measure_running_image}` (no cache type exists) | Behavioural, by construction: the `FileStamp` cache and `measure_executable` are deleted, so every gated command re-measures every ancestor. This closes R3-F2 by removing what it exploited (every stamp field was owner-settable, so a same-length in-place rewrite plus `utimensat` was served the pre-rewrite identity for the daemon's lifetime) rather than by adding `ctime` to the stamp. Cost of having no cache, measured (release, M-series): 6.3ms for a real 6-deep chain per gated command, against 40-90ms for spawning `op --version` alone. |
+| The four identity measures cannot collide in a grant key | `lease.rs::grant_key` (length-prefixed `IdentityMeasure::tag`: `cdhash`, `adhoc`, `bytes`, `none`) | `lease.rs::the_measures_are_domain_separated_in_the_grant_key` (all six pairs, same 32 bytes), `a_cdhash_measurement_is_stable_and_distinguishing` (an ad-hoc cdhash and a signed one share a digest and must not share a key), `an_unmeasured_ancestor_refuses_to_lease` |
+| An ancestor the daemon could not measure never opens or rides a lease | `lease.rs::Caller::fully_measured`, `daemon.rs::fulfill` (`may_lease` gates both `token_for` and the grant) | `lease.rs::{an_unmeasured_ancestor_refuses_to_lease,a_pid_with_no_live_image_is_unmeasured_and_never_leases,swapping_the_file_under_a_running_process_does_not_change_what_it_measures_as}`. Closes R3-F5's overstatement: the `Unmeasured` digest is still `BLAKE2b(pid)` and so does NOT "coalesce with nothing" (same pid, same digest); the refusal is this rule, not the digest. Such a request is still gated and still shown to the human; it is the auto-release window it cannot touch. |
 
 ## 8. Fail closed, leases bounded (invariants #7, #8)
 
@@ -876,10 +878,12 @@ These are real and deliberately surfaced, not defects hidden.
    from a Mac. Until verified, the biometric factor is inert (returns
    `NeedsVerification`), so the effective shipping gate is either the phone or
    residual #1. The third item that used to sit here, the ancestor code-signing
-   `identity`, is closed: it is now the platform cdhash where one exists, with a
-   domain-separated content-hash fallback, and it is exercised headlessly (see
-   §7). Its own residuals are stated in the `lease.rs` module docs and §7 rather
-   than here.
+   `identity`, is closed: it is now the platform's cdhash of the image each
+   ancestor is RUNNING, taken off a guest code object the platform vouched for
+   (ad-hoc signatures under their own tag, unmeasurable ancestors refused a
+   lease), and it is exercised headlessly (see §7). It is a measurement and not
+   tamper-evidence; its own residuals are stated in the `lease.rs` module docs
+   and §7 rather than here.
 
 3. **The SA token transits daemon RAM (unavoidable) and one copy is not
    zeroized.** The token is the injected credential, so it must reach the child
@@ -3574,3 +3578,315 @@ House-rule check: the implementer's edits to this document add behavior rows to
 §10a only and contain no verdict language, and the round-2 verdict section above
 is untouched. Nothing further is outstanding from rounds 1 or 2; this reviewer has
 no objection to the landing.
+
+## Independent review verdict, round 3: caller code identity measured by cdhash (`6c71207`, merged `a032e6c`, 2026-08-07)
+
+Scope: the whole of `6c71207` -- `IdentityMeasure`/`CodeIdentity` and the measure
+tag in `grant_key`, the `FileStamp` measurement cache, `peercode.m::sigil_cdhash_for_path`
+and its Rust wrapper, and the doc changes in `lease.rs`, the brief, and §7 above.
+Reviewer wrote none of this code. Findings are numbered **R3-Fn** to avoid
+colliding with F1-F8, F9/F10 or R2-F1..F6. Gate re-measured on the merged tree:
+**561 tests pass, 0 failures; clippy `-D warnings` clean; `cargo fmt --check` clean.**
+
+**VERDICT: SOUND IN CONSTRUCTION, OVERSTATED IN CLAIM. Does not block the landing;
+does require the two doc corrections below and should not be described to anyone
+as tamper-evidence.** The domain separation is right, the ad-hoc call is right, and
+the kernel-enforcement reasoning is (independently verified) true of the image the
+kernel executed. What is not true is the sentence that connects them: because the
+measure is a *static read of the path* rather than a measurement of the *running
+image*, a same-UID caller chooses what it is measured as, and the kernel is not in
+that loop at all. One HIGH (R3-F1), one MEDIUM-HIGH regression against the code
+this replaced (R3-F2), and four smaller items.
+
+Nothing here changes the round-1 or round-2 verdicts, and nothing here weakens the
+rule-scoped-lease or RAM-cached-credential conclusions on their own terms: those
+rested on the caller chain telling *honest* tool trees apart, which is still what
+it does. They did not rest on the chain resisting an adversary, and after this
+change they still must not.
+
+### Rulings on the three flags the implementer raised
+
+**1. The exec-path measurement race, and the static-vs-dynamic trade: the trade is
+WRONG, and it is not the trade it was described as.** The dynamic answer is not
+the expensive one. Measured on this machine (M-series, macOS 26.3), per ancestor:
+
+| measurement | cost |
+|---|---|
+| `SecCodeCopyGuestWithAttributes` + `SecCodeCheckValidityWithErrors` + cdhash, warm (large ad-hoc binary, `node`) | **0.08 - 0.12 ms** |
+| same, cold / first call in a process | 1.5 - 7.6 ms |
+| current static path measure, cold (implementer's own figures) | 0.6 ms small, ~11 ms for the 40 MB `op` |
+| `SecStaticCodeCheckValidity` strict, the rejected option | ~200 ms |
+
+So the dynamic guest lookup costs *less* than the static cdhash it would replace,
+needs no measurement cache to be affordable, and closes the race instead of
+conceding it. It also detects both swap flavours: with the process still running,
+overwriting its path in place (`cp -f`) or renaming a new file over it both turn
+`SecCodeCheckValidityWithErrors(guest, NULL)` from `0` into `-67034`
+(`errSecCSStaticCodeChanged`), while the static read reports the substituted
+file's identity without complaint. This is the same machinery `peercode.m`
+already uses for the keystore gate, which is consequently *not* vulnerable to this
+(verified: after a swap, the guest requirement check refuses).
+
+`csops(pid, CS_OPS_CDHASH)` is not an option here: it returns `EPERM`
+cross-process and `EINVAL` for self on this OS version.
+
+**The cache stamp does not narrow the race, and it does give false confidence.**
+The before/after stamp comparison guards a *benign* concurrent replacement (it
+declines to file a torn measurement). It is not an adversarial check, and the
+stamp itself is forgeable -- see R3-F2.
+
+**2. Kernel enforcement: yes, the kernel is the real enforcement, and it is real
+and broader than the one binary tested.** Independently verified here:
+
+* A page-tampered copy of a *platform* binary (`/bin/ls`) is SIGKILLed at exec
+  (exit 137), as reported.
+* A page-tampered copy of a *non-platform, Developer-ID, hardened-runtime* binary
+  (`1Password.app/Contents/MacOS/1Password`) is also SIGKILLed (exit 137). The
+  generalisation past platform binaries holds on Apple Silicon.
+* Appending bytes past the signed limit does not move the cdhash, but the result
+  is also SIGKILLed at exec, so it collapses into the same story.
+* `csops(CS_OPS_STATUS)` on a plain ad-hoc linker-signed, non-platform process
+  here returns `CS_VALID|CS_KILL`, so the kill applies to the `Content` population
+  too, not only to signed code.
+
+What a signed binary whose signature the kernel does not enforce means in practice
+is therefore *not* mainly about weakly-signed binaries; on this platform that set
+is close to empty. It is about the three places enforcement does not reach: pages
+that are never faulted; code loaded into a process after exec where library
+validation and the hardened runtime are off (a cdhash names the executable, never
+what it later loaded or, for an interpreter, what script it is running); and, the
+one that matters, **the file being swapped after exec, which the kernel has no
+opinion about because it is not the image it validated.** The docs must say that
+the kernel vouches for the image it executed, not for the answer this code returns.
+
+**3. The ad-hoc fallback is CORRECT, and the domain separation is correctly
+implemented -- but it prevents confusion, not a chooser.** Treating an ad-hoc
+signature as no identity is the right call: it has no signer, so its cdhash
+asserts nothing a content hash does not, and tagging it `Signed` would be a lie
+told in a security-relevant field. The separation itself is sound: the tag is
+length-prefixed ahead of the digest in `grant_key` (`lease.rs:307-310`), exactly
+as `ScopeKind` is, and the three-way separation is tested.
+
+On the confusion attack specifically: **no, an attacker cannot use the tags to
+land on a victim's grant key, because the tags are not where the weakness is.** An
+attacker freely *chooses* which branch their file takes (ad-hoc sign it for
+`Content`; give it a non-ad-hoc signature blob for `Signed`), so the separation
+buys nothing against them; it buys correctness against accidental collision, which
+is worth having. Having chosen the branch they still need the victim's path and
+digest -- and R3-F1 hands them both. Worth recording: **`kSecCodeInfoUnique` is
+returned without any validity check, so the cdhash a file reports is whatever its
+CodeDirectory says, not a fact about its bytes.** Verified: a page-tampered copy
+of `/bin/ls` reports the pristine cdhash `4f35b316...`, and a tampered copy of the
+40 MB `op` reports the pristine `9c2bfc85...`. A file can therefore claim any
+identity its author cares to copy; only the kernel stops it *running*.
+
+### Findings
+
+**R3-F1 (HIGH). The grant key measures the file at the ancestor's path, not the
+code that is running there, so a caller who can write that path chooses its own
+code identity -- including a victim's exactly.** `lease.rs:692-699`
+(`SysProcessTable::identity` -> `exe(pid)` -> `measure_executable`),
+`lease.rs:620-648`, `peercode.m:113` (`SecStaticCodeCreateWithPath` on a path).
+
+Demonstrated end to end. A process is started from a path holding an ad-hoc binary
+(measured `Content`, digest of those bytes). While it is still running, the file at
+that path is replaced with `/bin/ls`. The static measure the daemon uses then
+reports `IdentityMeasure::Signed` with `/bin/ls`'s cdhash
+`4f35b3163233a684d47f496a1e050f518de37621` for a process that is running none of
+that code. The same result via `rename(2)` as via in-place overwrite. Meanwhile the
+dynamic guest check on that pid returns `-67034 errSecCSStaticCodeChanged`, i.e.
+the platform can tell and this code did not ask.
+
+Attack, concretely: the attacker wants an ancestor entry that hashes identically to
+a victim's. They copy the victim binary aside, put their own executable at the
+victim's path, exec it, restore the genuine file at that path, then run the gated
+command. Every ancestor field the grant key binds -- path, measure tag, digest --
+now matches the victim's, so `grant_key` collides with the live lease and the
+release happens with **no phone round trip**, including the sealed-`env` lease that
+holds unsealed credentials in daemon RAM. The paths this requires write access to
+are ordinary user-writable ones on this machine: everything under `/opt/homebrew`,
+`~/.local/bin`, cargo/npm shims, and `~/.sigil/bin/sigil` itself.
+
+*Invariant:* #6 (caller identity is daemon-verified). The daemon does derive the
+identity itself -- and the value it derives is attacker-selected. *Severity:* HIGH
+rather than a restatement of the conceded same-UID residual, because the module
+docs sell this measure as backed by kernel tamper-evidence
+(`lease.rs:31-38`: "anything that actually appears in a chain under this measure is
+code the kernel accepted as that cdhash"). That sentence is false as written, and
+it is the sentence a future reader will lean on.
+
+*Fix:* measure the running image. Resolve the ancestor to a guest code object
+(`SecCodeCopyGuestWithAttributes` with `kSecGuestAttributePid`), call
+`SecCodeCheckValidityWithErrors(code, kSecCSDefaultFlags, NULL, NULL)` and treat
+anything but `errSecSuccess` as `Unmeasured` (the swap shows up as `-67034`), then
+take `kSecCodeInfoUnique` from that object. Costs less than the current cold path
+(table above) and removes the need for the `FileStamp` cache entirely; if a cache
+is still wanted, key it on pid plus process start time, not on the file. Note the
+leaf could do better still: `peercode::peer_audit_token` already gives a
+recycle-proof identity for the socket peer, and only the ancestors need the pid
+form.
+
+*Failing test:* the reproduction harness is at
+`/private/tmp/claude-501/-Users-tom-Projects-op-remote/f5633d91-0072-489e-a1eb-664011533f87/scratchpad/`
+(`measure_probe.c`, `guest_req.c`); it is a two-process scenario, so it belongs in
+an ignored integration test rather than the unit suite.
+
+**R3-F2 (MEDIUM-HIGH, and a regression against the code this replaces). The
+measurement cache serves a stale identity for a stamp-preserving rewrite; every
+field of `FileStamp` is settable by the file's owner.** `lease.rs:559-586`
+(`FileStamp`), `lease.rs:620-648` (`measure_executable`).
+
+`path`, `dev`, `ino`, `size`, `mtime`, `mtime_nsec`: an in-place rewrite at the
+same length preserves the first four, and `utimensat` restores the last two to the
+nanosecond. `ctime` is the one field that moves, and it is not in the stamp. So a
+same-UID attacker patches an ancestor executable in place, pads to the original
+length, re-signs it ad-hoc so the kernel will still run it, restores mtime, and the
+daemon serves the *pre-patch* identity for the rest of its lifetime. The pre-change
+code re-read and re-hashed the file on every gated command and would have caught
+exactly this; the cache is what introduces it. The comment at `lease.rs:559-562`
+("a rebuild, a `brew upgrade`, or a swap of the binary invalidates the entry by
+missing it") is true of honest change only and should say so.
+
+Proven against the real code, not by inspection. Dropping this into
+`lease.rs`'s test module fails today:
+
+```rust
+#[test]
+fn a_stamp_preserving_rewrite_is_re_measured() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = scratch("cache-forge");
+    let f = dir.join("artifact");
+    std::fs::write(&f, vec![b'A'; 4096]).unwrap();
+    let first = measure_executable(&f).expect("measures");
+    let stamp = FileStamp::of(&f).unwrap();
+
+    std::fs::write(&f, vec![b'B'; 4096]).unwrap(); // same length, new bytes
+    let ts = libc::timespec { tv_sec: stamp.mtime, tv_nsec: stamp.mtime_nsec };
+    let times = [ts, ts];
+    let c = std::ffi::CString::new(f.as_os_str().as_bytes()).unwrap();
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(rc, 0, "the owner may always restore mtime");
+    assert_eq!(Some(&stamp), FileStamp::of(&f).as_ref(), "all five fields restored");
+
+    let second = measure_executable(&f).expect("measures");
+    assert_ne!(first.digest, second.digest,
+        "different bytes must not be served the old measurement");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+```
+
+Observed: `assertion left != right failed: different bytes must not be served the
+old measurement`, both sides `75dd7676...`. The existing
+`replacing_the_file_at_a_path_invalidates_the_cached_measurement` passes only
+because it moves the size as well as the content.
+
+*Fix:* add `ctime`/`ctime_nsec` to `FileStamp` (available on `MetadataExt`,
+un-forgeable by the owner) -- one line, and it kills the cheap version of this. The
+finding disappears outright under R3-F1's fix, which stops keying identity on a
+file at all.
+
+**R3-F3 (MEDIUM, doc-correctness). "A userspace re-check does not work" is half
+right, and the wrong half is the one written down.** `lease.rs:36-38`,
+`peercode.m:100-105`.
+
+Measured on a fresh, never-executed page-tampered copy of `/bin/ls`:
+`SecCodeCopySigningInformation` returns the pristine cdhash;
+`SecStaticCodeCheckValidity(code, kSecCSDefaultFlags, NULL)` returns `0 SUCCESS`
+(the implementer's result reproduces exactly); but
+`SecStaticCodeCheckValidity(code, kSecCSDefaultFlags | kSecCSCheckAllArchitectures | kSecCSStrictValidate, NULL)`
+returns `-67671`, a refusal (it decodes to a generic internal error rather than a
+named tamper verdict, but it is emphatically not success). `codesign -v` also
+catches the same file, on `/bin/ls` (exit 1)
+and on the tampered 40 MB `op` (exit 1). So the accurate statement is "a
+*default-flag* validity check passes a page-tampered Mach-O, and a strict one costs
+~200 ms", not "a userspace re-check still passes it". Keep the decision -- at
+~200 ms per ancestor it is the right call, and R3-F1's dynamic check is both
+cheaper and more relevant -- but fix the sentence in both files. The wrong version
+would justify skipping validation somewhere it is the only check available.
+
+**R3-F4 (LOW-MEDIUM). `Ancestor.exe` and `Ancestor.identity` are resolved by two
+independent `proc_pidpath` calls, so they can describe two different processes.**
+`lease.rs:238` (the trait takes a pid, not a path), `lease.rs:251-252` (walk
+resolves the path), `lease.rs:696` (`identity` resolves it again). A pid recycled
+between the two pairs one process's path with another's digest. This fails closed
+-- the mismatched pair derives a key nobody holds, so the caller takes a fresh
+approval -- and it is not a widening. It is worth removing anyway because it costs
+nothing: pass the already-resolved path into the measurement and the window is
+gone. R3-F1's fix should take the identity from the same guest object the walk
+resolved, for the same reason.
+
+**R3-F5 (LOW). `Unmeasured` does not "coalesce with nothing"; it coalesces with the
+same pid at the same path.** `lease.rs:138-141`, `lease.rs:188-193`. The digest is
+`BLAKE2b(pid)`, so two requests whose ancestor is unmeasurable at the same path and
+the same pid derive one grant key. That reintroduces, in the one branch where the
+measure failed, precisely the pid dependence the grant key excludes pids to avoid
+(and which `grant_key_ignores_recycled_pids` exists to pin). A caller can force the
+branch deliberately (make its own exec path unreadable after exec) and can choose
+its pid by spawning; the victim would have to be `Unmeasured` at the same path too,
+so this is a narrow equivalence rather than a widening, hence LOW. *Fix if touched:*
+derive the unmeasured digest from pid plus process start time, or -- the
+fail-closed reading -- decline to lease at all when any ancestor is `Unmeasured`.
+The comment at `lease.rs:138-141` and the test name
+`an_unmeasurable_ancestor_coalesces_with_nothing` both currently overstate.
+
+**R3-F6 (LOW, pre-existing). `std::fs::read` of an ancestor executable is
+unbounded.** `lease.rs:634`. A padded ad-hoc Mach-O of arbitrary size is read whole
+into daemon memory on the `Content` path -- which on this machine is most of a dev
+box (`cargo`, `node` and the `sigil` shim itself are all ad-hoc here, so the leaf of
+every chain takes this path). The old code did the same on every request, so this is
+not a regression, and the failure mode is fail-closed (daemon death takes the leases
+with it). Streaming into the hasher removes it.
+
+### Verified clean
+
+* **Domain separation of the three measures.** Length-prefixed tag ahead of the
+  digest, no shared namespace, tested three ways. No collision is constructible
+  through the tags.
+* **`caller_pid` is not client-supplied.** `sshagent.rs:324` reads it via
+  `lease::peer_pid` off the socket; the `Option<i32>` field is populated by the
+  daemon and is `None` in tests only. Invariant #6 holds on that axis.
+* **Secrets, logging, relay.** `CodeIdentity` is 33 bytes of non-secret
+  measurement, never persisted, never logged, never sent. Provenance to the phone
+  is still file names only, the grant hex is still echo-only, and no part of this
+  change touches the op child's stdout path, the envelope, or the relay.
+  Invariants #2 and #3 untouched.
+* **Fail-closed on every measurement error.** An unresolvable exe truncates the
+  walk (a shorter chain is a different key, never a superset), an unmeasurable one
+  becomes `Unmeasured` with a pid-derived digest, and a torn measurement is
+  returned but not cached. No error path falls through to a wider key. Invariant #7
+  holds.
+* **The keystore gate is not affected by R3-F1.** It uses the audit token and a
+  dynamic guest check, which refuse after a post-exec swap (verified). R2-F4's
+  closure stands.
+* **Ad-hoc classification.** `peercode.m:155` tests `kSecCodeSignatureAdhoc`
+  explicitly and returns "no identity"; `errSecCSUnsigned` returns the same. Both
+  land on `Content`. Correct, and correctly tested on both sides.
+
+### Behaviour change worth telling the human about
+
+Two, and the second is the one that is easy to get wrong:
+
+1. **Grant keys moved once.** Live leases from a pre-upgrade daemon do not match
+   afterwards. RAM-only, so the cost is one extra approval. Accurately stated by
+   the implementer.
+2. **A re-signature of unchanged code is now the same caller; a rebuild is not.**
+   The cdhash covers the CodeDirectory, so it moves whenever the code moves. What
+   no longer forces a fresh approval is a certificate renewal, a re-notarisation,
+   or any other re-sign of byte-identical code inside a live lease window -- and
+   under the old content hash that would have re-prompted, because the signature
+   bytes changed. This is the correct behaviour and the window is bounded by the
+   lease TTL, but "leases survive a rebuild of signed software" is the wrong way to
+   describe it and should not be written anywhere: they survive a re-*sign*.
+
+### Residuals restated, so this change is not read as narrowing them
+
+The caller-chain imitation class is **unchanged by this commit and remains the
+dominant limit**. An attacker who can run a process as this user does not need any
+of the above: they can spawn under the same ancestors and run the genuine gated
+command, and the chain matches by construction. The cdhash measure adds no defence
+there. Its value is telling *honest* tool trees apart, and R2's consent-caption
+reasoning ("a genuinely different tool tree does not ride the window") should
+continue to be read as a statement about honest trees only. Alongside it stand the
+already-recorded residuals this change does not touch: the shim symlink making the
+chain leaf identical for every gated command, lease-window imitation, approved-
+consumer misuse, and metadata at the relay.

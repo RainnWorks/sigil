@@ -81,52 +81,76 @@ int sigil_audit_satisfies_requirement(const void *token, size_t token_len,
     return (st == errSecSuccess) ? 0 : 1;
 }
 
-// The platform code identity of the executable at `path`: its cdhash
-// (kSecCodeInfoUnique), the digest of the CodeDirectory that the signature
-// commits to and that the kernel enforces against the pages it maps.
+// The code identity of the image RUNNING as `pid`, in one resolution: its
+// executable path and its cdhash (kSecCodeInfoUnique), plus whether the
+// signature has a signer.
 //
 // This is a MEASUREMENT, not an authorization: nothing here decides whether a
-// binary may do anything. It exists so the lease grant key names an ancestor by
-// what the platform says it is rather than by a hash we compute ourselves.
+// process may do anything. It exists so the lease grant key names an ancestor by
+// what the platform says that RUNNING PROCESS is.
 //
-// Only a signature with a signer yields one. An ad-hoc signature (flags &
-// kSecCodeSignatureAdhoc) has no signer at all: its cdhash is a digest of the
-// binary and nothing more, exactly as strong as the caller's own content hash
-// and no stronger, so calling it a signing identity would overstate it. Ad-hoc
-// is reported as absent and the caller falls back to (and separately tags) its
-// own hash. A platform binary carries no certificate chain either, but the
-// kernel's trust cache vouches for it, so it counts.
+// Keyed on the live pid, never on a path. SecCodeCopyGuestWithAttributes with
+// kSecGuestAttributePid resolves the pid to the code object the kernel is
+// actually running, and SecCodeCheckValidityWithErrors then asks the platform
+// whether that image is still intact. That check is the load-bearing part:
+// kSecCodeInfoUnique is returned WITHOUT any validity check, so on its own a
+// cdhash is only whatever the CodeDirectory claims. Measured on this platform:
+// replace the file at a running process's path (in place or by rename) and the
+// signing information happily reports the substituted binary's cdhash while the
+// validity check turns into -67034 errSecCSStaticCodeChanged. So anything but
+// errSecSuccess is reported here as "could not measure", and the caller must not
+// coalesce on it. This is the same machinery sigil_peer_satisfies_requirement
+// uses for the keystore gate.
 //
-// Deliberately does NOT call SecStaticCodeCheckValidity: on this platform it
-// costs up to ~200ms on a large signed binary, and (measured) it still returns
-// success for a Mach-O whose text pages were altered under an intact
-// CodeDirectory. The tamper-evidence comes from the kernel refusing to execute
-// such a binary at all, not from a userspace re-check. See the Rust caller's
-// docs for the honest statement of what that does and does not buy.
+// `*adhoc_out` distinguishes a signature with a signer from an ad-hoc one (flags
+// & kSecCodeSignatureAdhoc). An ad-hoc signature has no signer at all: its
+// cdhash is a digest of the binary and nothing more, so the caller tags it as a
+// separate KIND of measurement rather than as a signing identity. A platform
+// binary carries no certificate chain either, but the kernel's trust cache
+// vouches for it, so it counts as signed.
 //
-// >0 = number of cdhash bytes written to `out`
-//  0 = no platform identity (unsigned, ad-hoc, or no cdhash in the signature)
+// What the validity check catches is SUBSTITUTION: an image whose identity is
+// not the one the kernel executed. It is not a page check. Measured: patching
+// bytes under an intact CodeDirectory leaves the cdhash where it was and the
+// check still succeeds, because the identity genuinely did not move; the kernel
+// is what refuses to RUN a page-tampered image. A static re-validation would not
+// close that either -- with default flags SecStaticCodeCheckValidity passes a
+// page-tampered Mach-O, and the strict flags that refuse one
+// (kSecCSCheckAllArchitectures | kSecCSStrictValidate) cost ~200ms per binary.
+//
+// >0 = number of cdhash bytes written to `out`; `path_out` holds the running
+//      image's executable path and `*adhoc_out` is 0 (signer) or 1 (ad-hoc)
+//  0 = the image validated but reports no cdhash
 // -1 = bad arguments
-// -2 = the path is not a code object
+// -2 = the pid does not resolve to a live guest (exited, or its image is gone)
 // -3 = signing information unavailable
-// -4 = `out` is too small for the cdhash
-int sigil_cdhash_for_path(const char *path, unsigned char *out, size_t out_len) {
-    if (path == NULL || out == NULL) {
-        return -1;
-    }
-    CFStringRef path_str = CFStringCreateWithCString(NULL, path, kCFStringEncodingUTF8);
-    if (path_str == NULL) {
-        return -1;
-    }
-    CFURLRef url = CFURLCreateWithFileSystemPath(NULL, path_str, kCFURLPOSIXPathStyle, false);
-    CFRelease(path_str);
-    if (url == NULL) {
+// -4 = `out` or `path_out` is too small
+// -5 = the running image did not validate: it was swapped after exec
+//      (-67034), or it is unsigned, or the platform refused for another reason
+int sigil_guest_measure(int pid, unsigned char *out, size_t out_len, char *path_out,
+                        size_t path_len, int *adhoc_out) {
+    if (out == NULL || path_out == NULL || adhoc_out == NULL || path_len == 0) {
         return -1;
     }
 
-    SecStaticCodeRef code = NULL;
-    OSStatus st = SecStaticCodeCreateWithPath(url, kSecCSDefaultFlags, &code);
-    CFRelease(url);
+    pid_t p = (pid_t)pid;
+    CFNumberRef pid_num = CFNumberCreate(NULL, kCFNumberIntType, &p);
+    if (pid_num == NULL) {
+        return -3;
+    }
+    const void *keys[] = {kSecGuestAttributePid};
+    const void *values[] = {pid_num};
+    CFDictionaryRef attrs = CFDictionaryCreate(NULL, keys, values, 1,
+                                               &kCFTypeDictionaryKeyCallBacks,
+                                               &kCFTypeDictionaryValueCallBacks);
+    CFRelease(pid_num);
+    if (attrs == NULL) {
+        return -3;
+    }
+
+    SecCodeRef code = NULL;
+    OSStatus st = SecCodeCopyGuestWithAttributes(NULL, attrs, kSecCSDefaultFlags, &code);
+    CFRelease(attrs);
     if (st != errSecSuccess || code == NULL) {
         if (code != NULL) {
             CFRelease(code);
@@ -134,16 +158,33 @@ int sigil_cdhash_for_path(const char *path, unsigned char *out, size_t out_len) 
         return -2;
     }
 
+    // The whole point of the dynamic path: does the platform still vouch for the
+    // image this pid is running? A post-exec swap of the file answers -67034 here
+    // and answers the substituted binary's cdhash below, so this must gate.
+    st = SecCodeCheckValidityWithErrors(code, kSecCSDefaultFlags, NULL, NULL);
+    if (st != errSecSuccess) {
+        CFRelease(code);
+        return -5;
+    }
+
     CFDictionaryRef info = NULL;
-    st = SecCodeCopySigningInformation(code, kSecCSDefaultFlags, &info);
+    st = SecCodeCopySigningInformation((SecStaticCodeRef)code, kSecCSDefaultFlags, &info);
     CFRelease(code);
     if (st != errSecSuccess || info == NULL) {
         if (info != NULL) {
             CFRelease(info);
         }
-        // An unsigned binary answers here rather than erroring; either way there
-        // is no platform identity to report.
-        return (st == errSecCSUnsigned) ? 0 : -3;
+        return -3;
+    }
+
+    // The path comes off the SAME guest object as the measurement, so the two can
+    // never describe different processes (a pid recycled between two independent
+    // lookups would).
+    CFURLRef exe = (CFURLRef)CFDictionaryGetValue(info, kSecCodeInfoMainExecutable);
+    if (exe == NULL ||
+        !CFURLGetFileSystemRepresentation(exe, true, (UInt8 *)path_out, (CFIndex)path_len)) {
+        CFRelease(info);
+        return -4;
     }
 
     uint32_t flags = 0;
@@ -151,12 +192,13 @@ int sigil_cdhash_for_path(const char *path, unsigned char *out, size_t out_len) 
     if (flags_num != NULL) {
         CFNumberGetValue(flags_num, kCFNumberSInt32Type, &flags);
     }
+    *adhoc_out = (flags & kSecCodeSignatureAdhoc) != 0 ? 1 : 0;
+
     CFDataRef unique = (CFDataRef)CFDictionaryGetValue(info, kSecCodeInfoUnique);
-    if (unique == NULL || (flags & kSecCodeSignatureAdhoc) != 0) {
+    if (unique == NULL) {
         CFRelease(info);
         return 0;
     }
-
     CFIndex len = CFDataGetLength(unique);
     if (len <= 0) {
         CFRelease(info);

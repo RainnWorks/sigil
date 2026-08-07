@@ -2470,6 +2470,15 @@ fn fulfill(
     // ride one decision.
     let coalesce_key = lease::grant_key(&caller, lease::ScopeKind::Command, cwd, &scope);
 
+    // Whether this caller may touch a LEASE at all, which is a stricter question
+    // than whether it may be gated. A lease is the one thing that releases a
+    // later request with no human in the loop, so it requires an identity the
+    // daemon actually established: if any ancestor could not be measured (its
+    // image is gone, or the platform refuses to vouch for it because the file at
+    // its path was replaced after exec), this run still goes to the phone like
+    // any other, but it neither rides nor opens a window.
+    let may_lease = caller.fully_measured();
+
     // For the inline `env` provider, fetch its threshold-sealed record now. The
     // record is public (ciphertext plus the base point E), safe to hold across the
     // approval wait; it is opened only AFTER the grant, by combining the phone's
@@ -2538,7 +2547,10 @@ fn fulfill(
     // the rule now consents to, is refused as a cache hit: the lease is dropped
     // and the run falls through to a fresh approval rather than injecting anything
     // the human did not agree to.
-    if let Some(cached) = core.leases.token_for(&gk, &binding) {
+    if let Some(cached) = may_lease
+        .then(|| core.leases.token_for(&gk, &binding))
+        .flatten()
+    {
         match leased_env(&cached, needs_sealed_env, &action.env_keys) {
             Ok(leased) => {
                 let refs = provider.describe(argv, &view);
@@ -2708,6 +2720,7 @@ fn fulfill(
     // `Zeroizing` token and dies with the lease.
     let lease_ttl = decision
         .lease_ttl()
+        .filter(|_| may_lease)
         .and_then(|ttl| {
             action
                 .lease
@@ -2905,19 +2918,26 @@ mod tests {
     use std::os::fd::{FromRawFd, RawFd};
     use std::path::PathBuf;
 
-    /// A process table that resolves nothing, so the ancestry walk returns an
-    /// empty chain instantly (the real table would hash every ancestor's
-    /// executable, which is slow and irrelevant to what these tests assert).
-    struct EmptyTable;
-    impl ProcessTable for EmptyTable {
+    /// The peer pid these tests hand `fulfill`. It has to be a plausible pid
+    /// (the walk stops at 1) and it has to RESOLVE, because a caller the daemon
+    /// could not measure is refused a lease by design; passing `None` here would
+    /// silently test the unmeasured path in every lease assertion.
+    const TEST_PEER: Option<i32> = Some(4242);
+
+    /// A synthetic process table: one measured leaf, no parents, so the ancestry
+    /// walk returns a one-node chain instantly. The real table asks the platform
+    /// about every ancestor of the test runner, which is slow and irrelevant to
+    /// what these tests assert.
+    struct StubTable;
+    impl ProcessTable for StubTable {
         fn parent(&self, _pid: i32) -> Option<i32> {
             None
         }
-        fn exe(&self, _pid: i32) -> Option<PathBuf> {
-            None
-        }
-        fn identity(&self, _pid: i32) -> lease::CodeIdentity {
-            lease::CodeIdentity::content([0u8; 32])
+        fn resolve(&self, _pid: i32) -> Option<(PathBuf, lease::CodeIdentity)> {
+            Some((
+                PathBuf::from("/test/caller"),
+                lease::CodeIdentity::content([0u8; 32]),
+            ))
         }
     }
 
@@ -3124,7 +3144,7 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending: pending.clone(),
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
             ))]),
@@ -3221,7 +3241,7 @@ mod tests {
             "op://Engineering/.env/password".into(),
         ];
         // Empty cwd: the fake op runs in the test's own directory (a real path).
-        let code = fulfill(&core, &argv, "", None, 0, None, Some(write_end), None);
+        let code = fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(write_end), None);
         assert_eq!(code, 0);
         assert_eq!(read_all(read_end), "known-secret-42");
         // No lease was requested, so none is held.
@@ -3249,7 +3269,7 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(&dir, "tok", "secret-1"),
             ))]),
@@ -3271,7 +3291,7 @@ mod tests {
         ];
         // Empty cwd: the fake op runs in the test's own directory (a real path).
         assert_eq!(
-            fulfill(&core, &argv, "", None, 0, None, Some(write_end), None),
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(write_end), None),
             0
         );
         assert_eq!(read_all(read_end), "secret-1");
@@ -3410,7 +3430,7 @@ mod tests {
         let (_r, w) = pipe();
         let worker = std::thread::spawn(move || {
             let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
-            fulfill(&park_core, &argv, "", None, 0, None, Some(w), None)
+            fulfill(&park_core, &argv, "", TEST_PEER, 0, None, Some(w), None)
         });
 
         // A subsequent event carries the parked request.
@@ -3508,7 +3528,7 @@ mod tests {
                 Duration::from_secs(60),
             ))),
             pending: Arc::new(PendingRegistry::new()),
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, "tok-abc", "secret-A"),
             ))]),
@@ -3569,7 +3589,10 @@ mod tests {
 
         let (r1, w1) = pipe();
         let first = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
-        assert_eq!(fulfill(&core, &first, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &first, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the first run is approved");
         assert_eq!(core.leases.active(), 1);
@@ -3577,7 +3600,7 @@ mod tests {
         let (r2, w2) = pipe();
         let second = vec!["op".into(), "item".into(), "get".into(), "Deploy".into()];
         assert_eq!(
-            fulfill(&core, &second, "", None, 0, None, Some(w2), None),
+            fulfill(&core, &second, "", TEST_PEER, 0, None, Some(w2), None),
             0
         );
         assert_eq!(read_all(r2), "secret-A");
@@ -3604,13 +3627,19 @@ mod tests {
 
         let (r1, w1) = pipe();
         let a = one.to_str().unwrap();
-        assert_eq!(fulfill(&core, &argv, a, None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, a, TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let (r2, w2) = pipe();
         let b = two.to_str().unwrap();
-        assert_eq!(fulfill(&core, &argv, b, None, 0, None, Some(w2), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, b, TEST_PEER, 0, None, Some(w2), None),
+            0
+        );
         assert_eq!(read_all(r2), "secret-A");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -3629,13 +3658,19 @@ mod tests {
 
         let (r1, w1) = pipe();
         let read = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
-        assert_eq!(fulfill(&core, &read, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &read, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let (r2, w2) = pipe();
         let item = vec!["op".into(), "item".into(), "get".into(), "Deploy".into()];
-        assert_eq!(fulfill(&core, &item, "", None, 0, None, Some(w2), None), 0);
+        assert_eq!(
+            fulfill(&core, &item, "", TEST_PEER, 0, None, Some(w2), None),
+            0
+        );
         assert_eq!(read_all(r2), "secret-A");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -3666,13 +3701,16 @@ mod tests {
 
         let (r1, w1) = pipe();
         let first = vec!["op".into(), "read".into(), "op://Engineering/first".into()];
-        assert_eq!(fulfill(&core, &first, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &first, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
 
         let (r2, w2) = pipe();
         let second = vec!["op".into(), "read".into(), "op://Engineering/second".into()];
         assert_eq!(
-            fulfill(&core, &second, "", None, 0, None, Some(w2), None),
+            fulfill(&core, &second, "", TEST_PEER, 0, None, Some(w2), None),
             0
         );
         assert_eq!(read_all(r2), "secret-A");
@@ -3718,14 +3756,20 @@ mod tests {
         let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
         // First request approves and leases.
         let (r1, w1) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
         assert_eq!(core.leases.active(), 1);
 
         // With a live lease the second identical request must be served from the
         // lease, not a fresh approval.
         let (r2, w2) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w2), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w2), None),
+            0
+        );
         assert_eq!(read_all(r2), "secret-A");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3747,7 +3791,10 @@ mod tests {
         );
         let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
         let (r1, w1) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
         assert_eq!(
             core.leases.active(),
@@ -3772,7 +3819,10 @@ mod tests {
         );
         let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
         let (r1, w1) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
         assert_eq!(core.leases.active(), 1, "a leasable rule grants the lease");
         let leases = core.leases.list();
@@ -3838,7 +3888,10 @@ mod tests {
         assert_eq!(resolved.lease.covers(), "op read");
 
         let (r1, w1) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
 
         // What `sigil lease list` renders, over the same control-socket DTO.
@@ -3909,7 +3962,7 @@ mod tests {
             &core,
             &["true".to_string()],
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -3945,7 +3998,7 @@ mod tests {
             &core,
             &argv,
             "/p",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -3976,7 +4029,7 @@ mod tests {
             &core,
             &argv,
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -4024,7 +4077,7 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
             lease_ttl: Duration::from_secs(60),
@@ -4049,7 +4102,7 @@ mod tests {
             &core,
             &["faketool".into()],
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -4133,7 +4186,7 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: env_inline_config("faketool", &["TOKEN"]).into(),
             lease_ttl: Duration::from_secs(60),
@@ -4159,7 +4212,7 @@ mod tests {
             &core,
             &["faketool".into()],
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -4220,7 +4273,7 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: cfg.into(),
             lease_ttl: Duration::from_secs(60),
@@ -4245,7 +4298,7 @@ mod tests {
             &core,
             &["faketool".into()],
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -4341,7 +4394,7 @@ mod tests {
                 CountingApprover::new(calls.clone(), lease_ttl).with_partial(zf),
             )),
             pending: Arc::new(PendingRegistry::new()),
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
             lease_ttl,
@@ -4386,7 +4439,7 @@ mod tests {
         let mut argv = vec!["faketool".to_string()];
         argv.extend(args.iter().map(|a| (*a).to_string()));
         let (r, w) = pipe();
-        let code = fulfill(core, &argv, "", None, 0, None, Some(w), None);
+        let code = fulfill(core, &argv, "", TEST_PEER, 0, None, Some(w), None);
         (code, read_all(r))
     }
 
@@ -4993,7 +5046,7 @@ mod tests {
             &core,
             &["curl".into(), "https://example.invalid".into()],
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(w),
@@ -5025,7 +5078,10 @@ mod tests {
 
         // A run under generation 0 opens a window.
         let (r1, w1) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
         assert_eq!(core.leases.active(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -5042,7 +5098,10 @@ mod tests {
         );
 
         let (r2, w2) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w2), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w2), None),
+            0
+        );
         assert_eq!(read_all(r2), "secret-A");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -5214,7 +5273,7 @@ mod tests {
                 Duration::from_secs(60),
             ))),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
             lease_ttl: Duration::from_secs(60),
@@ -5240,7 +5299,7 @@ mod tests {
             &core,
             &["faketool".into()],
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(w1),
@@ -5261,7 +5320,7 @@ mod tests {
             &core,
             &["faketool".into(), "--other".into()],
             elsewhere.to_str().unwrap(),
-            None,
+            TEST_PEER,
             0,
             None,
             Some(w2),
@@ -5322,7 +5381,7 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
             lease_ttl: Duration::from_secs(60),
@@ -5405,7 +5464,7 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: env_file_config("faketool", env_path.to_str().unwrap()).into(),
             lease_ttl: Duration::from_secs(60),
@@ -5495,7 +5554,7 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
@@ -5681,7 +5740,7 @@ mod tests {
             gate: ApprovalGate::new(Box::new(approver.clone())),
             remote: vec![approver.clone()],
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
             ))]),
@@ -5832,7 +5891,7 @@ mod tests {
             &core,
             &argv,
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -6125,7 +6184,7 @@ mod tests {
             "read".into(),
             "op://Engineering/.env/password".into(),
         ];
-        let code = fulfill(&core, &argv, "", None, 0, None, Some(write_end), None);
+        let code = fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(write_end), None);
 
         assert_eq!(code, 0, "the loop must complete after a relay bounce");
         assert_eq!(read_all(read_end), "bounce-secret-55");
@@ -6153,7 +6212,7 @@ mod tests {
             leases: LeaseStore::new(),
             gate,
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
             ))]),
@@ -6212,7 +6271,16 @@ mod tests {
         let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
         let (out_r, out_w) = pipe();
         let (err_r, err_w) = pipe();
-        let code = fulfill(&core, &argv, "", None, 0, None, Some(out_w), Some(err_w));
+        let code = fulfill(
+            &core,
+            &argv,
+            "",
+            TEST_PEER,
+            0,
+            None,
+            Some(out_w),
+            Some(err_w),
+        );
         assert_eq!(code, 1, "a sealed daemon fails closed");
         assert_eq!(read_all(out_r), "", "and delivers no secret");
 
@@ -6247,7 +6315,10 @@ mod tests {
         );
         let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
         let (r, w) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w), None),
+            0
+        );
         assert_eq!(
             read_all(r),
             "should-never-appear",
@@ -6257,7 +6328,16 @@ mod tests {
         let down = sealed_core(&dir, crate::keystore_seal::SealState::Downgraded, true);
         let (out_r, out_w) = pipe();
         let (err_r, err_w) = pipe();
-        let code = fulfill(&down, &argv, "", None, 0, None, Some(out_w), Some(err_w));
+        let code = fulfill(
+            &down,
+            &argv,
+            "",
+            TEST_PEER,
+            0,
+            None,
+            Some(out_w),
+            Some(err_w),
+        );
         assert_eq!(code, 1, "a downgraded keystore serves nothing");
         assert_eq!(read_all(out_r), "");
         assert!(read_all(err_r).contains("downgraded"));
@@ -6518,7 +6598,7 @@ mod tests {
             &core,
             &argv,
             "/p",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -7084,7 +7164,7 @@ mod tests {
         // derive a different grant key, so the approval gate can never let one
         // challenge ride another challenge's approval. Same caller, same key
         // label, different data fingerprints -> different scope -> different gk.
-        let caller = lease::walk_ancestry(&EmptyTable, -1);
+        let caller = lease::walk_ancestry(&StubTable, TEST_PEER.unwrap_or(-1));
         let fp_a = crate::sshagent::sha256_fingerprint(b"challenge-A");
         let fp_b = crate::sshagent::sha256_fingerprint(b"challenge-B");
         assert_ne!(fp_a, fp_b);
@@ -7144,7 +7224,7 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
             lease_ttl: Duration::from_secs(60),
@@ -7169,7 +7249,7 @@ mod tests {
             &core,
             &["faketool".into()],
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -7223,7 +7303,7 @@ mod tests {
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: op_config().into(),
             lease_ttl: Duration::from_secs(60),

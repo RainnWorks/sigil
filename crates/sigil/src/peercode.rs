@@ -77,42 +77,88 @@ extern "C" {
         requirement: *const libc::c_char,
     ) -> libc::c_int;
 
-    fn sigil_cdhash_for_path(
-        path: *const libc::c_char,
+    fn sigil_guest_measure(
+        pid: libc::c_int,
         out: *mut u8,
         out_len: libc::size_t,
+        path_out: *mut libc::c_char,
+        path_len: libc::size_t,
+        adhoc_out: *mut libc::c_int,
     ) -> libc::c_int;
 }
 
-/// The platform code identity of the executable at `path`: its cdhash, the
-/// digest of the CodeDirectory the signature commits to.
+/// What the platform says about the image a live pid is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestMeasure {
+    /// The executable path of the running image, read off the same code object
+    /// as the cdhash so the two cannot describe different processes.
+    pub exe: std::path::PathBuf,
+    /// The cdhash of the running image, as the platform reports it.
+    pub cdhash: Vec<u8>,
+    /// True when the signature has no signer (ad-hoc). Such a cdhash is a digest
+    /// of the binary and nothing more, so a caller must not read it as a signing
+    /// identity; see [`crate::lease::IdentityMeasure`].
+    pub adhoc: bool,
+}
+
+/// Measure the image running as `pid`: what the platform calls the code the
+/// kernel is executing, not what happens to sit at that process's path now.
 ///
-/// `None` means "this binary has no platform identity to report": unsigned,
-/// ad-hoc signed (a signature with no signer says nothing a content hash does
-/// not), not a code object, or unreadable. A caller must treat that as a
-/// different KIND of measurement rather than as a hash of nothing; see
-/// [`crate::lease::IdentityMeasure`].
+/// `None` is the honest "could not measure": the pid does not resolve to a live
+/// guest, or the platform refuses to vouch for the image. The refusal is the
+/// point. The cdhash in a signature is reported without any validity check, so a
+/// caller who rewrites the file under a running process gets the substituted
+/// binary's cdhash out of a static read; here the validity check on the guest
+/// answers `-67034 errSecCSStaticCodeChanged` for exactly that case (verified on
+/// this platform, both in-place overwrite and rename-over), and this function
+/// returns `None` rather than a chosen identity.
 ///
-/// This is a measurement, never an authorization. It answers "what does the
-/// platform call this file", not "may this file do anything"; the gate that
-/// authorizes is [`require_sigil_app`], and it is a different question.
+/// This is a measurement, never an authorization. It answers "what is that pid
+/// running", not "may it do anything"; the gate that authorizes is
+/// [`require_sigil_app`], and it is a different question.
 #[cfg(target_os = "macos")]
-pub fn cdhash_for_path(path: &std::path::Path) -> Option<Vec<u8>> {
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    // A cdhash is 20 bytes today (SHA-1-sized truncation of the CodeDirectory
-    // hash); the buffer is oversized so a longer future hash returns a length
-    // rather than -4.
+pub fn measure_guest(pid: i32) -> Option<GuestMeasure> {
+    use std::os::unix::ffi::OsStringExt;
+    // A cdhash is 20 bytes today (a truncation of the CodeDirectory hash); the
+    // buffer is oversized so a longer future hash returns a length rather than
+    // -4. The path buffer matches the `proc_pidpath` one.
     let mut buf = [0u8; 64];
-    // SAFETY: the shim reads the NUL-terminated path and writes at most
-    // `buf.len()` bytes into `buf`, returning the count written or a negative
-    // code. Both borrows outlive the call.
-    let n = unsafe { sigil_cdhash_for_path(c_path.as_ptr(), buf.as_mut_ptr(), buf.len()) };
-    (n > 0).then(|| buf[..n as usize].to_vec())
+    let mut path = [0i8; 4096];
+    let mut adhoc: libc::c_int = 0;
+    // SAFETY: the shim writes at most `buf.len()` cdhash bytes into `buf` and a
+    // NUL-terminated path of at most `path.len()` bytes into `path`, sets
+    // `adhoc`, and returns the cdhash count or a negative code. All three
+    // borrows outlive the call.
+    let n = unsafe {
+        sigil_guest_measure(
+            pid,
+            buf.as_mut_ptr(),
+            buf.len(),
+            path.as_mut_ptr(),
+            path.len(),
+            &mut adhoc,
+        )
+    };
+    if n <= 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = path
+        .iter()
+        .take_while(|c| **c != 0)
+        .map(|c| *c as u8)
+        .collect();
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(GuestMeasure {
+        exe: std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes)),
+        cdhash: buf[..n as usize].to_vec(),
+        adhoc: adhoc != 0,
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn cdhash_for_path(_path: &std::path::Path) -> Option<Vec<u8>> {
+pub fn measure_guest(_pid: i32) -> Option<GuestMeasure> {
     None
 }
 
@@ -302,42 +348,96 @@ mod tests {
         );
     }
 
+    /// A live child to measure, killed when the guard drops.
+    #[cfg(target_os = "macos")]
+    struct Running(std::process::Child);
+
+    #[cfg(target_os = "macos")]
+    impl Running {
+        fn spawn(exe: &str) -> Self {
+            let child = std::process::Command::new(exe)
+                .arg("30")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn");
+            // Give the child time to exec; before that it is still a fork of this
+            // test binary and would measure as this binary.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            Self(child)
+        }
+        fn pid(&self) -> i32 {
+            self.0.id() as i32
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_signed_binary_yields_a_cdhash_and_an_ad_hoc_one_does_not() {
-        // The measurement primitive behind the lease grant key. A platform
-        // binary has a real signature, so it answers with a cdhash (20 bytes
-        // today). This test binary is linker/ad-hoc signed, a signature with no
-        // signer, so it must answer with nothing rather than with a cdhash that
-        // would read as a platform identity it does not have.
-        let sh = cdhash_for_path(std::path::Path::new("/bin/sh")).expect("a signed system binary");
-        assert!(!sh.is_empty(), "a cdhash is not empty");
+    fn a_running_signed_binary_measures_as_itself_and_names_its_own_path() {
+        // The measurement primitive behind the lease grant key, aimed at a LIVE
+        // process rather than at a file. A platform binary has a real signature,
+        // so it answers with a cdhash (20 bytes today) and reports its own
+        // executable path from the same code object.
+        let sleeper = Running::spawn("/bin/sleep");
+        let m = measure_guest(sleeper.pid()).expect("a live signed binary measures");
+        assert!(!m.cdhash.is_empty(), "a cdhash is not empty");
+        assert!(!m.adhoc, "a platform binary is not ad-hoc signed");
         assert_eq!(
-            sh,
-            cdhash_for_path(std::path::Path::new("/bin/sh")).unwrap(),
-            "the same binary answers the same cdhash"
+            m.exe,
+            std::path::Path::new("/bin/sleep"),
+            "the path comes off the same object as the measurement"
         );
-        assert_ne!(
-            sh,
-            cdhash_for_path(std::path::Path::new("/bin/ls")).expect("also signed"),
-            "two binaries, two cdhashes"
+        assert_eq!(
+            measure_guest(sleeper.pid()).map(|m| m.cdhash),
+            Some(m.cdhash.clone()),
+            "the same process measures the same way twice"
         );
 
-        let me = std::env::current_exe().expect("current exe");
+        let other = Running::spawn("/usr/bin/yes");
+        let m2 = measure_guest(other.pid()).expect("also signed");
+        assert_ne!(m.cdhash, m2.cdhash, "two binaries, two cdhashes");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_ad_hoc_signature_is_reported_as_having_no_signer() {
+        // This test binary is linker/ad-hoc signed: a signature with no signer.
+        // It still has a cdhash, but the caller must be told it is ad-hoc so it
+        // does not read it as a signing identity it does not have.
+        let me = measure_guest(std::process::id() as i32).expect("this process measures");
+        assert!(me.adhoc, "an ad-hoc signature must be reported as such");
+        assert!(!me.cdhash.is_empty());
         assert_eq!(
-            cdhash_for_path(&me),
-            None,
-            "an ad-hoc signature must not be reported as a platform identity"
+            me.exe,
+            std::env::current_exe().expect("current exe"),
+            "and it names this binary"
         );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_path_that_is_not_code_yields_no_identity() {
-        assert_eq!(cdhash_for_path(std::path::Path::new("/dev/null")), None);
+    fn a_pid_that_is_not_a_live_process_measures_as_nothing() {
+        // Fail closed: "cannot measure" is never a measurement. pid 0 is not a
+        // resolvable guest, and neither is a pid that has exited.
+        assert_eq!(measure_guest(0), None);
+        let dead = {
+            let sleeper = Running::spawn("/bin/sleep");
+            sleeper.pid()
+        };
+        // Give the kill time to land before asking about the pid.
+        std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(
-            cdhash_for_path(std::path::Path::new("/nonexistent/sigil-test")),
-            None
+            measure_guest(dead),
+            None,
+            "an exited pid measures as nothing"
         );
     }
 
