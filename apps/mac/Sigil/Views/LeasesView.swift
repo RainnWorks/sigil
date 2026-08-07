@@ -35,7 +35,7 @@ struct LeasesView: View {
     private var empty: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("No active leases").font(.system(size: 13, weight: .semibold))
-            Text("A lease is granted when you approve with the session option. It holds the token in memory, triple-scoped and TTL-bound, then expires.")
+            Text("A lease is granted when you approve with the session option. It covers any command that rule matches, run from anywhere on this Mac, until it expires. A rule that injects sealed values also keeps those values in memory for the window.")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
         }
         .padding(16).frame(maxWidth: .infinity, alignment: .leading)
@@ -69,7 +69,14 @@ private struct LeaseRow: View {
                         Text(lease.account).font(.system(size: 11)).foregroundStyle(.secondary)
                     }
                 }
-                MonoText(lease.scope, size: 11, color: .secondary)
+                // `scope` is the matched rule's name, not a command line: the
+                // lease auto-approves anything that rule matches for this
+                // caller. Say the breadth out loud next to the name.
+                HStack(spacing: 5) {
+                    MonoText(lease.scope, size: 11, color: .secondary)
+                    Text("·").font(.system(size: 11)).foregroundStyle(.tertiary)
+                    Text("any matching command").font(.system(size: 11)).foregroundStyle(.tertiary)
+                }
                 MonoText("grant \(lease.grantHex)  ·  \(clockRemaining(remaining)) left",
                          size: 10, color: Color(.tertiaryLabelColor))
             }
@@ -84,6 +91,6 @@ private struct LeaseRow: View {
 
 #Preview {
     NavigationStack { LeasesView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle)))
         .frame(width: 640, height: 480)
 }

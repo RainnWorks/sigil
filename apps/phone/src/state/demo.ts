@@ -5,7 +5,12 @@
  * directly for pure-UI iteration.
  */
 import { type ApprovalRequest } from "@/src/protocol";
-import { type AppState, type HistoryEntry, type Lease } from "@/src/domain/types";
+import {
+  type AppState,
+  type HistoryEntry,
+  type Lease,
+  type RelayOrigin,
+} from "@/src/domain/types";
 
 const now = Date.now();
 
@@ -64,7 +69,7 @@ export function demoRoutineRequest(): ApprovalRequest {
 
 /**
  * A v2 threshold read: elevated, carrying a ThresholdChallenge so the approve
- * path exercises the Secure Enclave partial (Z_F) instead of a DEK. The
+ * path exercises the Secure Enclave partial (Z_F). The
  * `ephemeralPub` is a real on-curve P-256 X9.63 point (from the shared combiner
  * vectors), so on-device validation and key-agreement have a valid E to work on.
  */
@@ -98,7 +103,7 @@ export function demoThresholdRequest(): ApprovalRequest {
   });
 }
 
-/** A critical SSH signature to a production host: hold to approve. */
+/** An SSH signature to a known host: the destination is a known-hosts name. */
 export function demoSshRequest(): ApprovalRequest {
   return {
     requestId: crypto.randomUUID(),
@@ -107,7 +112,8 @@ export function demoSshRequest(): ApprovalRequest {
     secrets: [],
     ssh: {
       keyLabel: "github-deploy",
-      host: "git@github.com",
+      host: "github.com",
+      binding: "named",
       fingerprint: "SHA256:9Xk2p+Qm4rLt8vN0wYbZ3fJc1aDhEoRuS5iT7gUx6M",
     },
     provenance: {
@@ -122,11 +128,42 @@ export function demoSshRequest(): ApprovalRequest {
   };
 }
 
+/**
+ * An SSH signature with no host binding: the client sent no session-bind, so
+ * the destination is unverified and the sheet must say so (F8). The `host`
+ * string mirrors the daemon's plain marker and must never be rendered.
+ */
+export function demoUnboundSshRequest(): ApprovalRequest {
+  const r = demoSshRequest();
+  return {
+    ...r,
+    requestId: crypto.randomUUID(),
+    command: ["ssh"],
+    ssh: {
+      keyLabel: "legacy-bastion",
+      host: "(host not bound)",
+      binding: "unbound",
+      fingerprint: "SHA256:2vJq8wXr5tZk1mBn7cYd4fLh9aGpEsRu3iToUx0KgN",
+    },
+    reason: undefined,
+  };
+}
+
+/**
+ * A stand-in for the relay's origin hint, so the sheet's `network` row is
+ * reachable in a demo build. A documentation-range address (RFC 5737), never a
+ * real one. Demo only: a live pairing shows this row solely when the relay
+ * actually sent a claim that passed validation.
+ */
+export const demoRelayOrigin: RelayOrigin = { ip: "203.0.113.7", atMs: now };
+
 export const demoLeases: Lease[] = [
   {
     id: "l1",
     caller: "rowm launcher",
-    scope: "Engineering/.env",
+    // A rule name, not a secret path: the lease covers every command that rule
+    // matches for this caller until it lapses.
+    scope: "op-eu",
     grantedAt: now - 19 * 60_000,
     expiresAt: now + 41 * 60_000,
   },
@@ -147,7 +184,7 @@ export const demoHistory: HistoryEntry[] = [
   {
     id: "h2",
     kind: "ssh_signature",
-    label: "github-deploy → git@github.com",
+    label: "github-deploy → github.com",
     origin: "studio.local",
     process: "ssh",
     cwd: "~/Projects/rowm",
@@ -200,7 +237,8 @@ export function emptyInitialState(): AppState {
   return {
     paired: false,
     arm: "idle",
-    connection: { rung: "none", machine: "", lastSeenAt: 0 },
+    connection: { rung: "none", lastSeenAt: 0 },
+    pairedAt: 0,
     pending: [],
     history: [],
     leases: [],
@@ -214,7 +252,8 @@ export function demoInitialState(): AppState {
   return {
     paired: true,
     arm: "armed",
-    connection: { rung: "lan", machine: "studio.local", lastSeenAt: now - 12_000 },
+    connection: { rung: "lan", lastSeenAt: now - 12_000 },
+    pairedAt: now - 6 * 86_400_000,
     pending: [],
     history: demoHistory,
     leases: demoLeases,

@@ -1,17 +1,17 @@
 /**
  * A tiny observable app store exposed through useSyncExternalStore. Single
  * source of truth for every screen; the mock transport and the demo seed both
- * write here, and the UI only ever reads. Fails closed: lockdown denies all
- * pending and refuses new requests until cleared.
+ * write here, and the UI only ever reads.
  */
 import { useSyncExternalStore } from "react";
 
 import { type ApprovalRequest, type Decision, type ResolutionStatus } from "@/src/protocol";
-import { secretRefLabel } from "@/src/lib/format";
+import { secretRefLabel, sshLabel } from "@/src/lib/format";
 import {
   type AppState,
   type HistoryEntry,
   type PendingRequest,
+  type RelayOrigin,
   type RequestState,
 } from "@/src/domain/types";
 import { demoInitialState, emptyInitialState } from "./demo";
@@ -49,9 +49,17 @@ class Store {
     this.set({ ...this.state, ...p });
   }
 
-  /** A new request arrived. Identical grant keys coalesce behind the pending one. */
-  receive(request: ApprovalRequest): void {
-    if (this.state.arm === "lockedDown") return; // fail closed
+  /**
+   * A new request arrived. Identical grant keys coalesce behind the pending one.
+   *
+   * `relayOrigin` is the transport's unverified note about where the delivery came
+   * from (absent off the relay, or when it failed validation). It is held beside
+   * the request for the sheet to show and is never written to history: history
+   * is the audit mirror, and an unsigned relay claim has no business in it. On a
+   * coalesce the first origin is kept rather than overwritten, so the row keeps
+   * describing the delivery the human is actually looking at.
+   */
+  receive(request: ApprovalRequest, relayOrigin?: RelayOrigin): void {
     const key = grantKey(request);
     const existing = this.state.pending.find(
       (p) => p.state !== "approved" && p.state !== "denied" && grantKey(p.request) === key,
@@ -69,6 +77,7 @@ class Store {
       state: "fresh",
       receivedAt: Date.now(),
       coalesced: 0,
+      ...(relayOrigin ? { relayOrigin } : {}),
     };
     this.patch({ pending: [entry, ...this.state.pending] });
   }
@@ -129,21 +138,14 @@ class Store {
     this.remove(requestId);
   }
 
-  lockdown(): void {
-    // Deny everything pending, refuse everything new. Denied requests are recorded
-    // and cleared from the queue, so lockdown leaves nothing dangling.
-    for (const p of this.state.pending) {
-      if (p.state !== "approved" && p.state !== "denied" && p.state !== "expired") {
-        this.record(p, "denied", "locked down");
-      }
-    }
-    this.patch({ arm: "lockedDown", pending: [] });
-  }
-
-  clearLockdown(): void {
-    this.patch({ arm: "armed" });
-  }
-
+  /**
+   * PHONE-LOCAL ONLY, and deliberately not called by any screen (security review
+   * F7). This drops a row from this phone's array; it sends no envelope, so the
+   * daemon's `LeaseStore` keeps honoring the window for the rest of its TTL. Do
+   * NOT put a "Revoke" control behind this: a control that says a window closed
+   * when it did not is worse than no control. Wire a real revoke message first,
+   * then restore the affordance in the settings screen.
+   */
   revokeLease(id: string): void {
     this.patch({ leases: this.state.leases.filter((l) => l.id !== id) });
   }
@@ -159,14 +161,33 @@ class Store {
   /**
    * Reflect a real stored pairing into the store, called once the live session is
    * armed (at boot from the keystore, or right after the pairing ceremony). Marks
-   * the phone paired and arms it, unless it is currently locked down.
+   * the phone paired and arms it. Carries no machine name on purpose: the
+   * pairing pins keys, and the paired Mac names itself through signed provenance
+   * (see {@link pairedMacName}), never through a transport address. The
+   * connection itself is deliberately untouched here: the link dot goes live
+   * only when a real drain succeeds ({@link noteTransport}), never on hope.
    */
-  reflectPairing(info: { ownFingerprint: string | null; machine: string; seenAt: number }): void {
+  reflectPairing(info: { ownFingerprint: string | null; pairedAt: number }): void {
     this.patch({
       paired: true,
-      arm: this.state.arm === "lockedDown" ? "lockedDown" : "armed",
+      arm: "armed",
       ownFingerprint: info.ownFingerprint,
-      connection: { rung: "relay", machine: info.machine, lastSeenAt: info.seenAt },
+      pairedAt: info.pairedAt,
+    });
+  }
+
+  /**
+   * The transport reported a drain result: a success means the relay answered
+   * just now (link), a failure means it did not (no link). This is the ONLY
+   * writer of the live connection state, so the link dot always reflects the
+   * last real exchange, not an assumption. Transport status only: it says
+   * nothing about the Mac, and nothing here names a host.
+   */
+  noteTransport(connected: boolean): void {
+    this.patch({
+      connection: connected
+        ? { rung: "relay", lastSeenAt: Date.now() }
+        : { ...this.state.connection, rung: "none" },
     });
   }
 
@@ -196,7 +217,7 @@ class Store {
       r.secrets.length > 0
         ? r.secrets.map(secretRefLabel).join(", ")
         : r.ssh
-          ? `${r.ssh.keyLabel} → ${r.ssh.host}`
+          ? sshLabel(r.ssh)
           : (r.command.join(" ") || r.provenance.machine);
     const entry: HistoryEntry = {
       id: r.requestId,
@@ -213,9 +234,13 @@ class Store {
     this.patch({ history: [entry, ...this.state.history] });
   }
 
-  /** Test/dev helper: seed pending requests directly. */
-  seedPending(requests: ApprovalRequest[]): void {
-    for (const r of requests) this.receive(r);
+  /**
+   * Test/dev helper: seed pending requests directly. `relayOrigin` stands in for the
+   * relay's hint so the network row is reachable in a demo build; it is applied
+   * to every seeded request and never reaches a live pairing.
+   */
+  seedPending(requests: ApprovalRequest[], relayOrigin?: RelayOrigin): void {
+    for (const r of requests) this.receive(r, relayOrigin);
   }
 
   reset(): void {
@@ -239,6 +264,25 @@ function grantKey(r: ApprovalRequest): string {
 }
 
 export const store = new Store();
+
+/**
+ * The paired Mac's display name, as far as this phone can truthfully know it.
+ * The steady-state connection carries no machine name (pairing pins keys, not
+ * hostnames), so the name comes from what the Mac has actually said about
+ * itself: the daemon-signed provenance on a live request, else the most recent
+ * history entry. Null until a first request names it; screens fall back to
+ * "your Mac". Never derived from a transport address: the relay is plumbing,
+ * not a party, and its hostname must never stand in for the Mac.
+ */
+export function pairedMacName(s: AppState): string | null {
+  for (const p of s.pending) {
+    if (p.request.provenance.machine) return p.request.provenance.machine;
+  }
+  for (const h of s.history) {
+    if (h.origin) return h.origin;
+  }
+  return null;
+}
 
 export function useAppState(): AppState {
   return useSyncExternalStore(store.subscribe, store.getState, store.getState);

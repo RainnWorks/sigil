@@ -18,6 +18,7 @@
 import { useEffect, useState } from "react";
 import { View } from "react-native";
 
+import { Sf } from "@/components/ui/sf";
 import { Sans } from "@/components/ui/text";
 import { Mono } from "@/components/ui/text";
 import { useTheme } from "@/theme/colors";
@@ -25,7 +26,7 @@ import { space } from "@/theme/tokens";
 import { faceGate } from "@/src/lib/biometric";
 import { isArmed, liveApprove, liveDeny } from "@/src/session/controller";
 import { hapticCommit } from "@/src/lib/haptics";
-import { durationWindow } from "@/src/lib/format";
+import { commandWord, durationWindow } from "@/src/lib/format";
 import { type Decision } from "@/src/protocol";
 import { type PendingRequest } from "@/src/domain/types";
 import { store, useSelector } from "@/src/state/store";
@@ -48,23 +49,59 @@ export function ApprovalSheet({
 }) {
   const p = useTheme();
   const reduceMotion = useSelector((s) => s.settings.reduceMotion);
-  const [busy, setBusy] = useState(false);
+  // Which approve is in flight, if any. Not a bare boolean: the two capsules
+  // authorize different things (one invocation vs a window), so the frozen state
+  // has to say which one the human tapped instead of putting "Approving…" on
+  // both. Null while nothing is committing.
+  const [inFlight, setInFlight] = useState<"once" | "window" | null>(null);
+  const busy = inFlight !== null;
   const [gateNote, setGateNote] = useState<string | null>(null);
   // The human's just-made decision, held locally so we can show a brief neutral
   // acknowledgement before auto-dismissing. We defer writing it to the store
   // (which removes the request from the active queue) until that moment, so the
   // sheet stays stable during the acknowledgement instead of flashing empty.
-  const [committed, setCommitted] = useState<{ decision: Decision; note?: string } | null>(null);
+  // `windowSecs` is set only on an approve that opened a window, so the
+  // acknowledgement can name the window the human actually granted.
+  const [committed, setCommitted] = useState<{
+    decision: Decision;
+    note?: string;
+    windowSecs?: number;
+  } | null>(null);
 
   const { request, state } = pending;
-  // A leasable request lets the human approve once OR keep the grant approved
-  // for a window up to maxSecs. Run-once requests (no policy) show approve-once
-  // only. Purely the daemon's offer; the phone reads the duration and nothing
-  // provider-shaped.
+  // A leasable request lets the human keep the grant approved for a window up to
+  // maxSecs (the primary offer) OR approve this one invocation only. Run-once
+  // requests (no policy) show approve-only. Purely the daemon's offer; the phone
+  // reads the duration and nothing provider-shaped.
+  //
+  // The window is BROADER than a re-run of this exact argv, on three axes, and
+  // the caption below has to carry all three or the consent is not informed
+  // (security review F1/F2):
+  //   1. other commands the rule matches, not just this argv;
+  //   2. other SECRETS the rule matches, not just the reference in the readout
+  //      well above. This is the axis the human is actually reading, so it is
+  //      named explicitly and never left implied. The noun is "secrets", the
+  //      phone's own word (see the type banner and SecretRef); "items" is a
+  //      provider's noun and this app stays provider-blind;
+  //   3. no process, session, or terminal binding. The daemon's grant key binds
+  //      the CODE IDENTITY of the ancestor chain and deliberately excludes pids,
+  //      so a second agent session in another terminal and another project has
+  //      the same chain and rides the same window. "from anywhere on this Mac"
+  //      is the honest phrasing; never claim "from this process".
+  // It hedges with "this rule matches" because the rule, not the command word,
+  // is the boundary, and only the daemon knows how narrow that rule is.
   const lease = request.leasePolicy?.kind === "leasable" ? request.leasePolicy : null;
   const terminal = state === "approved" || state === "denied" || state === "expired" || state === "superseded";
-  const process = request.provenance.processChain[request.provenance.processChain.length - 1] ?? "process";
-  const origin = request.provenance.machine || process;
+  // The command word comes from argv[0], NOT from the process chain: the sheet
+  // never renders request.command, and the daemon resolves the chain separately,
+  // so the two can differ (a chain leaf may carry a subcommand). Null when argv
+  // is empty, in which case the caption drops the word and the deny control
+  // falls back to the chain leaf. One word for the actor across both adjacent
+  // controls, so they never name it two different ways.
+  const cmd = commandWord(request.command);
+  const chainLeaf = request.provenance.processChain[request.provenance.processChain.length - 1] ?? "process";
+  const actor = cmd ?? chainLeaf;
+  const origin = request.provenance.machine || chainLeaf;
 
   useEffect(() => {
     if (!committed) return;
@@ -87,18 +124,19 @@ export function ApprovalSheet({
   }, [committed, request.requestId, onDone]);
 
   async function handleApprove(leaseWindow?: { ttlMs: number }): Promise<void> {
-    setBusy(true);
+    setInFlight(leaseWindow ? "window" : "once");
     setGateNote(null);
     // The biometric is mandatory and non-negotiable; the settings toggle never
-    // removes it. When a live pairing is armed, reading the DEK / running the
-    // enclave key-agreement behind Face ID IS that gate (it seals the response
-    // back to the daemon over the relay); when unpaired (dev/demo), faceGate
-    // stands in. A non-"sent" live outcome only tells us the decision did not
-    // leave this phone; it never carries knowledge of the Mac's state.
+    // removes it. When a live pairing is armed, the Face ID gate (the enclave
+    // key-agreement for a threshold secret, or the bare gate for a plain gate) IS
+    // that gate and seals the response back to the daemon over the relay; when
+    // unpaired (dev/demo), faceGate stands in. A non-"sent" live outcome only
+    // tells us the decision did not leave this phone; it never carries knowledge
+    // of the Mac's state.
     if (isArmed()) {
       const outcome = await liveApprove(request, leaseWindow ? { lease: leaseWindow } : {});
       if (outcome !== "sent") {
-        setBusy(false);
+        setInFlight(null);
         setGateNote(
           outcome === "refused"
             ? "Face ID did not pass. Nothing was approved."
@@ -112,7 +150,7 @@ export function ApprovalSheet({
     } else {
       const gate = await faceGate("Approve secret release");
       if (!gate.ok) {
-        setBusy(false);
+        setInFlight(null);
         setGateNote(
           gate.reason === "cancelled" ? null : "Face ID did not pass. Nothing was approved.",
         );
@@ -120,7 +158,10 @@ export function ApprovalSheet({
       }
     }
     await hapticCommit("approved");
-    setCommitted({ decision: "approved" });
+    setCommitted({
+      decision: "approved",
+      windowSecs: leaseWindow ? Math.round(leaseWindow.ttlMs / 1000) : undefined,
+    });
   }
 
   async function handleDeny(): Promise<void> {
@@ -132,17 +173,27 @@ export function ApprovalSheet({
   async function handleDenyAndBlock(): Promise<void> {
     await hapticCommit("denied");
     if (isArmed()) await liveDeny(request);
-    setCommitted({ decision: "denied", note: `blocked ${process} 1h` });
+    setCommitted({ decision: "denied", note: `blocked ${actor} 1h` });
   }
 
   return (
     <View style={{ flex: 1 }}>
       <View style={{ flex: 1, paddingHorizontal: space.xl, gap: space.lg }}>
-        {/* origin header + gauge */}
-        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
-          <Mono size={14} tone="muted">
-            {origin}
-          </Mono>
+        {/* the asking machine + gauge: the party first, the clock second */}
+        <View
+          style={{
+            flexDirection: "row",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: space.md,
+          }}
+        >
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 8, flexShrink: 1 }}>
+            <Sf name="laptopcomputer" color={p.muted} size={16} />
+            <Mono size={15} weight="medium" numberOfLines={1} style={{ flexShrink: 1 }}>
+              {origin}
+            </Mono>
+          </View>
           <TimeoutGauge
             expiresAt={request.expiresAt}
             timeoutMs={request.timeoutMs}
@@ -159,7 +210,14 @@ export function ApprovalSheet({
           <SshReadout ssh={request.ssh} />
         ) : null}
 
-        <ProvenanceRows provenance={request.provenance} now={Date.now()} />
+        {/* `pending.relayOrigin` is the relay's unverified claim, kept off the
+            signed request object and passed separately so it can never be
+            mistaken for daemon-vouched provenance. */}
+        <ProvenanceRows
+          provenance={request.provenance}
+          now={Date.now()}
+          {...(pending.relayOrigin ? { relayOrigin: pending.relayOrigin } : {})}
+        />
 
         {pending.coalesced > 0 ? (
           <Mono size={12} tone="faint">
@@ -171,7 +229,7 @@ export function ApprovalSheet({
       {/* footer: controls, the just-sent acknowledgement, or a terminal status */}
       <View style={{ paddingHorizontal: space.xl, paddingTop: space.md, gap: space.md }}>
         {committed ? (
-          <DecisionSent decision={committed.decision} />
+          <DecisionSent decision={committed.decision} windowSecs={committed.windowSecs} />
         ) : terminal ? (
           <TerminalStatus state={state} onDone={onDone} />
         ) : (
@@ -187,17 +245,37 @@ export function ApprovalSheet({
               </View>
             ) : null}
             {lease ? (
-              <View style={{ gap: space.sm }}>
-                <ApproveControl label="Approve once" busy={busy} onApprove={() => void handleApprove()} />
+              <View style={{ gap: space.md }}>
+                {/* The caption belongs to the capsule above it, so it sits inside
+                    that group (space.sm) and the secondary sits a step away. */}
+                <View style={{ gap: space.sm }}>
+                  <ApproveControl
+                    label={`Keep approved for ${durationWindow(lease.maxSecs)}`}
+                    busy={busy}
+                    committing={inFlight === "window"}
+                    onApprove={() => void handleApprove({ ttlMs: lease.maxSecs * 1000 })}
+                  />
+                  <Sans size={13} tone="muted">
+                    {cmd
+                      ? `Also covers other ${cmd} commands and secrets this rule matches, from anywhere on this Mac.`
+                      : "Also covers other commands and secrets this rule matches, from anywhere on this Mac."}
+                  </Sans>
+                </View>
                 <ApproveControl
                   variant="secondary"
-                  label={`Keep approved for ${durationWindow(lease.maxSecs)}`}
+                  label="Approve once"
                   busy={busy}
-                  onApprove={() => void handleApprove({ ttlMs: lease.maxSecs * 1000 })}
+                  committing={inFlight === "once"}
+                  onApprove={() => void handleApprove()}
                 />
               </View>
             ) : (
-              <ApproveControl label="Approve" busy={busy} onApprove={() => void handleApprove()} />
+              <ApproveControl
+                label="Approve"
+                busy={busy}
+                committing={inFlight === "once"}
+                onApprove={() => void handleApprove()}
+              />
             )}
             {/* Fixed-height status slot: the gate note appears here without ever
                 nudging the deny control below it. */}
@@ -209,7 +287,7 @@ export function ApprovalSheet({
               ) : null}
             </View>
             <DenyControl
-              process={process}
+              process={actor}
               disabled={busy}
               onDeny={handleDeny}
               onDenyAndBlock={handleDenyAndBlock}
@@ -224,12 +302,20 @@ export function ApprovalSheet({
 /**
  * The neutral acknowledgement shown for a beat after a decision is dispatched.
  * It reports only that the decision was sent from the phone; it makes no claim
- * about what the Mac did, because the phone does not and must not know.
+ * about what the Mac did, because the phone does not and must not know. Naming
+ * the window on the lease path is likewise a phone-local fact: it is the window
+ * this phone chose and sent, not a claim that the Mac honored it.
  */
-function DecisionSent({ decision }: { decision: Decision }) {
+function DecisionSent({ decision, windowSecs }: { decision: Decision; windowSecs?: number }) {
   const copy =
     decision === "approved"
-      ? { text: "Approved. Sent.", tone: "ok" as const }
+      ? {
+          text:
+            windowSecs === undefined
+              ? "Approved. Sent."
+              : `Approved for ${durationWindow(windowSecs)}. Sent.`,
+          tone: "ok" as const,
+        }
       : { text: "Denied.", tone: "deny" as const };
   return (
     <View style={{ paddingVertical: space.lg }}>

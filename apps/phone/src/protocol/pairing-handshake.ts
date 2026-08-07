@@ -217,32 +217,3 @@ export function pairingResponseToSubmitString(resp: PairingResponse): string {
   const json = JSON.stringify(pairingResponseToJson(resp));
   return toBase64Url(enc.encode(json));
 }
-
-/** Raised when a delivered DEK envelope does not decrypt to 32 raw key bytes. */
-export class DekRecoverError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "DekRecoverError";
-  }
-}
-
-/**
- * Recover the 32-byte DEK from an opened DEK-delivery envelope. The daemon seals
- * a `Dek` (a `[u8; 32]` newtype) as the envelope payload, so `open` yields a
- * JSON array of 32 numbers. Fails closed on any other shape: a malformed DEK
- * yields an error, never a partial key.
- */
-export function recoverDek(payload: unknown): Uint8Array {
-  if (!Array.isArray(payload) || payload.length !== 32) {
-    throw new DekRecoverError("DEK payload is not a 32-byte array");
-  }
-  const out = new Uint8Array(32);
-  for (let i = 0; i < 32; i++) {
-    const b = payload[i];
-    if (typeof b !== "number" || !Number.isInteger(b) || b < 0 || b > 255) {
-      throw new DekRecoverError("DEK payload has a non-byte element");
-    }
-    out[i] = b;
-  }
-  return out;
-}

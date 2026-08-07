@@ -27,7 +27,8 @@
  * that fills that contract and is fully exercised today with in-memory doubles.
  */
 import { type Envelope } from "@/src/protocol";
-import { type Transport, type TransportStatus } from "./transport";
+import { type RelayOrigin } from "@/src/domain/types";
+import { type EnvelopeListener, type Transport, type TransportStatus } from "./transport";
 
 export interface LadderConfig {
   /** The always-available blind relay. Required; the floor of the ladder. */
@@ -46,8 +47,6 @@ export interface LadderConfig {
    */
   mirrorSend?: boolean;
 }
-
-type EnvelopeListener = (e: Envelope) => void;
 
 export class LadderTransport implements Transport {
   private readonly relay: Transport;
@@ -69,8 +68,12 @@ export class LadderTransport implements Transport {
     this.running = true;
     // Listen on BOTH rungs so a request on either reaches the sheet; the
     // controller's replay guard dedupes a request that arrives on both.
-    this.unsubs.push(this.relay.onEnvelope((e) => this.fanOut(e)));
-    if (this.direct) this.unsubs.push(this.direct.onEnvelope((e) => this.fanOut(e)));
+    // The origin hint (if the rung has one) rides along untouched: the ladder
+    // moves envelopes, it never inspects or vouches for them.
+    this.unsubs.push(this.relay.onEnvelope((e, relayOrigin) => this.fanOut(e, relayOrigin)));
+    if (this.direct) {
+      this.unsubs.push(this.direct.onEnvelope((e, relayOrigin) => this.fanOut(e, relayOrigin)));
+    }
     await this.relay.start();
     if (this.direct) await this.direct.start();
   }
@@ -129,7 +132,7 @@ export class LadderTransport implements Transport {
     await this.relay.send(e);
   }
 
-  private fanOut(e: Envelope): void {
-    for (const l of this.listeners) l(e);
+  private fanOut(e: Envelope, relayOrigin?: RelayOrigin): void {
+    for (const l of this.listeners) l(e, relayOrigin);
   }
 }

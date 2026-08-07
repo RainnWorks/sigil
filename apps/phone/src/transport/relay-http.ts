@@ -33,6 +33,7 @@
  * unaffected by this module.
  */
 import { toHex } from "@/src/protocol/bytes";
+import { type RelayOrigin } from "@/src/domain/types";
 
 /**
  * Client-side ceiling on one `to-phone` GET, comfortably above the relay's
@@ -60,15 +61,86 @@ const BACKOFF_CAP_MS = 20_000;
 /** Additive jitter ceiling, to desynchronize retries and never poll below a floor. */
 const JITTER_MS = 1_000;
 
+/**
+ * How far back a relay's `at_ms` may sit before the hint is dropped rather than
+ * shown. A delivery is drained within seconds of the deposit, so a stamp much
+ * older than this belongs to some other moment (a stale or replayed note) and
+ * would attach an address to a request it never described.
+ */
+const ORIGIN_MAX_AGE_MS = 5 * 60_000;
+
+/** Tolerance for a relay clock running ahead of ours before the hint is dropped. */
+const ORIGIN_MAX_SKEW_MS = 60_000;
+
+/** Longest an IPv6 literal can render, the IPv4-mapped form `…:255.255.255.255`. */
+const ORIGIN_IP_MAX_LEN = 45;
+
+/**
+ * IP-literal charset: hex digits, dots, and colons, and nothing else. This is a
+ * HOSTILE-INPUT gate, not a formatter. An honest relay renders `ip` from a
+ * parsed `IpAddr`, but a hostile one controls these bytes completely, and the
+ * field lands in the approval sheet: without this, a relay could ship
+ * "studio.local (verified)" and buy itself a verified look on the one screen
+ * that authorizes a release. Anything outside the charset is dropped whole.
+ *
+ * No `%zone` suffix: Rust's `IpAddr` display never renders one, so accepting it
+ * would widen the charset to arbitrary interface-name letters for a form the
+ * relay cannot produce.
+ */
+const ORIGIN_IP_RE = /^[0-9a-fA-F.:]+$/;
+
 /** The `/to-phone` GET response body. */
 interface ToPhoneBody {
   envelopes: string[];
+  /**
+   * ADDITIVE, optional, index-aligned with `envelopes`: `origins[i]` describes
+   * `envelopes[i]`, or is null where the relay has none. Absent entirely when no
+   * delivered item carried one (always so before the relay stamped origins).
+   */
+  origins?: (RawOrigin | null)[] | null;
+}
+
+/** The wire shape of one origin (snake_case, as the relay serializes it). */
+interface RawOrigin {
+  ip?: unknown;
+  at_ms?: unknown;
+}
+
+/** One drained item: the opaque envelope string plus the relay's claim about it. */
+export interface Delivery {
+  env: string;
+  /** Present only when the relay sent a claim that passed {@link parseRelayOrigin}. */
+  relayOrigin?: RelayOrigin;
+}
+
+/**
+ * Validate one relay-asserted origin, returning `undefined` for anything not
+ * plainly well-formed and current. FAIL QUIET, never fail closed: this is a
+ * display hint, so a bad or stale claim costs the row and nothing else. It never
+ * affects whether the envelope is delivered, opened, or approved.
+ *
+ * Rejects: a non-string or over-long `ip`, an `ip` outside the IP-literal
+ * charset, a non-finite `at_ms`, a stamp older than {@link ORIGIN_MAX_AGE_MS},
+ * and one further ahead than {@link ORIGIN_MAX_SKEW_MS}. None of this makes the
+ * hint trustworthy: a hostile relay can still put a plausible address here. It
+ * only stops the field from carrying free text or an unrelated moment into the
+ * sheet.
+ */
+export function parseRelayOrigin(raw: unknown, now: number): RelayOrigin | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const { ip, at_ms: atMs } = raw as RawOrigin;
+  if (typeof ip !== "string" || ip.length === 0 || ip.length > ORIGIN_IP_MAX_LEN) return undefined;
+  if (!ORIGIN_IP_RE.test(ip)) return undefined;
+  if (typeof atMs !== "number" || !Number.isFinite(atMs)) return undefined;
+  if (atMs < now - ORIGIN_MAX_AGE_MS) return undefined;
+  if (atMs > now + ORIGIN_MAX_SKEW_MS) return undefined;
+  return { ip, atMs };
 }
 
 /** The structured outcome of one `to-phone` GET, so the loop can reason without throwing. */
 interface PollResult {
   /** Drained payloads (empty when the hold expired with nothing waiting). */
-  envelopes: string[];
+  deliveries: Delivery[];
   /** HTTP status, or 0 for a network error / abort (no response). */
   status: number;
   /** `Retry-After` in ms if the server sent one (429/503), else null. */
@@ -203,15 +275,25 @@ export class RelayMailbox {
       const elapsedMs = this.now() - started;
       if (!resp.ok) {
         const retryAfterMs = parseRetryAfter(resp.headers.get("retry-after"), this.now());
-        return { envelopes: [], status: resp.status, retryAfterMs, elapsedMs };
+        return { deliveries: [], status: resp.status, retryAfterMs, elapsedMs };
       }
       const body = (await resp.json()) as ToPhoneBody;
       const envelopes = Array.isArray(body.envelopes) ? body.envelopes : [];
-      return { envelopes, status: resp.status, retryAfterMs: null, elapsedMs };
+      // `origins` is index-aligned and entirely optional; a client that ignored
+      // it would still be correct, so nothing here may throw or drop an
+      // envelope. A missing, short, or malformed array simply yields no hint.
+      const origins = Array.isArray(body.origins) ? body.origins : [];
+      const now = this.now();
+      const deliveries = envelopes.map((env) => ({ env }) as Delivery);
+      deliveries.forEach((d, i) => {
+        const o = parseRelayOrigin(origins[i], now);
+        if (o) d.relayOrigin = o;
+      });
+      return { deliveries, status: resp.status, retryAfterMs: null, elapsedMs };
     } catch {
       // Network error, or an abort (loop cancel / fetch timeout): a fast,
       // payload-less return. The loop decides whether to back off or bail.
-      return { envelopes: [], status: 0, retryAfterMs: null, elapsedMs: this.now() - started };
+      return { deliveries: [], status: 0, retryAfterMs: null, elapsedMs: this.now() - started };
     } finally {
       clearTimeout(timer);
       signal.removeEventListener("abort", onOuterAbort);
@@ -225,13 +307,17 @@ export class RelayMailbox {
    * or transport failure (fail closed), keeping the `relay to-phone:` prefix
    * its callers key error copy on. For a bounded, backing-off *wait*, use
    * {@link waitOne}; `drain` never loops or backs off on its own.
+   *
+   * Returns {@link Delivery} items rather than bare strings so the relay's
+   * display-only origin hint can ride alongside its envelope without ever being
+   * mixed into it.
    */
-  async drain(): Promise<string[]> {
+  async drain(): Promise<Delivery[]> {
     const controller = new AbortController();
     const r = await this.pollToPhone(controller.signal);
     if (r.status === 0) throw new Error("relay to-phone: request failed");
     if (r.status < 200 || r.status >= 300) throw new Error(`relay to-phone: HTTP ${r.status}`);
-    return r.envelopes;
+    return r.deliveries;
   }
 
   /**
@@ -258,7 +344,9 @@ export class RelayMailbox {
    *
    * Returns the first payload, or `null` once `timeoutMs` elapsed / the loop was
    * superseded. Extra payloads in a single drain are dropped here; the ceremony
-   * this backs is strictly one-message-per-direction.
+   * this backs is strictly one-message-per-direction. The origin hint is dropped
+   * too: this path is the pairing rendezvous, which has no approval sheet to
+   * show it on.
    */
   async waitOne(timeoutMs: number): Promise<string | null> {
     const key = this.toPhoneUrl();
@@ -274,7 +362,7 @@ export class RelayMailbox {
         if (controller.signal.aborted) return null;
         const r = await this.pollToPhone(controller.signal);
         if (controller.signal.aborted) return null;
-        if (r.envelopes.length > 0) return r.envelopes[0] ?? null;
+        if (r.deliveries.length > 0) return r.deliveries[0]?.env ?? null;
         if (this.now() >= deadline) return null;
 
         const held = r.status >= 200 && r.status < 300 && r.elapsedMs >= HELD_MIN_MS;

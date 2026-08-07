@@ -220,6 +220,9 @@ private struct RuleCard: View {
     /// Hover lifts the whole card: the border warms to cobalt and the grip lights
     /// up, so a row reads as a distinct, grabbable object rather than a flat blob.
     @State private var hovering = false
+    /// The env KEY names this rule injects. `export` drops the keys of an env
+    /// source with no sealed value, so an unsealed source arrives here empty and
+    /// reads as a plain gate ("no environment"), never as falsely "set".
     private var keys: [String] { source?.keys ?? [] }
 
     var body: some View {
@@ -428,15 +431,14 @@ private func previewLayeredConfig() -> SigilConfig {
 
 #Preview("Rules") {
     NavigationStack { RulesView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle), approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle)))
         .frame(width: 720, height: 640)
 }
 
 // The precedence the drag-to-reorder exists to author, at a comfortable width.
 #Preview("Rules - ordering") {
     NavigationStack { RulesView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: previewLayeredConfig()),
-                              approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: previewLayeredConfig())))
         .frame(width: 720, height: 640)
 }
 
@@ -445,14 +447,12 @@ private func previewLayeredConfig() -> SigilConfig {
 // never overflowing into a horizontal scroll.
 #Preview("Rules - narrow") {
     NavigationStack { RulesView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: previewLayeredConfig()),
-                              approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: previewLayeredConfig())))
         .frame(width: 360, height: 620)
 }
 
 #Preview("Rules - empty") {
     NavigationStack { RulesView() }
-        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: SigilConfig()),
-                              approver: MockApprover()))
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle, config: SigilConfig())))
         .frame(width: 720, height: 640)
 }

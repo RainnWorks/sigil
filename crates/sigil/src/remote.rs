@@ -56,8 +56,6 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use zeroize::Zeroizing;
-
 use sigil_direct::discovery::{self, VerifyError};
 use sigil_direct::{DirectLink, DirectListener, FallbackTransport};
 use sigil_proto::envelope::Envelope;
@@ -316,8 +314,9 @@ impl RemoteApprover {
             },
             lease_policy: ctx.lease,
             reason: None,
-            // A v2 account carries its threshold challenge to the phone; a v1
-            // account leaves this absent and takes the DEK path.
+            // A threshold-sealed secret (inline env, or a stored SSH key) carries
+            // its threshold challenge to the phone; a plain gate leaves it absent
+            // and approves without a partial.
             threshold: ctx.threshold.clone(),
             expires_at: now + timeout_ms,
             timeout_ms,
@@ -632,19 +631,19 @@ impl RemoteApprover {
                     None => Decision::Approve,
                 };
                 if let Some(challenge) = &req.threshold {
-                    // v2 account: an approve MUST carry the phone's partial Z_F for
-                    // this exact account. A missing/short partial, or one for a
-                    // different account, fails closed rather than approving emptily.
+                    // A request that opens a threshold-sealed secret: an approve
+                    // MUST carry the phone's partial Z_F for this exact id. A
+                    // missing/short partial, or one for a different id, fails closed
+                    // rather than approving emptily.
                     let (account_id, zf) = resp.partial_zf()?;
                     if account_id != challenge.account_id {
                         return None;
                     }
                     Some(ApprovalOutcome::with_partial(decision, zf))
                 } else {
-                    // v1 account: an approve MUST carry the DEK.
-                    let dek = resp.dek()?;
-                    let dek = Zeroizing::new(*dek.as_bytes());
-                    Some(ApprovalOutcome::with_dek(decision, dek))
+                    // A plain gate: nothing sealed to open, so the approve carries
+                    // no partial. The command runs with no injected secret.
+                    Some(ApprovalOutcome::local(decision))
                 }
             }
         }
@@ -1131,7 +1130,7 @@ mod tests {
         assert_eq!(req.provenance.process_chain, vec!["zsh", "op"]);
     }
 
-    use sigil_proto::{Dek, LocalRelay};
+    use sigil_proto::LocalRelay;
 
     /// Clone a device identity for a test (the approver takes ownership of one
     /// copy while the test keeps another to act as the phone's peer).
@@ -1143,6 +1142,9 @@ mod tests {
     }
 
     fn secret_ctx(id: &str) -> ApprovalContext {
+        // A request that opens a threshold-sealed secret keyed "Rowm": the phone's
+        // approve must carry a partial Z_F for that exact id. Tests use distinct
+        // Z_F bytes as a per-request discriminator (they used to use distinct DEKs).
         ApprovalContext {
             id: id.into(),
             account: "Rowm".into(),
@@ -1155,7 +1157,13 @@ mod tests {
             kind: RequestKind::SecretRead,
             lease: LeasePolicy::RunOnce,
             ssh: None,
-            threshold: None,
+            threshold: Some(sigil_proto::ThresholdChallenge {
+                account_id: "Rowm".into(),
+                label: "Rowm".into(),
+                ephemeral_pub: "BAQE".into(),
+                se_key_id: "se-key-1".into(),
+                ecdh_algo: "raw-x".into(),
+            }),
         }
     }
 
@@ -1261,7 +1269,7 @@ mod tests {
                     .recv(mailbox, Direction::ToPhone, Duration::from_secs(2))
                     .unwrap()
                     .expect("the daemon sent a request");
-                let resp = ApprovalResponse::approve("req-live", &Dek::from_bytes([9u8; 32]), 1);
+                let resp = ApprovalResponse::approve_v2("req-live", "Rowm", &[9u8; 32], 1);
                 let env = Envelope::seal(&resp, mailbox, 2, &phone.signing, &daemon_pub).unwrap();
                 relay.send(mailbox, Direction::ToDaemon, &env).unwrap();
             })
@@ -1277,8 +1285,8 @@ mod tests {
             "the approval must succeed; the owner must route its response to it"
         );
         assert_eq!(
-            outcome.dek.as_deref(),
-            Some(&[9u8; 32]),
+            outcome.zf.as_deref().map(|z| &z[..]),
+            Some(&[9u8; 32][..]),
             "the delivered DEK reaches the gate"
         );
         // The interleaved registration was still recorded off the same channel.
@@ -1318,11 +1326,11 @@ mod tests {
                         .unwrap()
                         .expect("a request was deposited");
                 }
-                let resp_a = ApprovalResponse::approve("req-A", &Dek::from_bytes([1u8; 32]), 1);
+                let resp_a = ApprovalResponse::approve_v2("req-A", "Rowm", &[1u8; 32], 1);
                 let env_a =
                     Envelope::seal(&resp_a, mailbox, 1, &phone.signing, &daemon_pub).unwrap();
                 relay.send(mailbox, Direction::ToDaemon, &env_a).unwrap();
-                let resp_b = ApprovalResponse::approve("req-B", &Dek::from_bytes([2u8; 32]), 1);
+                let resp_b = ApprovalResponse::approve_v2("req-B", "Rowm", &[2u8; 32], 1);
                 let env_b =
                     Envelope::seal(&resp_b, mailbox, 2, &phone.signing, &daemon_pub).unwrap();
                 relay.send(mailbox, Direction::ToDaemon, &env_b).unwrap();
@@ -1342,13 +1350,13 @@ mod tests {
         assert!(out_a.decision.is_grant() && out_b.decision.is_grant());
         // Each waiter received exactly its own DEK: no cross-routing.
         assert_eq!(
-            out_a.dek.as_deref(),
-            Some(&[1u8; 32]),
+            out_a.zf.as_deref().map(|z| &z[..]),
+            Some(&[1u8; 32][..]),
             "req-A got its own DEK"
         );
         assert_eq!(
-            out_b.dek.as_deref(),
-            Some(&[2u8; 32]),
+            out_b.zf.as_deref().map(|z| &z[..]),
+            Some(&[2u8; 32][..]),
             "req-B got its own DEK"
         );
     }
@@ -1481,7 +1489,7 @@ mod tests {
                 relay.send(mailbox, Direction::ToDaemon, &env).unwrap();
                 // Give the owner a moment to process the receipt before approving.
                 std::thread::sleep(Duration::from_millis(60));
-                let resp = ApprovalResponse::approve("req-live", &Dek::from_bytes([8u8; 32]), 1);
+                let resp = ApprovalResponse::approve_v2("req-live", "Rowm", &[8u8; 32], 1);
                 let env = Envelope::seal(&resp, mailbox, 2, &phone.signing, &daemon_pub).unwrap();
                 relay.send(mailbox, Direction::ToDaemon, &env).unwrap();
             })
@@ -1495,7 +1503,7 @@ mod tests {
         // The approval still succeeded with its own DEK: the receipt did not steal
         // or short-circuit the decision.
         assert!(outcome.decision.is_grant());
-        assert_eq!(outcome.dek.as_deref(), Some(&[8u8; 32]));
+        assert_eq!(outcome.zf.as_deref().map(|z| &z[..]), Some(&[8u8; 32][..]));
     }
 
     // --- #36 ring-all / first-wins coordinator --------------------------------
@@ -1601,7 +1609,7 @@ mod tests {
                 .recv(mailbox, Direction::ToPhone, Duration::from_secs(5))
                 .unwrap()
                 .expect("the winner received its request");
-            let resp = ApprovalResponse::approve("req-RING", &Dek::from_bytes([7u8; 32]), 1);
+            let resp = ApprovalResponse::approve_v2("req-RING", "Rowm", &[7u8; 32], 1);
             let env = Envelope::seal(&resp, mailbox, 1, &phone.signing, &daemon_pub).unwrap();
             relay_w.send(mailbox, Direction::ToDaemon, &env).unwrap();
         });
@@ -1613,8 +1621,8 @@ mod tests {
 
         assert!(outcome.decision.is_grant(), "the winner's approve resolves");
         assert_eq!(
-            outcome.dek.as_deref(),
-            Some(&[7u8; 32]),
+            outcome.zf.as_deref().map(|z| &z[..]),
+            Some(&[7u8; 32][..]),
             "exactly the winner's DEK reaches the gate"
         );
 
@@ -1667,7 +1675,7 @@ mod tests {
         phone_thread.join().unwrap();
 
         assert_eq!(outcome.decision, Decision::Deny, "the first deny wins");
-        assert!(outcome.dek.is_none(), "a deny carries no DEK");
+        assert!(outcome.zf.is_none(), "a deny carries no DEK");
 
         // The other device is dismissed with Settled (not told it was a deny).
         let status = drain_resolution(&devices[1], &relay);
@@ -1696,7 +1704,7 @@ mod tests {
             Decision::Deny,
             "an all-timeout ring must fail closed to deny"
         );
-        assert!(outcome.dek.is_none());
+        assert!(outcome.zf.is_none());
 
         shutdown.store(true, Ordering::SeqCst);
         for o in owners {
@@ -1722,7 +1730,7 @@ mod tests {
                 .recv(mailbox, Direction::ToPhone, Duration::from_secs(5))
                 .unwrap()
                 .expect("the sole device received its request");
-            let resp = ApprovalResponse::approve("req-ONE", &Dek::from_bytes([5u8; 32]), 1);
+            let resp = ApprovalResponse::approve_v2("req-ONE", "Rowm", &[5u8; 32], 1);
             let env = Envelope::seal(&resp, mailbox, 1, &phone.signing, &daemon_pub).unwrap();
             relay_c.send(mailbox, Direction::ToDaemon, &env).unwrap();
         });
@@ -1732,7 +1740,7 @@ mod tests {
         phone_thread.join().unwrap();
 
         assert!(outcome.decision.is_grant());
-        assert_eq!(outcome.dek.as_deref(), Some(&[5u8; 32]));
+        assert_eq!(outcome.zf.as_deref().map(|z| &z[..]), Some(&[5u8; 32][..]));
 
         shutdown.store(true, Ordering::SeqCst);
         for o in owners {
@@ -1911,7 +1919,7 @@ mod tests {
                     .recv(mailbox, Direction::ToPhone, Duration::from_secs(2))
                     .unwrap()
                     .expect("the request arrived on the direct link");
-                let resp = ApprovalResponse::approve("req-DL", &Dek::from_bytes([7u8; 32]), 2);
+                let resp = ApprovalResponse::approve_v2("req-DL", "Rowm", &[7u8; 32], 2);
                 let env = Envelope::seal(&resp, mailbox, 2, &phone.signing, &daemon_pub).unwrap();
                 client.send(mailbox, Direction::ToDaemon, &env).unwrap();
             })
@@ -1926,7 +1934,7 @@ mod tests {
             outcome.decision.is_grant(),
             "the approval rode the direct link"
         );
-        assert_eq!(outcome.dek.as_deref(), Some(&[7u8; 32]));
+        assert_eq!(outcome.zf.as_deref().map(|z| &z[..]), Some(&[7u8; 32][..]));
         // The relay never carried the request: it was genuinely skipped.
         assert_eq!(relay.depth(mailbox, Direction::ToPhone), 0);
         assert!(fb.has_primary(), "a healthy link stays promoted");
@@ -1986,7 +1994,7 @@ mod tests {
                     .recv(mailbox, Direction::ToPhone, Duration::from_secs(2))
                     .unwrap()
                     .expect("the demote re-deposit reached the relay");
-                let resp = ApprovalResponse::approve("req-DEMOTE", &Dek::from_bytes([3u8; 32]), 1);
+                let resp = ApprovalResponse::approve_v2("req-DEMOTE", "Rowm", &[3u8; 32], 1);
                 let env = Envelope::seal(&resp, mailbox, 1, &phone.signing, &daemon_pub).unwrap();
                 relay.send(mailbox, Direction::ToDaemon, &env).unwrap();
             })
@@ -2001,7 +2009,7 @@ mod tests {
             outcome.decision.is_grant(),
             "a black-holed direct link demotes and completes over the relay"
         );
-        assert_eq!(outcome.dek.as_deref(), Some(&[3u8; 32]));
+        assert_eq!(outcome.zf.as_deref().map(|z| &z[..]), Some(&[3u8; 32][..]));
         assert!(
             !fb.has_primary(),
             "the silent primary was retired on demote"

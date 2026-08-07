@@ -30,7 +30,7 @@ use base64::Engine;
 
 use sigil_proto::envelope::Envelope;
 use sigil_proto::identity::DeviceIdentity;
-use sigil_proto::pairing::{DaemonPairing, Dek};
+use sigil_proto::pairing::DaemonPairing;
 use sigil_proto::{
     now_ms, ApprovalRequest, Direction, LeasePolicy, LocalRelay, Provenance, RequestKind,
     SecretRef, Transport,
@@ -162,12 +162,9 @@ fn cmd_demo(args: &[String]) -> anyhow::Result<()> {
     assert_eq!(daemon.sas_words().unwrap(), pairing.sas_words());
     daemon.confirm()?;
     pairing.confirm()?;
-    let dek = Dek::generate();
-    let dek_hex = hex(dek.as_bytes());
-    let dek_env = daemon.deliver_dek(&dek, 1)?;
-    let phone = pairing.receive_dek(&dek_env)?;
+    let phone = pairing.finish()?;
     println!(
-        "3. paired · mailbox {} · DEK delivered",
+        "3. paired · mailbox {} · no key delivered (threshold at rest)",
         &hex(&phone.mailbox())[..16]
     );
 
@@ -237,17 +234,16 @@ fn cmd_demo(args: &[String]) -> anyhow::Result<()> {
             &mut guard,
         )
         .context("open response")?;
-    match response.dek() {
-        Some(recovered) => {
-            let ok = hex(recovered.as_bytes()) == dek_hex;
+    match response.decision {
+        sigil_proto::Decision::Approved => {
             println!(
-                "6. daemon recovered DEK from the response: {} (matches delivered DEK: {ok})",
-                &hex(recovered.as_bytes())[..16]
+                "6. daemon received an APPROVE. `op` is a plain gate, so nothing is injected; the \
+                 gated command runs and resolves its own secret."
             );
-            println!("\nRESULT: approve path complete. The daemon could now decrypt the token.");
+            println!("\nRESULT: approve path complete. The gated command may now run.");
         }
-        None => {
-            println!("6. response carried no DEK (denied); daemon fails closed, no secret served.");
+        sigil_proto::Decision::Denied => {
+            println!("6. response is a DENY; daemon fails closed, the command never runs.");
             println!("\nRESULT: deny path complete. Nothing released.");
         }
     }

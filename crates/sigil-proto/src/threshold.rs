@@ -50,8 +50,8 @@
 //! ([`EcdhAlgo::X963Sha256`]). The record pins which; both sides apply the
 //! identical shaping so `Z_M` and `Z_F` agree byte-for-byte. For the X9.63 variant
 //! this module fixes `sharedInfo = E`'s X9.63 bytes; **NV-7**: the exact parameter
-//! dict the SE applies to a *bare* key-agreement (distinct from the ECIES use in
-//! [`crate::se_ecies`]) must be confirmed on device and pinned to match this.
+//! dict the SE applies to a *bare* key-agreement must be confirmed on device and
+//! pinned to match this.
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
@@ -230,11 +230,9 @@ fn shape(raw_x: &[u8; XCOORD_LEN], algo: EcdhAlgo, e_x963: &[u8]) -> Zeroizing<[
 /// ANSI-X9.63 KDF (SHA-256) producing exactly 32 bytes: `SHA256(Z ‖ 0x00000001 ‖
 /// sharedInfo)`. 32 bytes fit one SHA-256 block, so the counter never advances.
 ///
-/// Deliberately local to this module and NOT shared with
-/// [`crate::se_ecies::x963_kdf_sha256`]: that instance is Apple's *ECIES* KDF
-/// (`sharedInfo` = the ephemeral point, 32-byte AES-key+IV output); this one is
-/// the *bare key-agreement* KDF (`sharedInfo` = `E`). NV-7 warns the two uses must
-/// not be conflated.
+/// This is the *bare key-agreement* KDF (`sharedInfo` = `E`), distinct from
+/// Apple's *ECIES* KDF (`sharedInfo` = the ephemeral point, 32-byte AES-key+IV
+/// output). NV-7 warns the two uses must not be conflated.
 fn x963_kdf_sha256_32(z: &[u8], shared_info: &[u8]) -> Zeroizing<[u8; XCOORD_LEN]> {
     let mut h = Sha256::new();
     h.update(z);

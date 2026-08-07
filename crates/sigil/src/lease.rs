@@ -7,14 +7,51 @@
 //! 1. Read the true peer pid off the unix socket (`LOCAL_PEERPID`).
 //! 2. Walk the ancestor chain kernel-side (sysctl `KERN_PROC` on macOS), pid by
 //!    pid, resolving each to an executable path and a content hash.
-//! 3. The grant key is `BLAKE2b(chain ++ project_root ++ scope)`. Raw pids are
-//!    excluded from the hash because they recycle; only the stable code
-//!    identity (path + hash) of each ancestor is bound in.
+//! 3. The grant key is `BLAKE2b(chain ++ project_root ++ kind ++ scope)`. Raw
+//!    pids are excluded from the hash because they recycle; only the stable code
+//!    identity (path + hash) of each ancestor is bound in. `kind` is the
+//!    request-kind tag ([`ScopeKind`]), so a command scope and an SSH scope live
+//!    in separate namespaces and cannot collide however they are spelled.
 //!
-//! A lease holds the unwrapped SA token in RAM, scoped to that grant key plus
-//! the account and request scope, until a TTL elapses. Expiry, revoke,
-//! lockdown, and daemon restart all zeroize it. Client-supplied ancestry is
-//! never consulted; the whole chain is measured here.
+//! Honest limit on the chain: every gated command reaches the daemon through a
+//! `~/.sigil/bin` symlink to the ONE `sigil` binary, and macOS `proc_pidpath`
+//! resolves symlinks, so the chain leaf is byte-identical for every gated
+//! command. The chain distinguishes *tool trees*, never commands. The rule name
+//! in the scope is the whole command-discriminating boundary; the chain is an
+//! outer fence around it.
+//!
+//! What the daemon puts in `project_root` and `scope` decides how wide one
+//! approval reaches, and the two callers differ deliberately:
+//!
+//! * **A gated command run** ([`crate::daemon`]'s `fulfill`) passes an empty
+//!   project root and the matched RULE's name as the scope. So a lease covers
+//!   "this caller chain, running anything this rule matches, from anywhere":
+//!   `op read A` and `op item get B` from the same tree share one lease, and a
+//!   `cd` no longer splits it. Breadth is bounded by the rule the user wrote
+//!   plus the rule's own lease policy (a run-once rule never leases at all).
+//! * **An SSH signature** passes an empty project root and a scope that folds in
+//!   the data-to-sign fingerprint, so every signature is its own approval. That
+//!   path grants no lease; the key only coalesces byte-identical re-signs.
+//!
+//! A lease is RAM-only and triple-scoped (grant key + account + scope), plus the
+//! [`LeaseBinding`] fingerprint of the source material a cached value came from.
+//! What it holds depends on the rule it covers:
+//!
+//! * **Plain gate** (`op`, `env-file`): an empty presence marker. The lease only
+//!   says "this caller already got a yes"; nothing is injected.
+//! * **Sealed inline `env`**: the unsealed values themselves, so a burst of runs
+//!   inside the window injects from RAM with no phone round trip. This is the
+//!   only place a credential lives in daemon memory across requests, and it is
+//!   why the window has to die the moment anything under it moves.
+//!
+//! Everything that can end the window zeroizes it: TTL expiry, `sigil lease
+//! revoke`, daemon restart/ctrl-c ([`LeaseStore::clear`]), and a config change
+//! that removes or edits the covering rule ([`LeaseStore::revoke_scope`], driven
+//! by `daemon::Core::reload_config`). A re-seal of the source is caught by the
+//! `binding` mismatch on lookup, so a stale plaintext is never injected.
+//!
+//! Client-supplied ancestry is never consulted; the whole chain is measured
+//! here.
 //!
 //! NEEDS-VERIFICATION: the ancestor "code identity" here is a BLAKE2b hash of
 //! the executable's bytes. The design calls for the platform code-signing
@@ -104,13 +141,41 @@ pub fn walk_ancestry(table: &dyn ProcessTable, start: i32) -> Caller {
     Caller { chain }
 }
 
-/// `BLAKE2b(domain ++ chain ++ project_root ++ scope)`, the lease grant key.
+/// Which kind of request a scope string belongs to. Hashed into the grant key so
+/// the two scope namespaces are separated: a rule named exactly like an SSH sign
+/// scope (or vice versa) can never derive the same key, whatever the strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeKind {
+    /// A gated command run; the scope is the matched rule's name.
+    Command,
+    /// One SSH signature; the scope folds in the data-to-sign fingerprint.
+    SshSignature,
+}
+
+impl ScopeKind {
+    /// The tag hashed into the grant key. Short and fixed; never displayed.
+    fn tag(self) -> &'static [u8] {
+        match self {
+            ScopeKind::Command => b"cmd",
+            ScopeKind::SshSignature => b"ssh",
+        }
+    }
+}
+
+/// `BLAKE2b(domain ++ chain ++ project_root ++ kind ++ scope)`, the lease grant
+/// key.
 ///
 /// Only the stable code identity of each ancestor is bound in, never its pid.
-/// Two runs of the same tool tree from the same project for the same scope
-/// therefore share a grant key (so one approval leases the burst); a different
-/// tool, project, or scope derives a different key.
-pub fn grant_key(caller: &Caller, project_root: &str, scope: &str) -> [u8; 32] {
+/// Two runs of the same tool tree for the same kind and scope therefore share a
+/// grant key (so one approval leases the burst); a different tool chain, kind, or
+/// scope derives a different key. `project_root` still hashes in when a caller
+/// supplies one, but the command path passes it empty on purpose (see the module
+/// docs): a lease is scoped to the rule, not to the directory the command
+/// happened to run in.
+///
+/// Every field is length-prefixed, so no two different inputs can serialize to
+/// the same byte string.
+pub fn grant_key(caller: &Caller, kind: ScopeKind, project_root: &str, scope: &str) -> [u8; 32] {
     let mut h = Blake2b256::new();
     h.update(GRANT_DOMAIN);
     h.update((caller.chain.len() as u64).to_le_bytes());
@@ -123,17 +188,71 @@ pub fn grant_key(caller: &Caller, project_root: &str, scope: &str) -> [u8; 32] {
     let root = project_root.as_bytes();
     h.update((root.len() as u64).to_le_bytes());
     h.update(root);
+    let tag = kind.tag();
+    h.update((tag.len() as u64).to_le_bytes());
+    h.update(tag);
     let scope = scope.as_bytes();
     h.update((scope.len() as u64).to_le_bytes());
     h.update(scope);
     h.finalize().into()
 }
 
-/// A granted lease: an unwrapped token held in RAM, scoped and TTL-bound.
+/// Everything besides the grant key that a lease must match on. Grouped into one
+/// value so three adjacent strings can never be passed in the wrong order, and
+/// so a lookup is forced to name the same three things a grant did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseBinding {
+    /// The account/source label the grant covers. Empty for a plain gate, which
+    /// injects nothing and so has no account to bind.
+    pub account: String,
+    /// The matched rule's name for a command lease (so the whole rule is
+    /// covered, not one argv). Never a raw command line.
+    pub scope: String,
+    /// A fingerprint of the exact source material a cached value came from (for
+    /// sealed inline `env`, the sealed record's ephemeral public point, which is
+    /// fresh on every re-seal). Empty when the lease caches nothing. A lookup
+    /// misses once the source is re-sealed, so a stale plaintext can never be
+    /// injected: the run falls back to a fresh approval.
+    pub source: String,
+    /// The config generation this grant was decided under.
+    ///
+    /// Rule invalidation on reload cannot cover a lease that does not exist yet:
+    /// an approval blocks on the phone for as long as the human takes, and a
+    /// config edit landing during that wait is invalidated before the grant is
+    /// filed. Binding the generation closes that by construction rather than by
+    /// timing, since a lease decided under generation N cannot match any lookup
+    /// after a reload has moved it.
+    pub config_gen: u64,
+}
+
+impl LeaseBinding {
+    /// A binding over cached source material, decided under config `generation`.
+    pub fn cached(account: &str, scope: &str, source: &str, generation: u64) -> Self {
+        Self {
+            account: account.to_string(),
+            scope: scope.to_string(),
+            source: source.to_string(),
+            config_gen: generation,
+        }
+    }
+
+    /// A binding for a lease that caches nothing (the plain-gate presence
+    /// marker): no source material to pin.
+    pub fn presence(account: &str, scope: &str, generation: u64) -> Self {
+        Self::cached(account, scope, "", generation)
+    }
+}
+
+/// A granted lease: a RAM-only, scoped, TTL-bound auto-approve window.
+///
+/// `token` is what the grant releases on a later matching run. A plain gate
+/// stores an empty marker (it injects nothing, so the lease only means "this
+/// caller already got a yes"); a sealed inline `env` rule stores the unsealed
+/// values, which is the one place a credential outlives a single request. Every
+/// removal path drops the `Zeroizing` token and wipes it.
 struct Lease {
     grant: [u8; 32],
-    account: String,
-    scope: String,
+    binding: LeaseBinding,
     token: Token,
     granted: Instant,
     expires: Instant,
@@ -144,6 +263,8 @@ struct Lease {
 pub struct LeaseInfo {
     pub grant_hex: String,
     pub account: String,
+    /// The rule name the lease covers. Display must make the breadth plain: the
+    /// lease covers any command that rule matches, not the one that opened it.
     pub scope: String,
     pub remaining: Duration,
     pub age: Duration,
@@ -161,14 +282,16 @@ impl LeaseStore {
         Self::default()
     }
 
-    /// Grant (or refresh) a lease for `grant`/`account`/`scope` with `ttl`.
-    pub fn grant(&self, grant: [u8; 32], account: &str, scope: &str, token: Token, ttl: Duration) {
+    /// Grant (or refresh) a lease for `grant` + `binding` with `ttl`. Refreshing
+    /// replaces the cached token, so the newest approval's values are the ones
+    /// served (the old ones are dropped, and so zeroized).
+    pub fn grant(&self, grant: [u8; 32], binding: &LeaseBinding, token: Token, ttl: Duration) {
         let now = Instant::now();
         let mut leases = self.inner.lock().expect("lease store poisoned");
         leases.retain(|l| l.expires > now);
         if let Some(l) = leases
             .iter_mut()
-            .find(|l| l.grant == grant && l.account == account && l.scope == scope)
+            .find(|l| l.grant == grant && &l.binding == binding)
         {
             l.token = token;
             l.expires = now + ttl;
@@ -176,23 +299,24 @@ impl LeaseStore {
         }
         leases.push(Lease {
             grant,
-            account: account.to_string(),
-            scope: scope.to_string(),
+            binding: binding.clone(),
             token,
             granted: now,
             expires: now + ttl,
         });
     }
 
-    /// The token for an active lease matching `grant`/`account`/`scope`, if any.
-    /// Expired leases are purged (and zeroized) as a side effect.
-    pub fn token_for(&self, grant: &[u8; 32], account: &str, scope: &str) -> Option<Token> {
+    /// The token for an active lease matching `grant` + `binding`, if any. All
+    /// four legs must match: a different account, rule, or source fingerprint is
+    /// a miss, and a miss means a fresh approval. Expired leases are purged (and
+    /// zeroized) as a side effect.
+    pub fn token_for(&self, grant: &[u8; 32], binding: &LeaseBinding) -> Option<Token> {
         let now = Instant::now();
         let mut leases = self.inner.lock().expect("lease store poisoned");
         leases.retain(|l| l.expires > now);
         leases
             .iter()
-            .find(|l| &l.grant == grant && l.account == account && l.scope == scope)
+            .find(|l| &l.grant == grant && &l.binding == binding)
             .map(|l| l.token.clone())
     }
 
@@ -205,8 +329,8 @@ impl LeaseStore {
             .iter()
             .map(|l| LeaseInfo {
                 grant_hex: hex32(&l.grant),
-                account: l.account.clone(),
-                scope: l.scope.clone(),
+                account: l.binding.account.clone(),
+                scope: l.binding.scope.clone(),
                 remaining: l.expires.saturating_duration_since(now),
                 age: now.saturating_duration_since(l.granted),
             })
@@ -224,7 +348,18 @@ impl LeaseStore {
         before - leases.len()
     }
 
-    /// Drop and zeroize every lease. The lockdown and restart path.
+    /// Revoke every lease whose scope is exactly `scope`. The config-change path:
+    /// a lease names a rule by a mutable string, so when that rule is removed or
+    /// edited the window it opened must die with it rather than transfer to the
+    /// new definition. Returns the number zeroized.
+    pub fn revoke_scope(&self, scope: &str) -> usize {
+        let mut leases = self.inner.lock().expect("lease store poisoned");
+        let before = leases.len();
+        leases.retain(|l| l.binding.scope != scope);
+        before - leases.len()
+    }
+
+    /// Drop and zeroize every lease. The daemon-restart path.
     pub fn clear(&self) -> usize {
         let mut leases = self.inner.lock().expect("lease store poisoned");
         let n = leases.len();
@@ -365,7 +500,6 @@ impl ProcessTable for SysProcessTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secrets::generate_dek;
     use std::collections::HashMap;
     use zeroize::Zeroizing;
 
@@ -395,6 +529,9 @@ mod tests {
             self.ident.get(&pid).copied().unwrap_or([0u8; 32])
         }
     }
+
+    /// The kind every command-path test derives keys under.
+    const CMD: ScopeKind = ScopeKind::Command;
 
     fn tree() -> MapTable {
         // 1 (init) → 100 zsh → 200 claude → 300 op
@@ -437,8 +574,18 @@ mod tests {
     #[test]
     fn grant_key_is_stable_for_the_same_tree_scope_and_root() {
         let c = walk_ancestry(&tree(), 300);
-        let a = grant_key(&c, "/Projects/rowm", "item get .env --vault Engineering");
-        let b = grant_key(&c, "/Projects/rowm", "item get .env --vault Engineering");
+        let a = grant_key(
+            &c,
+            CMD,
+            "/Projects/rowm",
+            "item get .env --vault Engineering",
+        );
+        let b = grant_key(
+            &c,
+            CMD,
+            "/Projects/rowm",
+            "item get .env --vault Engineering",
+        );
         assert_eq!(a, b);
     }
 
@@ -455,24 +602,103 @@ mod tests {
         t2.node(888, 777, "/usr/local/bin/claude", 2);
         t2.node(777, 1, "/bin/zsh", 1);
 
-        let a = grant_key(&walk_ancestry(&tree(), 300), "/p", "s");
-        let b = grant_key(&walk_ancestry(&t2, 999), "/p", "s");
+        let a = grant_key(&walk_ancestry(&tree(), 300), CMD, "/p", "s");
+        let b = grant_key(&walk_ancestry(&t2, 999), CMD, "/p", "s");
         assert_eq!(a, b, "grant key must not depend on pids");
+    }
+
+    /// The command path's call shape: no project root, the matched rule's name
+    /// as the scope. Mirrors `daemon::fulfill` so these tests move if it does.
+    fn rule_key(caller: &Caller, rule: &str) -> [u8; 32] {
+        grant_key(caller, CMD, "", rule)
+    }
+
+    #[test]
+    fn request_kinds_live_in_separate_scope_namespaces() {
+        // A rule may be named anything, including exactly what the SSH path uses
+        // as its scope. The kind tag is what stops the two from ever deriving one
+        // key (and so from ever sharing a coalesced approval).
+        let c = walk_ancestry(&tree(), 300);
+        let same = "ssh-sign GitHub SHA256:abc";
+        assert_ne!(
+            grant_key(&c, ScopeKind::Command, "", same),
+            grant_key(&c, ScopeKind::SshSignature, "", same),
+            "identical scope strings of different kinds must not collide"
+        );
+    }
+
+    #[test]
+    fn one_rule_covers_any_command_it_matches() {
+        // The point of rule scoping: `op read A` and `op item get B` are the same
+        // lease as long as the same caller chain runs them under the same rule.
+        let c = walk_ancestry(&tree(), 300);
+        assert_eq!(
+            rule_key(&c, "op"),
+            rule_key(&c, "op"),
+            "the argv is not in the key at all, so any two commands under one rule match"
+        );
+    }
+
+    #[test]
+    fn cwd_no_longer_splits_a_lease() {
+        // Historically the project root was hashed in, so a `cd` cost a fresh
+        // approval. The command path now passes "", so the key is cwd-blind.
+        let c = walk_ancestry(&tree(), 300);
+        assert_eq!(rule_key(&c, "op"), grant_key(&c, CMD, "", "op"));
+        assert_ne!(
+            grant_key(&c, CMD, "/Projects/rowm", "op"),
+            grant_key(&c, CMD, "/Projects/other", "op"),
+            "the root still hashes in when a caller supplies one"
+        );
+    }
+
+    #[test]
+    fn different_rules_do_not_share_a_grant_key() {
+        let c = walk_ancestry(&tree(), 300);
+        assert_ne!(
+            rule_key(&c, "op"),
+            rule_key(&c, "op-account-rowmhq-1password-eu"),
+            "a lease on one rule must not cover another rule"
+        );
+    }
+
+    #[test]
+    fn different_caller_chains_do_not_share_a_rule_lease() {
+        // Same rule, different tool tree: the lease must not carry across. This
+        // is the whole security boundary now that argv and cwd are out of the key.
+        let mine = walk_ancestry(&tree(), 300);
+        let mut other = tree();
+        other.node(300, 200, "/opt/homebrew/bin/op", 3);
+        other.node(200, 100, "/usr/local/bin/some-other-tool", 9);
+        assert_ne!(
+            rule_key(&mine, "op"),
+            rule_key(&walk_ancestry(&other, 300), "op"),
+            "a different caller chain is a different grant"
+        );
+
+        // And a tampered ancestor (same paths, different code identity) too.
+        let mut tampered = tree();
+        tampered.ident.insert(200, [0x42; 32]);
+        assert_ne!(
+            rule_key(&mine, "op"),
+            rule_key(&walk_ancestry(&tampered, 300), "op"),
+            "ancestor code identity must still matter"
+        );
     }
 
     #[test]
     fn grant_key_changes_with_root_scope_or_ancestry() {
         let c = walk_ancestry(&tree(), 300);
-        let base = grant_key(&c, "/p", "s");
-        assert_ne!(base, grant_key(&c, "/other", "s"), "root must matter");
-        assert_ne!(base, grant_key(&c, "/p", "other"), "scope must matter");
+        let base = grant_key(&c, CMD, "/p", "s");
+        assert_ne!(base, grant_key(&c, CMD, "/other", "s"), "root must matter");
+        assert_ne!(base, grant_key(&c, CMD, "/p", "other"), "scope must matter");
 
         // A different ancestor identity (e.g. a tampered claude) must move it.
         let mut t = tree();
         t.ident.insert(200, [0x42; 32]);
         assert_ne!(
             base,
-            grant_key(&walk_ancestry(&t, 300), "/p", "s"),
+            grant_key(&walk_ancestry(&t, 300), CMD, "/p", "s"),
             "ancestor code identity must matter"
         );
     }
@@ -481,43 +707,101 @@ mod tests {
         Zeroizing::new(s.as_bytes().to_vec())
     }
 
+    /// The config generation these store-level tests bind under; which one does
+    /// not matter here, only that grant and lookup agree (the daemon-level tests
+    /// cover a generation actually moving).
+    const GEN: u64 = 0;
+
+    /// A presence binding (what a plain gate stores).
+    fn gate(account: &str, scope: &str) -> LeaseBinding {
+        LeaseBinding::presence(account, scope, GEN)
+    }
+
     #[test]
     fn lease_grant_lookup_and_scope_isolation() {
+        // Scope is the rule name; every leg of the binding must match on lookup.
         let store = LeaseStore::new();
-        let gk = grant_key(&walk_ancestry(&tree(), 300), "/p", "read .env");
+        let gk = rule_key(&walk_ancestry(&tree(), 300), "op");
+        let b = gate("Rowm", "op");
+        store.grant(gk, &b, token("tok"), Duration::from_secs(60));
+
+        assert_eq!(store.active(), 1);
+        let t = store.token_for(&gk, &b).unwrap();
+        assert_eq!(&t[..], b"tok");
+        // Wrong rule, account, or grant key does not match.
+        assert!(store.token_for(&gk, &gate("Rowm", "op-eu")).is_none());
+        assert!(store.token_for(&gk, &gate("Other", "op")).is_none());
+        assert!(store.token_for(&[0u8; 32], &b).is_none());
+    }
+
+    #[test]
+    fn a_reseal_of_the_source_misses_the_cached_lease() {
+        // The source-material leg: a lease holding values unsealed from record E
+        // must not serve a run whose source has since been re-sealed under E'.
+        // The lookup misses, so that run takes a fresh approval instead of being
+        // handed values that are no longer what is on disk.
+        let store = LeaseStore::new();
+        let gk = rule_key(&walk_ancestry(&tree(), 300), "deploy");
+        let sealed_then = LeaseBinding::cached("prod-env", "deploy", "E-original", GEN);
+        let sealed_now = LeaseBinding::cached("prod-env", "deploy", "E-after-reseal", GEN);
         store.grant(
             gk,
-            "Rowm",
-            "read .env",
-            token("tok"),
+            &sealed_then,
+            token("TOKEN=old"),
             Duration::from_secs(60),
         );
 
-        assert_eq!(store.active(), 1);
-        let t = store.token_for(&gk, "Rowm", "read .env").unwrap();
-        assert_eq!(&t[..], b"tok");
-        // Wrong scope, account, or grant key does not match.
-        assert!(store.token_for(&gk, "Rowm", "read other").is_none());
-        assert!(store.token_for(&gk, "Other", "read .env").is_none());
-        assert!(store.token_for(&[0u8; 32], "Rowm", "read .env").is_none());
+        assert!(store.token_for(&gk, &sealed_then).is_some());
+        assert!(
+            store.token_for(&gk, &sealed_now).is_none(),
+            "a re-sealed source must not hit the old cache"
+        );
+        // And a presence lookup (no cached material) is a different binding too.
+        assert!(store.token_for(&gk, &gate("prod-env", "deploy")).is_none());
     }
 
     #[test]
     fn lease_expires_and_is_purged() {
         let store = LeaseStore::new();
         let gk = [7u8; 32];
-        store.grant(gk, "Rowm", "s", token("tok"), Duration::from_millis(15));
-        assert!(store.token_for(&gk, "Rowm", "s").is_some());
+        let b = gate("Rowm", "s");
+        store.grant(gk, &b, token("tok"), Duration::from_millis(15));
+        assert!(store.token_for(&gk, &b).is_some());
         std::thread::sleep(Duration::from_millis(30));
-        assert!(store.token_for(&gk, "Rowm", "s").is_none());
+        assert!(store.token_for(&gk, &b).is_none());
         assert_eq!(store.active(), 0);
     }
 
     #[test]
-    fn lockdown_clears_all_leases() {
+    fn an_expired_cached_lease_stops_serving_its_values() {
+        // The cache-path lifecycle in miniature: values are served while the
+        // window is live and are gone (and wiped with the purge) the moment it
+        // lapses. A caller past the TTL gets nothing to inject, so it re-gates.
         let store = LeaseStore::new();
-        store.grant([1u8; 32], "A", "s", token("a"), Duration::from_secs(60));
-        store.grant([2u8; 32], "B", "s", token("b"), Duration::from_secs(60));
+        let gk = [9u8; 32];
+        let b = LeaseBinding::cached("prod-env", "deploy", "E1", GEN);
+        store.grant(gk, &b, token("TOKEN=live"), Duration::from_millis(15));
+        assert_eq!(&store.token_for(&gk, &b).unwrap()[..], b"TOKEN=live");
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(store.token_for(&gk, &b).is_none(), "the window lapsed");
+        assert_eq!(store.active(), 0, "and the values were purged with it");
+    }
+
+    #[test]
+    fn clear_zeroizes_all_leases() {
+        let store = LeaseStore::new();
+        store.grant(
+            [1u8; 32],
+            &gate("A", "s"),
+            token("a"),
+            Duration::from_secs(60),
+        );
+        store.grant(
+            [2u8; 32],
+            &gate("B", "s"),
+            token("b"),
+            Duration::from_secs(60),
+        );
         assert_eq!(store.active(), 2);
         assert_eq!(store.clear(), 2);
         assert_eq!(store.active(), 0);
@@ -527,20 +811,56 @@ mod tests {
     fn revoke_by_grant_prefix() {
         let store = LeaseStore::new();
         let gk = [0xabu8; 32];
-        store.grant(gk, "A", "s", token("a"), Duration::from_secs(60));
+        let b = gate("A", "s");
+        store.grant(gk, &b, token("a"), Duration::from_secs(60));
         let prefix = &hex32(&gk)[..8];
         assert_eq!(store.revoke(prefix), 1);
         assert_eq!(store.active(), 0);
+        assert!(
+            store.token_for(&gk, &b).is_none(),
+            "revoke drops the values"
+        );
+    }
+
+    #[test]
+    fn revoke_scope_kills_every_lease_on_one_rule() {
+        // The config-change path: one rule's window dies whoever opened it, and
+        // other rules' windows are untouched.
+        let store = LeaseStore::new();
+        let doomed = LeaseBinding::cached("prod-env", "deploy", "E1", GEN);
+        store.grant(
+            [1u8; 32],
+            &doomed,
+            token("TOKEN=a"),
+            Duration::from_secs(60),
+        );
+        store.grant(
+            [2u8; 32],
+            &doomed,
+            token("TOKEN=b"),
+            Duration::from_secs(60),
+        );
+        store.grant(
+            [3u8; 32],
+            &gate("", "op"),
+            token(""),
+            Duration::from_secs(60),
+        );
+
+        assert_eq!(store.revoke_scope("deploy"), 2);
+        assert_eq!(store.active(), 1, "the unrelated rule keeps its lease");
+        assert!(store.token_for(&[1u8; 32], &doomed).is_none());
+        assert_eq!(store.revoke_scope("deploy"), 0, "idempotent");
     }
 
     #[test]
     fn lease_refresh_keeps_one_entry() {
         let store = LeaseStore::new();
         let gk = [3u8; 32];
-        let _ = generate_dek(); // touch the CSPRNG path used by the real flow
-        store.grant(gk, "A", "s", token("a"), Duration::from_secs(1));
-        store.grant(gk, "A", "s", token("b"), Duration::from_secs(60));
+        let b = gate("A", "s");
+        store.grant(gk, &b, token("a"), Duration::from_secs(1));
+        store.grant(gk, &b, token("b"), Duration::from_secs(60));
         assert_eq!(store.active(), 1);
-        assert_eq!(&store.token_for(&gk, "A", "s").unwrap()[..], b"b");
+        assert_eq!(&store.token_for(&gk, &b).unwrap()[..], b"b");
     }
 }

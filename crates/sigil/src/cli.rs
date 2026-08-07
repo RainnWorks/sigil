@@ -3,6 +3,7 @@
 
 use std::io::Read;
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
 use sigil_proto::DeviceIdentity;
 use zeroize::Zeroizing;
@@ -12,8 +13,6 @@ use crate::json::{self, ControlResult};
 use crate::keystore;
 use crate::local::{self, Frame, Reply};
 use crate::paths;
-use crate::provider::{OpProvider, SecretProvider};
-use crate::secrets::AccountStore;
 use crate::settings::{self, Settings};
 use crate::style::Style;
 
@@ -33,6 +32,7 @@ pub fn run_gating() -> i32 {
     let json = extract_flag(&mut args, "--json");
     match args.first().map(String::as_str).unwrap_or("") {
         "" | "status" => cmd_status(),
+        "up" => crate::up::cmd_up(),
         "daemon" => cmd_daemon(&args[1..]),
         "doctor" => cmd_doctor(),
         "setup" => cmd_setup(&args[1..]),
@@ -41,7 +41,7 @@ pub fn run_gating() -> i32 {
         "unpair" => cmd_unpair(json),
         "start" | "stop" | "restart" => cmd_service(&args[0]),
         "lease" => cmd_lease(&args[1..]),
-        "lockdown" => cmd_lockdown(&args[1..]),
+        "keystore" => cmd_keystore(&args[1..]),
         "approve" => cmd_approve(&args[1..]),
         "deny" => cmd_deny(&args[1..]),
         "history" => cmd_history(),
@@ -93,7 +93,6 @@ pub fn run_config() -> i32 {
         "add" => config_add(&args[1..], json),
         "remove" | "rm" => config_remove(args.get(1).map(String::as_str), json),
         "proxy" => cmd_proxy(&args[1..], json),
-        "account" => cmd_account(&args[1..], json),
         "settings" => cmd_settings(&args[1..], json),
         "mac-approvals" => cmd_mac_approvals(&args[1..], json),
         "wipe" => cmd_wipe(&args[1..], json),
@@ -123,6 +122,7 @@ pub fn is_reserved_verb(cmd: &str) -> bool {
     matches!(
         cmd,
         "" | "status"
+            | "up"
             | "daemon"
             | "doctor"
             | "setup"
@@ -133,7 +133,7 @@ pub fn is_reserved_verb(cmd: &str) -> bool {
             | "stop"
             | "restart"
             | "lease"
-            | "lockdown"
+            | "keystore"
             | "approve"
             | "deny"
             | "history"
@@ -210,6 +210,9 @@ usage: sigil <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
                     command is refused; configure one with: sigil-config add <cmd>
   run -- <cmd>      escape hatch: run <cmd> even if it collides with a verb
   status            instrument panel: daemon, shim, op, factor
+  up                ensure everything: install the binary and launchd agent,
+                    heal a dead or wedged daemon, wire the shim, check pairing.
+                    Idempotent; run it any time something looks off
   setup             guided first run: shim, PATH, launchd, then pair
   daemon [--dev-insecure]  run the approval daemon (foreground). Without a
                     paired phone or a hardware biometric it fails closed;
@@ -228,15 +231,17 @@ usage: sigil <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
   start|stop|restart   control the launchd daemon agent
   lease list        list active session leases with countdowns
   lease revoke <p>  revoke leases whose grant-key hex starts with <p>
-  lockdown [--clear]  seal the daemon (deny + refuse) or unseal it
+  keystore status   whether the on-disk keystore is sealed to the Sigil app
+  keystore unwrap --confirm   ask the app to return the keystore to plaintext
   approve --local --id <id> [--lease]  approve a pending request at the Mac
   deny --local --id <id>               deny a pending request at the Mac
   history           the decision audit log (names and metadata only)
   pending           requests currently parked for a local decision
-  ssh add           serve a 1Password SSH key (--vault --item --pubkey-file)
-  ssh add-file      serve a local key file (--path <key>, signs from ~/.ssh/…)
+  ssh add-file      serve a local key file (--path <key>, signs from ~/.ssh/… [--host h])
+  ssh add-stored    seal a private key under threshold, phone-gated (key on stdin, [--host h])
   ssh list          list the SSH keys the agent serves
-  ssh remove <item> stop serving an SSH key
+  ssh remove <id>   stop serving an SSH key (by its path or stored id)
+  ssh config        route chosen hosts via ~/.ssh/config (--install / --uninstall)
   sshagent          print the SSH_AUTH_SOCK to point ssh/git at Sigil
   shim install      symlink ~/.sigil/bin/op at this binary
   shim add <cmd>    drop a transparent alias binary for a configured command
@@ -248,7 +253,7 @@ binary: run `sigil-config help`. Keeping it off this binary means a program
 literally named `config`/`account`/… stays gateable as `sigil <that-name> …`.
 
 The Mac app speaks the daemon control socket directly (see PROTOCOL.md):
-status, doctor, lease, lockdown, approve, deny, history, and pending are
+status, doctor, lease, approve, deny, history, and pending are
 socket queries the human CLI renders."
     );
 }
@@ -270,6 +275,13 @@ usage: sigil-config <cmd> [args...]   author rules/sources, manage accounts
                     lines instead. source env unset <name> --key <KEY> removes
                     one. Values are AES-256-GCM at rest; list/export show only
                     KEY names
+  source env set-plain <name> --key <K> --value <V> [--force-plain]
+                    attach a NON-SECRET env var to a source, stored in cleartext
+                    in config.json and injected alongside the sealed values (a
+                    sealed value of the same name wins). For behavior switches
+                    like OP_BIOMETRIC_UNLOCK_ENABLED=false, not for credentials;
+                    if leaking it would matter, use `source env set` instead.
+                    also: source env unset-plain <name> --key <K>
   rule add <name> --source <s> [--command <c>] [--subcommand <s>]
                     [--argv-contains <str>...] [--flag <f>...] [--flag-eq <f>=<v>...]
                     [--leasable [--lease-max <secs>]] [--timeout <sec>]
@@ -282,10 +294,6 @@ usage: sigil-config <cmd> [args...]   author rules/sources, manage accounts
   proxy add <cmd>   install a transparent PATH alias so a bare <cmd> hits Sigil;
                     also: proxy remove <cmd> [--purge] | list | status |
                     doctor [<cmd>] | env [--shell zsh|bash|fish|nu]
-  account add       add a service-account token (reads token from stdin)
-  account list      list configured accounts and their vault routing
-  account rotate --id <id>  replace an account's token (reads from stdin)
-  account remove --id <id>  forget an account
   settings get|set  read or change preferences (timeouts, relay, retention)
   mac-approvals --enable|--phone-only  toggle the Mac local-approval factor
   wipe [--force]    remove pairing, accounts, keys, config, and settings
@@ -294,7 +302,7 @@ usage: sigil-config <cmd> [args...]   author rules/sources, manage accounts
 
 --json is for the CLI-only mutation commands the Mac app shells out for
 (source/rule/list/export/import, account, settings, wipe, mac-approvals).
-Re-run `sigil restart` to apply a config change."
+A running daemon picks up config, sealed values, and SSH keys on its own."
     );
 }
 
@@ -307,16 +315,21 @@ fn fetch_status() -> json::StatusJson {
             return st;
         }
     }
-    crate::report::status(false, crate::report::Runtime::down())
+    crate::report::status(false)
 }
+
+/// The two columns every `status` row shares. Padding happens BEFORE styling, so
+/// the ANSI escapes never count toward a width; hand-spacing each row is how the
+/// name column drifted between 8, 9, and 11 in the first place. `STATE_COL` fits
+/// the longest state label ("Sealed, not open") so no row pushes its note right.
+const NAME_COL: usize = 10;
+const STATE_COL: usize = 16;
 
 fn cmd_status() -> i32 {
     let s = Style::stdout();
     let st = fetch_status();
 
-    let head = if st.locked_down {
-        s.brass("locked down")
-    } else if st.daemon_up && st.factor.kind != "fail_closed" {
+    let head = if st.daemon_up && st.factor.kind != "fail_closed" {
         s.ok("armed")
     } else if st.daemon_up {
         s.brass("idle")
@@ -332,7 +345,11 @@ fn cmd_status() -> i32 {
     } else {
         (s.deny("\u{2717}"), "down", s.dim("socket not listening"))
     };
-    println!("  {}  {glyph} {}  {note}", s.dim("daemon"), pad(label, 13));
+    println!(
+        "  {} {glyph} {}  {note}",
+        s.dim(&pad("daemon", NAME_COL)),
+        pad(label, STATE_COL)
+    );
 
     // shim (with drift detection)
     let (glyph, label, note) = match st.shim.kind.as_str() {
@@ -353,7 +370,11 @@ fn cmd_status() -> i32 {
         ),
         _ => (s.brass("\u{2717}"), "unknown", s.dim("")),
     };
-    println!("  {}    {glyph} {}  {note}", s.dim("shim"), pad(label, 13));
+    println!(
+        "  {} {glyph} {}  {note}",
+        s.dim(&pad("shim", NAME_COL)),
+        pad(label, STATE_COL)
+    );
 
     // op
     let (glyph, label, note) = if st.op.found {
@@ -365,23 +386,31 @@ fn cmd_status() -> i32 {
     } else {
         (s.deny("\u{2717}"), "missing", s.dim("no `op` on PATH"))
     };
-    println!("  {}      {glyph} {}  {note}", s.dim("op"), pad(label, 13));
+    println!(
+        "  {} {glyph} {}  {note}",
+        s.dim(&pad("op", NAME_COL)),
+        pad(label, STATE_COL)
+    );
 
     // accounts
     let (glyph, label, note) = if st.accounts > 0 {
         (
             s.ok("\u{2713}"),
             "configured",
-            s.dim(&format!("{} account(s)", st.accounts)),
+            s.dim(&format!("{} sealed secret(s)", st.accounts)),
         )
     } else {
         (
             s.brass("\u{2717}"),
             "none",
-            s.dim("run: sigil account add --token-stdin --label <name>"),
+            s.dim("set inline env values: sigil-config source env set <name> --stdin"),
         )
     };
-    println!("  {} {glyph} {}  {note}", s.dim("accounts"), pad(label, 13));
+    println!(
+        "  {} {glyph} {}  {note}",
+        s.dim(&pad("sealed env", NAME_COL)),
+        pad(label, STATE_COL)
+    );
 
     // factor
     let (glyph, label, note) = match st.factor.kind.as_str() {
@@ -404,12 +433,34 @@ fn cmd_status() -> i32 {
             s.brass("no factor; run: sigil pair"),
         ),
     };
-    println!("  {}   {glyph} {}  {note}", s.dim("factor"), pad(label, 13));
+    println!(
+        "  {} {glyph} {}  {note}",
+        s.dim(&pad("factor", NAME_COL)),
+        pad(label, STATE_COL)
+    );
+
+    // keystore: shown only when the daemon says the store is wrapped, since a
+    // plaintext store is the unremarkable default and needs no row. The
+    // unprovisioned state is the one that must read unmistakably as "the app is
+    // not running", never as anything a human could mistake for a lost pairing.
+    if let Some(row) = keystore_row(&st) {
+        let (glyph, note) = match row.tone {
+            RowTone::Fine => (s.ok(row.glyph), s.dim(row.note)),
+            // Rust, not brass: nothing here is pending, every gated command is
+            // being refused right now.
+            RowTone::Denied => (s.deny(row.glyph), s.deny(row.note)),
+        };
+        println!(
+            "  {} {glyph} {}  {note}",
+            s.dim(&pad("keystore", NAME_COL)),
+            pad(row.label, STATE_COL)
+        );
+    }
 
     // ssh agent: how many keys it would serve (a local CLI convenience row; the
     // count is not part of the machine status shape).
     let ssh_count = crate::sshagent::SshKeyConfig::load()
-        .map(|c| c.keys.len())
+        .map(|c| c.files.len() + c.stored.len())
         .unwrap_or(0);
     let (glyph, label, note) = if ssh_count > 0 {
         (
@@ -423,10 +474,14 @@ fn cmd_status() -> i32 {
         (
             s.dim("\u{25cb}"),
             "no keys",
-            s.dim("add one: sigil ssh add --vault <V> --item <I> --pubkey-file <p>"),
+            s.dim("add one: sigil ssh add-file --path <key>"),
         )
     };
-    println!("  {}     {glyph} {}  {note}", s.dim("ssh"), pad(label, 13));
+    println!(
+        "  {} {glyph} {}  {note}",
+        s.dim(&pad("ssh", NAME_COL)),
+        pad(label, STATE_COL)
+    );
 
     println!();
     println!(
@@ -436,9 +491,141 @@ fn cmd_status() -> i32 {
     0
 }
 
+/// How a status row should be coloured. Returned WITH the row rather than
+/// derived from its label: colour is semantics (this row means "everything is
+/// fine" or "this is failing closed"), and deriving it by matching the display
+/// string means editing copy silently flips the meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowTone {
+    Fine,
+    /// Failing closed right now. Rust, not brass: brass says "needs attention
+    /// soon", and this state means every gated command is being refused.
+    Denied,
+}
+
+/// One `status` row's content: tone, glyph, state label, and the detail note.
+struct Row {
+    tone: RowTone,
+    glyph: &'static str,
+    label: &'static str,
+    note: &'static str,
+}
+
+/// The `status` keystore row, or `None` when there is nothing worth a row (a
+/// plaintext store, or a daemon too old to say).
+///
+/// The wording of the not-open case is load-bearing. What has actually happened
+/// is that the Sigil app is not running; what a careless message would imply is
+/// that the pairing is gone, and a human acting on that would re-pair and destroy
+/// a perfectly good pairing to fix an app that just needed launching. So the note
+/// names the app and says the pairing is intact.
+fn keystore_row(st: &json::StatusJson) -> Option<Row> {
+    match (st.keystore_sealed, st.keystore_provisioned) {
+        // Older daemon (field absent): say nothing rather than guess.
+        (None, _) | (Some(false), _) => None,
+        (Some(true), Some(true)) => Some(Row {
+            tone: RowTone::Fine,
+            glyph: "\u{25cf}",
+            label: crate::keystore_seal::STATE_OPEN,
+            note: "wrapped to the Sigil app's Secure Enclave; opened for this session",
+        }),
+        (Some(true), _) => Some(Row {
+            tone: RowTone::Denied,
+            glyph: "\u{2717}",
+            label: crate::keystore_seal::STATE_NOT_OPEN,
+            note: "start the Sigil app to open it \u{b7} your pairing is intact, this is not a re-pair",
+        }),
+    }
+}
+
+/// `sigil keystore <status|unwrap>`: read the seal state, or ask the Sigil app to
+/// return the store to plaintext.
+///
+/// De-adoption is deliberately a two-party ceremony. The daemon cannot unwrap
+/// (it has no key), and the CLI cannot either; only the app's Secure Enclave can.
+/// So this asks the daemon to raise a request, the app answers it, and the daemon
+/// clears the adoption marker only once the app reports the plaintext is written
+/// and fsynced. If the app never answers, nothing changes and the store stays
+/// wrapped, which is the safe direction.
+fn cmd_keystore(args: &[String]) -> i32 {
+    let s = Style::stdout();
+    match args.first().map(String::as_str) {
+        Some("status") | None => {
+            // One shape for every state: a glyph and the state name, then exactly
+            // one faint line of detail. Uniform shape is what lets someone read
+            // the state at a glance instead of parsing a paragraph.
+            let st = fetch_status();
+            let (glyph, state, detail) = match (st.keystore_sealed, st.keystore_provisioned) {
+                (Some(true), Some(true)) => (
+                    s.ok("\u{2713}"),
+                    crate::keystore_seal::STATE_OPEN.to_string(),
+                    "offline copies of the keystore file are useless without this Mac's enclave"
+                        .to_string(),
+                ),
+                (Some(true), _) => (
+                    s.deny("\u{2717}"),
+                    crate::keystore_seal::STATE_NOT_OPEN.to_string(),
+                    "start the Sigil app to open it \u{b7} your pairing is intact, this is not a re-pair"
+                        .to_string(),
+                ),
+                (Some(false), _) => (
+                    s.dim("\u{25cb}"),
+                    "Plaintext".to_string(),
+                    format!(
+                        "{} \u{b7} {}",
+                        crate::keystore::file_keystore_path().display(),
+                        crate::keystore::file_keystore_residual()
+                    ),
+                ),
+                (None, _) => (
+                    s.dim("\u{25cb}"),
+                    "Unknown".to_string(),
+                    "the daemon did not report a keystore state".to_string(),
+                ),
+            };
+            println!("  {glyph} {state}");
+            println!("  {}", s.faint(&detail));
+            0
+        }
+        Some("unwrap") => {
+            if !has_flag(args, "--confirm") {
+                eprintln!(
+                    "sigil: this returns the keystore to plaintext on disk, undoing the \
+                     Secure Enclave wrapping.\n  \
+                     Offline copies (backups, snapshots, a stolen disk) become useful to a \
+                     reader again.\n  \
+                     Re-run with --confirm if that is what you want: sigil keystore unwrap --confirm"
+                );
+                return 2;
+            }
+            print_control(send_control_with_timeout(
+                &Frame::KeystoreUnwrapRequest,
+                // The app has to do real work (an enclave decrypt, a durable
+                // write) and a human may have to bring it to the front, so this
+                // waits longer than an ordinary control round trip.
+                Duration::from_secs(90),
+            ))
+        }
+        _ => {
+            eprintln!("usage: sigil keystore <status|unwrap --confirm>");
+            2
+        }
+    }
+}
+
 /// Connect to the daemon, send one control frame, and return its reply.
 fn send_control(frame: &Frame) -> std::io::Result<Reply> {
     let mut stream = UnixStream::connect(local::socket_path())?;
+    local::send_frame(&stream, frame, &[])?;
+    local::recv_reply(&mut stream)
+}
+
+/// [`send_control`] with a read deadline, for the verbs whose answer depends on
+/// another party doing real work (the keystore ceremonies wait on the Sigil app).
+/// Without this the CLI would block forever on an app that never answers.
+fn send_control_with_timeout(frame: &Frame, timeout: Duration) -> std::io::Result<Reply> {
+    let mut stream = UnixStream::connect(local::socket_path())?;
+    stream.set_read_timeout(Some(timeout))?;
     local::send_frame(&stream, frame, &[])?;
     local::recv_reply(&mut stream)
 }
@@ -506,422 +693,6 @@ fn flag_values(args: &[String], name: &str) -> Vec<String> {
     out
 }
 
-fn cmd_account(args: &[String], json: bool) -> i32 {
-    match args.first().map(String::as_str) {
-        Some("add") => account_add(&args[1..], json),
-        Some("list") => account_list(json),
-        Some("rotate") => account_rotate(&args[1..], json),
-        Some("remove") | Some("rm") => account_remove(&args[1..], json),
-        _ => {
-            eprintln!("usage: sigil account <add|list|rotate|remove>");
-            2
-        }
-    }
-}
-
-/// The GUI-facing shape for one account. The store keys accounts by their unique
-/// label, so `id == label`; it retains no token-health or last-used metadata, so
-/// those are `healthy`/absent (see JSON.md).
-fn account_json(a: &crate::secrets::Account) -> json::AccountJson {
-    json::AccountJson {
-        id: a.label.clone(),
-        label: a.label.clone(),
-        vaults: a.vaults.clone(),
-        health: "healthy".into(),
-        detail: None,
-        last_used_ms: None,
-    }
-}
-
-/// Read a service-account token from stdin into a wiped buffer, trimming a
-/// trailing newline. `None` (with a printed error) on read failure or empty.
-fn read_token_stdin() -> Option<Zeroizing<Vec<u8>>> {
-    let mut token = Zeroizing::new(Vec::new());
-    if let Err(e) = std::io::stdin().read_to_end(&mut token) {
-        eprintln!("sigil: reading token from stdin: {e}");
-        return None;
-    }
-    while matches!(token.last(), Some(b'\n' | b'\r')) {
-        token.pop();
-    }
-    if token.is_empty() {
-        eprintln!("sigil: empty token on stdin");
-        return None;
-    }
-    Some(token)
-}
-
-fn account_add(args: &[String], json: bool) -> i32 {
-    let s = Style::stdout();
-    let Some(label) = flag_value(args, "--label").map(str::to_string) else {
-        eprintln!("usage: sigil account add --token-stdin --label <name>");
-        return 2;
-    };
-    if !has_flag(args, "--token-stdin") {
-        eprintln!("sigil: refusing to read a token from argv; pass --token-stdin");
-        return 2;
-    }
-    // A v2 (threshold) account is sealed under the two-party key, not a DEK.
-    if has_flag(args, "--threshold") {
-        return account_add_v2(&label, json);
-    }
-    let Some(token) = read_token_stdin() else {
-        return 1;
-    };
-
-    // Unwrap the DEK (biometric on macOS) and encrypt the token under it.
-    let ks = keystore::for_host();
-    if let Err(e) = ks.ensure_dek() {
-        eprintln!(
-            "sigil: provisioning the DEK: {}\n  (detail: {e})",
-            keystore::dek_error_hint(&e)
-        );
-        return 1;
-    }
-    let dek = match ks.unwrap_dek(&format!("Add the {label} service-account token")) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!(
-                "sigil: unwrapping the DEK: {}\n  (detail: {e})",
-                keystore::dek_error_hint(&e)
-            );
-            return 1;
-        }
-    };
-
-    // Probe the vaults this token can actually route (best effort), through the
-    // provider seam rather than calling `op` directly.
-    let vaults = OpProvider::new().probe(&token).unwrap_or_default();
-    if vaults.is_empty() && !json {
-        println!(
-            "  {} {}",
-            s.brass("\u{2717}"),
-            s.dim("no vaults visible to this token (service accounts cannot see built-in Personal/Shared vaults)")
-        );
-    }
-
-    let mut store = match AccountStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("sigil: loading account store: {e}");
-            return 1;
-        }
-    };
-    // sec-review Note A: account routing matches a hint against an account's
-    // label OR one of its vaults (first hit wins). If this account's label equals
-    // another account's vault name (or vice versa), a routing hint that string is
-    // order-dependent — surprising, though not exploitable (both are the
-    // operator's own accounts and the approval still gates). Warn at authoring so
-    // the ambiguity is visible; prefer labels that are not also vault names.
-    if !json {
-        if let Some(other) = store
-            .accounts
-            .iter()
-            .find(|a| a.vaults.iter().any(|v| v == &label))
-        {
-            println!(
-                "  {} {}",
-                s.brass("\u{2717}"),
-                s.dim(&format!(
-                    "label {label:?} also names a vault of account {:?}; routing that name is ambiguous",
-                    other.label
-                ))
-            );
-        }
-        if let Some((other, vault)) = store.accounts.iter().find_map(|a| {
-            vaults
-                .iter()
-                .find(|v| **v == a.label)
-                .map(|v| (a.label.clone(), v.clone()))
-        }) {
-            println!(
-                "  {} {}",
-                s.brass("\u{2717}"),
-                s.dim(&format!(
-                    "vault {vault:?} of this account matches the label of account {other:?}; routing that name is ambiguous"
-                ))
-            );
-        }
-    }
-    if let Err(e) = store.add(&label, &dek, &token, vaults.clone()) {
-        eprintln!("sigil: {e}");
-        return 1;
-    }
-    if let Err(e) = store.save() {
-        eprintln!("sigil: saving account store: {e}");
-        return 1;
-    }
-
-    if json {
-        // Echo the newly-added account shape the Swift client decodes.
-        if let Some(a) = store.accounts.iter().find(|a| a.label == label) {
-            println!("{}", json::to_line(&account_json(a)));
-        }
-        return 0;
-    }
-
-    println!("{} account {} added", s.ok("\u{2713}"), s.cobalt(&label));
-    if !vaults.is_empty() {
-        println!("  {} {}", s.dim("vaults"), vaults.join(", "));
-    }
-    0
-}
-
-/// Add a v2 (threshold) service account: seal the token under the two-party key
-/// `K = combine(Z_M, Z_F, E, account_id)`, destroying the ephemeral `e` so `Z_F`
-/// becomes computable only by the phone's Secure Enclave. Requires a v2 pairing
-/// (one that pinned the phone's SE share `F`); the Mac share `m` is generated and
-/// sealed on first use.
-fn account_add_v2(label: &str, json: bool) -> i32 {
-    let s = Style::stdout();
-    let ks = keystore::for_host();
-
-    // The pairing must have pinned the phone's SE share F (a v2 pairing).
-    let phone = match crate::pairing_store::load(ks.as_ref()) {
-        Ok(Some(cfg)) => match cfg.phone_share {
-            Some(share) => share,
-            None => {
-                eprintln!(
-                    "sigil: this pairing has no phone Secure-Enclave share; \
-                     re-pair for v2 threshold accounts"
-                );
-                return 1;
-            }
-        },
-        Ok(None) => {
-            eprintln!("sigil: no phone is paired; run `sigil pair` first");
-            return 1;
-        }
-        Err(e) => {
-            eprintln!("sigil: loading the pairing: {e}");
-            return 1;
-        }
-    };
-
-    let token = match read_token_stdin() {
-        Some(t) => t,
-        None => return 1,
-    };
-
-    // Generate/seal the Mac share m on first use, then seal the token.
-    let m = match crate::threshold::load_or_create_mac_share(ks.as_ref()) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("sigil: provisioning the Mac threshold share: {e}");
-            return 1;
-        }
-    };
-
-    let vaults = OpProvider::new().probe(&token).unwrap_or_default();
-
-    let mut store = match crate::threshold::ThresholdStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("sigil: loading the threshold store: {e}");
-            return 1;
-        }
-    };
-    if let Err(e) =
-        crate::threshold::seal_account(&mut store, label, &m, &phone, &token, vaults.clone())
-    {
-        eprintln!("sigil: {e}");
-        return 1;
-    }
-    drop(m);
-    if let Err(e) = store.save() {
-        eprintln!("sigil: saving the threshold store: {e}");
-        return 1;
-    }
-
-    if json {
-        // The v2 account presents the same GUI shape as a v1 account.
-        println!(
-            "{}",
-            json::to_line(&json::AccountJson {
-                id: label.to_string(),
-                label: label.to_string(),
-                vaults: vaults.clone(),
-                health: "healthy".into(),
-                detail: Some("threshold (v2)".into()),
-                last_used_ms: None,
-            })
-        );
-        return 0;
-    }
-
-    println!(
-        "{} threshold account {} added",
-        s.ok("\u{2713}"),
-        s.cobalt(label)
-    );
-    if !vaults.is_empty() {
-        println!("  {} {}", s.dim("vaults"), vaults.join(", "));
-    }
-    0
-}
-
-fn account_rotate(args: &[String], json: bool) -> i32 {
-    let s = Style::stdout();
-    let Some(id) = flag_value(args, "--id").map(str::to_string) else {
-        eprintln!("usage: sigil account rotate --id <id> --token-stdin");
-        return 2;
-    };
-    let Some(token) = read_token_stdin() else {
-        return 1;
-    };
-
-    let ks = keystore::for_host();
-    if let Err(e) = ks.ensure_dek() {
-        eprintln!(
-            "sigil: provisioning the DEK: {}\n  (detail: {e})",
-            keystore::dek_error_hint(&e)
-        );
-        return 1;
-    }
-    let dek = match ks.unwrap_dek(&format!("Rotate the {id} service-account token")) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!(
-                "sigil: unwrapping the DEK: {}\n  (detail: {e})",
-                keystore::dek_error_hint(&e)
-            );
-            return 1;
-        }
-    };
-
-    // Re-probe the vaults the new token can route; an empty probe keeps the
-    // previous routing rather than erasing it.
-    let vaults = OpProvider::new().probe(&token).unwrap_or_default();
-
-    let mut store = match AccountStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("sigil: loading account store: {e}");
-            return 1;
-        }
-    };
-    if let Err(e) = store.rotate(&id, &dek, &token, vaults) {
-        eprintln!("sigil: {e}");
-        return 1;
-    }
-    if let Err(e) = store.save() {
-        eprintln!("sigil: saving account store: {e}");
-        return 1;
-    }
-
-    if json {
-        if let Some(a) = store.accounts.iter().find(|a| a.label == id) {
-            println!("{}", json::to_line(&account_json(a)));
-        }
-        return 0;
-    }
-    println!("{} account {} rotated", s.ok("\u{2713}"), s.cobalt(&id));
-    0
-}
-
-fn account_remove(args: &[String], json: bool) -> i32 {
-    let Some(id) = flag_value(args, "--id").map(str::to_string) else {
-        eprintln!("usage: sigil account remove --id <id>");
-        return 2;
-    };
-    let mut store = match AccountStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("sigil: loading account store: {e}");
-            return 1;
-        }
-    };
-    let mut removed = store.remove(&id);
-    if removed {
-        if let Err(e) = store.save() {
-            eprintln!("sigil: saving account store: {e}");
-            return 1;
-        }
-    }
-    // A label may name a v2 (threshold) account instead; remove it there too.
-    if let Ok(mut v2) = crate::threshold::ThresholdStore::load() {
-        if v2.remove(&id) {
-            removed = true;
-            if let Err(e) = v2.save() {
-                eprintln!("sigil: saving the threshold store: {e}");
-                return 1;
-            }
-        }
-    }
-    let result = if removed {
-        ControlResult::line(true, format!("account {id} removed"))
-    } else {
-        ControlResult::line(false, format!("no account named {id}"))
-    };
-    if json {
-        return emit_local_control(&result);
-    }
-    let s = Style::stdout();
-    for line in &result.lines {
-        let glyph = if result.ok {
-            s.ok("\u{2713}")
-        } else {
-            s.brass("\u{2717}")
-        };
-        println!("  {glyph} {line}");
-    }
-    i32::from(!result.ok)
-}
-
-fn account_list(json: bool) -> i32 {
-    let s = Style::stdout();
-    let store = match AccountStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("sigil: loading account store: {e}");
-            return 1;
-        }
-    };
-    // v2 (threshold) accounts live in a separate store; list both.
-    let v2 = crate::threshold::ThresholdStore::load().unwrap_or_default();
-    if json {
-        let mut list: Vec<_> = store.accounts.iter().map(account_json).collect();
-        list.extend(v2.accounts.iter().map(|a| json::AccountJson {
-            id: a.label().to_string(),
-            label: a.label().to_string(),
-            vaults: a.vaults.clone(),
-            health: "healthy".into(),
-            detail: Some("threshold (v2)".into()),
-            last_used_ms: None,
-        }));
-        println!("{}", json::to_pretty(&list));
-        return 0;
-    }
-    if store.accounts.is_empty() && v2.accounts.is_empty() {
-        println!("  {}", s.dim("no accounts; run: sigil account add"));
-        return 0;
-    }
-    println!("{}", s.cobalt("accounts"));
-    println!();
-    for a in &store.accounts {
-        let vaults = if a.vaults.is_empty() {
-            s.dim("no vaults probed")
-        } else {
-            s.dim(&a.vaults.join(", "))
-        };
-        println!("  {}  {}", pad(&a.label, 20), vaults);
-    }
-    for a in &v2.accounts {
-        let vaults = if a.vaults.is_empty() {
-            s.dim("no vaults probed")
-        } else {
-            s.dim(&a.vaults.join(", "))
-        };
-        println!(
-            "  {}  {}  {}",
-            pad(a.label(), 20),
-            vaults,
-            s.dim("threshold (v2)")
-        );
-    }
-    0
-}
-
 /// Deserialize a `Reply::Json` array body from a query frame into a typed vec,
 /// or `None` when the daemon is unreachable / replied unexpectedly.
 fn query_list<T: serde::de::DeserializeOwned>(frame: &Frame) -> Option<Vec<T>> {
@@ -944,17 +715,13 @@ fn cmd_lease(args: &[String]) -> i32 {
                 return 0;
             }
             let now = sigil_proto::now_ms();
+            // The account column only earns its width when some lease names one
+            // (a plain gate carries none), so it never renders as a blank gutter.
+            let with_account = leases.iter().any(|l| !l.account.is_empty());
             println!("{}", s.cobalt("leases"));
             println!();
             for l in &leases {
-                let left = l.expires_ms.saturating_sub(now) / 1000;
-                println!(
-                    "  {}  {}  {}  {}",
-                    s.dim(&l.grant_hex[..12.min(l.grant_hex.len())]),
-                    pad(&l.account, 14),
-                    l.scope,
-                    s.faint(&format!("{left}s left"))
-                );
+                println!("{}", lease_row(s, l, now, with_account));
             }
             0
         }
@@ -974,10 +741,27 @@ fn cmd_lease(args: &[String]) -> i32 {
     }
 }
 
-fn cmd_lockdown(args: &[String]) -> i32 {
-    print_control(send_control(&Frame::Lockdown {
-        clear: has_flag(args, "--clear"),
-    }))
+/// One `sigil lease list` row: grant-key prefix (what `lease revoke` takes), the
+/// account when there is one, the RULE the lease covers, and the countdown.
+///
+/// A lease is rule-wide: it auto-approves anything that rule matches for the
+/// caller chain that opened it, not only the command that did. The row says so
+/// outright rather than leaving the rule name to be read as a command.
+fn lease_row(s: Style, l: &json::LeaseJson, now: u64, with_account: bool) -> String {
+    let left = l.expires_ms.saturating_sub(now) / 1000;
+    let account = if with_account {
+        format!("{}  ", pad(&l.account, 14))
+    } else {
+        String::new()
+    };
+    format!(
+        "  {}  {}{}  {}  {}",
+        s.dim(&l.grant_hex[..12.min(l.grant_hex.len())]),
+        account,
+        pad(&l.scope, 30),
+        s.faint("\u{b7} any matching command"),
+        s.faint(&format!("{left}s left"))
+    )
 }
 
 fn cmd_approve(args: &[String]) -> i32 {
@@ -1411,26 +1195,19 @@ fn run_pairing(args: &[String]) -> i32 {
     }
 
     let ks = keystore::for_host();
-    // Provision (idempotently) the keystore DEK now, so a first-time pair fails
-    // fast if provisioning itself is broken; a later account add reuses it
-    // (ensure_dek never regenerates an existing DEK). This is a public-key-only
-    // operation on a Secure Enclave keystore (no Touch ID yet); the actual
-    // unwrap happens later, gated on the SAS confirm below.
-    if let Err(e) = ks.ensure_dek() {
-        eprintln!(
-            "{} provisioning the DEK: {}\n  (detail: {e})",
-            s.deny("\u{2717}"),
-            keystore::dek_error_hint(&e)
-        );
-        return 1;
-    }
-    // Unwraps the SAME key `sigil account add` seals tokens under. Called by
-    // `run_ceremony` only after the human confirms the SAS, never before: on a
-    // Secure Enclave keystore that is where Touch ID fires, so the biometric
-    // gates authorizing this specific confirmed device.
-    let mut unwrap_dek = || -> anyhow::Result<crate::secrets::Dek> {
-        ks.unwrap_dek("Deliver the encryption key to your phone during pairing")
-            .map_err(|e| anyhow::anyhow!("{}\n  (detail: {e})", keystore::dek_error_hint(&e)))
+    // Arm the pairing after the human confirms the SAS (never before): prove a
+    // live hardware presence (on a Secure Enclave keystore this is the Touch ID
+    // prompt, so the biometric gates authorizing this specific confirmed device)
+    // and provision the Mac threshold share `m`. Nothing is delivered to the
+    // phone: everything at rest is threshold-sealed and opened per-approval.
+    let mut arm_after_sas = || -> anyhow::Result<()> {
+        if ks.is_biometric() {
+            ks.verify_presence("Authorize pairing this phone with Sigil")
+                .map_err(|e| anyhow::anyhow!("proving hardware presence: {e}"))?;
+        }
+        crate::threshold::load_or_create_mac_share(ks.as_ref())
+            .map_err(|e| anyhow::anyhow!("provisioning the Mac threshold share: {e}"))?;
+        Ok(())
     };
     let daemon_identity = DeviceIdentity::generate();
 
@@ -1485,7 +1262,7 @@ fn run_pairing(args: &[String]) -> i32 {
         make_channel: &mut make_channel,
         present_qr: &mut present_qr,
         confirm_sas: &mut confirm,
-        unwrap_dek: &mut unwrap_dek,
+        arm_after_sas: &mut arm_after_sas,
     };
 
     let new_pairing = match crate::pair::run_ceremony(daemon_identity, opts) {
@@ -1552,27 +1329,18 @@ fn run_pairing_json(args: &[String]) -> i32 {
     };
 
     let ks = keystore::for_host();
-    // Same key discipline as the interactive path: the ceremony delivers the
-    // keystore DEK that `sigil account add` seals tokens under, provisioned
-    // idempotently here so a first-time pair still arms the daemon. This is a
-    // public-key-only operation on a Secure Enclave keystore (no Touch ID
-    // yet); the actual unwrap happens later, gated on the SAS confirm below.
-    if let Err(e) = ks.ensure_dek() {
-        emit_ndjson(&serde_json::json!({
-            "event": "failed",
-            // The Mac app renders `reason` verbatim in its error panel, so it
-            // must lead with the actionable hint, never the raw error chain.
-            "reason": format!("provisioning the DEK: {}", keystore::dek_error_hint(&e))
-        }));
-        return 1;
-    }
-    // Unwraps the SAME key `sigil account add` seals tokens under. Called by
-    // `run_ceremony` only after the human writes "confirm" below, never
-    // before: on a Secure Enclave keystore that is where Touch ID fires, so
-    // the biometric gates authorizing this specific confirmed device.
-    let mut unwrap_dek = || -> anyhow::Result<crate::secrets::Dek> {
-        ks.unwrap_dek("Deliver the encryption key to your phone during pairing")
-            .map_err(|e| anyhow::anyhow!("{}\n  (detail: {e})", keystore::dek_error_hint(&e)))
+    // After the human confirms the SAS, arm the pairing: prove a live hardware
+    // presence (Touch ID on a Secure Enclave keystore) and provision the Mac
+    // threshold share `m`. Nothing is delivered to the phone; everything at rest
+    // is threshold-sealed and opened per-approval with the phone's partial.
+    let mut arm_after_sas = || -> anyhow::Result<()> {
+        if ks.is_biometric() {
+            ks.verify_presence("Authorize pairing this phone with Sigil")
+                .map_err(|e| anyhow::anyhow!("proving hardware presence: {e}"))?;
+        }
+        crate::threshold::load_or_create_mac_share(ks.as_ref())
+            .map_err(|e| anyhow::anyhow!("provisioning the Mac threshold share: {e}"))?;
+        Ok(())
     };
     let daemon_identity = DeviceIdentity::generate();
 
@@ -1581,10 +1349,10 @@ fn run_pairing_json(args: &[String]) -> i32 {
     };
     let mut confirm = |words: &[&'static str; 6]| -> bool {
         emit_ndjson(&serde_json::json!({ "event": "sas", "words": words.to_vec() }));
-        // Block here: the DEK must not be sealed and sent until a real human
-        // has compared the six words on both screens and confirmed. The GUI
-        // writes "confirm\n" to our stdin after the tap; anything else (or the
-        // pipe closing) fails the ceremony closed instead of leaking the DEK.
+        // Block here: the pairing must not be armed until a real human has
+        // compared the six words on both screens and confirmed. The GUI writes
+        // "confirm\n" to our stdin after the tap; anything else (or the pipe
+        // closing) fails the ceremony closed.
         let mut line = String::new();
         match std::io::stdin().read_line(&mut line) {
             Ok(0) => false,
@@ -1604,7 +1372,7 @@ fn run_pairing_json(args: &[String]) -> i32 {
         make_channel: &mut make_channel,
         present_qr: &mut present_qr,
         confirm_sas: &mut confirm,
-        unwrap_dek: &mut unwrap_dek,
+        arm_after_sas: &mut arm_after_sas,
     };
 
     match crate::pair::run_ceremony(daemon_identity, opts) {
@@ -1694,8 +1462,8 @@ fn cmd_setup(args: &[String]) -> i32 {
     //    VERIFICATION); a dev keystore provisions immediately. A failure here is
     //    not fatal to the rest of setup, so we report and continue.
     let ks = keystore::for_host();
-    match ks.ensure_dek() {
-        Ok(()) => println!("  {} keystore ready", s.ok("\u{2713}")),
+    match crate::threshold::load_or_create_mac_share(ks.as_ref()) {
+        Ok(_) => println!("  {} keystore ready", s.ok("\u{2713}")),
         Err(e) => println!(
             "  {} keystore: {}",
             s.brass("\u{2717}"),
@@ -1788,12 +1556,13 @@ fn format_unix_ms(ms: u64) -> String {
 
 fn cmd_ssh(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
-        Some("add") => ssh_add(&args[1..]),
         Some("add-file") => ssh_add_file(&args[1..]),
+        Some("add-stored") => ssh_add_stored(&args[1..]),
         Some("list") | None => ssh_list(),
         Some("remove") | Some("rm") => ssh_remove(args.get(1).map(String::as_str)),
+        Some("config") => ssh_config(&args[1..]),
         _ => {
-            eprintln!("usage: sigil ssh <add|add-file|list|remove>");
+            eprintln!("usage: sigil ssh <add-file|add-stored|list|remove|config>");
             2
         }
     }
@@ -1806,13 +1575,20 @@ fn cmd_ssh(args: &[String]) -> i32 {
 fn ssh_add_file(args: &[String]) -> i32 {
     let s = Style::stdout();
     let Some(path) = flag_value(args, "--path").map(str::to_string) else {
-        eprintln!("usage: sigil ssh add-file --path <private-key-path> [--comment <c>]");
+        eprintln!(
+            "usage: sigil ssh add-file --path <private-key-path> [--comment <c>] [--host <h> ...]"
+        );
         return 2;
     };
     let comment = flag_value(args, "--comment").unwrap_or("").to_string();
+    let hosts = flag_values(args, "--host");
+    if let Some(code) = reject_bad_hosts(&s, &hosts) {
+        return code;
+    }
     let entry = crate::sshagent::SshFileEntry {
         path: path.clone(),
         comment,
+        hosts,
     };
     // Validate before persisting: the sibling .pub must parse as ed25519.
     let Some(id) = crate::sshagent::resolve_file_identity(&entry) else {
@@ -1834,6 +1610,7 @@ fn ssh_add_file(args: &[String]) -> i32 {
         eprintln!("sigil: {path} is already served (remove it first to replace)");
         return 1;
     }
+    let hosts = entry.hosts.clone();
     cfg.files.push(entry);
     if let Err(e) = cfg.save() {
         eprintln!("sigil: saving ssh-keys config: {e}");
@@ -1843,72 +1620,138 @@ fn ssh_add_file(args: &[String]) -> i32 {
     println!("{} serving {}", s.ok("\u{2713}"), s.cobalt(&id.label));
     println!("  {}  {}", s.dim("key"), s.dim(&id.fingerprint));
     println!("  {}  {}", s.dim("file"), s.dim(&path));
-    println!(
-        "  {}",
-        s.faint("restart the daemon to serve it: sigil restart")
-    );
+    ssh_add_epilogue(&s, &hosts);
     0
 }
 
-/// `sigil ssh add --vault <V> --item <I> [--field <f>] [--comment <c>]
-/// (--pubkey-file <path> | --pubkey-stdin)`: register a 1Password SSH key for the
-/// agent to serve. Only the public key (not secret) is provided here; the private
-/// key is fetched per-signature. v1 accepts ed25519 only.
-fn ssh_add(args: &[String]) -> i32 {
+/// `sigil ssh add-stored [--comment <c>] [--host <h> ...]`: seal an OpenSSH
+/// private key (read from stdin) under the v2 threshold, so Sigil holds the key at
+/// rest as ciphertext and opens it per-signature only with the phone's partial.
+/// This is the "store SSH creds for people without 1Password" source. A Mac-side,
+/// human-present ceremony (needs the paired phone's share F and the Mac share m);
+/// v1 seals ed25519 only.
+fn ssh_add_stored(args: &[String]) -> i32 {
     let s = Style::stdout();
-    let (Some(vault), Some(item)) = (
-        flag_value(args, "--vault").map(str::to_string),
-        flag_value(args, "--item").map(str::to_string),
-    ) else {
+    let comment = flag_value(args, "--comment").unwrap_or("").to_string();
+    let hosts = flag_values(args, "--host");
+    if let Some(code) = reject_bad_hosts(&s, &hosts) {
+        return code;
+    }
+
+    // Read the private key from stdin into a wiped buffer (never a file, never a
+    // flag). It leaves this function only as threshold ciphertext.
+    let mut raw = Zeroizing::new(Vec::new());
+    if let Err(e) = std::io::stdin().read_to_end(&mut raw) {
+        eprintln!("sigil: reading the private key from stdin: {e}");
+        return 1;
+    }
+    if raw.is_empty() {
         eprintln!(
-            "usage: sigil ssh add --vault <V> --item <I> [--field <f>] [--comment <c>] \
-             (--pubkey-file <path> | --pubkey-stdin)"
+            "usage: sigil ssh add-stored [--comment <c>] [--host <h> ...]   (OpenSSH private key on stdin)"
         );
         return 2;
-    };
-    let field = flag_value(args, "--field")
-        .unwrap_or("private key")
-        .to_string();
-    let comment = flag_value(args, "--comment").unwrap_or("").to_string();
+    }
 
-    // The public key line comes from a file or stdin (never secret).
-    let public_key = if let Some(path) = flag_value(args, "--pubkey-file") {
-        match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("sigil: reading {path}: {e}");
-                return 1;
-            }
-        }
-    } else if has_flag(args, "--pubkey-stdin") {
-        let mut buf = String::new();
-        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-            eprintln!("sigil: reading public key from stdin: {e}");
+    // Decode + validate ed25519, then re-encode to a canonical OpenSSH PEM so what
+    // we seal is exactly what the daemon will decode and sign.
+    let key = match ssh_key::PrivateKey::from_openssh(&raw[..]) {
+        Ok(k) => k,
+        Err(_) => {
+            eprintln!("{} not a valid OpenSSH private key", s.deny("\u{2717}"));
             return 1;
         }
-        buf
-    } else {
-        eprintln!("sigil: provide the public key with --pubkey-file <path> or --pubkey-stdin");
-        return 2;
     };
-    let public_key = public_key.trim().to_string();
-
-    let entry = crate::sshagent::SshKeyEntry {
-        public_key,
-        vault: vault.clone(),
-        item: item.clone(),
-        field,
-        comment,
-    };
-    // Validate before persisting: it must parse as an ed25519 public key.
-    let Some(id) = crate::sshagent::resolve_identity(&entry) else {
+    if key.algorithm() != ssh_key::Algorithm::Ed25519 {
         eprintln!(
-            "{} not a usable ed25519 public key (v1 serves ed25519 only)",
+            "{} only ed25519 keys are served (v1); this key is {}",
+            s.deny("\u{2717}"),
+            key.algorithm().as_str()
+        );
+        return 1;
+    }
+    let pem = match key.to_openssh(ssh_key::LineEnding::LF) {
+        Ok(p) => p, // Zeroizing<String>
+        Err(e) => {
+            eprintln!("sigil: re-encoding the private key: {e}");
+            return 1;
+        }
+    };
+    let public_key = match key.public_key().to_openssh() {
+        Ok(l) => l.trim().to_string(),
+        Err(e) => {
+            eprintln!("sigil: encoding the public key: {e}");
+            return 1;
+        }
+    };
+    let fingerprint = key
+        .public_key()
+        .fingerprint(ssh_key::HashAlg::Sha256)
+        .to_string();
+    // The threshold-store id: stable across re-seals of the same key, unique per
+    // key, and namespaced so it never collides with an env-source id.
+    let account_id = format!("ssh:{fingerprint}");
+
+    // Seal the PEM to the phone's pinned Secure-Enclave share F plus the Mac share
+    // m (the same ceremony as sealing an env source's values).
+    let ks = keystore::for_host();
+    let phone = match crate::pairing_store::load(ks.as_ref()) {
+        Ok(Some(pc)) => match pc.phone_share {
+            Some(share) => share,
+            None => {
+                eprintln!(
+                    "sigil: this pairing has no phone Secure-Enclave share; re-pair before storing a key"
+                );
+                return 1;
+            }
+        },
+        Ok(None) => {
+            eprintln!("sigil: no phone is paired; run `sigil pair` first");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("sigil: loading the pairing: {e}");
+            return 1;
+        }
+    };
+    let m = match crate::threshold::load_or_create_mac_share(ks.as_ref()) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("sigil: provisioning the Mac threshold share: {e}");
+            return 1;
+        }
+    };
+    let mut store = match crate::threshold::ThresholdStore::load() {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("sigil: loading the threshold store: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) =
+        crate::threshold::seal_secret(&mut store, &account_id, &m, &phone, pem.as_bytes())
+    {
+        eprintln!("sigil: sealing the private key: {e}");
+        return 1;
+    }
+    if let Err(e) = store.save() {
+        eprintln!("sigil: saving the threshold store: {e}");
+        return 1;
+    }
+
+    // Register the served entry (public material + the sealed-key id only).
+    let entry = crate::sshagent::SshStoredEntry {
+        public_key,
+        account_id: account_id.clone(),
+        comment,
+        hosts: hosts.clone(),
+    };
+    let Some(id) = crate::sshagent::resolve_stored_identity(&entry) else {
+        eprintln!(
+            "{} could not derive an ed25519 identity from the key",
             s.deny("\u{2717}")
         );
         return 1;
     };
-
     let mut cfg = match crate::sshagent::SshKeyConfig::load() {
         Ok(c) => c,
         Err(e) => {
@@ -1916,24 +1759,57 @@ fn ssh_add(args: &[String]) -> i32 {
             return 1;
         }
     };
-    if cfg.keys.iter().any(|k| k.vault == vault && k.item == item) {
-        eprintln!("sigil: op://{vault}/{item} is already served (remove it first to replace)");
-        return 1;
-    }
-    cfg.keys.push(entry);
+    // A re-seal of the same key replaces the entry (the store record was upserted).
+    cfg.stored.retain(|k| k.account_id != account_id);
+    cfg.stored.push(entry);
     if let Err(e) = cfg.save() {
         eprintln!("sigil: saving ssh-keys config: {e}");
         return 1;
     }
 
-    println!("{} serving {}", s.ok("\u{2713}"), s.cobalt(&id.label));
+    println!("{} storing {}", s.ok("\u{2713}"), s.cobalt(&id.label));
     println!("  {}  {}", s.dim("key"), s.dim(&id.fingerprint));
-    println!("  {}  {}", s.dim("ref"), s.dim(&id.key_ref));
     println!(
-        "  {}",
-        s.faint("restart the daemon to serve it: sigil restart")
+        "  {}  {}",
+        s.dim("sealed"),
+        s.dim("threshold; opens only with your phone")
     );
+    ssh_add_epilogue(&s, &hosts);
     0
+}
+
+/// Reject any `--host` token that is not a safe ssh_config `Host` value (a token
+/// carrying whitespace or a control character could splice extra directives into
+/// the generated config). Returns `Some(exit_code)` to stop the command, or
+/// `None` when every token is clean.
+fn reject_bad_hosts(s: &Style, hosts: &[String]) -> Option<i32> {
+    for h in hosts {
+        if !crate::sshconfig::valid_host(h) {
+            eprintln!(
+                "{} invalid --host {h:?}: no spaces or control characters",
+                s.deny("\u{2717}")
+            );
+            return Some(2);
+        }
+    }
+    None
+}
+
+/// Shared closing lines for `ssh add-file`: the restart hint, and, when the key
+/// names hosts, the routing hint to (re)generate the ssh config.
+fn ssh_add_epilogue(s: &Style, hosts: &[String]) {
+    if hosts.is_empty() {
+        println!(
+            "  {}",
+            s.faint("the running daemon serves it within a couple of seconds")
+        );
+    } else {
+        println!("  {}  {}", s.dim("hosts"), s.dim(&hosts.join(" ")));
+        println!(
+            "  {}",
+            s.faint("served automatically; route these hosts with: sigil ssh config --install")
+        );
+    }
 }
 
 fn ssh_list() -> i32 {
@@ -1945,35 +1821,15 @@ fn ssh_list() -> i32 {
             return 1;
         }
     };
-    if cfg.keys.is_empty() && cfg.files.is_empty() {
+    if cfg.files.is_empty() && cfg.stored.is_empty() {
         println!(
             "  {}",
-            s.dim("no SSH keys served; add one: sigil ssh add --vault <V> --item <I> --pubkey-file <p>  (or: sigil ssh add-file --path <key>)")
+            s.dim("no SSH keys served; add one: sigil ssh add-file --path <key>  (or: sigil ssh add-stored)")
         );
         return 0;
     }
     println!("{}", s.cobalt("ssh keys served"));
     println!();
-    for e in &cfg.keys {
-        match crate::sshagent::resolve_identity(e) {
-            Some(id) => {
-                println!("  {}  {}", pad(&id.label, 18), s.dim(&id.fingerprint));
-                println!(
-                    "  {}  {}",
-                    pad("", 18),
-                    s.faint(&format!(
-                        "1password · op://{}/{} · {}",
-                        e.vault, e.item, id.comment
-                    ))
-                );
-            }
-            None => println!(
-                "  {}  {}",
-                pad(&e.item, 18),
-                s.brass("unusable (not an ed25519 public key)")
-            ),
-        }
-    }
     for e in &cfg.files {
         match crate::sshagent::resolve_file_identity(e) {
             Some(id) => {
@@ -1983,11 +1839,42 @@ fn ssh_list() -> i32 {
                     pad("", 18),
                     s.faint(&format!("file · {} · {}", e.path, id.comment))
                 );
+                if !e.hosts.is_empty() {
+                    println!(
+                        "  {}  {}",
+                        pad("", 18),
+                        s.faint(&format!("routed: {}", e.hosts.join(" ")))
+                    );
+                }
             }
             None => println!(
                 "  {}  {}",
                 pad(&e.path, 18),
                 s.brass("unusable (need an ed25519 key with a sibling .pub)")
+            ),
+        }
+    }
+    for e in &cfg.stored {
+        match crate::sshagent::resolve_stored_identity(e) {
+            Some(id) => {
+                println!("  {}  {}", pad(&id.label, 18), s.dim(&id.fingerprint));
+                println!(
+                    "  {}  {}",
+                    pad("", 18),
+                    s.faint("stored · threshold-sealed; opens only with your phone")
+                );
+                if !e.hosts.is_empty() {
+                    println!(
+                        "  {}  {}",
+                        pad("", 18),
+                        s.faint(&format!("routed: {}", e.hosts.join(" ")))
+                    );
+                }
+            }
+            None => println!(
+                "  {}  {}",
+                pad(&e.account_id, 18),
+                s.brass("unusable (not an ed25519 public key)")
             ),
         }
     }
@@ -2007,9 +1894,20 @@ fn ssh_remove(item: Option<&str>) -> i32 {
             return 1;
         }
     };
-    let before = cfg.keys.len();
-    cfg.keys.retain(|k| k.item != item);
-    if cfg.keys.len() == before {
+    // Match a local key-file path (the file source, added by `ssh add-file`) or a
+    // stored key by its id (`ssh:<fp>`) or bare fingerprint (`add-stored`).
+    let before = cfg.files.len() + cfg.stored.len();
+    cfg.files.retain(|f| f.path != item);
+    let stored_id = format!("ssh:{item}");
+    let mut removed_stored: Vec<String> = Vec::new();
+    cfg.stored.retain(|k| {
+        let hit = k.account_id == item || k.account_id == stored_id;
+        if hit {
+            removed_stored.push(k.account_id.clone());
+        }
+        !hit
+    });
+    if cfg.files.len() + cfg.stored.len() == before {
         println!("  {}", s.dim(&format!("no served key named {item}")));
         return 0;
     }
@@ -2017,12 +1915,115 @@ fn ssh_remove(item: Option<&str>) -> i32 {
         eprintln!("sigil: saving ssh-keys config: {e}");
         return 1;
     }
+    // Drop the sealed private key(s) from the threshold store too, so removal
+    // leaves no ciphertext behind. Best-effort: the config change already stopped
+    // it being served; a store error is reported but not fatal.
+    if !removed_stored.is_empty() {
+        match crate::threshold::ThresholdStore::load() {
+            Ok(mut store) => {
+                for id in &removed_stored {
+                    store.remove(id);
+                }
+                if let Err(e) = store.save() {
+                    eprintln!("sigil: removing the sealed key from the threshold store: {e}");
+                }
+            }
+            Err(e) => eprintln!("sigil: loading the threshold store to drop the sealed key: {e}"),
+        }
+    }
     println!("{} stopped serving {}", s.ok("\u{2713}"), s.cobalt(item));
     println!(
         "  {}",
-        s.faint("restart the daemon to apply: sigil restart")
+        s.faint("the running daemon drops it within a couple of seconds")
     );
     0
+}
+
+/// `sigil ssh config [--install | --uninstall]`: manage the `~/.ssh/config`
+/// routing that sends chosen hosts through Sigil's agent (1Password-style), while
+/// every other host stays on the user's normal agent. With no flag it prints the
+/// block to paste by hand; `--install` writes it (with a backup); `--uninstall`
+/// removes it and the generated files.
+fn ssh_config(args: &[String]) -> i32 {
+    let s = Style::stdout();
+
+    if has_flag(args, "--uninstall") {
+        match crate::sshconfig::uninstall() {
+            Ok(changed) => {
+                if changed {
+                    println!(
+                        "{} removed the Sigil block from ~/.ssh/config",
+                        s.ok("\u{2713}")
+                    );
+                } else {
+                    println!("  {}", s.dim("no Sigil block was present in ~/.ssh/config"));
+                }
+                println!("  {}", s.faint("your normal agent now answers every host"));
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("sigil: removing the ssh config block: {e}");
+                return 1;
+            }
+        }
+    }
+
+    let cfg = match crate::sshagent::SshKeyConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("sigil: loading ssh-keys config: {e}");
+            return 1;
+        }
+    };
+    let routed = crate::sshconfig::routed_keys(&cfg);
+    if routed.is_empty() {
+        println!(
+            "  {}",
+            s.dim("no keys name any hosts to route; add hosts with: sigil ssh add-file --path <key> --host <h>")
+        );
+        return 0;
+    }
+    let sock = crate::sshagent::socket_path();
+
+    if has_flag(args, "--install") {
+        match crate::sshconfig::install(&cfg, &sock) {
+            Ok(report) => {
+                println!("{} routing through Sigil", s.ok("\u{2713}"));
+                for r in &report.routed {
+                    println!("  {}  {}", pad(&r.label, 18), s.dim(&r.hosts.join(" ")));
+                }
+                if let Some(backup) = &report.backup {
+                    println!(
+                        "  {}  {}",
+                        s.dim("backup"),
+                        s.faint(&backup.display().to_string())
+                    );
+                }
+                if !report.ssh_config_changed {
+                    println!("  {}", s.faint("~/.ssh/config already current"));
+                }
+                println!(
+                    "  {}",
+                    s.faint("every other host stays on your normal agent")
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("sigil: installing the ssh config: {e}");
+                1
+            }
+        }
+    } else {
+        // Default: print the block for manual placement, write nothing.
+        println!("{}", s.cobalt("sigil ssh routing (preview)"));
+        println!(
+            "  {}",
+            s.faint("apply with: sigil ssh config --install  (or paste the below by hand)")
+        );
+        println!();
+        print!("{}", crate::sshconfig::preview(&cfg, &sock));
+        0
+    }
 }
 
 /// `sigil sshagent`: print the SSH_AUTH_SOCK a user points `ssh`/`git` at, plus
@@ -2031,7 +2032,7 @@ fn cmd_sshagent() -> i32 {
     let s = Style::stdout();
     let sock = crate::sshagent::socket_path();
     let count = crate::sshagent::SshKeyConfig::load()
-        .map(|c| c.keys.len())
+        .map(|c| c.files.len() + c.stored.len())
         .unwrap_or(0);
     println!("{}", s.cobalt("sigil ssh-agent"));
     println!();
@@ -2650,6 +2651,7 @@ fn config_source_add(args: &[String], json: bool) -> i32 {
         // The inline `env` source starts with no keys; values are added securely
         // via `source env set` (which reads them from stdin, never argv).
         keys: Vec::new(),
+        plain: Default::default(),
     };
     if let Err(e) = cfg.add_source(src) {
         eprintln!("sigil: {e}");
@@ -2670,7 +2672,7 @@ fn config_source_add(args: &[String], json: bool) -> i32 {
 }
 
 fn config_source_list(json: bool) -> i32 {
-    let cfg = match load_config() {
+    let cfg = match sources_for_display() {
         Some(c) => c,
         None => return 1,
     };
@@ -2689,29 +2691,77 @@ fn config_source_list(json: bool) -> i32 {
     println!("{}", s.cobalt("sources"));
     println!();
     for src in &cfg.sources {
-        // For the inline `env` source, show the KEY names (never values, which
-        // are not here at all). For others, the account label or env-file path.
-        let extra = if src.provider == crate::provider::EnvProvider::ID {
-            if src.keys.is_empty() {
-                " \u{b7} (no keys set)".to_string()
-            } else {
-                format!(" \u{b7} {}", src.keys.join(", "))
-            }
-        } else {
-            src.account
-                .as_deref()
-                .or(src.path.as_deref())
-                .map(|x| format!(" \u{b7} {x}"))
-                .unwrap_or_default()
-        };
         println!(
             "  {}  {}{}",
             pad(&src.name, 16),
             s.dim(&src.provider),
-            s.dim(&extra)
+            s.dim(&source_extra(src))
         );
+        // Plain vars show their VALUES, on their own lines, labelled `plain`. The
+        // distinction from a sealed key (name only, above) has to survive a
+        // glance: it is the difference between what Sigil is protecting and what
+        // it is merely setting.
+        for (k, v) in &src.plain {
+            let line = format!("plain {k}={v}");
+            if src.keys.contains(k) {
+                // Listed, but inert: the sealed value of the same name is what the
+                // child will get. Saying so here is the difference between config
+                // a human can trust and config they have to test.
+                println!(
+                    "  {}  {}",
+                    pad("", 16),
+                    s.brass(&format!("{line}  (shadowed by the sealed value)"))
+                );
+            } else {
+                println!("  {}  {}", pad("", 16), s.faint(&line));
+            }
+        }
     }
     0
+}
+
+/// The config as `list` must show it: loaded, then reconciled against the
+/// threshold store so a DECLARED key with no sealed record is not presented as
+/// one.
+///
+/// `config.json` records that a value was declared, never that one exists. The
+/// two diverge whenever a value was never sealed or a migration dropped it, and
+/// the honest rendering of that state is the one `export` already takes: drop the
+/// phantom keys and show the source as the plain gate it actually behaves as.
+/// Reusing [`reconcile_unsealed_env_sources`] rather than inventing a second
+/// notion of "sealed" is the point; a parallel sealed/unsealed badge would be a
+/// "needs values" state, and an unsealed declared key is dead config, not a
+/// pending one.
+fn sources_for_display() -> Option<crate::config::Config> {
+    let mut cfg = load_config()?;
+    reconcile_unsealed_env_sources(&mut cfg);
+    Some(cfg)
+}
+
+/// The trailing descriptor on a source's `list` line.
+///
+/// For the inline `env` source that is the sealed KEY names (never values, which
+/// are not in the config at all), labelled `sealed` so it can never be mistaken
+/// for the `plain KEY=value` lines below it. It runs on a config that
+/// [`sources_for_display`] has already reconciled, so a name reaching the
+/// `sealed` label has a record behind it. For others, the account label or the
+/// env-file path.
+fn source_extra(src: &crate::config::Source) -> String {
+    if src.provider != crate::provider::EnvProvider::ID {
+        return src
+            .account
+            .as_deref()
+            .or(src.path.as_deref())
+            .map(|x| format!(" \u{b7} {x}"))
+            .unwrap_or_default();
+    }
+    match (src.keys.is_empty(), src.plain.is_empty()) {
+        (false, _) => format!(" \u{b7} sealed {}", src.keys.join(", ")),
+        // Not dead config: a gate that injects only non-secret vars, which are
+        // listed underneath.
+        (true, false) => " \u{b7} no sealed values".to_string(),
+        (true, true) => " \u{b7} (nothing set)".to_string(),
+    }
 }
 
 fn config_source_remove(name: Option<&str>, json: bool) -> i32 {
@@ -2747,44 +2797,20 @@ fn config_source_remove(name: Option<&str>, json: bool) -> i32 {
 /// so removing a source (or clearing its last key) leaves no orphaned ciphertext.
 /// A no-op when there is no blob. Returns false (having printed) on a store error.
 fn purge_env_blob(name: &str) -> bool {
-    let mut store = match AccountStore::load() {
+    let mut store = match crate::threshold::ThresholdStore::load() {
         Ok(st) => st,
         Err(e) => {
-            eprintln!("sigil: loading account store: {e}");
+            eprintln!("sigil: loading the threshold store: {e}");
             return false;
         }
     };
-    if store.remove_env_blob(name) {
+    if store.remove(name) {
         if let Err(e) = store.save() {
-            eprintln!("sigil: saving account store: {e}");
+            eprintln!("sigil: saving the threshold store: {e}");
             return false;
         }
     }
     true
-}
-
-/// Provision (idempotently) and unwrap the host DEK for a config-side seal, the
-/// same key `sigil account add` seals tokens under. On a Secure Enclave keystore
-/// this is where Touch ID fires. `None` (with a printed error) on any failure.
-fn unwrap_host_dek(reason: &str) -> Option<crate::secrets::Dek> {
-    let ks = keystore::for_host();
-    if let Err(e) = ks.ensure_dek() {
-        eprintln!(
-            "sigil: provisioning the DEK: {}\n  (detail: {e})",
-            keystore::dek_error_hint(&e)
-        );
-        return None;
-    }
-    match ks.unwrap_dek(reason) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            eprintln!(
-                "sigil: unwrapping the DEK: {}\n  (detail: {e})",
-                keystore::dek_error_hint(&e)
-            );
-            None
-        }
-    }
 }
 
 /// Whether `k` is a safe environment variable name to inject: non-empty and free
@@ -2824,11 +2850,17 @@ fn cmd_config_source_env(args: &[String], json: bool) -> i32 {
     match args.first().map(String::as_str) {
         Some("set") => config_source_env_set(&args[1..], json),
         Some("unset") => config_source_env_unset(&args[1..], json),
+        Some("set-plain") => config_source_env_set_plain(&args[1..], json),
+        Some("unset-plain") => config_source_env_unset_plain(&args[1..], json),
         _ => {
             eprintln!(
-                "usage: sigil-config source env <set <name> --key <KEY> | set <name> --stdin | \
-                 unset <name> --key <KEY>>\n  \
-                 (set --key reads the VALUE from stdin; --stdin reads KEY=VALUE lines from stdin)"
+                "usage: sigil-config source env <set <name> --stdin | set <name> --key <KEY> | \
+                 unset <name> | set-plain <name> --key <KEY> --value <V> | \
+                 unset-plain <name> --key <KEY>>\n  \
+                 (set replaces the source's whole sealed set; values are write-only: sealed under \
+                 threshold and openable only with the phone, so they are never read back here.\n   \
+                 set-plain stores a NON-SECRET value in cleartext in config.json, for behavior \
+                 switches like turning off a tool's interactive fallback)"
             );
             2
         }
@@ -2858,69 +2890,92 @@ fn load_env_source(name: &str) -> Option<crate::config::Config> {
     }
 }
 
-/// Decode the stored sealed blob for `name` into a mutable pair list, decrypting
-/// under `dek`. An absent blob yields an empty list (first key being set). `Err`
-/// (printed) on a store or decrypt error.
-fn load_env_pairs(
-    store: &AccountStore,
-    name: &str,
-    dek: &crate::secrets::Dek,
-) -> Result<Vec<(String, Zeroizing<String>)>, ()> {
-    match store.env_blob(name) {
-        None => Ok(Vec::new()),
-        Some(Err(e)) => {
-            eprintln!("sigil: reading the sealed env blob: {e}");
-            Err(())
-        }
-        Some(Ok(ct)) => {
-            let plain = crate::secrets::decrypt_token(dek, &ct).map_err(|e| {
-                eprintln!("sigil: opening the sealed env blob: {e}");
-            })?;
-            let pairs = crate::provider::decode_env_pairs(&plain).ok_or_else(|| {
-                eprintln!("sigil: the sealed env blob is corrupt; unset and re-set its keys");
-            })?;
-            Ok(pairs.to_vec())
-        }
-    }
-}
-
-/// Re-seal `pairs` under `dek` into the store for `name` (or remove the blob when
-/// empty), persist the store, then sync the config source's KEY-name list to the
-/// pair set and persist the config. Returns false (printed) on any failure. This
-/// is the one writer that keeps the sealed values (`sigil.db`) and the public KEY
-/// names (`config.json`) in lockstep.
+/// Threshold-seal `pairs` as the inline-env source `name`'s sealed record (or
+/// remove it when empty), persist the threshold store, then sync the source's
+/// public KEY-name list and persist the config. The values seal to the two-party
+/// key `K = combine(Z_M, Z_F)`: openable only with the phone's per-request
+/// partial, so nothing at rest can release them. Write-only by design: the Mac
+/// seals but never reads env values back (opening needs the phone), so a `set`
+/// replaces the source's whole sealed set. Returns false (printed) on failure.
 fn seal_env_pairs(
-    mut cfg: crate::config::Config,
+    cfg: crate::config::Config,
     name: &str,
     pairs: &[(String, Zeroizing<String>)],
-    dek: &crate::secrets::Dek,
 ) -> bool {
-    let mut store = match AccountStore::load() {
+    let mut store = match crate::threshold::ThresholdStore::load() {
         Ok(st) => st,
         Err(e) => {
-            eprintln!("sigil: loading account store: {e}");
+            eprintln!("sigil: loading the threshold store: {e}");
             return false;
         }
     };
+    // Under a wrapped keystore this process cannot read the Mac share it would
+    // seal with; the daemon holds the opened material and does it instead. Try
+    // that route first whenever the daemon can do it, so the behaviour is the
+    // same whether or not the store happens to be wrapped, and only fall back to
+    // sealing here when there is no daemon AND nothing is sealed to begin with.
+    match seal_via_daemon(name, pairs) {
+        DaemonSeal::Done => return sync_source_keys(cfg, name, pairs),
+        DaemonSeal::Failed(why) => {
+            eprintln!("sigil: {why}");
+            return false;
+        }
+        DaemonSeal::NoDaemon => {}
+    }
+
     if pairs.is_empty() {
-        store.remove_env_blob(name);
+        store.remove(name);
     } else {
-        let encoded = crate::provider::encode_env_pairs(pairs);
-        let ct = match crate::secrets::encrypt_token(dek, &encoded) {
-            Ok(ct) => ct,
+        // Seal to the phone's pinned Secure-Enclave share F plus the Mac share m.
+        let ks = keystore::for_host();
+        let phone = match crate::pairing_store::load(ks.as_ref()) {
+            Ok(Some(pc)) => match pc.phone_share {
+                Some(s) => s,
+                None => {
+                    eprintln!(
+                        "sigil: this pairing has no phone Secure-Enclave share; \
+                         re-pair before sealing env values"
+                    );
+                    return false;
+                }
+            },
+            Ok(None) => {
+                eprintln!("sigil: no phone is paired; run `sigil pair` first");
+                return false;
+            }
             Err(e) => {
-                eprintln!("sigil: sealing the env values: {e}");
+                eprintln!("sigil: loading the pairing: {e}");
                 return false;
             }
         };
-        store.set_env_blob(name, &ct);
+        let m = match crate::threshold::load_or_create_mac_share(ks.as_ref()) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("sigil: provisioning the Mac threshold share: {e}");
+                return false;
+            }
+        };
+        let encoded = crate::provider::encode_env_pairs(pairs);
+        if let Err(e) = crate::threshold::seal_secret(&mut store, name, &m, &phone, &encoded) {
+            eprintln!("sigil: sealing the env values: {e}");
+            return false;
+        }
     }
     if let Err(e) = store.save() {
-        eprintln!("sigil: saving account store: {e}");
+        eprintln!("sigil: saving the threshold store: {e}");
         return false;
     }
-    // Sync the public KEY names onto the source (sorted+unique for a stable
-    // export), never the values.
+    sync_source_keys(cfg, name, pairs)
+}
+
+/// Record the public KEY names on the source (sorted+unique for a stable export)
+/// and persist the config. Names only; the values live sealed in the threshold
+/// store and are never written here.
+fn sync_source_keys(
+    mut cfg: crate::config::Config,
+    name: &str,
+    pairs: &[(String, Zeroizing<String>)],
+) -> bool {
     let mut keys: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
     keys.sort();
     keys.dedup();
@@ -2930,11 +2985,60 @@ fn seal_env_pairs(
     save_config(&cfg)
 }
 
+/// What happened when we asked the daemon to seal for us.
+enum DaemonSeal {
+    /// The daemon sealed it (or removed it).
+    Done,
+    /// The daemon answered, and the answer was no. The string is for the human.
+    Failed(String),
+    /// No daemon is listening, so the caller may seal locally if it can.
+    NoDaemon,
+}
+
+/// Ask the daemon to seal `pairs` under `id`, because it holds material this
+/// process may not be able to read.
+///
+/// The values cross the control socket as raw bytes after the header, never
+/// inside a JSON frame: a serde-deserialized field sitting in a `Debug` enum is
+/// one stray format string away from a secret in a log. The socket is the same
+/// 0600 same-UID channel every other CLI verb uses.
+fn seal_via_daemon(id: &str, pairs: &[(String, Zeroizing<String>)]) -> DaemonSeal {
+    let payload: Zeroizing<Vec<u8>> = if pairs.is_empty() {
+        Zeroizing::new(Vec::new())
+    } else {
+        crate::provider::encode_env_pairs(pairs)
+    };
+    let stream = match UnixStream::connect(local::socket_path()) {
+        Ok(s) => s,
+        Err(_) => return DaemonSeal::NoDaemon,
+    };
+    let frame = Frame::SealThreshold {
+        id: id.to_string(),
+        len: payload.len() as u64,
+    };
+    if local::send_frame_with_payload(&stream, &frame, &payload).is_err() {
+        return DaemonSeal::NoDaemon;
+    }
+    let mut stream = stream;
+    match local::recv_reply(&mut stream) {
+        Ok(Reply::Control { ok: true, .. }) => DaemonSeal::Done,
+        Ok(Reply::Control { lines, .. }) => DaemonSeal::Failed(
+            lines
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "the daemon refused to seal".into()),
+        ),
+        Ok(_) => DaemonSeal::Failed("the daemon gave an unexpected answer".into()),
+        Err(e) => DaemonSeal::Failed(format!("the daemon did not answer: {e}")),
+    }
+}
+
 fn config_source_env_set(args: &[String], json: bool) -> i32 {
     let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
         eprintln!(
-            "usage: sigil-config source env set <name> --key <KEY>   (VALUE from stdin)\n       \
-             sigil-config source env set <name> --stdin        (KEY=VALUE lines from stdin)"
+            "usage: sigil-config source env set <name> --stdin        (KEY=VALUE lines from stdin)\n       \
+             sigil-config source env set <name> --key <KEY>   (one VALUE from stdin)\n  \
+             note: set REPLACES the source's whole sealed set (values are write-only under threshold)"
         );
         return 2;
     };
@@ -2942,11 +3046,12 @@ fn config_source_env_set(args: &[String], json: bool) -> i32 {
         return 1;
     };
 
-    // Gather the (KEY, VALUE) updates from stdin. Two shapes: a single --key with
-    // its VALUE on stdin (so a value may hold '='), or --stdin bulk KEY=VALUE
-    // lines. Either way values arrive on stdin, never argv.
+    // Gather the complete (KEY, VALUE) set from stdin. Two shapes: a single --key
+    // with its VALUE on stdin (so a value may hold '='), or --stdin bulk KEY=VALUE
+    // lines. Either way values arrive on stdin, never argv, and REPLACE the whole
+    // set (threshold-sealed values cannot be read back to merge onto).
     let single_key = flag_value(args, "--key").map(str::to_string);
-    let updates: Vec<(String, Zeroizing<String>)> = if let Some(key) = single_key {
+    let pairs: Vec<(String, Zeroizing<String>)> = if let Some(key) = single_key {
         if !valid_env_key(&key) {
             eprintln!("sigil: '{key}' is not a valid environment variable name");
             return 2;
@@ -2965,92 +3070,203 @@ fn config_source_env_set(args: &[String], json: bool) -> i32 {
             None => return 1,
         }
     } else {
-        eprintln!("sigil: pass --key <KEY> (VALUE on stdin) or --stdin (KEY=VALUE lines on stdin)");
+        eprintln!(
+            "sigil: pass --stdin (KEY=VALUE lines on stdin) or --key <KEY> (one VALUE on stdin)"
+        );
         return 2;
     };
 
-    let Some(dek) = unwrap_host_dek(&format!("Seal env values for {name}")) else {
+    let count = pairs.len();
+    if !seal_env_pairs(cfg, &name, &pairs) {
         return 1;
-    };
-    // Read the current pairs (to merge onto), then release the store; seal reloads
-    // it fresh so no stale copy is held across the merge.
-    let store = match AccountStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("sigil: loading account store: {e}");
-            return 1;
-        }
-    };
-    let mut pairs = match load_env_pairs(&store, &name, &dek) {
-        Ok(p) => p,
-        Err(()) => return 1,
-    };
-    drop(store);
-
-    // Merge the updates: replace an existing KEY in place, else append.
-    let set_names: Vec<String> = updates.iter().map(|(k, _)| k.clone()).collect();
-    for (k, v) in updates {
-        if let Some(existing) = pairs.iter_mut().find(|(ek, _)| ek == &k) {
-            existing.1 = v;
-        } else {
-            pairs.push((k, v));
-        }
     }
-
-    if !seal_env_pairs(cfg, &name, &pairs, &dek) {
-        return 1;
+    if !json {
+        // Said out loud because it used not to be true: a seal into a daemon that
+        // was already running went to disk and nowhere else, and every gated run
+        // after it injected nothing until a restart.
+        println!(
+            "  {}",
+            Style::stdout().faint("in effect on the next gated run; no restart needed")
+        );
     }
     print_config_result(
-        &ControlResult::line(
-            true,
-            format!("sealed {} value(s) on {name}", set_names.len()),
-        ),
+        &ControlResult::line(true, format!("sealed {count} value(s) on {name}")),
         json,
     )
 }
 
 fn config_source_env_unset(args: &[String], json: bool) -> i32 {
     let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
-        eprintln!("usage: sigil-config source env unset <name> --key <KEY>");
-        return 2;
-    };
-    let Some(key) = flag_value(args, "--key").map(str::to_string) else {
-        eprintln!("usage: sigil-config source env unset <name> --key <KEY>");
+        eprintln!("usage: sigil-config source env unset <name>");
         return 2;
     };
     let Some(cfg) = load_env_source(&name) else {
         return 1;
     };
-    let Some(dek) = unwrap_host_dek(&format!("Re-seal env values for {name}")) else {
-        return 1;
-    };
-    let store = match AccountStore::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("sigil: loading account store: {e}");
-            return 1;
-        }
-    };
-    let mut pairs = match load_env_pairs(&store, &name, &dek) {
-        Ok(p) => p,
-        Err(()) => return 1,
-    };
-    drop(store);
-    let before = pairs.len();
-    pairs.retain(|(k, _)| k != &key);
-    if pairs.len() == before {
-        return print_config_result(
-            &ControlResult::line(false, format!("no key {key} on {name}")),
-            json,
+    // Threshold-sealed values are write-only, so a single key cannot be dropped
+    // while preserving the others (that would require reading them, which needs
+    // the phone). `unset` therefore clears the source's whole sealed set; re-set
+    // the keys you want to keep with `set --stdin`.
+    if flag_value(args, "--key").is_some() {
+        eprintln!(
+            "sigil: env values are write-only (threshold-sealed); a single key cannot be dropped.\n       \
+             `unset <name>` clears the whole source; re-set the keys to keep with `set --stdin`."
         );
+        return 2;
     }
-    if !seal_env_pairs(cfg, &name, &pairs, &dek) {
+    if !seal_env_pairs(cfg, &name, &[]) {
         return 1;
     }
     print_config_result(
-        &ControlResult::line(true, format!("removed key {key} from {name}")),
+        &ControlResult::line(true, format!("cleared all sealed values on {name}")),
         json,
     )
+}
+
+/// Load the config and confirm `name` names an existing source of ANY provider.
+///
+/// The `env` verb group is about environment variables, not about the inline
+/// `env` provider: `set`/`unset` seal values (inline-env only, hence the stricter
+/// [`load_env_source`]), while `set-plain`/`unset-plain` attach cleartext vars to
+/// any source, because a plain gate (`1password`, `env-file`) is exactly where a
+/// behavior switch like `OP_BIOMETRIC_UNLOCK_ENABLED=false` belongs.
+fn load_plain_source(name: &str) -> Option<crate::config::Config> {
+    let cfg = load_config()?;
+    if cfg.source(name).is_none() {
+        eprintln!(
+            "sigil: no source named {name}; create one first: \
+             sigil-config source add {name} --provider <id>"
+        );
+        return None;
+    }
+    Some(cfg)
+}
+
+/// `source env set-plain <name> --key K --value V`: store ONE non-secret env var
+/// on a source, in cleartext.
+///
+/// The value on the command line is deliberate and correct here: these are not
+/// secrets, so keeping them out of `ps` buys nothing and the round trip through
+/// stdin would only make the everyday case (`--value false`) awkward. The
+/// name-shape guardrail is what keeps that from becoming a way to smuggle a
+/// credential into `config.json`.
+fn config_source_env_set_plain(args: &[String], json: bool) -> i32 {
+    let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
+        eprintln!(
+            "usage: sigil-config source env set-plain <name> --key <KEY> --value <VALUE> [--force-plain]\n  \
+             the VALUE is stored in cleartext in config.json and is fine on the command line: \
+             plain vars are NON-SECRET behavior switches (OP_BIOMETRIC_UNLOCK_ENABLED=false, \
+             OP_CONFIG_DIR=..., a scratch HOME).\n  \
+             never pipe a credential in here; seal it instead: sigil-config source env set <name> --key <KEY>"
+        );
+        return 2;
+    };
+    // The lead-in spelling `set-plain <name> --unset-plain K` removes one, so the
+    // pair reads the way the flags do.
+    if let Some(key) = flag_value(args, "--unset-plain").map(str::to_string) {
+        return remove_plain_key(&name, &key, json);
+    }
+    let Some(key) = flag_value(args, "--key").map(str::to_string) else {
+        eprintln!("sigil: --key <KEY> is required");
+        return 2;
+    };
+    let Some(value) = flag_value(args, "--value").map(str::to_string) else {
+        eprintln!(
+            "sigil: --value <VALUE> is required (plain vars are not secrets, so the value goes \
+             on the command line)"
+        );
+        return 2;
+    };
+    if !valid_env_key(&key) {
+        eprintln!("sigil: '{key}' is not a valid environment variable name");
+        return 2;
+    }
+    let forced = has_flag(args, "--force-plain");
+    if let Some(token) = crate::config::secret_looking_name(&key) {
+        if !forced {
+            eprintln!(
+                "sigil: '{key}' looks like a secret (it contains '{token}') and a plain value is \
+                 stored in cleartext in config.json.\n       \
+                 seal it instead: sigil-config source env set {name} --key {key}\n       \
+                 if it really is not a secret: re-run with --force-plain"
+            );
+            return 2;
+        }
+        // Said out loud, every time: the override is the one path by which a
+        // credential-shaped name reaches cleartext on disk, so it leaves a trace
+        // in the terminal the human is looking at.
+        eprintln!(
+            "sigil: storing '{key}' in cleartext at your explicit request (--force-plain); \
+             it contains '{token}'"
+        );
+    }
+
+    let mut cfg = match load_plain_source(&name) {
+        Some(c) => c,
+        None => return 1,
+    };
+    // A name that is also sealed on this source is not refused (the sealed value
+    // may be added or dropped later), but it will not take effect while both
+    // exist, and dead config that reads as live is the thing this tool is against.
+    let shadowed = cfg
+        .source(&name)
+        .is_some_and(|s| s.keys.iter().any(|k| k == &key));
+    let replaced = match cfg.sources.iter_mut().find(|s| s.name == name) {
+        Some(src) => src.plain.insert(key.clone(), value.clone()).is_some(),
+        None => return 1,
+    };
+    if !save_config(&cfg) {
+        return 1;
+    }
+    if shadowed && !json {
+        println!(
+            "  {}",
+            Style::stdout().brass(&format!(
+                "\u{2717} {key} is also a sealed value on {name}; the sealed value wins and this \
+                 plain one is not injected"
+            ))
+        );
+    }
+    let verb = if replaced { "updated" } else { "set" };
+    print_config_result(
+        &ControlResult::line(true, format!("{verb} plain {key}={value} on {name}")),
+        json,
+    )
+}
+
+/// `source env unset-plain <name> --key K`: drop one non-secret env var.
+fn config_source_env_unset_plain(args: &[String], json: bool) -> i32 {
+    let Some(name) = args.first().filter(|a| !a.starts_with('-')).cloned() else {
+        eprintln!("usage: sigil-config source env unset-plain <name> --key <KEY>");
+        return 2;
+    };
+    let Some(key) = flag_value(args, "--key").map(str::to_string) else {
+        eprintln!("sigil: --key <KEY> is required");
+        return 2;
+    };
+    remove_plain_key(&name, &key, json)
+}
+
+/// Drop the plain var `key` from source `name`, persisting the config.
+fn remove_plain_key(name: &str, key: &str, json: bool) -> i32 {
+    let mut cfg = match load_plain_source(name) {
+        Some(c) => c,
+        None => return 1,
+    };
+    let removed = cfg
+        .sources
+        .iter_mut()
+        .find(|s| s.name == name)
+        .is_some_and(|s| s.plain.remove(key).is_some());
+    if removed && !save_config(&cfg) {
+        return 1;
+    }
+    let result = if removed {
+        ControlResult::line(true, format!("removed plain {key} from {name}"))
+    } else {
+        ControlResult::line(false, format!("{name} has no plain {key}"))
+    };
+    print_config_result(&result, json)
 }
 
 /// Read `KEY=VALUE` lines from stdin into wiped buffers for a bulk env set. Blank
@@ -3139,13 +3355,39 @@ fn lease_flag(args: &[String]) -> Result<sigil_proto::LeasePolicy, i32> {
     Ok(sigil_proto::LeasePolicy::Leasable { max_secs })
 }
 
+/// Normalize a rule-matcher flag name to the form it must have to ever match.
+///
+/// `--flag-eq account=x` is an easy and natural thing to type, and it stored the
+/// flag as `account`: a rule that reads correctly in `sigil-config list`, gates
+/// nothing, and gives no hint why. The matcher compares whole argv tokens, so a
+/// name with no leading dash can only match a bare positional word (which is what
+/// `--argv-contains` is for). A bare name is therefore taken to mean `--name`,
+/// and the substitution is printed rather than made silently. Anything already
+/// starting with `-` is left exactly as typed, so a short `-a` still works.
+/// An empty name is refused: there is nothing to guess at.
+fn normalize_match_flag(flag: &str) -> Result<String, i32> {
+    if flag.is_empty() {
+        eprintln!("sigil: an empty flag name cannot match anything");
+        return Err(2);
+    }
+    if flag.starts_with('-') {
+        return Ok(flag.to_string());
+    }
+    let dashed = format!("--{flag}");
+    eprintln!(
+        "sigil: matching '{dashed}' (a bare '{flag}' would never match an argv token; \
+         use --argv-contains to match a positional word)"
+    );
+    Ok(dashed)
+}
+
 /// Build a [`Match`](crate::config::Match) from the rule-matcher flags.
 fn build_match(args: &[String]) -> Result<crate::config::Match, i32> {
     let flag_equals = flag_values(args, "--flag-eq")
         .into_iter()
         .map(|fe| match fe.split_once('=') {
             Some((f, v)) => Ok(crate::config::FlagEq {
-                flag: f.to_string(),
+                flag: normalize_match_flag(f)?,
                 value: v.to_string(),
             }),
             None => {
@@ -3154,11 +3396,15 @@ fn build_match(args: &[String]) -> Result<crate::config::Match, i32> {
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let flag_present = flag_values(args, "--flag")
+        .iter()
+        .map(|f| normalize_match_flag(f))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(crate::config::Match {
         command: flag_value(args, "--command").map(str::to_string),
         subcommand: flag_value(args, "--subcommand").map(str::to_string),
         argv_contains: flag_values(args, "--argv-contains"),
-        flag_present: flag_values(args, "--flag"),
+        flag_present,
         flag_equals,
         arg_regex: flag_value(args, "--regex").map(str::to_string),
     })
@@ -3252,9 +3498,11 @@ fn config_rule_add(args: &[String], json: bool) -> i32 {
     }
     let s = Style::stdout();
     if !json {
+        // config.json hot-reloads (#59), so telling the human to restart is both
+        // unnecessary and, worse, teaches that a restart is how changes land.
         println!(
             "  {}",
-            s.faint("restart the daemon to apply, then: sigil <cmd> <args>")
+            s.faint("the running daemon applies it within a couple of seconds: sigil <cmd> <args>")
         );
     }
     print_config_result(
@@ -3299,6 +3547,18 @@ fn config_rule_list(json: bool) -> i32 {
             pad(&target, 22),
             s.dim(&format!("{} \u{b7} {}", policy, describe_match(&r.match_)))
         );
+        // A rule authored before flag normalization can hold a flag with no
+        // leading dash, which never matches. It reads as a working rule on the
+        // line above, so say plainly that it is not one.
+        for dead in r.match_.dead_flags() {
+            println!(
+                "  {}",
+                s.brass(&format!(
+                    "\u{2717} flag '{dead}' has no leading dashes and never matches; \
+                     re-add the rule with '--{dead}'"
+                ))
+            );
+        }
     }
     0
 }
@@ -3356,12 +3616,40 @@ fn config_rule_remove(name: Option<&str>, json: bool) -> i32 {
 /// desktop to load or a human to inspect. Inherently machine-readable, so it
 /// ignores `--json` and always emits JSON.
 fn config_export() -> i32 {
-    let cfg = match load_config() {
+    let mut cfg = match load_config() {
         Some(c) => c,
         None => return 1,
     };
+    // An inline `env` source carries only its KEY *names* in config.json; the
+    // VALUES live in the threshold store, keyed by the source name. An env source
+    // with no sealed record is inert dead config (a value was never sealed, or a
+    // migration dropped it): the daemon does not inject from it. So the exported
+    // view drops its declared keys, presenting it as the plain gate it now
+    // behaves as, rather than falsely advertising a key as set. This is a view
+    // only; config.json is untouched, so a later `source env set` re-seals it.
+    reconcile_unsealed_env_sources(&mut cfg);
     println!("{}", json::to_pretty(&cfg));
     0
+}
+
+/// Empty the `keys` of every inline `env` source that has no sealed record in the
+/// threshold store, so a source whose value was never sealed (or was dropped by a
+/// migration) presents as the plain gate it actually behaves as. Operates on a
+/// config VALUE for export/inspection; it never writes config.json. A store that
+/// fails to load leaves the config untouched (conservative: show what is there).
+fn reconcile_unsealed_env_sources(cfg: &mut crate::config::Config) {
+    let store = match crate::threshold::ThresholdStore::load() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    for src in &mut cfg.sources {
+        if src.provider == crate::provider::EnvProvider::ID
+            && !src.keys.is_empty()
+            && store.get(&src.name).is_none()
+        {
+            src.keys.clear();
+        }
+    }
 }
 
 /// `sigil-config import`: replace the whole config from a JSON object on stdin
@@ -3399,6 +3687,21 @@ fn config_import(json: bool) -> i32 {
             return 2;
         }
     }
+    // Plain vars arrive here in cleartext, so an import is the one path that can
+    // write a credential-shaped name into config.json without passing the
+    // `set-plain` guardrail. It is NOT refused (that would make a config with a
+    // legitimately `--force-plain`ed name un-round-trippable), but it is named.
+    for src in &cfg.sources {
+        for key in src.plain.keys() {
+            if let Some(token) = crate::config::secret_looking_name(key) {
+                eprintln!(
+                    "sigil: source {} has plain '{key}' (contains '{token}'), stored in cleartext; \
+                     seal it instead if it is a secret: sigil-config source env set {} --key {key}",
+                    src.name, src.name
+                );
+            }
+        }
+    }
     if !save_config(&cfg) {
         return 1;
     }
@@ -3420,11 +3723,11 @@ fn config_import(json: bool) -> i32 {
     )
 }
 
-/// Remove sealed env blobs from the account store whose inline-env source is
-/// absent from `cfg` (an import dropped it). Best-effort: a store error is logged,
-/// not fatal to the import that already succeeded.
+/// Remove threshold-sealed env records whose inline-env source is absent from
+/// `cfg` (an import dropped it). Best-effort: a store error is logged, not fatal
+/// to the import that already succeeded.
 fn prune_orphan_env_blobs(cfg: &crate::config::Config) {
-    let mut store = match AccountStore::load() {
+    let mut store = match crate::threshold::ThresholdStore::load() {
         Ok(st) => st,
         Err(e) => {
             eprintln!("sigil: pruning orphan env blobs: {e}");
@@ -3437,11 +3740,13 @@ fn prune_orphan_env_blobs(cfg: &crate::config::Config) {
         .filter(|s| s.provider == crate::provider::EnvProvider::ID)
         .map(|s| s.name.as_str())
         .collect();
-    let before = store.env_sources.len();
-    store.env_sources.retain(|e| live.contains(e.name.as_str()));
-    if store.env_sources.len() != before {
+    let before = store.secrets.len();
+    store
+        .secrets
+        .retain(|r| live.contains(r.account_id.as_str()));
+    if store.secrets.len() != before {
         if let Err(e) = store.save() {
-            eprintln!("sigil: saving account store after prune: {e}");
+            eprintln!("sigil: saving the threshold store after prune: {e}");
         }
     }
 }
@@ -3490,6 +3795,7 @@ fn config_add(args: &[String], json: bool) -> i32 {
         account,
         path: path.clone(),
         keys: Vec::new(),
+        plain: Default::default(),
     };
     if let Err(e) = cfg.add_source(src) {
         eprintln!("sigil: {e}");
@@ -3532,7 +3838,8 @@ fn config_add(args: &[String], json: bool) -> i32 {
     println!(
         "  {}",
         s.faint(&format!(
-            "restart the daemon to apply, then: sigil {cmd} <args>  (or: sigil shim add {cmd})"
+            "the running daemon applies it within a couple of seconds, then: sigil {cmd} <args>  \
+             (or: sigil shim add {cmd})"
         ))
     );
     0
@@ -3636,13 +3943,13 @@ fn cmd_mac_approvals(args: &[String], json: bool) -> i32 {
         return 0;
     }
 
-    // --enable: provision the local DEK envelope. On a dev keystore this
-    // always succeeds; on a real Secure Enclave the mint (`keystore_macos.rs`)
-    // is implemented but still pending on-hardware Touch ID verification, so a
-    // real failure here is surfaced honestly rather than faking success.
+    // --enable: provision the Mac threshold share and confirm the keystore is
+    // usable. The phone is always the approving factor now (there is no local
+    // Touch-ID approve path); this only readies the Mac side. On a dev keystore
+    // this always succeeds; a real keystore failure is surfaced honestly.
     let ks = keystore::for_host();
-    match ks.ensure_dek() {
-        Ok(()) => {
+    match crate::threshold::load_or_create_mac_share(ks.as_ref()) {
+        Ok(_) => {
             settings.mac_approvals = settings::MAC_APPROVALS_ENABLED.to_string();
             if let Err(e) = settings.save() {
                 eprintln!("sigil: saving settings: {e}");
@@ -3652,18 +3959,15 @@ fn cmd_mac_approvals(args: &[String], json: bool) -> i32 {
                 println!("{}", json::to_line(&json::MacApprovalsJson { ok: true }));
             } else {
                 println!(
-                    "{} mac approvals enabled (Touch ID can approve)",
+                    "{} Mac side readied (the phone remains the approving factor)",
                     s.ok("\u{2713}")
                 );
             }
             0
         }
         Err(e) => {
-            // Honest failure: the SE envelope could not be minted here.
             eprintln!(
-                "sigil: cannot enable Mac approvals: {}. \
-                 The phone remains the approving factor.\n  (detail: {e})",
-                keystore::dek_error_hint(&e)
+                "sigil: cannot ready the Mac side: {e}. The phone remains the approving factor."
             );
             if json {
                 println!("{}", json::to_line(&json::MacApprovalsJson { ok: false }));
@@ -3811,7 +4115,8 @@ fn cmd_wipe(args: &[String], json: bool) -> i32 {
             ("config", home.join("config.json")),
             ("legacy command config", home.join("commands.json")),
             ("settings", home.join("settings.json")),
-            ("dev keystore", home.join("dev-keystore.json")),
+            ("keystore file", home.join("keystore.json")),
+            ("legacy keystore file", home.join("dev-keystore.json")),
             ("history", home.join("history.jsonl")),
         ] {
             match std::fs::remove_file(&path) {
@@ -3853,12 +4158,285 @@ fn pad(s: &str, width: usize) -> String {
 mod tests {
     use super::*;
 
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn env_source(keys: &[&str], plain: &[(&str, &str)]) -> crate::config::Source {
+        crate::config::Source {
+            name: "s".into(),
+            provider: crate::provider::EnvProvider::ID.into(),
+            account: None,
+            path: None,
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+            plain: plain
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn list_labels_sealed_keys_and_never_shows_their_values() {
+        // The distinction a reader must be able to make at a glance: sealed keys
+        // are names only (Sigil is protecting the value), plain vars carry their
+        // values (Sigil is only setting them).
+        let sealed = env_source(&["OP_SERVICE_ACCOUNT_TOKEN"], &[]);
+        assert_eq!(
+            source_extra(&sealed),
+            " \u{b7} sealed OP_SERVICE_ACCOUNT_TOKEN"
+        );
+    }
+
+    #[test]
+    fn list_never_calls_a_declared_but_unsealed_key_sealed() {
+        // `config.json` records that a key was DECLARED, never that a value
+        // exists. Rendering the declaration as "sealed" told the human Sigil was
+        // protecting a value it had never been given: the `op` source below
+        // carries an inherited key name and has never been sealed, yet read
+        // identically to the source that had. `list` now reconciles against the
+        // threshold store exactly as `export` does, so a phantom key is simply
+        // not shown; it is dead config that degrades to a plain gate, not a
+        // pending state deserving a badge.
+        use sigil_proto::threshold::{EcdhAlgo, MacShare, ThresholdRecord};
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("sigil-listseal-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var_os("SIGIL_HOME");
+        std::env::set_var("SIGIL_HOME", &dir);
+
+        let mut cfg = crate::config::Config::default();
+        for name in ["real", "phantom"] {
+            cfg.sources
+                .push(env_source_named(name, &["OP_SERVICE_ACCOUNT_TOKEN"]));
+        }
+        cfg.save().unwrap();
+
+        // Only `real` has a record. It is a genuine seal (a throwaway stand-in
+        // for the phone's pinned share) because the store refuses to persist a
+        // record whose ephemeral point is not on the curve; nothing here is ever
+        // opened, since the rendering decision turns on the record existing.
+        let m = MacShare::generate();
+        let phone_f = MacShare::generate().public_point();
+        let mut store = crate::threshold::ThresholdStore::default();
+        store.secrets.push(
+            ThresholdRecord::seal("real", &m, &phone_f, EcdhAlgo::X963Sha256, "k", b"v").unwrap(),
+        );
+        store.save().unwrap();
+
+        let shown = sources_for_display().expect("the display config loads");
+        let extra = |name: &str| {
+            source_extra(
+                shown
+                    .sources
+                    .iter()
+                    .find(|s| s.name == name)
+                    .expect("source present"),
+            )
+        };
+        assert_eq!(extra("real"), " \u{b7} sealed OP_SERVICE_ACCOUNT_TOKEN");
+        assert_eq!(
+            extra("phantom"),
+            " \u{b7} (nothing set)",
+            "a declared key with no record claims nothing"
+        );
+        assert!(
+            !extra("phantom").contains("OP_SERVICE_ACCOUNT_TOKEN"),
+            "and the phantom key is not named at all"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("SIGIL_HOME", v),
+            None => std::env::remove_var("SIGIL_HOME"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn env_source_named(name: &str, keys: &[&str]) -> crate::config::Source {
+        let mut src = env_source(keys, &[]);
+        src.name = name.to_string();
+        src
+    }
+
+    #[test]
+    fn list_calls_a_plain_only_source_configured_not_empty() {
+        // Requirement of the degrade path: gate plus plain env injection is a
+        // legitimate configuration, so `list` must not render it as dead config.
+        let plain_only = env_source(&[], &[("OP_BIOMETRIC_UNLOCK_ENABLED", "false")]);
+        assert_eq!(source_extra(&plain_only), " \u{b7} no sealed values");
+        assert_eq!(source_extra(&env_source(&[], &[])), " \u{b7} (nothing set)");
+    }
+
+    #[test]
+    fn a_bare_matcher_flag_is_normalized_to_the_form_that_can_match() {
+        // `rule add --flag-eq account=x` stored the flag as "account", which can
+        // never equal an argv token like "--account=x". The rule then read
+        // correctly in `list` and gated nothing. A bare name now means "--name".
+        let m = build_match(&argv(&[
+            "--flag-eq",
+            "account=rowmhq.1password.eu",
+            "--flag",
+            "no-input",
+        ]))
+        .expect("a normalizable match");
+        assert_eq!(m.flag_equals[0].flag, "--account");
+        assert_eq!(m.flag_equals[0].value, "rowmhq.1password.eu");
+        assert_eq!(m.flag_present, vec!["--no-input".to_string()]);
+        assert!(m.dead_flags().is_empty(), "nothing dead survives authoring");
+
+        // And the normalized rule matches the argv it was written for.
+        assert!(m.matches(&argv(&[
+            "op",
+            "--account",
+            "rowmhq.1password.eu",
+            "--no-input"
+        ])));
+        assert!(m.matches(&argv(&[
+            "op",
+            "--account=rowmhq.1password.eu",
+            "--no-input=1"
+        ])));
+    }
+
+    #[test]
+    fn an_already_dashed_flag_is_left_exactly_as_typed() {
+        let m = build_match(&argv(&["--flag", "-4", "--flag-eq", "--account=x"]))
+            .expect("a valid match");
+        assert_eq!(
+            m.flag_present,
+            vec!["-4".to_string()],
+            "a short flag survives"
+        );
+        assert_eq!(m.flag_equals[0].flag, "--account");
+    }
+
+    #[test]
+    fn an_empty_matcher_flag_is_refused() {
+        // Nothing to guess at, so this is an error rather than a silent "--".
+        assert_eq!(build_match(&argv(&["--flag-eq", "=x"])).unwrap_err(), 2);
+        assert_eq!(build_match(&argv(&["--flag", ""])).unwrap_err(), 2);
+    }
+
+    /// A status shape with the keystore fields set, everything else inert.
+    fn status_with_keystore(sealed: Option<bool>, provisioned: Option<bool>) -> json::StatusJson {
+        json::StatusJson {
+            daemon_up: true,
+            socket: String::new(),
+            shim: json::ShimJson {
+                kind: "healthy".into(),
+                path: None,
+                issue: None,
+            },
+            op: json::OpJson {
+                found: true,
+                path: None,
+            },
+            accounts: 0,
+            factor: json::FactorJson {
+                kind: "phone".into(),
+                relay: None,
+            },
+            relay_reachable: None,
+            relay_url: None,
+            locked_down: false,
+            keystore_sealed: sealed,
+            keystore_provisioned: provisioned,
+        }
+    }
+
+    #[test]
+    fn the_keystore_row_carries_its_own_tone_and_the_shared_state_words() {
+        // Tone travels WITH the row, never derived from the label, so editing
+        // copy cannot silently flip a failing-closed row to a warning colour.
+        let not_open = keystore_row(&status_with_keystore(Some(true), Some(false)))
+            .expect("a sealed store gets a row");
+        assert_eq!(
+            not_open.tone,
+            RowTone::Denied,
+            "not-open fails every gated command closed, so it is denied, not pending"
+        );
+        assert_eq!(not_open.label, crate::keystore_seal::STATE_NOT_OPEN);
+        assert!(not_open.note.contains("Sigil app"));
+        assert!(
+            !not_open.note.to_lowercase().contains("no pairing"),
+            "must never read as a lost pairing: {}",
+            not_open.note
+        );
+
+        let open =
+            keystore_row(&status_with_keystore(Some(true), Some(true))).expect("open gets a row");
+        assert_eq!(open.tone, RowTone::Fine);
+        assert_eq!(open.label, crate::keystore_seal::STATE_OPEN);
+
+        // A plaintext store is the unremarkable default and earns no row; an
+        // older daemon that cannot say gets no row either, rather than a guess.
+        assert!(keystore_row(&status_with_keystore(Some(false), None)).is_none());
+        assert!(keystore_row(&status_with_keystore(None, None)).is_none());
+    }
+
+    #[test]
+    fn the_state_labels_fit_the_column_they_are_printed_in() {
+        // The vocabulary is shared with the Mac surface, so it can change there
+        // and land here. If it outgrows the column, every note on that row shifts
+        // right and the block goes ragged; catch that here rather than on screen.
+        for label in [
+            crate::keystore_seal::STATE_OPEN,
+            crate::keystore_seal::STATE_NOT_OPEN,
+        ] {
+            assert!(
+                label.len() <= STATE_COL,
+                "'{label}' ({}) does not fit the {STATE_COL}-wide state column",
+                label.len()
+            );
+        }
+        // And the two states stay distinguishable at a glance: one says open, the
+        // other says not open, in the same words.
+        assert!(crate::keystore_seal::STATE_OPEN.starts_with("Sealed"));
+        assert!(crate::keystore_seal::STATE_NOT_OPEN.starts_with("Sealed"));
+        assert_ne!(
+            crate::keystore_seal::STATE_OPEN,
+            crate::keystore_seal::STATE_NOT_OPEN
+        );
+    }
+
+    #[test]
+    fn a_lease_row_names_its_rule_and_says_how_wide_it_is() {
+        // Display honesty: the middle column is a RULE, and the row must not let
+        // it read as "the one command that was approved".
+        let s = Style::with_color(false);
+        let l = json::LeaseJson {
+            grant_hex: "a1b2c3d4e5f60718293a4b5c6d7e8f90".into(),
+            caller: String::new(),
+            account: String::new(),
+            scope: "op-account-rowmhq-1password-eu".into(),
+            granted_ms: 1_000,
+            expires_ms: 121_000,
+        };
+        let row = lease_row(s, &l, 1_000, false);
+        // Revoke prefix first, then the rule: with no account anywhere, the row
+        // spends no width on an empty column.
+        assert!(
+            row.starts_with("  a1b2c3d4e5f6  op-account-rowmhq-1password-eu"),
+            "{row}"
+        );
+        assert!(row.contains("\u{b7} any matching command"), "{row}");
+        assert!(row.ends_with("120s left"), "{row}");
+
+        // An account, when there is one, keeps its own aligned column.
+        let mut with = l.clone();
+        with.account = "Rowm".into();
+        assert!(lease_row(s, &with, 1_000, true).contains("Rowm"));
+    }
+
     #[test]
     fn reserved_verbs_take_precedence_over_command_dispatch() {
         // A runtime verb is reserved in the lean binary; a bare tool name (op,
         // gcloud) is not, so it falls through to the `sigil <cmd>` primitive.
         for v in [
-            "status", "daemon", "pair", "run", "ssh", "shim", "help", "version",
+            "status", "up", "daemon", "pair", "run", "ssh", "shim", "help", "version",
         ] {
             assert!(is_reserved_verb(v), "{v} must be a reserved verb");
         }
@@ -3871,7 +4449,6 @@ mod tests {
             "kubectl",
             "mytool",
             "config",
-            "account",
             "settings",
             "wipe",
             "mac-approvals",

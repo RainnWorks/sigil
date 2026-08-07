@@ -11,7 +11,7 @@
  * injected (a fake clock advanced by fetch/sleep), so the suite runs with zero
  * real waits. Run: `bun run src/transport/relay-http.selftest.ts`.
  */
-import { RelayMailbox, type RelayMailboxDeps } from "./relay-http";
+import { parseRelayOrigin, RelayMailbox, type RelayMailboxDeps } from "./relay-http";
 
 let failures = 0;
 function ok(cond: boolean, label: string): void {
@@ -32,6 +32,8 @@ interface FakeResp {
   status: number;
   headers?: Record<string, string>;
   envelopes?: string[];
+  /** The optional, index-aligned origins sibling; omitted when undefined. */
+  origins?: (unknown | null)[];
 }
 
 /** One scripted `to-phone` GET outcome; `hold` is the simulated server-side hold, ms. */
@@ -69,7 +71,10 @@ function harness(steps: Step[]): { deps: RelayMailboxDeps; sleeps: number[]; fet
       ok: r.ok,
       status: r.status,
       headers: { get: (name: string) => r.headers?.[name.toLowerCase()] ?? null },
-      json: async () => ({ envelopes: r.envelopes ?? [] }),
+      json: async () =>
+        r.origins === undefined
+          ? { envelopes: r.envelopes ?? [] }
+          : { envelopes: r.envelopes ?? [], origins: r.origins },
     };
   }) as unknown as typeof fetch;
 
@@ -204,6 +209,133 @@ async function main(): Promise<void> {
     ok(r1 === null, "(d) first loop was superseded/aborted, resolves null");
     eq(r2, "from-second", "(d) second loop is the sole survivor");
     ok(releaseFirst !== null, "(d) first unblocked via abort, never via a payload");
+  }
+
+  // (e) The relay's origin hint: index-aligned, optional, and never able to
+  // break a drain. The whole field is display-only hearsay from the adversary
+  // in the threat model, so every malformed shape must cost the hint and only
+  // the hint; the envelope is delivered either way.
+  {
+    const h = harness([
+      {
+        kind: "response",
+        hold: 100,
+        resp: {
+          ok: true,
+          status: 200,
+          envelopes: ["first", "second", "third"],
+          origins: [{ ip: "203.0.113.7", at_ms: 1_000 }, null, { ip: "198.51.100.4", at_ms: 1_000 }],
+        },
+      },
+    ]);
+    const mb = new RelayMailbox("https://relay.example", freshMailbox(), h.deps);
+    const out = await mb.drain();
+    eq(
+      out.map((d) => d.env),
+      ["first", "second", "third"],
+      "(e) every envelope is delivered, order preserved",
+    );
+    eq(out[0]?.relayOrigin?.ip, "203.0.113.7", "(e) origins[0] lands on envelopes[0]");
+    eq(out[1]?.relayOrigin, undefined, "(e) a null origin leaves that envelope without one");
+    eq(out[2]?.relayOrigin?.ip, "198.51.100.4", "(e) index alignment holds past a null");
+  }
+
+  // (e') The pre-origin relay: no `origins` key at all, drain unchanged.
+  {
+    const h = harness([
+      { kind: "response", hold: 100, resp: { ok: true, status: 200, envelopes: ["only"] } },
+    ]);
+    const mb = new RelayMailbox("https://relay.example", freshMailbox(), h.deps);
+    const out = await mb.drain();
+    eq(out.length, 1, "(e') an older relay still drains");
+    eq(out[0]?.relayOrigin, undefined, "(e') absent origins yields no hint");
+  }
+
+  // (e'') A short / malformed origins array never drops or reorders envelopes.
+  {
+    const h = harness([
+      {
+        kind: "response",
+        hold: 100,
+        resp: {
+          ok: true,
+          status: 200,
+          envelopes: ["a", "b"],
+          origins: [{ ip: "203.0.113.7", at_ms: 1_000 }],
+        },
+      },
+    ]);
+    const mb = new RelayMailbox("https://relay.example", freshMailbox(), h.deps);
+    const out = await mb.drain();
+    eq(out.map((d) => d.env), ["a", "b"], "(e'') short origins array keeps both envelopes");
+    eq(out[1]?.relayOrigin, undefined, "(e'') the unmatched envelope simply has no hint");
+  }
+
+  // (f) parseRelayOrigin is the hostile-input gate. A relay controls these bytes
+  // completely and they land on the approval sheet, so anything that is not
+  // plainly an IP literal at a plausible moment is dropped whole.
+  {
+    const now = 1_000_000;
+    eq(parseRelayOrigin({ ip: "203.0.113.7", at_ms: now }, now)?.ip, "203.0.113.7", "(f) IPv4 accepted");
+    eq(parseRelayOrigin({ ip: "2001:db8::1", at_ms: now }, now)?.ip, "2001:db8::1", "(f) IPv6 accepted");
+    eq(
+      parseRelayOrigin({ ip: "::ffff:192.0.2.128", at_ms: now }, now)?.ip,
+      "::ffff:192.0.2.128",
+      "(f) IPv4-mapped IPv6 accepted",
+    );
+    // Rust's IpAddr display never renders a zone, so the charset excludes it
+    // rather than admitting arbitrary interface-name letters.
+    eq(parseRelayOrigin({ ip: "fe80::1%en0", at_ms: now }, now), undefined, "(f) zone id rejected");
+    eq(parseRelayOrigin({ ip: "203.0.113.7", at_ms: now }, now)?.atMs, now, "(f) at_ms maps to atMs");
+
+    // The attack this gate exists for: free text buying a verified look.
+    eq(
+      parseRelayOrigin({ ip: "studio.local (verified)", at_ms: now }, now),
+      undefined,
+      "(f) spoof text rejected",
+    );
+    eq(parseRelayOrigin({ ip: "Tom's Mac", at_ms: now }, now), undefined, "(f) a name is not an address");
+    eq(
+      parseRelayOrigin({ ip: "1".repeat(46), at_ms: now }, now),
+      undefined,
+      "(f) over-long address rejected",
+    );
+    eq(parseRelayOrigin({ ip: "", at_ms: now }, now), undefined, "(f) empty address rejected");
+
+    // Shape failures.
+    eq(parseRelayOrigin(null, now), undefined, "(f) null rejected");
+    eq(parseRelayOrigin("203.0.113.7", now), undefined, "(f) a bare string is not an origin");
+    eq(parseRelayOrigin({ at_ms: now }, now), undefined, "(f) missing ip rejected");
+    eq(parseRelayOrigin({ ip: "203.0.113.7" }, now), undefined, "(f) missing at_ms rejected");
+    eq(parseRelayOrigin({ ip: "203.0.113.7", at_ms: "now" }, now), undefined, "(f) non-numeric at_ms rejected");
+    eq(
+      parseRelayOrigin({ ip: "203.0.113.7", at_ms: Number.NaN }, now),
+      undefined,
+      "(f) NaN at_ms rejected",
+    );
+
+    // Freshness: a stale or future-dated stamp describes some other moment, so
+    // it is dropped rather than attached to this request.
+    eq(
+      parseRelayOrigin({ ip: "203.0.113.7", at_ms: now - 4 * 60_000 }, now)?.ip,
+      "203.0.113.7",
+      "(f) 4 minutes old still shown",
+    );
+    eq(
+      parseRelayOrigin({ ip: "203.0.113.7", at_ms: now - 6 * 60_000 }, now),
+      undefined,
+      "(f) 6 minutes old dropped",
+    );
+    eq(
+      parseRelayOrigin({ ip: "203.0.113.7", at_ms: now + 30_000 }, now)?.ip,
+      "203.0.113.7",
+      "(f) small forward skew tolerated",
+    );
+    eq(
+      parseRelayOrigin({ ip: "203.0.113.7", at_ms: now + 120_000 }, now),
+      undefined,
+      "(f) far-future stamp dropped",
+    );
   }
 
   console.log(failures === 0 ? "\nrelay-http self-test: all green" : `\nrelay-http self-test: ${failures} FAILED`);

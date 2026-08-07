@@ -1,7 +1,7 @@
 //  AppModel.swift
-//  The app's single source of truth. Holds the DaemonClient and the local
-//  approver seams, polls the daemon for status/leases/pending, and exposes the
-//  actions the window and menubar drive. @MainActor because it feeds SwiftUI.
+//  The app's single source of truth. Holds the DaemonClient seam, polls the
+//  daemon for status/leases/pending, and exposes the actions the window and
+//  menubar drive. @MainActor because it feeds SwiftUI.
 
 import SwiftUI
 import Observation
@@ -9,9 +9,8 @@ import Observation
 @MainActor
 @Observable
 final class AppModel {
-    // Seams (swapped for mocks in previews / dev).
+    // Seam (swapped for a mock in previews / dev).
     let daemon: DaemonClient
-    let approver: LocalApprovalService
 
     // Observed state.
     private(set) var status: StatusReport?
@@ -24,6 +23,30 @@ final class AppModel {
     /// The if-this-then-that config: the rules the daemon gates on and the
     /// sources they inject from. Authored on the Rules screen.
     private(set) var config = SigilConfig()
+    /// The SSH keys the agent serves and whether the managed `~/.ssh/config`
+    /// routing is currently installed. Loaded alongside the other secondary
+    /// screens; authored on the SSH screen.
+    private(set) var sshKeys = SshKeyStore()
+    private(set) var sshRoutingInstalled = false
+    /// The local daemon's lifecycle, shown on the Status pane's daemon card:
+    /// whether its control socket is listening, the binary's reported version, and
+    /// the resolved binary path (for display). `daemonBusy` is true while a
+    /// lifecycle action (auto-ensure, restart, stop) is in flight, so the card
+    /// disables its buttons and shows an in-flight state.
+    private(set) var daemonRunning = false
+    private(set) var daemonVersion: String?
+    private(set) var daemonBinaryPath: String?
+    private(set) var daemonBusy = false
+    /// Whether this launch has already run the `sigil up` auto-ensure. The
+    /// ensure runs once at startup (and again only via the explicit Repair
+    /// control), never on a poll observing the daemon down: a human who
+    /// pressed Stop stays stopped.
+    private var autoEnsured = false
+    /// The Secure Enclave wrapping of the daemon's keystore file: whether it is
+    /// sealed, and whether this daemon has been handed the material for this run.
+    /// The app owns this because the daemon cannot: it is unsigned and portable,
+    /// so it has no Enclave of its own.
+    let keystore: KeystoreCoordinator
     /// Whether the first secondary load (config, history, settings) has completed.
     /// The Rules screen gates its teaching empty state on this so it never flashes
     /// before the load or on a pane re-select.
@@ -37,22 +60,44 @@ final class AppModel {
     private var pollTask: Task<Void, Never>?
     private var pendingTask: Task<Void, Never>?
 
-    init(daemon: DaemonClient, approver: LocalApprovalService) {
+    private var keystoreTask: Task<Void, Never>?
+
+    init(daemon: DaemonClient, keystore: KeystoreCoordinator? = nil) {
         self.daemon = daemon
-        self.approver = approver
+        self.keystore = keystore ?? (daemon.isFixtureClient
+            ? KeystoreCoordinator(previewState: .sealed(path: "~/.sigil/keystore.json"))
+            : KeystoreCoordinator())
     }
 
     /// The coarse arm state that drives the menubar glyph and the header word.
     var armState: ArmState { status?.armState ?? .idle }
 
-    var macApprovalsMode: MacApprovalsMode {
-        approver.macApprovalsEnabled ? .enabled : .hardenedPhoneOnly
-    }
-
     // MARK: lifecycle
 
     func start() {
         guard pollTask == nil else { return }
+        // Auto-ensure: the app owns keeping the daemon healthy, the human
+        // never presses Start. `sigil up` is idempotent (a healthy install is
+        // a fast all-ok pass) and heals the wedge a bare liveness probe would
+        // call running. Runs once per launch, before the first refresh lands.
+        Task { [weak self] in
+            guard let self, !self.autoEnsured else { return }
+            self.autoEnsured = true
+            await self.ensureUp()
+            // Only once the daemon is actually up: provisioning is a socket call,
+            // and a keystore this app cannot hand over is exactly the fail-closed
+            // state the Status pane has to report rather than retry blindly.
+            await self.keystore.sync(daemon: self.daemon)
+        }
+        // The keystore channel, live for the whole session. It carries three
+        // things: each successful connection (which is how a daemon restart is
+        // noticed, since the daemon accepts a provision once per lifetime), the
+        // de-adoption requests `sigil keystore unwrap` cannot prompt for itself,
+        // and the write-back a pairing triggers.
+        keystoreTask = Task { [weak self] in
+            guard let self else { return }
+            await self.keystore.watchKeystoreEvents(daemon: self.daemon)
+        }
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refresh()
@@ -73,6 +118,7 @@ final class AppModel {
     func stop() {
         pollTask?.cancel(); pollTask = nil
         pendingTask?.cancel(); pendingTask = nil
+        keystoreTask?.cancel(); keystoreTask = nil
     }
 
     func refresh() async {
@@ -129,47 +175,74 @@ final class AppModel {
         history = (try? await daemon.history()) ?? history
         settings = (try? await daemon.settings()) ?? settings
         config = (try? await daemon.config()) ?? config
+        sshKeys = (try? await daemon.sshKeys()) ?? sshKeys
+        sshRoutingInstalled = await daemon.sshRoutingInstalled()
+        await refreshDaemonStatus()
         secondaryLoaded = true
+    }
+
+    /// Refresh the daemon lifecycle readout: is the control socket listening, what
+    /// version does the binary report, and where is it. Cheap enough to run on
+    /// every secondary load and after each lifecycle action.
+    func refreshDaemonStatus() async {
+        daemonRunning = await daemon.daemonRunning()
+        daemonVersion = await daemon.daemonVersion()
+        daemonBinaryPath = daemon.daemonBinaryPath()
     }
 
     // MARK: actions
 
-    /// Approve a pending request at the Mac. Presents Touch ID (via the approver
-    /// seam) to unwrap the DEK, then tells the daemon to release. If Mac
-    /// approvals are off (hardened), this is unreachable in the UI; we still fail
-    /// closed with the phone-only message.
-    func approveLocally(_ req: PendingRequest, lease: Bool) async {
-        guard approver.macApprovalsEnabled else {
-            lastError = LocalApprovalError.noMacEnvelope.errorDescription
-            return
-        }
-        do {
-            // In the wired daemon, the daemon hands us the wrapped DEK for this
-            // request; here the seam takes it and returns the unwrapped DEK. The
-            // Touch ID sheet is presented inside approve(...).
-            let reason = "Approve \(req.title)"
-            _ = try await approver.approve(wrappedDEK: Data(), reason: reason)
-            _ = try await daemon.approve(id: req.id, lease: lease)
-            await refresh()
-        } catch let e as LocalApprovalError {
-            if case .userCancelled = e { return }   // cancel is not an error state
-            lastError = e.errorDescription
-        } catch {
-            lastError = describe(error)
-        }
-    }
-
+    // Approving is the phone's job: a request is unsealed only with the phone's
+    // per-approval partial, so this Mac cannot approve locally. The menubar
+    // offers Deny (which needs nothing) and points approvals at the iPhone.
     func deny(_ req: PendingRequest) async {
         await performControl { try await self.daemon.deny(id: req.id) }
-    }
-
-    func lockdown(clear: Bool) async {
-        await performControl { try await self.daemon.lockdown(clear: clear) }
     }
 
     func installShim() async {
         await performControl { try await self.daemon.installShim() }
     }
+
+    /// Re-run the keystore sync behind the Status pane's Retry control: read the
+    /// file, unwrap it, hand it to the daemon again. Idempotent, like `ensureUp`.
+    /// Nothing retries this on a timer; a refusal is surfaced and left for the
+    /// human, because the reasons a daemon refuses material do not heal by
+    /// themselves.
+    func syncKeystore() async {
+        await keystore.sync(daemon: daemon)
+    }
+
+    /// Re-wrap after a downgrade was detected. Deliberately its own verb: this is
+    /// the human answering an alarm, not routine upkeep.
+    func rewrapKeystore() async {
+        await keystore.rewrapAfterDowngrade(daemon: daemon)
+    }
+
+    // MARK: daemon lifecycle (start / stop / restart / install)
+
+    /// Run a daemon lifecycle action, showing an in-flight state, surfacing any
+    /// failure via `lastError` (e.g. `sigil start` refusing because something
+    /// already holds the socket), and refreshing both the lifecycle readout and
+    /// the status afterward. Mirrors `performControl`'s shape for the
+    /// throwing-void service verbs.
+    private func performLifecycle(_ operation: () async throws -> Void) async {
+        daemonBusy = true
+        do {
+            try await operation()
+            lastError = nil
+        } catch {
+            lastError = describe(error)
+        }
+        await refreshDaemonStatus()
+        await refresh()
+        daemonBusy = false
+    }
+
+    /// The self-healing keystone (`sigil up`): runs automatically at launch and
+    /// behind the Repair control. Replaces the old Start and Install buttons.
+    func ensureUp() async { await performLifecycle { try await self.daemon.ensureUp() } }
+    func stopDaemon() async { await performLifecycle { try await self.daemon.stopDaemon() } }
+    func restartDaemon() async { await performLifecycle { try await self.daemon.restartDaemon() } }
 
     func revokeLease(_ lease: Lease) async {
         await performControl { try await self.daemon.revokeLease(grantPrefix: lease.grantHex) }
@@ -185,7 +258,7 @@ final class AppModel {
     /// brand-new rule goes through `rule add`; an edit keeps the existing identity
     /// and round-trips the whole config through `import` (atomic, revalidated).
     /// Either way the draft's environment is then sealed: new and replaced VALUES
-    /// are encrypted under the DEK in one pass, and removed KEYs are dropped.
+    /// are threshold-sealed in one pass, and removed KEYs are dropped.
     ///
     /// Returns whether it actually took, so the editor sheet dismisses only on a
     /// real success and stays open (with the reason) on a refusal. The reload runs
@@ -311,9 +384,9 @@ final class AppModel {
     }
 
     /// Seal the draft's environment into `source`. New rows (and existing rows the
-    /// user retyped) are sealed together in one `sealEnv` call so the DEK unwraps
-    /// once; KEYs that were present before the edit but are gone from the draft are
-    /// unset. Values live only for the moment of the seal, then are gone.
+    /// user retyped) are sealed together in one `sealEnv` call; KEYs that were
+    /// present before the edit but are gone from the draft are unset. Values live
+    /// only for the moment of the seal, then are gone.
     private func applyEnv(_ draft: RuleDraft, source: String, priorKeys: [String]) async throws {
         let secrets: [EnvSecret] = draft.env.compactMap { row in
             let key = row.key.trimmed
@@ -343,21 +416,60 @@ final class AppModel {
         }
     }
 
-    func setMacApprovals(_ mode: MacApprovalsMode) async {
+    // MARK: SSH keys + routing
+
+    /// Add a served SSH key from a draft: a local key file (the CLI reads the
+    /// sibling `.pub`). The CLI does all validation (ed25519, dedupe, safe host
+    /// tokens); a refusal lands in `lastError` and the editor stays open. Returns
+    /// whether it took, so the sheet dismisses only on a real success. Reloads
+    /// inline so the caller's check sees the new list.
+    ///
+    /// Only the file source is wired here for now; a threshold "stored key"
+    /// source is planned (see docs/design/secret-model.md).
+    @discardableResult
+    func saveSshKey(_ draft: SSHKeyDraft) async -> Bool {
+        var ok = false
         do {
-            switch mode {
-            case .enabled:
-                let key = try approver.enableMacApprovals()
-                // Hand the SE public key to the daemon so it wraps the DEK to it.
-                try await daemon.setMacApprovals(.enabled)
-                _ = key   // (the daemon call carries the key in the wired build)
-            case .hardenedPhoneOnly:
-                try approver.disableMacApprovals()
-                try await daemon.setMacApprovals(.hardenedPhoneOnly)
-            }
+            try await daemon.addSshFileKey(
+                path: draft.path.trimmed, comment: draft.comment.trimmed, hosts: draft.hosts)
+            lastError = nil
+            ok = true
         } catch {
             lastError = describe(error)
         }
+        await loadSecondaryScreens()
+        return ok
+    }
+
+    /// Stop serving a key. The CLI `remove <item>` matches a 1Password item name;
+    /// a file key is dropped by its path where the mock supports it.
+    func removeSshKey(_ key: SshServedKey) async {
+        do {
+            try await daemon.removeSshKey(item: key.removeItem)
+            lastError = nil
+        } catch {
+            lastError = describe(error)
+        }
+        await loadSecondaryScreens()
+    }
+
+    /// Toggle the managed `~/.ssh/config` routing on or off. On installs the block
+    /// that sends the routed hosts through Sigil; off restores the normal agent.
+    func setSshRouting(_ install: Bool) async {
+        do {
+            if install { try await daemon.installSshRouting() }
+            else { try await daemon.uninstallSshRouting() }
+            lastError = nil
+        } catch {
+            lastError = describe(error)
+        }
+        await loadSecondaryScreens()
+    }
+
+    /// The generated `~/.sigil/ssh/config` contents for the "View block"
+    /// affordance, read on demand (nil when routing is not installed).
+    func generatedSshConfig() async -> String? {
+        await daemon.generatedSshConfig()
     }
 
     func beginPairing(relayURL: String) {
@@ -370,7 +482,7 @@ final class AppModel {
     }
 
     /// The human's decision at the `.confirmSAS` step. This is the real MITM
-    /// backstop: the DEK is only sealed and sent once `match: true` reaches the
+    /// backstop: the pairing completes only once `match: true` reaches the
     /// running ceremony (see `DaemonClient.confirmPairing`). A mismatch tears
     /// the ceremony down here too, since the CLI side fails closed but has no
     /// way to push a friendlier reason than its own error string.

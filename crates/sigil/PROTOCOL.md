@@ -18,13 +18,25 @@ keystore/tokens/config or wipe**. Those are short-lived, user-invoked CLI
 operations so a compromised daemon cannot perform them. Therefore:
 
 - **Over this socket (daemon):** status, doctor, leases (list + revoke), pending
-  (+ live subscription), history, lockdown (engage/clear), approve/deny.
+  (+ live subscription), history, approve/deny.
 - **CLI-only mutations (the Mac app shells out to `sigil … --json`):** account
   add/rotate/remove, **command config** (`config add|list|remove`), settings
   get/set, wipe `--force`, mac-approvals `--enable|--phone-only`, shim
   install/add, and **pairing** (`sigil pair --relay <url> --json`, an NDJSON
   ceremony stream). These write the keystore / `~/.sigil` and so are deliberately
   not daemon capabilities. Their `--json` shapes are in `JSON.md`.
+
+**Exception, added with the wrapped keystore (2026-08-04).** The daemon can now
+perform exactly one mutation: `seal_threshold` writes a threshold-sealed record
+into `threshold.db`. It exists because under a Secure-Enclave-wrapped keystore
+the CLI cannot read the Mac share it would seal with, and the daemon holds the
+opened material. Weigh it honestly: the daemon can now write sealed values a
+caller hands it, where before only a short-lived CLI could. It still cannot read
+any sealed value back (opening needs the phone's per-request partial), cannot
+mutate the keystore itself (see below), and cannot mutate rules, settings, or
+pairing. The keystore verbs are likewise not mutations of the keystore *by the
+daemon*: they hand it material and drive de-adoption, and the file itself is only
+ever written by the signed app.
 
 Pairing note: the brief initially placed the pairing ceremony on the socket
 (the daemon owns the relay connection). It is kept CLI-side because completing a
@@ -73,7 +85,7 @@ too: `exit` | `control` | `json` | `event`.
 The reply is `{"kind":"json","body":"<the JSON text>"}`; the client parses
 `body`. The daemon is the source of truth: it computes the host facts (shim
 drift, `op` discovery, pairing factor, relay reachability, counts) *and* holds
-the runtime facts (lockdown, live leases, the pending set, the audit log).
+the runtime facts (live leases, the pending set, the audit log).
 
 `StatusJson`:
 ```json
@@ -82,13 +94,17 @@ the runtime facts (lockdown, live leases, the pending set, the audit log).
   "op": { "found": bool, "path": str? },
   "accounts": int,
   "factor": { "kind": "phone|biometric|fail_closed", "relay": str? },
-  "relay_reachable": bool?, "relay_url": str?, "locked_down": bool }
+  "relay_reachable": bool?, "relay_url": str?,
+  "locked_down": bool (always false; retained for wire compatibility) }
 ```
 `CheckJson`: `{ "label": str, "ok": bool, "hint": str }` — the last row
 (`ssh-agent socket`) is informational (always `ok`).
 
 `LeaseJson`: `{ "grant_hex": str, "caller": str, "account": str, "scope": str,
-"granted_ms": int, "expires_ms": int }`.
+"granted_ms": int, "expires_ms": int }`. `scope` is the matched RULE's name: the
+lease covers any command that rule matches for the caller chain that opened it,
+not just the command line that did. Renderers must show that breadth (the CLI
+prints `<rule> · any matching command`).
 
 `PendingJson`:
 ```json
@@ -108,8 +124,6 @@ the runtime facts (lockdown, live leases, the pending set, the audit log).
 
 | Frame | Effect |
 |-------|--------|
-| `{"kind":"lockdown","clear":false}` | seal: deny + refuse, zeroize leases |
-| `{"kind":"lockdown","clear":true}` | unseal |
 | `{"kind":"lease_revoke","prefix":str}` | revoke leases whose grant hex starts with `prefix` |
 | `{"kind":"approve","id":str,"lease":bool}` | resolve a parked local request as approve (optionally lease) |
 | `{"kind":"deny","id":str}` | resolve a parked local request as deny |
@@ -134,6 +148,48 @@ disconnects. It also re-emits as a periodic keepalive so a dead client is
 detected. Drives the live menubar. The client parses each `event.body` as
 `[PendingJson]` and replaces its view.
 
+### The Secure-Enclave-wrapped keystore (v2)
+
+When `keystore.json` is wrapped (`{"v":2,...}`), its bytes are ciphertext only
+the signed Sigil app's enclave can open, and the daemon is handed the plaintext
+at runtime. The delta this buys is **at-rest exfiltration only** (backups,
+snapshots, a stolen disk); a live same-UID attacker is exactly as capable as
+before, and the daemon is unsigned by design.
+
+Four verbs, all of which the daemon refuses unless the **peer's code identity**
+satisfies `anchor apple generic and certificate leaf[subject.OU] = "53W966FBFP"`
+(checked live against the connecting pid via Security.framework, not asserted):
+
+- `{"kind":"keystore_provision","len":N}` **followed immediately by N raw bytes**
+  on the same stream. The daemon digests what it received
+  (`BLAKE2b-256("sigil.keystore.v2" || len||se_pub || len||material)`) and
+  compares it, constant time, against the value the file committed to, read once
+  at startup. Reply is a bare `control` ok/fail that never echoes the expected
+  digest. Accepted **once per daemon lifetime**; a refused attempt does not
+  consume that slot (otherwise one bad frame would be a denial of service).
+  Material never travels inside a JSON field: no `Frame` variant carries it.
+- `{"kind":"subscribe_keystore"}` → an `event` stream of ceremony events,
+  currently `{"kind":"unwrap","nonce":str}` only.
+- `{"kind":"keystore_unwrap_done","nonce":str,"ok":bool,"reason":str}`: the app
+  reports the outcome; on `ok` the daemon clears the adoption marker.
+- `{"kind":"keystore_unwrap_request"}`, same-UID (it is `sigil keystore unwrap
+  --confirm`), asks the daemon to raise an unwrap request and waits for the app.
+
+**Deferred, deliberately:** the commit flow (`keystore_commit_fetch` /
+`keystore_commit_done`) for daemon-side keystore mutations. It has no trigger
+today: the daemon never writes the keystore (every write is CLI-side in
+`pairing_store`), and those CLI paths refuse upfront against a sealed store. So
+while wrapped, nothing mutates the keystore from either side, by construction
+rather than by machinery. When daemon-side mutations exist, `subscribe_keystore`
+is the stream they announce on.
+
+One more verb exists because of wrapping, but is same-UID (not app-only):
+`{"kind":"seal_threshold","id":str,"len":N}` + N raw bytes asks the daemon to
+threshold-seal a value the caller supplies, because under a wrapped store the CLI
+cannot read the Mac share to seal with. `len == 0` removes the record. The caller
+is `sigil-config`, an unsigned CLI, so there is no code identity to demand; the
+boundary is the 0600 socket, the same one every other CLI verb has.
+
 ### The run path (not part of the control surface)
 
 `{"kind":"run","argv":[str],"cwd":str}` with the caller's stdout/stderr passed as
@@ -151,7 +207,7 @@ this; it is the shim / primitive channel.
 line(s), parse `body`):
 - `status()` → `status`; `doctor()` → `doctor`; `leases()` → `lease_list`;
   `pending()` → `pending`; `history()` → `history`.
-- `revokeLease` → `lease_revoke`; `lockdown(clear:)` → `lockdown`;
+- `revokeLease` → `lease_revoke`;
   `approve/deny` → `approve`/`deny` (read the `control` `{ok,lines}`).
 - A long-lived `subscribe_pending` connection feeding the menubar; reconnect on
   drop.

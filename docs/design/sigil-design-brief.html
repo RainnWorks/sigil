@@ -206,7 +206,8 @@
     font-size: 0.95rem; font-weight: 500;
   }
   .tapcap.primary { background: oklch(0.42 0.1 231); color: oklch(0.97 0.004 235); }
-  .tapcap.secondary { margin-top: 8px; border: 1px solid oklch(0.5 0.12 231 / 0.6); color: oklch(0.72 0.09 235); }
+  .tapcap.secondary { margin-top: 12px; border: 1px solid oklch(0.5 0.12 231 / 0.6); color: oklch(0.72 0.09 235); }
+  .leasecap { margin-top: 8px; font-size: 0.72rem; line-height: 1.35; color: var(--muted); }
   .denybtn { margin-top: 12px; text-align: center; padding: 13px; border-radius: 999px; border: 1px solid oklch(0.5 0.12 25 / 0.65); color: oklch(0.74 0.13 25); font-size: 0.95rem; }
   .mock-cap { font-size: 0.8rem; color: var(--muted); margin-top: 14px; max-width: 40ch; }
 
@@ -344,7 +345,7 @@
       <ul>
         <li>pairing · phone approval · leases</li>
         <li>transport · keystore · sealed protocol</li>
-        <li>lease policy · audit · lockdown</li>
+        <li>lease policy · audit</li>
         <li class="cant">produce a secret while at rest</li>
         <li class="cant">read the secret bytes it brokers</li>
       </ul>
@@ -372,7 +373,7 @@
 <div class="cols">
   <div>
     <h4>Layer 1 · Core</h4>
-    <p style="max-width:48ch">The generic machine. Its whole job is: gate a command on a phone, then inject the approved environment into it and run it. It carries the pairing handshake, the sealed and signed protocol, leases, the transport ladder, the keystore seam, the per-rule lease policy, the audit log, and lockdown. It has no concept of 1Password or SSH. The protocol types it seals to the phone name no provider: a request carries the raw argv, a list of opaque secret references, and a display hint, never a vault or a field.</p>
+    <p style="max-width:48ch">The generic machine. Its whole job is: gate a command on a phone, then inject the approved environment into it and run it. It carries the pairing handshake, the sealed and signed protocol, leases, the transport ladder, the keystore seam, the per-rule lease policy, and the audit log. It has no concept of 1Password or SSH. The protocol types it seals to the phone name no provider: a request carries the raw argv, a list of opaque secret references, and a display hint, never a vault or a field.</p>
   </div>
   <div>
     <h4>Layer 2 · Integrations</h4>
@@ -419,11 +420,12 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
   <li><span class="who">caller</span> Receives the output exactly as if the local prompt had been approved. On deny or timeout the integration fails closed with a clear stderr line.</li>
 </ol>
 
-<h3>Leases: approve once, cover the session <span class="badge shipped">shipped</span></h3>
+<h3>Leases: cover the session, or approve once <span class="badge shipped">shipped</span></h3>
 <div class="prose">
-  <p>One dev session can fire dozens of gated calls, and the callers cannot be changed; they think they are running the real tool. So the caller's identity is derived instead: the daemon reads the true peer pid from the socket, walks the ancestor chain kernel-side, and resolves each ancestor to its executable and code-signing identity (never raw pids, which recycle). The hash of that chain plus the project root plus the requested scope is the <strong>grant key</strong>. The daemon verifies all of it itself; a client's claims about its own ancestry are ignored.</p>
-  <p>Approving "for this session" turns the approval into a <strong>lease</strong>: the unwrapped credential is held in RAM only, scoped to that grant key, account, and scope, until the TTL expires, then zeroed. A lease is a leased capability, not a policy flag; the daemon still cannot serve anything outside it without the phone. Lockdown, deny-and-block, restart, or expiry kill a lease instantly, and the phone lists every active lease with a countdown and one-tap revoke.</p>
-  <p>Spam is handled before it reaches you: requests with an identical grant key arriving while one is pending coalesce behind it, so one decision settles the whole burst; pushes collapse to a count; per-caller rate limits back-pressure anything pathological. Honest limit: a process-tree key reduces fatigue, it does not upgrade the security boundary; same-user malware could imitate a caller during a live lease window, which is exactly why leases are triple-scoped, TTL-bound, and memory-only, and cannot widen their own scope.</p>
+  <p>One dev session can fire dozens of gated calls, and the callers cannot be changed; they think they are running the real tool. So the caller's identity is derived instead: the daemon reads the true peer pid from the socket, walks the ancestor chain kernel-side, and resolves each ancestor to its executable and code-signing identity (never raw pids, which recycle). The hash of that chain plus the <em>rule</em> the invocation matched is the <strong>grant key</strong>. The command line and the directory are deliberately not in it: one approval on a leasable rule should cover the work that rule describes, not one retyped argv from one folder. The daemon verifies all of it itself; a client's claims about its own ancestry are ignored. Be precise about what that chain buys: because every gated command arrives through one symlinked binary, the chain tells <em>tool trees</em> apart, never commands, and it is not bound to a process, a session, or a terminal. A second agent session with the same ancestors is the same grant key. The rule is what discriminates commands; the chain is the fence around it.</p>
+  <p>Approving "for this session" turns the approval into a <strong>lease</strong>: for a rule that injects sealed values, the values the approval unsealed are held in RAM only, scoped to that grant key, account, and rule, and every later run under that rule injects them from memory with no phone round trip, until the TTL expires and they are zeroed. A rule that injects nothing (a plain gate like <code>op</code>, which brings its own auth) holds only a presence marker, so its window skips the round trip and releases nothing. Either way the breadth is stated plainly wherever a lease is listed, because the window covers every command the rule matches for that caller. A lease is a leased capability, not a policy flag; the daemon still cannot serve anything outside it without the phone.</p>
+  <p>Because a lease names a <em>rule</em>, and rules are a file the user edits, a window dies the moment the ground under it moves: editing or deleting the rule, or the source it draws from, revokes and zeroes it on the next config reload, so a rule rewritten mid-window can never inherit an approval given for what it used to match. Re-sealing the source misses the cached values the same way. Expiry, an explicit revoke, and daemon restart all zero it too.</p>
+  <p>Spam is handled before it reaches you: requests identical in command and directory arriving while one is pending coalesce behind it, so one decision settles the whole burst (coalescing stays that narrow on purpose, so a decision about one readout never settles a different command); pushes collapse to a count; per-caller rate limits back-pressure anything pathological. Honest limit: a caller-chain key reduces fatigue, it does not upgrade the security boundary. It is a measure of the tool tree, not of a process, a session, or a terminal, so any concurrent tree with the same ancestors rides the same window, and same-user malware running under those ancestors could exercise a live lease, cached values included. That is exactly why leases are scoped to a rule the user wrote, TTL-bound, memory-only, revocable, killed by any edit to the rule they name, and unable to widen their own scope.</p>
 </div>
 
 <h2 id="approve">The approval is the interaction</h2>
@@ -436,7 +438,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
     <div class="phone"><div class="screen">
       <div class="sheet-grab"></div>
       <div class="apr-head">
-        <span class="apr-acct">Rowm work</span>
+        <span class="apr-acct">studio.local</span>
         <span class="gauge">
           <svg width="52" height="52" viewBox="0 0 52 52">
             <circle cx="26" cy="26" r="22" fill="none" stroke="oklch(0.3 0.016 245)" stroke-width="3.5"/>
@@ -455,29 +457,30 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
         <div><span class="k">cwd</span><span class="v">~/Projects/rowm-api</span></div>
         <div><span class="k">machine</span><span class="v">studio.local</span></div>
         <div><span class="k">when</span><span class="v">just now</span></div>
+        <div><span class="k">relay says</span><span class="v">203.0.113.7</span></div>
       </div>
-      <div class="risk">Leasable rule &middot; approve once, or approve for up to 15 min.</div>
-      <div class="tapcap primary">Approve once</div>
-      <div class="tapcap secondary">Keep approved for 15 min</div>
+      <div class="risk">Leasable rule &middot; keep approved for up to 15 minutes, or approve once.</div>
+      <div class="tapcap primary">Keep approved for 15 minutes</div>
+      <div class="leasecap">Also covers other op commands and secrets this rule matches, from anywhere on this Mac.</div>
+      <div class="tapcap secondary">Approve once</div>
       <div class="denybtn">Deny</div>
     </div></div>
-    <p class="mock-cap">The approval sheet: brass gauge counting to expiry, the readout well leading with the reference label, provenance in mono, one tap to approve. A leasable rule additionally offers "approve for N minutes"; a run-once rule shows only the single tap. The well renders provider-supplied display segments; the phone never parses what the reference means.</p>
+    <p class="mock-cap">The approval sheet: the asking Mac in the header (the party, never the transport), brass gauge counting to expiry, the readout well leading with the reference label, provenance in mono, one tap to approve. A leasable rule leads with "Keep approved for N minutes" and captions it "Also covers other op commands and secrets this rule matches, from anywhere on this Mac." so the full breadth of the window is stated where it is granted: the window is rule-wide, so it serves other secrets besides the one in the well, and it binds the caller chain's code identity rather than a process, session, or terminal. "Approve once" sits below as the narrower second choice, and a run-once rule shows only the single tap. The well renders provider-supplied display segments; the phone never parses what the reference means.</p>
   </div>
   <div>
     <h3 style="margin-top:0">One tap; the rule sets what that tap may do</h3>
     <p style="max-width:46ch">There is no risk tier scaling the control. Every approve is one tap and every deny is one tap. The matched rule carries a lease policy, and that policy changes exactly one thing: whether the tap may <em>also</em> open a bounded auto-approve window. Any reason line the request carries is a display-only heads-up; it never scales the gesture.</p>
     <div class="ladder">
       <div class="rung"><span class="lv" style="color:var(--cobalt)">run-once</span><span>The safe default. A fresh phone approval every invocation; a lease is never offered or granted</span><span class="act">tap to approve</span></div>
-      <div class="rung"><span class="lv" style="color:var(--brass)">leasable</span><span>The rule opts in with a per-rule cap; the tap may open a session up to that cap (e.g. <code>gcloud</code> 15m)</span><span class="act">tap, or approve for N min</span></div>
+      <div class="rung"><span class="lv" style="color:var(--brass)">leasable</span><span>The rule opts in with a per-rule cap; the tap may open a session up to that cap (e.g. <code>gcloud</code> 15m), covering matching commands and secrets from that caller's tool tree, anywhere on this Mac, for the window</span><span class="act">keep approved for N min, or tap once</span></div>
     </div>
-    <p style="max-width:46ch">Run-once is enforced end to end: even if a compromised approver returns a lease, the daemon refuses it, and an over-long request is clamped down to the rule's cap. Every approve additionally passes Face ID: the Secure Enclave will not release the unwrap key without it, so a stolen unlocked phone still cannot approve. Long-press deny offers "Deny and block this process for 1 hour." An SSH request swaps the readout well for key label, host, and challenge fingerprint, the two things worth verifying.</p>
+    <p style="max-width:46ch">Run-once is enforced end to end: even if a compromised approver returns a lease, the daemon refuses it, and an over-long request is clamped down to the rule's cap. Every approve additionally passes Face ID: the Secure Enclave will not compute its share of the release without it, so a stolen unlocked phone still cannot approve. Long-press deny offers "Deny and block this process for 1 hour." An SSH request swaps the readout well for key label, destination, and challenge fingerprint, and the destination is shown only as verified as it truly is: a known-hosts name, an unrecognized host key's fingerprint, or a plain "destination unverified" when the client sent no host binding at all (an unbound signature works against any host, so the sheet never dresses one up as a destination). The provenance block carries one row the daemon did not sign: when a request arrives over the relay, the relay's own note of the address it saw the deposit from is shown as <span class="dim">relay says &nbsp; 203.0.113.7</span>. The attribution sits in the key, which keeps the value a bare address for the two-second read and names the speaker in the same breath, because this is hearsay from the one party the system treats as the adversary: a hostile relay can forge it, strip it, or replay an old one, and nothing on the phone verifies it. It gets one flat row and no state color, deliberately: a colored row would hand the relay a lever on the phone's alarm vocabulary, letting it paint caution on requests it dislikes or strip the row to make anything look clean. It gates nothing, is never stored in history, and is absent (silently, never "unknown") on the LAN rung and whenever the claim does not survive validation. Its only job is to be a soft tell, because an approval that claims to come from your own Mac while arriving from an unfamiliar network is exactly what a stolen keystore file would look like.</p>
     <h4>The rest of the app <span class="badge shipped">shipped</span></h4>
     <div class="tblwrap"><table>
-      <tr><td class="mono">home</td><td>armed state at a glance: <span class="dim">Armed &middot; studio.local connected &middot; 2 accounts</span>, last decision, lockdown control</td></tr>
+      <tr><td class="mono">home</td><td>this phone's own state at a glance: <span class="dim">Armed</span> or <span class="dim">Idle</span> with a quiet link dot, last decision. The transport is plumbing and is never named a party; the paired Mac's name comes only from what it says about itself in a daemon-signed request, never from a relay address.</td></tr>
       <tr><td class="mono">history</td><td>dense reverse-chron audit mirror; decision-colored rows; swipe to block a process; searchable. Never stores values.</td></tr>
-      <tr><td class="mono">accounts</td><td>credential health per account: <span class="dim">healthy &middot; rotate &middot; expires in 6d</span>, last used</td></tr>
-      <tr><td class="mono">leases</td><td>active grants with live TTL countdowns, one-tap revoke: <span class="dim">launcher &middot; Engineering/.env, 41m left</span></td></tr>
-      <tr><td class="mono">lockdown</td><td>hold-to-seal. Denies everything pending, refuses everything new, until Face ID plus hold releases it.</td></tr>
+      <tr><td class="mono">devices</td><td>the paired Macs this phone approves for: which Mac, a link/no-link dot, when it was pinned, this phone's own fingerprint. The relay is never shown. The phone is provider-blind, so there is no account surface anywhere.</td></tr>
+      <tr><td class="mono">settings</td><td>the active-lease list is <span class="badge planned">planned</span>: the phone cannot yet read or end a daemon lease, so the section shows no rows from a live pairing and offers no revoke, and says outright that ending a window today is the Mac's own Revoke button, or <code>sigil lease revoke &lt;prefix&gt;</code>. When it is wired it will show live TTL countdowns and one-tap revoke, each row naming the rule it covers and its breadth (<span class="dim">launcher &middot; op-eu, any matching command, 41m left</span>). Also here: approval and notification preferences, default timeout, re-pair and reset</td></tr>
     </table></div>
   </div>
 </div>
@@ -495,6 +498,11 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
   <tr><td class="mono">bitwarden</td><td><code>bw</code> session credential</td><td><span class="badge planned">planned</span></td></tr>
   <tr><td class="mono">aws-vault &middot; doppler</td><td>each an impl of the same trait</td><td><span class="badge planned">planned</span></td></tr>
 </table></div>
+
+<div class="prose">
+  <p><strong>Plain vars sit next to sealed ones, and the difference is never blurred.</strong> A source can also carry <em>non-secret</em> environment variables, stored in cleartext in <code>config.json</code> and injected into the gated child alongside whatever its provider resolves. They exist because a gated tool can have an ambient authentication fallback of its own that overrides the credential Sigil injects: <code>op</code>, handed a valid <code>OP_SERVICE_ACCOUNT_TOKEN</code>, still opened a caller channel to the 1Password desktop app and blocked in <code>open()</code> forever, because the daemon is not an authorized CLI caller of that app. <code>OP_BIOMETRIC_UNLOCK_ENABLED=false</code> is the fix, and it is not a secret. The rule of thumb is one line: if leaking it would matter, seal it; plain is for behavior switches like turning off a tool's interactive fallback, pointing at a scratch config directory, or setting a throwaway <code>HOME</code>.</p>
+  <p><code>sigil-config source env set-plain &lt;src&gt; --key K --value V</code> takes the value on the command line precisely because it is not a secret, and refuses a name that <em>looks</em> like one (<code>TOKEN</code>, <code>SECRET</code>, <code>PASSWORD</code>, <code>KEY</code>, <code>CREDENTIAL</code>, <code>PAT</code>, <code>APIKEY</code>) unless you pass <code>--force-plain</code>, which says so out loud each time it is used. A sealed value always wins a name collision, and the shadowed plain var is named in <code>list</code> and in the daemon log rather than quietly dropped. Sealed keys render as names only and plain vars render as <code>KEY=value</code>, so a reader can tell at a glance which values Sigil is protecting and which it is merely setting. A source carrying only plain vars and nothing sealed is a legitimate configuration, not dead config: a phone gate plus an environment tweak.</p>
+</div>
 
 <div class="prose">
   <p>"Sigil for 1Password" is a use-case page, not the product. The provider registry and a second reference provider are the concrete next step: a second live provider is what turns "the seam is designed" into "the seam is proven." Until then, 1Password is the sole shipping provider and the trait is exercised only by it plus test fakes.</p>
@@ -540,13 +548,22 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
   <tr><th>Threat</th><th>Answer</th><th>Honest residual</th></tr>
   <tr><td>Daemon store stolen (cold disk)</td><td>ciphertext without the phone or Mac enclave; the daemon private identity is in the login Keychain, so a powered-off disk reveals no key material</td><td>rotate credentials on suspicion anyway</td></tr>
   <tr><td>Live same-UID compromise</td><td>the unwrap key still never releases without a fresh hardware-gated tap, so nothing is served automatically</td><td>a live attacker holding the signing key can originate a request with chosen provenance; the phone's last defense is a human declining a request they did not initiate</td></tr>
-  <tr><td>Phone stolen</td><td>keys are enclave-gated; every approve needs Face ID</td><td>remote lockdown from the Mac, re-pair, rotate</td></tr>
+  <tr><td>Phone stolen</td><td>keys are enclave-gated; every approve needs Face ID</td><td>re-pair and rotate from the Mac</td></tr>
   <tr><td>Malicious process calls an integration</td><td>every fulfillment needs a fresh out-of-band approval showing process and cwd</td><td>an approved request does deliver that secret; Sigil gates release, it does not sandbox the recipient</td></tr>
   <tr><td>Approval replay</td><td>single-use ids, per-pairing counters, 90s window, sealed per-response ephemeral keys</td><td>aggressive clock skew rejects valid responses; doctor flags it</td></tr>
   <tr><td>Relay compromised</td><td>sees only sealed envelopes plus a transient, per-deposit push token; cannot read, forge, or replay; dropping traffic fails closed</td><td>metadata: mailbox hash, timing, sizes; can flood a known mailbox (bounded, rate-limited DoS) or ring a stolen push token with content-free doorbell noise (nuisance only, never a secret or an approval); self-host to keep even that at home</td></tr>
   <tr><td>SSH key exposure</td><td>default signer: in daemon RAM for one signature, then zeroed</td><td>a compromise at that instant leaks durable signing power, not one signature; removed by the v2 enclave-resident signer</td></tr>
   <tr><td>Phone lost entirely</td><td>recovery is intentionally a rotation: pair a new phone, rotate every credential; old ciphertext dies</td><td>hardened mode makes this the only path, by design</td></tr>
 </table></div>
+
+<h3>The keystore at rest: wrapped to this Mac's Enclave <span class="badge planned">planned</span></h3>
+<div class="prose">
+  <p>The daemon is a portable, unsigned binary, so it can hold no Secure Enclave key of its own. Its keystore is therefore a 0600 JSON file holding two things: the daemon's private identity, and this Mac's threshold share. Neither opens a secret alone, and that stays true. But a <em>copy</em> of that file impersonates this daemon from anywhere, and copying a file is the cheapest attack there is: a backup, a sync folder, a drive that leaves the building.</p>
+  <p>The signed Mac app closes that gap, because the app <em>can</em> hold an Enclave key. It mints a P-256 key inside this Mac's Secure Enclave, encrypts the keystore file to it, and replaces the file with ciphertext: <code>{"v":2,"pub_digest":...,"se_pub":...,"ciphertext":...}</code>, where <code>se_pub</code> is the wrapping public key and the digest is BLAKE2b-256 over a domain tag, that public key, and the material, each length-prefixed. Binding the key into the digest is what stops a re-wrap under somebody else's key passing as the original. Whenever the daemon starts, the app decrypts and hands it the material over the control socket, as raw bytes rather than JSON so no copy of it lands in a string that is never cleared; the daemon recomputes the digest, checks the app's code signature, and holds the material in RAM only. A daemon that finds a wrapped file it has not been given the material for fails closed, as everything here does.</p>
+  <p>Pairing writes new blobs, so a wrapped store raises an obvious question: who writes the file now? The answer turned out to be simpler than a protocol. The daemon never wrote that file in the first place; every write is a short-lived CLI operation, and while the store is wrapped those refuse <em>upfront</em>, before they touch anything, with an error that names the app and says the pairing is intact. So while wrapped, nothing mutates the keystore from either side, by construction rather than by machinery, and re-pairing is a deliberate de-adopt-first ceremony rather than a silent plaintext write beside a wrapped file. If daemon-side mutations ever exist, the designed path is for the daemon to hand the new material to the app, which re-wraps and confirms only once the new file is on disk and synced; that path is specified and not built, because machinery with no trigger is machinery that rots untested. The ordering discipline that does ship covers adoption and de-adoption: whichever file is about to become the only copy is written and flushed <em>before</em> anything else is released.</p>
+  <p>The unwrap is deliberately <strong>silent</strong>. The wrapping key carries no user-presence requirement, so launching prompts for nothing: no Touch ID is spent on something that is not an approval, and approvals themselves are unchanged, still gated on the phone. Turning the protection back off is the one exception and takes a live Touch ID, because it is the one direction that lowers protection. That path also destroys the wrapping key, which doubles as the record that the unwrap was sanctioned: a plaintext file sitting next to a surviving wrapping key is a downgrade nothing legitimate produces, and the app says so loudly rather than quietly wrapping back over the evidence. The daemon keeps its own half of that record, a marker it writes the first time it serves a wrapped store, and refuses to serve if it later finds plaintext with the marker still there. Honest limit: that marker is an ordinary same-UID file, so it catches accidents and unsigned opportunists rather than a determined local attacker, which is exactly why the app's surviving key is the independent alarm.</p>
+  <p>What this layer does and does not do, stated plainly, because a layer like this invites over-reading. It removes <strong>at-rest exfiltration</strong>, which is the way this file realistically leaves a machine: Time Machine and other backups, a cloud-synced home folder, a disk image, a drive that is sold, repaired, or stolen. Every one of those copies is now inert anywhere but this Mac. It is <strong>not runtime protection</strong>. Anything running as you on this Mac can read the daemon's material by design, and can ask the Enclave to decrypt exactly as the app does. And no secret was ever at stake in this file in either case, since opening any sealed secret still needs the phone's per-approval partial. This is device binding, not access control, and it is not a replacement for the threshold layer that actually protects secrets.</p>
+</div>
 
 <h3>The factor policy: what actually gates a request <span class="badge shipped">shipped</span></h3>
 <div class="prose">
@@ -599,7 +616,6 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
       <div class="mb"><span class="glyph" style="color:var(--faint)">&#9676;</span><div class="nm">Idle</div><div class="ds">daemon down or unpaired, dotted outline</div></div>
       <div class="mb"><span class="glyph" style="color:var(--cobalt)">&#9670;</span><div class="nm">Armed</div><div class="ds">solid latch, requests will route</div></div>
       <div class="mb"><span class="glyph" style="color:var(--brass)">&#9670;&middot;</span><div class="nm">Pending</div><div class="ds">brass corner dot, one gentle pulse</div></div>
-      <div class="mb"><span class="glyph" style="color:var(--deny)">&#8856;</span><div class="nm">Locked</div><div class="ds">barred silhouette until unsealed</div></div>
     </div>
   </div>
 </div>
@@ -628,7 +644,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
   <tr><td>Sealed protocol</td><td>the sealed and signed envelope with a single-use id and a freshness (replay) window; any field tamper breaks the signature. The counter still rides the signed wire but no longer gates acceptance: it reset to 0 on any restart or session recreation and dropped genuine approvals as false replays, so replay now rests on signature + freshness + single-use id</td></tr>
   <tr><td>Pairing</td><td>the full handshake: optical QR, secret-authenticated return channel, six-word SAS, unwrap-key delivery only after SAS confirmation and a fresh Secure Enclave Touch ID gate, with roughly thirty adversarial MITM proofs plus an independent review of the ordering</td></tr>
   <tr><td>Approval loop</td><td>the gated round-trip with fd passthrough: secret bytes reach the caller's fd, never the daemon; deny and timeout deliver no secret</td></tr>
-  <tr><td>Leases</td><td>daemon-verified caller fingerprints, triple-scoped RAM-only grants, coalescing, TTL purge, lockdown clears all</td></tr>
+  <tr><td>Leases</td><td>daemon-verified caller fingerprints, triple-scoped RAM-only grants, coalescing, TTL purge</td></tr>
   <tr><td>Factor policy</td><td>phone &gt; biometric &gt; fail-closed; the dev path is behind <code>--dev-insecure</code> with a loud warning; the same-UID self-approval finding is closed</td></tr>
   <tr><td>Provider seam</td><td>the <code>SecretProvider</code> trait with 1Password as provider #1; the protocol carries no op-specific field names</td></tr>
   <tr><td>Transport</td><td>the v4 relay transport: daemon and phone both deposit and drain opaque envelopes over plain HTTP, proven cross-process end-to-end over the real Bun relay, including recovery after a relay restart</td></tr>
@@ -670,7 +686,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
   <div class="sw"><div class="c" style="background:oklch(0.45 0.086 230)"></div><div class="i"><div class="n">Cobalt</div><div class="v">accent &middot; app tint<br>oklch(0.45 0.086 230)</div></div></div>
   <div class="sw"><div class="c" style="background:oklch(0.62 0.115 75)"></div><div class="i"><div class="n">Brass</div><div class="v">pending &middot; the gauge<br>oklch(0.62 0.115 75)</div></div></div>
   <div class="sw"><div class="c" style="background:oklch(0.5 0.095 165)"></div><div class="i"><div class="n">Sea green</div><div class="v">approved<br>oklch(0.5 0.095 165)</div></div></div>
-  <div class="sw"><div class="c" style="background:oklch(0.5 0.15 25)"></div><div class="i"><div class="n">Oxidized rust</div><div class="v">denied &middot; lockdown<br>oklch(0.5 0.15 25)</div></div></div>
+  <div class="sw"><div class="c" style="background:oklch(0.5 0.15 25)"></div><div class="i"><div class="n">Oxidized rust</div><div class="v">denied<br>oklch(0.5 0.15 25)</div></div></div>
   <div class="sw"><div class="c" style="background:oklch(0.175 0.014 245)"></div><div class="i"><div class="n">Ink</div><div class="v">terminal ground<br>oklch(0.175 0.014 245)</div></div></div>
 </div>
 
@@ -679,15 +695,15 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
     <h4>Type and shape</h4>
     <p style="max-width:46ch">SF Pro for UI voice via Dynamic Type; SF Mono for content voice: paths, fingerprints, process chains, timestamps, all tabular. No display face; the wordmark is lowercase mono. Native squircle control shapes everywhere; the single bespoke control is the full-radius approve capsule, because it is the most important interaction in the product.</p>
     <h4>Motion</h4>
-    <p style="max-width:46ch">Platform motion plus a small set of custom movements: the brass gauge depleting (a real clock), the approve capsule press-in with its commit haptic and symbol change, and one weightier lockdown seal from cobalt to rust. There is no drag track: approve is a tap, never a swipe. Reduced motion collapses the gauge to a numeric countdown. No confetti, ever.</p>
+    <p style="max-width:46ch">Platform motion plus a small set of custom movements: the brass gauge depleting (a real clock), and the approve capsule press-in with its commit haptic and symbol change. There is no drag track: approve is a tap, never a swipe. Reduced motion collapses the gauge to a numeric countdown. No confetti, ever.</p>
   </div>
   <div>
     <h4>Voice</h4>
     <div class="tblwrap"><table>
       <tr><td class="mono dim">push</td><td>"Approval requested" <span class="dim">(nothing more until unlocked)</span></td></tr>
-      <tr><td class="mono dim">approve</td><td>"Approved. Secret delivered."</td></tr>
+      <tr><td class="mono dim">approve</td><td>"Approved. Sent." <span class="dim">(or "Approved for 15 minutes. Sent." on a window; the phone cannot know what the Mac did)</span></td></tr>
       <tr><td class="mono dim">timeout</td><td>"Request expired. No secret was delivered."</td></tr>
-      <tr><td class="mono dim">lockdown</td><td>"Locked down. No requests will be served."</td></tr>
+      <tr><td class="mono dim">ssh unbound</td><td>"Destination unverified" <span class="dim">(no host binding was sent)</span></td></tr>
       <tr><td class="mono dim">phone gone</td><td>"Phone unreachable. No secrets can be unsealed until it reconnects."</td></tr>
       <tr><td class="mono dim">pairing</td><td>"Confirm both devices show: tide &middot; brass &middot; anchor"</td></tr>
     </table></div>

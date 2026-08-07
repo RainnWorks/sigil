@@ -10,7 +10,7 @@ import { useCountdown } from "@/src/lib/use-countdown";
 import { usePushDiag } from "@/src/lib/push";
 import { unpair } from "@/src/session/controller";
 import { type Lease } from "@/src/domain/types";
-import { store, useAppState } from "@/src/state/store";
+import { DEMO, store, useAppState } from "@/src/state/store";
 
 /**
  * Leases (view + revoke), approval and notification preferences, default
@@ -43,22 +43,42 @@ export default function SettingsScreen() {
       contentInsetAdjustmentBehavior="automatic"
       contentContainerStyle={{ padding: space.lg, gap: space.xl, paddingBottom: 48 }}
     >
-      {/* leases */}
+      {/* Leases: PREVIEW ONLY (security review F7). `AppState.leases` is written
+          by the demo seed and by nothing else, and no envelope message carries a
+          revoke, so this list cannot show a real window and cannot end one. It
+          therefore renders no revoke control and never claims the list is empty:
+          a phone that cannot see the Mac's leases saying "No active leases" is a
+          false statement of fact, and a revoke that silently drops a local row is
+          worse than no revoke at all. Revocation today is the Mac CLI, named
+          below. Restore the rows and the control when the daemon-side messages
+          land. */}
       <View>
-        <SectionHeader>Active leases</SectionHeader>
+        <SectionHeader badge="Planned">Active leases</SectionHeader>
         <Card>
-          {s.leases.length === 0 ? (
-            <View style={{ padding: space.lg }}>
-              <Sans tone="muted">No active leases.</Sans>
-            </View>
-          ) : (
-            s.leases.map((l, i) => (
-              <View key={l.id}>
-                {i > 0 ? <Hairline inset={space.lg} /> : null}
-                <LeaseRow lease={l} />
-              </View>
-            ))
-          )}
+          {DEMO && s.leases.length > 0 ? (
+            <>
+              {s.leases.map((l, i) => (
+                <View key={l.id}>
+                  {i > 0 ? <Hairline inset={space.lg} /> : null}
+                  <LeaseRow lease={l} />
+                </View>
+              ))}
+              <Hairline inset={space.lg} />
+            </>
+          ) : null}
+          <View style={{ padding: space.lg, gap: space.sm }}>
+            <Sans size={13} tone="muted">
+              {DEMO && s.leases.length > 0
+                ? "Sample rows only. This phone does not read or end the Mac's leases yet."
+                : "This phone does not read or end the Mac's leases yet."}
+            </Sans>
+            <Sans size={13} tone="muted">
+              To end a window now, revoke it in Sigil on the Mac, or run:
+            </Sans>
+            <Mono size={12} tone="faint">
+              {"sigil lease revoke <prefix>"}
+            </Mono>
+          </View>
         </Card>
       </View>
 
@@ -181,7 +201,6 @@ export default function SettingsScreen() {
 }
 
 function LeaseRow({ lease }: { lease: Lease }) {
-  const p = useTheme();
   const { remainingMs } = useCountdown(lease.expiresAt, lease.expiresAt - lease.grantedAt);
   const mins = Math.max(0, Math.round(remainingMs / 60000));
   return (
@@ -190,25 +209,17 @@ function LeaseRow({ lease }: { lease: Lease }) {
         <Mono size={14} weight="medium">
           {lease.caller}
         </Mono>
+        {/* The scope is a RULE name, and one lease covers every command that
+            rule matches for this caller until it expires. The row says so
+            outright rather than letting a rule name read as a command line
+            (the daemon's `sigil lease list` row states the same breadth). */}
         <Mono size={12} tone="muted">
-          {lease.scope} · {mins}m left
+          {lease.scope}, any matching command, {mins}m left
         </Mono>
       </View>
-      <Pressable
-        onPress={() => store.revokeLease(lease.id)}
-        hitSlop={8}
-        style={{
-          paddingHorizontal: 14,
-          paddingVertical: 7,
-          borderRadius: radius.capsule,
-          borderWidth: 1,
-          borderColor: p.deny + "80",
-        }}
-      >
-        <Sans size={13} weight="medium" style={{ color: p.deny }}>
-          Revoke
-        </Sans>
-      </Pressable>
+      {/* No revoke control here on purpose: nothing on this phone can end a
+          daemon lease yet, and a button that quietly drops a local row would
+          tell the human the window closed while the Mac keeps honoring it. */}
     </View>
   );
 }

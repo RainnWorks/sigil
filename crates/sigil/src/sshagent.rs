@@ -1,6 +1,6 @@
-//! The SSH agent: an RFC 9987 unix-socket listener that serves Tom's 1Password
-//! SSH keys and gates every signature through the same phone approval loop as an
-//! `op` secret release.
+//! The SSH agent: an RFC 9987 unix-socket listener that serves Sigil's SSH keys
+//! and gates every signature through the same phone approval loop as an injected
+//! secret release.
 //!
 //! ## What this is
 //!
@@ -17,28 +17,34 @@
 //! * `REQUEST_IDENTITIES (11) -> IDENTITIES_ANSWER (12)` — "what keys do you
 //!   have?"; we answer with each served public key's wire blob + comment.
 //! * `SIGN_REQUEST (13) -> SIGN_RESPONSE (14)` — the approval-worthy event; we
-//!   gate it on the phone, fetch the private key per-signature, sign, and wipe.
+//!   gate it on the phone, source the private key, sign, and wipe.
 //!
 //! We also accept and record `session-bind@openssh.com` (the server host key, for
 //! the approval screen's destination line). Everything else — add/remove/lock,
 //! other extensions — is refused with `SSH_AGENT_FAILURE (5)`. `ssh-add <file>`
-//! failing cleanly is correct: our keys come from 1Password, not pushed in.
+//! failing cleanly is correct: our keys are configured, not pushed in.
 //!
-//! ## Custody (v1) and the residual it carries
+//! ## Key sources and the custody residual
 //!
-//! Unlike an `op` secret release — where the secret never enters daemon memory
-//! (the `op` child streams straight to the caller's fd) — the agent is the one
-//! doing the crypto, so **the private key must be in daemon RAM for the duration
-//! of one signature**. On an approved `SIGN_REQUEST` the daemon fetches the key
-//! (`op read "op://<shared-vault>/<item>/private key?ssh-format=openssh"`) into a
-//! [`Zeroizing`] buffer, decodes with [`ssh_key`], signs, and zeroizes at once.
-//! Because the service-account token can read the *whole* key, a compromise at
-//! the moment of an approved request leaks durable signing power, not one
-//! signature — strictly worse than the secret case, and the reason v2 moves keys
-//! into the Secure Enclave. See `docs/design/ssh-agent.md` §4.
+//! Sigil stays the universal phone-gate regardless of where the key lives. Two
+//! sources ship:
 //!
-//! The key MUST live in a service-account-visible shared vault (Engineering/…),
-//! never Personal (the SA cannot see Personal at all).
+//! * [`FileSshSigner`] (a pluggable [`SshSigner`]) — a local OpenSSH key file (e.g.
+//!   `~/.ssh/id_ed25519`), read into a [`Zeroizing`] buffer for the one signature
+//!   and wiped.
+//! * a **threshold-stored** source (see [`SshStoredEntry`]) — the private key is
+//!   sealed at rest under the v2 threshold and openable only per-signature with the
+//!   phone's partial `Z_F` combined with the Mac share `m`; the daemon decrypts,
+//!   decodes, signs, and zeroizes. This source needs the phone's returned partial
+//!   and the keystore, so it is handled inline in the daemon's approval path (it
+//!   carries a `ThresholdChallenge` like an injected env secret), not via
+//!   [`SshSigner::sign`]. This is "store SSH creds for people without 1Password."
+//!
+//! Unlike an injected secret — which never enters daemon memory — the agent is the
+//! one doing the crypto, so **the private key is in daemon RAM for the duration of
+//! one signature** whichever source it came from. The 1Password case is now just a
+//! gated command (`op read` under a normal gate rule); there is no op-fetch signer
+//! and Sigil never holds or injects a service-account token.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -46,8 +52,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
-
-use crate::secrets::Token;
 
 // --- RFC 9987 message types -------------------------------------------------
 
@@ -201,9 +205,14 @@ pub struct ServedIdentity {
 /// `session-bind` host key. Honest by construction: either a name we actually
 /// found in `~/.ssh/known_hosts`, or the host-key fingerprint — never a
 /// fabricated hostname (the agent protocol carries no hostname).
+///
+/// `binding` is the structured discriminator that says which of those three
+/// states produced `host`, so the approval screen keys "destination unverified"
+/// on structure rather than on parsing the string.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostContext {
     pub host: String,
+    pub binding: sigil_proto::HostBinding,
 }
 
 /// The daemon-side capability the listener needs, kept as a trait so the wire
@@ -239,85 +248,38 @@ pub struct SignRequest<'a> {
 
 // --- the pluggable key source (signer) seam ---------------------------------
 
-/// A pluggable SSH key SOURCE. SSH is a distinct integration — its event is a
-/// signature, not an env injection — but the *key source* is as pluggable as the
+/// A pluggable SSH key SOURCE that signs from its own material once the daemon
+/// has approved. SSH is a distinct integration — its event is a signature, not an
+/// env injection — but the *key source* is as pluggable as the
 /// [`SecretProvider`](crate::provider::SecretProvider) seam is for secrets. Sigil
 /// stays the universal phone-gate regardless of where the key lives: the daemon
 /// applies the approval gate, then delegates the key-source-specific signing to
 /// the owning signer here.
 ///
-/// Shipping impls:
-/// * [`OpSshSigner`] (the default) — fetch the key from 1Password per signature
-///   via the service account, sign, zeroize. The honest residual: the key is in
-///   daemon RAM for one signature (see the module custody note).
-/// * [`FileSshSigner`] — sign from a local `~/.ssh/id_*` file, for users who do
-///   not keep their keys in 1Password. Proves the seam is real, not op-shaped.
+/// Shipping impl:
+/// * [`FileSshSigner`] — sign from a local `~/.ssh/id_*` file. Needs no account
+///   credential; the key is read into a wiped buffer for the one signature.
 ///
-/// Future impls are additive: a Secure-Enclave-resident signer (v2, key never
-/// leaves hardware) or a proxy-to-another-agent signer plug in here without
-/// touching the wire listener or the phone gate.
+/// A threshold-stored source (the private key sealed at rest, opened per-signature
+/// with the phone's partial) does NOT implement this trait: its sign needs the
+/// phone's returned partial and the Mac share, so it is handled inline in the
+/// daemon's approval path. Future in-source signers (a Secure-Enclave-resident
+/// signer whose key never leaves hardware, or a proxy-to-another-agent signer)
+/// plug in here without touching the wire listener or the phone gate.
 pub trait SshSigner: Send + Sync {
     /// The identities this source can serve, for `IDENTITIES_ANSWER`.
     fn identities(&self) -> Vec<ServedIdentity>;
 
-    /// Whether the daemon must decrypt a stored account token before this signer
-    /// can sign (true for [`OpSshSigner`]: the SA token authenticates the fetch;
-    /// false for [`FileSshSigner`]: the key is a local file).
-    fn needs_account(&self) -> bool;
-
     /// Produce the SSH signature blob (`string algorithm` + `string signature`)
     /// over `data` with `id`'s key. Called **after** the daemon's phone approval.
-    /// `credential` is the decrypted account token when [`needs_account`] is true,
-    /// else `None`. Returns `None` on any failure (fail closed).
-    ///
-    /// [`needs_account`]: SshSigner::needs_account
-    fn sign(&self, id: &ServedIdentity, data: &[u8], credential: Option<&Token>)
-        -> Option<Vec<u8>>;
+    /// The signer sources its own key (a local file today); Sigil injects no
+    /// credential. Returns `None` on any failure (fail closed).
+    fn sign(&self, id: &ServedIdentity, data: &[u8]) -> Option<Vec<u8>>;
 
     /// True if this signer serves `key_blob` (so the daemon can route a sign
     /// request to its owning signer).
     fn owns(&self, key_blob: &[u8]) -> bool {
         self.identities().iter().any(|i| i.key_blob == key_blob)
-    }
-}
-
-/// The default signer: fetch-per-signature from 1Password via the service
-/// account. Holds the resolved op identities and the `op` binary to shell out to
-/// (`None` uses PATH discovery; tests point it at a fake `op`).
-pub struct OpSshSigner {
-    identities: Vec<ServedIdentity>,
-    op_path: Option<PathBuf>,
-}
-
-impl OpSshSigner {
-    pub fn new(identities: Vec<ServedIdentity>, op_path: Option<PathBuf>) -> Self {
-        Self {
-            identities,
-            op_path,
-        }
-    }
-}
-
-impl SshSigner for OpSshSigner {
-    fn identities(&self) -> Vec<ServedIdentity> {
-        self.identities.clone()
-    }
-
-    fn needs_account(&self) -> bool {
-        true
-    }
-
-    fn sign(
-        &self,
-        id: &ServedIdentity,
-        data: &[u8],
-        credential: Option<&Token>,
-    ) -> Option<Vec<u8>> {
-        let token = credential?;
-        let op = self.op_path.clone().or_else(crate::paths::find_real_op)?;
-        // fetch_and_sign holds the key in a Zeroizing buffer for the one
-        // signature and wipes it (the v1 custody exception; see module docs).
-        fetch_and_sign(&op, token, &id.key_ref, data)
     }
 }
 
@@ -345,16 +307,7 @@ impl SshSigner for FileSshSigner {
         self.keys.iter().map(|(id, _)| id.clone()).collect()
     }
 
-    fn needs_account(&self) -> bool {
-        false
-    }
-
-    fn sign(
-        &self,
-        id: &ServedIdentity,
-        data: &[u8],
-        _credential: Option<&Token>,
-    ) -> Option<Vec<u8>> {
+    fn sign(&self, id: &ServedIdentity, data: &[u8]) -> Option<Vec<u8>> {
         let (_, path) = self.keys.iter().find(|(i, _)| i.key_blob == id.key_blob)?;
         let pem = Zeroizing::new(std::fs::read(path).ok()?);
         sign_openssh_ed25519(&pem, data)
@@ -493,16 +446,22 @@ fn extension(payload: &[u8], bound_hostkey: &mut Option<Vec<u8>>) -> Vec<u8> {
 /// fields. v2 (SE-resident keys) does not change this; it is inherent to the
 /// agent protocol carrying no authenticated hostname.
 fn derive_host(bound_hostkey: Option<&[u8]>) -> HostContext {
+    use sigil_proto::HostBinding;
     match bound_hostkey {
         None => HostContext {
             host: "(host not bound)".to_string(),
+            binding: HostBinding::Unbound,
         },
         Some(blob) => {
             if let Some(name) = known_hosts_lookup(blob, &known_hosts_path()) {
-                HostContext { host: name }
+                HostContext {
+                    host: name,
+                    binding: HostBinding::Named,
+                }
             } else {
                 HostContext {
                     host: hostkey_fingerprint(blob),
+                    binding: HostBinding::Fingerprint,
                 }
             }
         }
@@ -586,60 +545,16 @@ pub fn sha256_fingerprint(bytes: &[u8]) -> String {
     format!("SHA256:{}", B64.encode(digest))
 }
 
-// --- fetch-per-signature: op read -> decode -> ed25519 sign -> zeroize -------
-
-/// Fetch the OpenSSH private key for `reference` via the service account and
-/// produce the SSH signature blob over `data`, holding the key material for the
-/// one signature only.
-///
-/// This is the v1 custody exception (see the module docs): the key lands in a
-/// [`Zeroizing`] buffer, is decoded, signs, and is wiped when the buffer drops
-/// at the end of this function. It is never written to disk and never logged.
-///
-/// Returns the inner signature blob (`string algorithm` + `string signature`),
-/// ready to be wrapped as the `SIGN_RESPONSE`'s single `string` field, or `None`
-/// on any failure (missing `op`, a non-ed25519 key, a decode/sign error).
-pub fn fetch_and_sign(op: &Path, token: &[u8], reference: &str, data: &[u8]) -> Option<Vec<u8>> {
-    let pem = op_read_openssh_key(op, token, reference)?;
-    sign_openssh_ed25519(&pem, data)
-}
-
-/// Run `op read "<reference>?ssh-format=openssh"` with the service-account token
-/// injected, capturing stdout into a [`Zeroizing`] buffer so the key material
-/// never lands in an un-wiped allocation. Returns `None` on a non-zero exit or a
-/// spawn failure (fail closed).
-fn op_read_openssh_key(op: &Path, token: &[u8], reference: &str) -> Option<Zeroizing<Vec<u8>>> {
-    use std::process::{Command, Stdio};
-
-    // `op` accepts the format as a query parameter on the reference. Appending it
-    // here keeps the stored reference clean (`.../private key`).
-    let reference = format!("{reference}?ssh-format=openssh");
-    let token = std::str::from_utf8(token).ok()?;
-
-    let mut child = Command::new(op)
-        .args(["read", &reference])
-        .env("OP_SERVICE_ACCOUNT_TOKEN", token)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    // Read stdout ourselves into a wiped buffer rather than `Command::output`,
-    // whose captured `Vec` would not be zeroized.
-    let mut pem = Zeroizing::new(Vec::new());
-    child.stdout.take()?.read_to_end(&mut pem).ok()?;
-    let status = child.wait().ok()?;
-    if !status.success() || pem.is_empty() {
-        return None;
-    }
-    Some(pem)
-}
+// --- decode -> ed25519 sign -> zeroize --------------------------------------
 
 /// Decode an `-----BEGIN OPENSSH PRIVATE KEY-----` body and sign `data` with it,
 /// producing the SSH signature blob. ed25519-only: a key of any other type
 /// yields `None` (we neither advertise nor sign other types in v1).
-fn sign_openssh_ed25519(pem: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+///
+/// Public so the daemon's stored-key sign path can reuse it after opening the
+/// threshold-sealed private key: it hands the decrypted (zeroize-on-drop) PEM
+/// straight here and signs, matching the file signer's custody discipline.
+pub fn sign_openssh_ed25519(pem: &[u8], data: &[u8]) -> Option<Vec<u8>> {
     use signature::Signer;
 
     // The decoded key's secret scalar lives inside `ssh_key::PrivateKey`, which
@@ -669,31 +584,6 @@ fn encode_signature(sig: &ssh_key::Signature) -> Vec<u8> {
 
 // --- the served-key config (`~/.sigil/ssh-keys.json`) -----------------------
 
-/// One configured SSH identity on disk. Holds only public material and 1Password
-/// coordinates — never key bytes — so the store stays inert like the account
-/// catalogue. The public key line is what we advertise; the vault/item locate
-/// the private key to fetch per-signature.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SshKeyEntry {
-    /// The OpenSSH public-key line, e.g. `ssh-ed25519 AAAA… comment`.
-    pub public_key: String,
-    /// The vault holding the SSH Key item (must be SA-visible / shared).
-    pub vault: String,
-    /// The item name.
-    pub item: String,
-    /// The private-key field name (`op` calls it `private key`).
-    #[serde(default = "default_field")]
-    pub field: String,
-    /// Optional comment override; the public-key line's own comment is used when
-    /// this is empty.
-    #[serde(default)]
-    pub comment: String,
-}
-
-fn default_field() -> String {
-    "private key".to_string()
-}
-
 /// One configured file-based SSH identity on disk: a path to a local OpenSSH
 /// private key (e.g. `~/.ssh/id_ed25519`). The public key is read from the
 /// sibling `<path>.pub` for `IDENTITIES_ANSWER`; the private key is read only at
@@ -706,17 +596,47 @@ pub struct SshFileEntry {
     /// Optional comment override; the `.pub` line's own comment is used when empty.
     #[serde(default)]
     pub comment: String,
+    /// SSH hosts to route through Sigil for this key, e.g.
+    /// `["github.com", "gist.github.com"]`. Pure client-side routing metadata: the
+    /// agent serves the key regardless; these only decide which `Host` stanzas
+    /// [`crate::sshconfig`] emits into the managed `~/.ssh/config` block. Empty
+    /// means served but not routed.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
+/// One configured threshold-stored SSH identity on disk. Holds only public
+/// material and the id of the sealed private key in the threshold store
+/// (`~/.sigil/threshold.db`) — never key bytes — so the config stays inert. The
+/// private key is opened per-signature by combining the phone's partial with the
+/// Mac share; the daemon signs and zeroizes. This is "store SSH creds for people
+/// without 1Password."
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SshStoredEntry {
+    /// The OpenSSH public-key line, e.g. `ssh-ed25519 AAAA… comment` (advertised).
+    pub public_key: String,
+    /// The id under which the private key is sealed in the threshold store. Stable
+    /// across re-seals of the same key (the key's SHA256 fingerprint).
+    pub account_id: String,
+    /// Optional comment override; the public-key line's own comment is used when
+    /// this is empty.
+    #[serde(default)]
+    pub comment: String,
+    /// SSH hosts to route through Sigil for this key (see [`SshFileEntry::hosts`]).
+    /// Client-side routing metadata only; empty means served but not routed.
+    #[serde(default)]
+    pub hosts: Vec<String>,
 }
 
 /// The persisted list of served SSH identities, at `~/.sigil/ssh-keys.json`.
-/// Two sources: `keys` (fetched from 1Password per signature) and `files` (local
-/// key files). Each becomes a distinct [`SshSigner`] at arm time.
+/// The `files` source is a local key file signed after approval; the `stored`
+/// source is a threshold-sealed key opened per-signature with the phone's partial.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SshKeyConfig {
     #[serde(default)]
-    pub keys: Vec<SshKeyEntry>,
-    #[serde(default)]
     pub files: Vec<SshFileEntry>,
+    #[serde(default)]
+    pub stored: Vec<SshStoredEntry>,
 }
 
 impl SshKeyConfig {
@@ -754,26 +674,6 @@ impl SshKeyConfig {
         Ok(())
     }
 
-    /// Resolve every entry to a [`ServedIdentity`], parsing its public-key line
-    /// into the wire blob and fingerprint. Non-ed25519 or unparseable entries are
-    /// dropped (with a stderr note) rather than failing the whole agent: v1
-    /// serves ed25519 only.
-    pub fn served_identities(&self) -> Vec<ServedIdentity> {
-        self.keys
-            .iter()
-            .filter_map(|e| match resolve_identity(e) {
-                Some(id) => Some(id),
-                None => {
-                    eprintln!(
-                        "sigil sshagent: skipping key op://{}/{} (not a usable ed25519 public key)",
-                        e.vault, e.item
-                    );
-                    None
-                }
-            })
-            .collect()
-    }
-
     /// Resolve every file entry to a `(served identity, private-key path)` pair,
     /// reading each `<path>.pub` for the public blob. Unparseable / non-ed25519 /
     /// missing-`.pub` entries are dropped with a stderr note (v1 ed25519 only).
@@ -792,29 +692,25 @@ impl SshKeyConfig {
             })
             .collect()
     }
-}
 
-/// Parse one config entry's public-key line into a served identity. Returns
-/// `None` if the line does not parse or is not ed25519 (v1 serves ed25519 only).
-/// Public so `sigil ssh add` can validate an entry before persisting it.
-pub fn resolve_identity(e: &SshKeyEntry) -> Option<ServedIdentity> {
-    let pk = ssh_key::PublicKey::from_openssh(&e.public_key).ok()?;
-    if pk.algorithm() != ssh_key::Algorithm::Ed25519 {
-        return None;
+    /// Resolve every stored entry to a `(served identity, threshold-store id)`
+    /// pair. Unparseable / non-ed25519 entries are dropped with a stderr note (v1
+    /// ed25519 only). The id is what the daemon opens the sealed private key with.
+    pub fn stored_keys(&self) -> Vec<(ServedIdentity, String)> {
+        self.stored
+            .iter()
+            .filter_map(|e| match resolve_stored_identity(e) {
+                Some(id) => Some((id, e.account_id.clone())),
+                None => {
+                    eprintln!(
+                        "sigil sshagent: skipping stored key {} (not a usable ed25519 public key)",
+                        e.account_id
+                    );
+                    None
+                }
+            })
+            .collect()
     }
-    let key_blob = pk.to_bytes().ok()?;
-    let comment = if e.comment.is_empty() {
-        pk.comment().to_string()
-    } else {
-        e.comment.clone()
-    };
-    Some(ServedIdentity {
-        key_blob,
-        comment,
-        key_ref: format!("op://{}/{}/{}", e.vault, e.item, e.field),
-        label: e.item.clone(),
-        fingerprint: pk.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
-    })
 }
 
 /// Resolve a file entry's sibling `<path>.pub` into a served identity, without
@@ -847,6 +743,39 @@ pub fn resolve_file_identity(e: &SshFileEntry) -> Option<ServedIdentity> {
         key_ref: e.path.clone(),
         label,
         fingerprint: pk.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
+    })
+}
+
+/// Resolve a stored entry's public-key line into a served identity, without
+/// touching the sealed private key. Returns `None` if the line does not parse or
+/// is not ed25519 (v1 serves ed25519 only). For a stored identity `key_ref` holds
+/// `stored:<account_id>` (display only; the daemon opens the sealed key via the
+/// threshold store). Public so `sigil ssh add-stored` can validate before sealing.
+pub fn resolve_stored_identity(e: &SshStoredEntry) -> Option<ServedIdentity> {
+    let pk = ssh_key::PublicKey::from_openssh(e.public_key.trim()).ok()?;
+    if pk.algorithm() != ssh_key::Algorithm::Ed25519 {
+        return None;
+    }
+    let key_blob = pk.to_bytes().ok()?;
+    let fingerprint = pk.fingerprint(ssh_key::HashAlg::Sha256).to_string();
+    let comment = if e.comment.is_empty() {
+        pk.comment().to_string()
+    } else {
+        e.comment.clone()
+    };
+    // The label is shown brightest on the approval screen; prefer the comment,
+    // fall back to a short fingerprint so the human always sees which key signs.
+    let label = if !comment.is_empty() {
+        comment.clone()
+    } else {
+        fingerprint.clone()
+    };
+    Some(ServedIdentity {
+        key_blob,
+        comment,
+        key_ref: format!("stored:{}", e.account_id),
+        label,
+        fingerprint,
     })
 }
 
@@ -1100,6 +1029,12 @@ mod tests {
             Some("github.example.com")
         );
 
+        // A matched name derives to the structured Named binding, not a parsed
+        // string, so the approver can trust the discriminator.
+        let ctx = derive_host_with(Some(&host_blob), &kh);
+        assert_eq!(ctx.host, "github.example.com");
+        assert_eq!(ctx.binding, sigil_proto::HostBinding::Named);
+
         // The handler records the host key and hands the derived name to the sign.
         let backend = FakeBackend::new(true);
         let mut bound = None;
@@ -1142,6 +1077,8 @@ mod tests {
             ctx.host.starts_with("SHA256:"),
             "honest fingerprint, not a name"
         );
+        // The structured discriminator says fingerprint, not a verified name.
+        assert_eq!(ctx.binding, sigil_proto::HostBinding::Fingerprint);
         // It matches ssh-key's own fingerprint of the same key.
         assert_eq!(
             ctx.host,
@@ -1156,16 +1093,24 @@ mod tests {
     fn no_session_bind_yields_an_honest_unbound_marker() {
         let ctx = derive_host(None);
         assert_eq!(ctx.host, "(host not bound)");
+        // Unbound keys on structure so the approver renders "destination
+        // unverified" without parsing the marker string.
+        assert_eq!(ctx.binding, sigil_proto::HostBinding::Unbound);
     }
 
     /// Test seam: derive with an explicit known_hosts path (avoids env mutation).
     fn derive_host_with(bound_hostkey: Option<&[u8]>, kh: &Path) -> HostContext {
+        use sigil_proto::HostBinding;
         match bound_hostkey {
             None => derive_host(None),
             Some(blob) => match known_hosts_lookup(blob, kh) {
-                Some(name) => HostContext { host: name },
+                Some(name) => HostContext {
+                    host: name,
+                    binding: HostBinding::Named,
+                },
                 None => HostContext {
                     host: hostkey_fingerprint(blob),
+                    binding: HostBinding::Fingerprint,
                 },
             },
         }
@@ -1212,86 +1157,6 @@ mod tests {
             "marker stripped and [host]:port normalized"
         );
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    // --- fetch-and-sign against a fake `op` ---------------------------------
-
-    /// Write a fake `op` that, on `read <ref>`, emits a fixed OpenSSH private key
-    /// only when the expected token is in its env (proving token injection). The
-    /// key is generated by the caller and passed in as PEM.
-    fn write_fake_op(dir: &Path, expected_token: &str, pem: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("op");
-        // The PEM is written to a sidecar file the script cats, to avoid quoting.
-        let pem_file = dir.join("key.pem");
-        std::fs::write(&pem_file, pem).unwrap();
-        let script = format!(
-            "#!/bin/sh\nif [ \"$OP_SERVICE_ACCOUNT_TOKEN\" = \"{expected_token}\" ]; then cat \"{}\"; else exit 1; fi\n",
-            pem_file.display()
-        );
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
-
-    #[test]
-    fn fetch_and_sign_reads_the_key_and_signs_a_verifiable_signature() {
-        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-            .unwrap();
-        let pem = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
-
-        let dir = std::env::temp_dir().join(format!("sigil-fetchsign-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let op = write_fake_op(&dir, "tok-xyz", &pem);
-
-        let data = b"the-exact-bytes-to-sign";
-        let sig_blob = fetch_and_sign(&op, b"tok-xyz", "op://Engineering/Test/private key", data)
-            .expect("fetch-and-sign produced a signature");
-
-        // The blob is string algo + string sig; verify it.
-        let mut r = Reader::new(&sig_blob);
-        assert_eq!(r.string(), Some(&b"ssh-ed25519"[..]));
-        let raw = r.string().unwrap();
-        verify_ed25519(key.public_key(), data, raw);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn fetch_and_sign_fails_closed_when_the_token_is_wrong() {
-        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-            .unwrap();
-        let pem = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
-        let dir = std::env::temp_dir().join(format!("sigil-fetchsign-bad-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let op = write_fake_op(&dir, "the-right-token", &pem);
-        // A wrong token makes the fake op exit 1; we must get None, not a panic.
-        assert!(
-            fetch_and_sign(&op, b"WRONG", "op://Engineering/Test/private key", b"d").is_none(),
-            "a failed op read fails closed"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    // --- config round trip --------------------------------------------------
-
-    #[test]
-    fn config_entry_resolves_to_a_served_identity() {
-        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-            .unwrap();
-        let pub_line = key.public_key().to_openssh().unwrap();
-        let entry = SshKeyEntry {
-            public_key: pub_line,
-            vault: "Engineering".to_string(),
-            item: "GitHub".to_string(),
-            field: "private key".to_string(),
-            comment: "tom@github".to_string(),
-        };
-        let id = resolve_identity(&entry).expect("ed25519 entry resolves");
-        assert_eq!(id.key_blob, key.public_key().to_bytes().unwrap());
-        assert_eq!(id.key_ref, "op://Engineering/GitHub/private key");
-        assert_eq!(id.label, "GitHub");
-        assert_eq!(id.comment, "tom@github");
-        assert!(id.fingerprint.starts_with("SHA256:"));
     }
 
     // --- an end-to-end socket round trip with a raw client ------------------
@@ -1424,138 +1289,16 @@ mod tests {
         std::fs::write(&path, key.to_openssh(ssh_key::LineEnding::LF).unwrap()).unwrap();
 
         let signer = FileSshSigner::new(vec![(id.clone(), path.clone())]);
-        assert!(!signer.needs_account(), "a file signer needs no account");
         assert!(signer.owns(&id.key_blob));
 
         let data = b"file-signer-challenge";
         let sig_blob = signer
-            .sign(&id, data, None)
+            .sign(&id, data)
             .expect("file signer produces a signature");
         let mut r = Reader::new(&sig_blob);
         assert_eq!(r.string(), Some(&b"ssh-ed25519"[..]));
         let raw = r.string().unwrap();
         verify_ed25519(key.public_key(), data, raw);
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn op_signer_fetches_and_signs_and_requires_a_credential() {
-        // The default signer: fetch from 1Password per signature via the SA
-        // token, then sign. Proves the same seam the file signer implements.
-        let (key, id) = gen_identity("op://Engineering/Seam/private key");
-        let pem = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
-        let dir = std::env::temp_dir().join(format!("sigil-opsign-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let op = write_fake_op(&dir, "tok-xyz", &pem);
-
-        let signer = OpSshSigner::new(vec![id.clone()], Some(op));
-        assert!(
-            signer.needs_account(),
-            "the op signer needs an account token"
-        );
-
-        let data = b"op-signer-challenge";
-        let token: Token = Zeroizing::new(b"tok-xyz".to_vec());
-        let sig_blob = signer
-            .sign(&id, data, Some(&token))
-            .expect("op signer produces a signature");
-        let mut r = Reader::new(&sig_blob);
-        assert_eq!(r.string(), Some(&b"ssh-ed25519"[..]));
-        let raw = r.string().unwrap();
-        verify_ed25519(key.public_key(), data, raw);
-
-        // Without a credential the op signer fails closed (no key to fetch).
-        assert!(
-            signer.sign(&id, data, None).is_none(),
-            "no credential, no signature"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    // --- the LIVE op read -> decode -> sign path (ignored; needs a token) ----
-
-    /// Deletes a 1Password item on drop, so the live test leaves the vault clean
-    /// even if an assertion panics mid-test.
-    struct OpItemGuard {
-        title: String,
-        vault: String,
-    }
-    impl Drop for OpItemGuard {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("op")
-                .args(["item", "delete", &self.title, "--vault", &self.vault])
-                .output();
-        }
-    }
-
-    /// End-to-end against the LIVE service account: create a throwaway ed25519
-    /// SSH Key item, fetch+decode+sign through [`fetch_and_sign`] exactly as the
-    /// daemon would, verify the signature against the item's real public key, and
-    /// delete the item. Ignored by default (needs `OP_SERVICE_ACCOUNT_TOKEN` and
-    /// network); run with:
-    ///   OP_SERVICE_ACCOUNT_TOKEN=… cargo test -p sigil fetch_and_sign_live_op -- --ignored --nocapture
-    #[test]
-    #[ignore = "needs a live OP_SERVICE_ACCOUNT_TOKEN and network"]
-    fn fetch_and_sign_live_op() {
-        use std::process::Command;
-
-        let Ok(token) = std::env::var("OP_SERVICE_ACCOUNT_TOKEN") else {
-            eprintln!("SKIPPED fetch_and_sign_live_op: no OP_SERVICE_ACCOUNT_TOKEN");
-            return;
-        };
-        let op = crate::paths::find_real_op().expect("a real op on PATH");
-        let vault = "Engineering";
-        let title = format!("sigil-agent-livetest-{}-DELETE-ME", std::process::id());
-
-        // Create the throwaway key and arrange for its deletion no matter what.
-        let created = Command::new(&op)
-            .args([
-                "item",
-                "create",
-                "--category",
-                "SSH Key",
-                "--title",
-                &title,
-                "--vault",
-                vault,
-                "--ssh-generate-key",
-                "ed25519",
-                "--format=json",
-            ])
-            .env("OP_SERVICE_ACCOUNT_TOKEN", &token)
-            .output()
-            .expect("op item create runs");
-        assert!(
-            created.status.success(),
-            "op item create failed: {}",
-            String::from_utf8_lossy(&created.stderr)
-        );
-        let _guard = OpItemGuard {
-            title: title.clone(),
-            vault: vault.to_string(),
-        };
-
-        // Read the item's real public key line to verify against.
-        let pub_out = Command::new(&op)
-            .args(["read", &format!("op://{vault}/{title}/public key")])
-            .env("OP_SERVICE_ACCOUNT_TOKEN", &token)
-            .output()
-            .expect("op read public key runs");
-        assert!(pub_out.status.success());
-        let pub_line = String::from_utf8(pub_out.stdout).unwrap();
-        let pk = ssh_key::PublicKey::from_openssh(pub_line.trim()).unwrap();
-
-        // Fetch the private key and sign, exactly as the daemon's sign path does.
-        let data = b"live-op-challenge-bytes";
-        let reference = format!("op://{vault}/{title}/private key");
-        let sig_blob = fetch_and_sign(&op, token.as_bytes(), &reference, data)
-            .expect("live fetch_and_sign produced a signature");
-
-        // The blob is string algo + string sig; verify the raw signature.
-        let mut r = Reader::new(&sig_blob);
-        assert_eq!(r.string(), Some(&b"ssh-ed25519"[..]));
-        let raw = r.string().unwrap();
-        verify_ed25519(&pk, data, raw);
-        // _guard deletes the item on drop.
     }
 }

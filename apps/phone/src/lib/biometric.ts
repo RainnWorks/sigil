@@ -3,11 +3,12 @@
  * that seals an approval response without one. Deny requires nothing and never
  * calls in here.
  *
- * On a real build the biometric unlocks the Secure Enclave key that re-wraps the
- * DEK. Here it is modeled as an authentication check; the enclave binding is the
- * device-keystore seam (NEEDS VERIFICATION: expo-local-authentication gates a
- * key via `.biometryCurrentSet`-equivalent; enclave key custody needs a small
- * native module or SecureStore with `requireAuthentication`, confirmed on device).
+ * On a real build the biometric unlocks the Secure Enclave key-agreement that
+ * produces the per-request threshold partial. Here it is modeled as a bare
+ * authentication check; it also stands in for the gate on a plain gate approve,
+ * which releases no key material at all (NEEDS VERIFICATION: expo-local-
+ * authentication gates the enclave key via a `.biometryCurrentSet`-equivalent,
+ * confirmed on device).
  */
 import * as LocalAuthentication from "expo-local-authentication";
 

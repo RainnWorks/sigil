@@ -24,7 +24,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
 use sigil_proto::identity::DeviceIdentity;
-use sigil_proto::pairing::{DaemonPairing, Dek};
+use sigil_proto::pairing::DaemonPairing;
 use sigil_proto::{rendezvous_mailbox, PairingResponse, TransportError};
 
 use crate::pairing_store::{NewPairing, NewPhoneShare};
@@ -97,23 +97,23 @@ pub struct CeremonyOpts<'a> {
     /// Confirm the six SAS words match the phone's screen. Returns false to
     /// cancel.
     pub confirm_sas: &'a mut dyn FnMut(&[&'static str; 6]) -> bool,
-    /// Unwrap the keystore's DEK for delivery. Called exactly once, and only
-    /// after [`Self::confirm_sas`] has returned `true` -- never before. On a
-    /// Secure Enclave keystore this is where Touch ID fires, so the biometric
-    /// gates authorizing *this confirmed device*, not just starting the
-    /// ceremony: a same-UID process that can drive the pipe up to this point
-    /// still cannot complete a pairing without a live biometric at the moment
-    /// the human has already compared the SAS words. Must return the SAME key
-    /// `sigil account add` seals tokens under: sealing under one DEK and
-    /// unlocking with another is exactly the divergence this exists to
-    /// prevent, so it is never a freshly generated key.
-    pub unwrap_dek: &'a mut dyn FnMut() -> Result<crate::secrets::Dek>,
+    /// Arm the pairing: prove a live hardware presence (Touch ID) and provision
+    /// the Mac threshold share `m`. Called exactly once, and only after
+    /// [`Self::confirm_sas`] has returned `true` -- never before. On a Secure
+    /// Enclave keystore the presence check is where Touch ID fires, so the
+    /// biometric gates authorizing *this confirmed device*, not just starting the
+    /// ceremony: a same-UID process that can drive the pipe up to this point still
+    /// cannot complete a pairing without a live biometric at the moment the human
+    /// has already compared the SAS words. There is no key handed to the phone: at
+    /// rest everything is threshold-sealed and opened per-approval with the phone's
+    /// partial, so provisioning `m` (idempotently) is all that arms this daemon.
+    pub arm_after_sas: &'a mut dyn FnMut() -> Result<()>,
 }
 
-/// Run the full daemon-side ceremony and return what to persist. The keystore's
-/// DEK ([`CeremonyOpts::unwrap_dek`]) is unwrapped only after the SAS is
-/// confirmed, delivered to the phone, and dropped (zeroized) here; it is
-/// deliberately absent from the returned [`NewPairing`].
+/// Run the full daemon-side ceremony and return what to persist. The pairing is
+/// armed ([`CeremonyOpts::arm_after_sas`]) only after the SAS is confirmed: a live
+/// hardware presence is proven and the Mac threshold share `m` is provisioned. No
+/// key is handed to the phone -- at rest everything is threshold-sealed.
 pub fn run_ceremony(daemon_identity: DeviceIdentity, opts: CeremonyOpts<'_>) -> Result<NewPairing> {
     // Keep a copy of the daemon identity to persist: `mint` consumes the one we
     // pass it. Rebuilding from the secret bytes yields the same pinned keys.
@@ -164,28 +164,16 @@ pub fn run_ceremony(daemon_identity: DeviceIdentity, opts: CeremonyOpts<'_>) -> 
     }
     daemon.confirm().context("confirming the SAS")?;
 
-    // 4. ONLY NOW -- after a human has confirmed the SAS -- unwrap the
-    //    keystore's DEK. On a Secure Enclave keystore this is the Touch ID
-    //    prompt; placing it here rather than at ceremony start means the
-    //    biometric gates authorizing this specific confirmed device.
-    let keystore_dek = (opts.unwrap_dek)().context("unwrapping the DEK for delivery")?;
+    // 4. ONLY NOW -- after a human has confirmed the SAS -- arm the pairing: prove
+    //    a live hardware presence (on a Secure Enclave keystore this is the Touch
+    //    ID prompt) and provision the Mac threshold share `m`. Placing it here
+    //    rather than at ceremony start means the biometric gates authorizing this
+    //    specific confirmed device. Nothing is sealed to the phone: at rest every
+    //    secret is threshold-sealed and opened per-approval with the phone's
+    //    partial `F`, which the response already pinned.
+    (opts.arm_after_sas)().context("arming the pairing (presence + threshold share)")?;
 
-    // 5. Deliver the KEYSTORE's DEK, sealed to the phone (message 3), then erase
-    //    the transport copy. This must be the same key `sigil account add` seals
-    //    tokens under, never a fresh one, or a real approval would return a DEK
-    //    that cannot decrypt the stored token. `Dek::from_bytes` copies into a
-    //    proto `Dek`, which is `ZeroizeOnDrop`; the keystore's own copy is the
-    //    `Zeroizing` `keystore_dek` above and is dropped (zeroized) right after.
-    let dek = Dek::from_bytes(*keystore_dek);
-    let env = daemon.deliver_dek(&dek, 1).context("sealing the DEK")?;
-    let env_wire = serde_json::to_string(&env).context("serializing the DEK envelope")?;
-    channel
-        .send(env_wire)
-        .context("sending the DEK to the phone")?;
-    drop(dek);
-    drop(keystore_dek);
-
-    // Let the transport flush the DEK before the channel is torn down.
+    // Let the transport settle before the channel is torn down.
     if !opts.flush_grace.is_zero() {
         std::thread::sleep(opts.flush_grace);
     }
@@ -193,11 +181,11 @@ pub fn run_ceremony(daemon_identity: DeviceIdentity, opts: CeremonyOpts<'_>) -> 
     let phone = daemon
         .phone()
         .expect("phone is pinned once the response verified");
-    // The ceremony delivers the v1 DEK (above) AND, when the phone's response
-    // carried its v2 Secure-Enclave threshold share F (already tag-bound and
-    // on-curve-validated by `receive_response`), pins F too, so one pairing arms
-    // both v1 accounts (DEK) and v2 accounts (threshold). The wire carries only F;
-    // the Mac names the key locally and defaults its ECDH shape (NV-2/NV-7).
+    // When the phone's response carried its Secure-Enclave threshold share F
+    // (already tag-bound and on-curve-validated by `receive_response`), pin F, so
+    // this pairing arms both the Mac share `m` (provisioned above) and the phone
+    // share `F` together. The wire carries only F; the Mac names the key locally
+    // and defaults its ECDH shape (NV-2/NV-7).
     let phone_share = daemon.phone_se_share().map(|f| NewPhoneShare {
         se_key_id: crate::threshold::DEFAULT_SE_KEY_ID.to_string(),
         f_x963: f.to_vec(),
@@ -229,7 +217,6 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
-    use sigil_proto::Envelope;
     use sigil_softphone::{Pairing, Policy};
 
     const NOW: u64 = 1_720_000_000_000;
@@ -279,15 +266,10 @@ mod tests {
                 let resp_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&resp).unwrap());
                 p2d.lock().unwrap().push_back(resp_b64);
                 pairing.confirm().unwrap();
-                // Message 3: the DEK envelope the daemon seals back.
-                let env_wire = loop {
-                    if let Some(s) = d2p.lock().unwrap().pop_front() {
-                        break s;
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                };
-                let env: Envelope = serde_json::from_str(&env_wire).unwrap();
-                let sp = pairing.receive_dek(&env).unwrap();
+                // The ceremony delivers no key: after SAS confirmation the phone
+                // just finishes (it holds only its identity / SE share).
+                let sp = pairing.finish().unwrap();
+                let _ = &d2p; // no envelope is sent back anymore
                 sp.phone_identity()
             })
         };
@@ -306,8 +288,7 @@ mod tests {
         };
         let mut confirm = |_w: &[&'static str; 6]| true;
         let clock = || NOW;
-        let dek = crate::secrets::generate_dek();
-        let mut unwrap_dek = || -> Result<crate::secrets::Dek> { Ok(dek.clone()) };
+        let mut arm_after_sas = || -> Result<()> { Ok(()) };
 
         let opts = CeremonyOpts {
             relay_url: "ws://relay.test".into(),
@@ -317,7 +298,7 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
-            unwrap_dek: &mut unwrap_dek,
+            arm_after_sas: &mut arm_after_sas,
         };
         let np = run_ceremony(daemon_id, opts).expect("ceremony completes");
 
@@ -359,8 +340,7 @@ mod tests {
         let mut present_qr = |_u: &str, b64: &str| qr_tx.send(b64.to_string()).unwrap();
         let mut confirm = |_w: &[&'static str; 6]| false; // human says the words differ
         let clock = || NOW;
-        let dek = crate::secrets::generate_dek();
-        let mut unwrap_dek = || -> Result<crate::secrets::Dek> { Ok(dek.clone()) };
+        let mut arm_after_sas = || -> Result<()> { Ok(()) };
         let opts = CeremonyOpts {
             relay_url: "ws://relay.test".into(),
             response_timeout: Duration::from_secs(5),
@@ -369,7 +349,7 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
-            unwrap_dek: &mut unwrap_dek,
+            arm_after_sas: &mut arm_after_sas,
         };
         let err = match run_ceremony(daemon_id, opts) {
             Err(e) => e,
@@ -379,17 +359,16 @@ mod tests {
         phone_thread.join().unwrap();
     }
 
-    /// Ordering guard for #48 (commit 13e56c2): the keystore DEK unwrap -- on a
-    /// Secure Enclave keystore, the Touch ID moment -- must fire *only after*
-    /// the SAS is confirmed, never before. A same-UID caller that can drive the
-    /// ceremony's `confirm_sas` decision to `false` (a hostile GUI, or a stdin
-    /// writer that sends anything but "confirm" on the `--json` path) must not
-    /// be able to make the ceremony reach `unwrap_dek` at all: no biometric
-    /// prompt, no sealed DEK. Counts unwrap invocations and asserts zero on the
-    /// declined path, so a future refactor that moved the unwrap back ahead of
-    /// the SAS gate (the exact bug #48 fixed) would fail here.
+    /// Ordering guard for #48: arming the pairing -- on a Secure Enclave keystore,
+    /// the Touch ID moment, plus provisioning the Mac threshold share -- must fire
+    /// *only after* the SAS is confirmed, never before. A same-UID caller that can
+    /// drive the ceremony's `confirm_sas` decision to `false` (a hostile GUI, or a
+    /// stdin writer that sends anything but "confirm" on the `--json` path) must
+    /// not be able to make the ceremony reach `arm_after_sas` at all: no biometric
+    /// prompt. Counts arm invocations and asserts zero on the declined path, so a
+    /// future refactor that moved arming back ahead of the SAS gate would fail here.
     #[test]
-    fn the_dek_is_never_unwrapped_when_the_sas_is_declined() {
+    fn arm_after_sas_never_fires_when_the_sas_is_declined() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let d2p = Arc::new(Mutex::new(VecDeque::<String>::new()));
@@ -416,11 +395,10 @@ mod tests {
         let mut present_qr = |_u: &str, b64: &str| qr_tx.send(b64.to_string()).unwrap();
         let mut confirm = |_w: &[&'static str; 6]| false; // the SAS did not match
         let clock = || NOW;
-        let dek = crate::secrets::generate_dek();
-        let unwraps = AtomicUsize::new(0);
-        let mut unwrap_dek = || -> Result<crate::secrets::Dek> {
-            unwraps.fetch_add(1, Ordering::SeqCst);
-            Ok(dek.clone())
+        let arms = AtomicUsize::new(0);
+        let mut arm_after_sas = || -> Result<()> {
+            arms.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         };
         let opts = CeremonyOpts {
             relay_url: "ws://relay.test".into(),
@@ -430,122 +408,18 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
-            unwrap_dek: &mut unwrap_dek,
+            arm_after_sas: &mut arm_after_sas,
         };
         assert!(
             run_ceremony(daemon_id, opts).is_err(),
             "a declined SAS must fail the ceremony closed"
         );
         assert_eq!(
-            unwraps.load(Ordering::SeqCst),
+            arms.load(Ordering::SeqCst),
             0,
-            "unwrap_dek (the Touch ID moment) must never fire when the SAS is declined"
-        );
-        // Nothing was ever sealed toward the phone.
-        assert!(
-            d2p.lock().unwrap().is_empty(),
-            "no DEK envelope may be sent when the SAS is declined"
+            "arm_after_sas (the Touch ID + share-provision moment) must never fire when the SAS is declined"
         );
         phone_thread.join().unwrap();
-    }
-
-    /// The regression for the DEK-divergence bug: the ceremony must deliver the
-    /// *keystore* DEK (the one `sigil account add` seals tokens under), not a
-    /// fresh key. This drives the real seam end to end — provision a keystore
-    /// DEK, seal a known token under it, run the ceremony passing that DEK, have
-    /// the phone recover the delivered DEK, and assert the recovered DEK
-    /// decrypts the token back to plaintext.
-    ///
-    /// Against the old `Dek::generate()` code the phone recovers a *different*
-    /// key and `decrypt_token` fails (AEAD error), so this test fails pre-fix
-    /// and passes post-fix.
-    #[test]
-    fn delivered_dek_decrypts_a_token_sealed_under_the_keystore_dek() {
-        use crate::keystore::{Keystore, MemoryKeystore};
-        use crate::secrets::{decrypt_token, encrypt_token};
-        use sigil_proto::pairing::PhonePairing;
-        use sigil_proto::{PairingPayload, ReplayGuard};
-        use zeroize::Zeroizing;
-
-        const TOKEN: &[u8] = b"ops_eyJzaWduSW5BZGRyZXNzIjoi.example.account.token";
-
-        // 1. Provision the keystore DEK and seal a known token under it, exactly
-        //    as `sigil account add` does.
-        let ks = MemoryKeystore::new();
-        ks.ensure_dek().unwrap();
-        let keystore_dek = ks.unwrap_dek("seal the account token").unwrap();
-        let ciphertext = encrypt_token(&keystore_dek, TOKEN).unwrap();
-
-        let d2p = Arc::new(Mutex::new(VecDeque::<String>::new()));
-        let p2d = Arc::new(Mutex::new(VecDeque::<String>::new()));
-        let (qr_tx, qr_rx) = std::sync::mpsc::channel::<String>();
-
-        // The phone: scan, respond, confirm, then open the delivered DEK and
-        // return its raw bytes so the test can try to decrypt with them.
-        let phone_thread = {
-            let d2p = d2p.clone();
-            let p2d = p2d.clone();
-            std::thread::spawn(move || -> [u8; 32] {
-                let qr = qr_rx.recv().expect("daemon rendered a QR");
-                let phone_id = DeviceIdentity::generate();
-                let payload = PairingPayload::from_qr_string(&qr).unwrap();
-                let mut phone = PhonePairing::scan(phone_id, payload, NOW + 1_000).unwrap();
-                let resp = phone.respond().unwrap();
-                let resp_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&resp).unwrap());
-                p2d.lock().unwrap().push_back(resp_b64);
-                phone.confirm().unwrap();
-                let env_wire = loop {
-                    if let Some(s) = d2p.lock().unwrap().pop_front() {
-                        break s;
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                };
-                let env: Envelope = serde_json::from_str(&env_wire).unwrap();
-                let mut guard = ReplayGuard::new();
-                let recovered = phone.receive_dek(&env, &mut guard).unwrap();
-                *recovered.as_bytes()
-            })
-        };
-
-        let daemon_id = DeviceIdentity::generate();
-        let mut make_channel = |_mailbox: [u8; 32]| -> Result<Box<dyn PairChannel>> {
-            Ok(Box::new(MemChannel {
-                d2p: d2p.clone(),
-                p2d: p2d.clone(),
-            }))
-        };
-        let mut present_qr = |_unicode: &str, b64: &str| {
-            qr_tx.send(b64.to_string()).unwrap();
-        };
-        let mut confirm = |_w: &[&'static str; 6]| true;
-        let clock = || NOW;
-        let mut unwrap_dek = || -> Result<crate::secrets::Dek> { Ok(keystore_dek.clone()) };
-
-        let opts = CeremonyOpts {
-            relay_url: "ws://relay.test".into(),
-            response_timeout: Duration::from_secs(5),
-            flush_grace: Duration::ZERO,
-            now: &clock,
-            make_channel: &mut make_channel,
-            present_qr: &mut present_qr,
-            confirm_sas: &mut confirm,
-            unwrap_dek: &mut unwrap_dek,
-        };
-        run_ceremony(daemon_id, opts).expect("ceremony completes");
-
-        let recovered_bytes = phone_thread.join().unwrap();
-        let recovered_dek: crate::secrets::Dek = Zeroizing::new(recovered_bytes);
-
-        // The phone recovered the very key the daemon sealed the token with.
-        assert_eq!(
-            &recovered_dek[..],
-            &keystore_dek[..],
-            "the delivered DEK diverged from the keystore DEK"
-        );
-        // The whole point: that recovered DEK decrypts the stored token.
-        let plaintext = decrypt_token(&recovered_dek, &ciphertext)
-            .expect("the phone-delivered DEK must decrypt the account token");
-        assert_eq!(&plaintext[..], TOKEN);
     }
 
     #[test]
@@ -593,8 +467,7 @@ mod tests {
         let mut present_qr = |_u: &str, b64: &str| qr_tx.send(b64.to_string()).unwrap();
         let mut confirm = |_w: &[&'static str; 6]| true;
         let clock = || NOW;
-        let dek = crate::secrets::generate_dek();
-        let mut unwrap_dek = || -> Result<crate::secrets::Dek> { Ok(dek.clone()) };
+        let mut arm_after_sas = || -> Result<()> { Ok(()) };
         let opts = CeremonyOpts {
             relay_url: "ws://relay.test".into(),
             response_timeout: Duration::from_secs(5),
@@ -603,7 +476,7 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
-            unwrap_dek: &mut unwrap_dek,
+            arm_after_sas: &mut arm_after_sas,
         };
         let np = run_ceremony(daemon_id, opts).expect("ceremony completes");
         phone_thread.join().unwrap();

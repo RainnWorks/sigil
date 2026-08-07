@@ -8,24 +8,23 @@ import { Card } from "@/components/ui/primitives";
 import { useTheme } from "@/theme/colors";
 import { radius, space } from "@/theme/tokens";
 import {
-  awaitDekDelivery,
   currentCeremony,
   describePairingError,
+  finishPairing,
   LOST_PLACE_COPY,
   resetCeremony,
   submitPairingResponse,
 } from "@/src/session/pairing-flow";
-import { armLiveSession } from "@/src/session/controller";
 
-type Phase = "handshaking" | "confirm" | "delivering" | "error";
+type Phase = "handshaking" | "confirm" | "completing" | "error";
 
 /**
  * The fingerprint confirmation and the live rendezvous. On mount the phone sends
  * its authenticated PairingResponse to the daemon (message 1) over the relay;
  * both devices then show the same six words derived from the two pinned
- * identities. "They match" waits for the daemon's sealed DEK (message 3), stores
- * it, and completes. "Don't match" aborts, because a mismatch is the signature of
- * a man-in-the-middle on the QR channel.
+ * identities. "They match" persists the pairing and arms the session (the
+ * ceremony delivers no key). "Don't match" aborts, because a mismatch is the
+ * signature of a man-in-the-middle on the QR channel.
  */
 export default function ConfirmScreen() {
   const p = useTheme();
@@ -64,14 +63,13 @@ export default function ConfirmScreen() {
   }, []);
 
   async function onMatch(): Promise<void> {
-    setPhase("delivering");
+    setPhase("completing");
     try {
-      // Message 3: the daemon seals the DEK once its human confirms too.
-      await awaitDekDelivery();
-      // Reflect the freshly persisted pairing into the store (paired: true, armed)
-      // so the root layout keeps us on the tabs instead of bouncing back into the
-      // pairing stack. Without this the flag only flips on the next cold boot.
-      await armLiveSession();
+      // The ceremony delivers no key: persist the pairing and arm the live
+      // session (finishPairing does both). Arming reflects the freshly persisted
+      // pairing into the store (paired: true, armed) so the root layout keeps us
+      // on the tabs instead of bouncing back into the pairing stack.
+      await finishPairing();
       router.replace({ pathname: "/pairing/done", params: { ok: "1" } });
     } catch (e) {
       setError(describePairingError(e));
@@ -98,20 +96,20 @@ export default function ConfirmScreen() {
   return (
     <View style={{ flex: 1, padding: space.xl, gap: space.xl, justifyContent: "center" }}>
       <View style={{ alignItems: "center", gap: space.sm }}>
-        {phase === "handshaking" || phase === "delivering" ? (
+        {phase === "handshaking" || phase === "completing" ? (
           <Sf name="dot.radiowaves.left.and.right" color={p.cobalt} size={36} />
         ) : (
-          <Sf name="checkmark.shield" color={p.cobalt} size={36} />
+          <Sf name="checkmark.seal" color={p.cobalt} size={36} />
         )}
         <Sans size={20} weight="semibold" style={{ textAlign: "center" }}>
           {phase === "handshaking"
             ? "Handshaking…"
-            : phase === "delivering"
-              ? "Delivering the key…"
+            : phase === "completing"
+              ? "Completing…"
               : "Do both screens match?"}
         </Sans>
         <Sans size={15} tone="muted" style={{ textAlign: "center", maxWidth: 320 }}>
-          Confirm both devices show these six words.
+          Your Mac should be showing the same six words.
         </Sans>
       </View>
 

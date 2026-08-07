@@ -128,14 +128,30 @@ Residuals for the security-reviewer to weigh:
 | A phone-claimed grant key is ignored; the daemon derives and trusts its own | `daemon.rs::fulfill` (uses `gk`), `request.rs::InstallLease` (echo only), `softphone/lib.rs` (empty `grant_key`) | reviewed by inspection; exercised by `daemon.rs::lease_decision_covers_the_next_identical_request` |
 | The ancestor "code identity" is a real code-signing measurement | `lease.rs::SysProcessTable::identity` | **UNPROVEN, PARTIAL**: interim BLAKE2b of the exe bytes; the design calls for the cdhash / Developer ID (NEEDS-VERIFICATION in `lease.rs`) |
 
-## 8. Fail closed, leases bounded, lockdown (invariants #7, #8)
+## 8. Fail closed, leases bounded (invariants #7, #8)
+
+> Lockdown was removed entirely (`e16b0da`); this section no longer maps a
+> lockdown claim. See Addendum 2026-07-15 (three-commit review) for why the
+> removal weakens no default gate.
 
 | Claim | Enforcing code | Proving test |
 |-------|----------------|--------------|
-| Every failure path denies (deny, timeout, dead phone, decrypt failure, lockdown) | `daemon.rs::fulfill` (`fail_closed` on each branch), `remote.rs::round_trip` (`?`/`None` → Deny) | `daemon.rs::denied_request_fails_closed_and_delivers_no_secret`, `remote_softphone_denial_fails_closed_with_no_secret`, `approve.rs::local_timeout_fails_closed` |
-| Leases are RAM-only, triple-scoped (grant key + account + scope) | `lease.rs::LeaseStore`, `Lease` | `lease.rs::lease_grant_lookup_and_scope_isolation` |
+| Every failure path denies (deny, timeout, dead phone, decrypt failure) | `daemon.rs::fulfill` (`fail_closed` on each branch), `remote.rs::round_trip` (`?`/`None` → Deny) | `daemon.rs::denied_request_fails_closed_and_delivers_no_secret`, `remote_softphone_denial_fails_closed_with_no_secret`, `approve.rs::local_timeout_fails_closed` |
+| Leases are RAM-only, triple-scoped (grant key + account + scope, where scope is the matched RULE's name), plus a source-material fingerprint when they cache values | `lease.rs::LeaseStore`, `Lease`, `LeaseBinding` | `lease.rs::lease_grant_lookup_and_scope_isolation`, `a_reseal_of_the_source_misses_the_cached_lease` |
+| A lease covers the whole matched rule for that caller chain (any argv, any cwd), and stops at the rule boundary | `daemon.rs::fulfill` (`lease_scope = action.rule`, `grant_key(&caller, ScopeKind::Command, "", &lease_scope)`) | `daemon.rs::a_lease_covers_any_command_the_same_rule_matches`, `a_lease_survives_a_change_of_directory`, `a_lease_on_one_rule_does_not_cover_another_rule`, `lease.rs::{one_rule_covers_any_command_it_matches,cwd_no_longer_splits_a_lease,different_rules_do_not_share_a_grant_key}` |
+| A lease never crosses caller chains: a different tool tree (or a tampered ancestor) is a different grant | `lease.rs::grant_key` (chain code identity) | `lease.rs::different_caller_chains_do_not_share_a_rule_lease` |
+| A lease is **not** bound to a process, session, terminal, or user instance. The grant key excludes pids by design, so any *other* concurrently-running tree with the same ancestor executables (a second editor/agent session, another terminal, another project) shares the grant key and rides the window. Compounding it, every gated command arrives through a `~/.sigil/bin` symlink to the one `sigil` binary and macOS resolves symlinks, so the chain leaf is identical across commands: the chain discriminates tool trees, never commands | `lease.rs::grant_key` (pids excluded) | `lease.rs::grant_key_ignores_recycled_pids` (proves the property; the security consequence is reviewer finding **F2**). The load-bearing comment F2 called wrong is corrected at `daemon.rs::fulfill`, and the brief's "process tree key" phrasing with it |
+| A rule's *name* is the lease's scope, and rule names are user-mutable config, so a config reload REVOKES (and zeroizes) every lease whose rule did not survive it unchanged: rule removed, rule differing in any field by whole-struct comparison, or the source it injects from differing in any field. A rule rewritten mid-window cannot inherit the window | `daemon.rs::reload_config` -> `Core::invalidate_leases_for_config_change` -> `lease.rs::LeaseStore::revoke_scope`; each revocation is logged | `daemon.rs::a_rule_rewritten_mid_window_does_not_inherit_the_lease` (the reviewer's F3 scenario: a rule renamed to match `curl` mid-window), `config_reload_invalidates_exactly_the_leases_whose_rule_moved` (removed / match changed / policy changed / source changed / no-op), `lease.rs::revoke_scope_kills_every_lease_on_one_rule` |
+| What a lease holds depends on the rule. A plain gate (`op`, `env-file`, a degraded inline `env`) stores an empty presence marker and injects nothing on a leased run. A **sealed inline `env`** rule stores the values that approval unsealed, and leased runs inject them from RAM with no phone round trip: this is the one place a credential outlives a single request | `daemon.rs::fulfill` (the unseal runs BEFORE the grant, so a failed open leaves no lease; `sealed_plain` is what is stored, else `Zeroizing::new(Vec::new())`), `lease.rs::Lease::token` | `daemon.rs::a_sealed_env_lease_injects_from_ram_with_no_second_approval`, `leased_unsealed_inline_env_source_runs_as_a_plain_gate` (a plain gate still injects nothing) |
+| A cached value is re-checked on every leased run and refused unless it is exactly what the rule now consents to: the blob must decode and its KEY set must equal the rule's `env_keys`. A refusal drops the lease and re-gates rather than injecting | `daemon.rs::{leased_env,env_keys_match}` (same check the fresh-approval path runs) | `daemon.rs::a_cached_lease_is_only_used_when_it_still_matches_the_rule` (accepts an exact match; refuses an extra key, a missing key, a corrupt blob, and an empty marker where values are expected), `a_sealed_env_lease_injects_from_ram_with_no_second_approval` (the accept path end to end) |
+| Every window-ending path zeroizes the cached values: TTL expiry, `sigil lease revoke`, daemon restart/ctrl-c, and a config change to the covering rule. `Token` is `Zeroizing`, so every removal wipes | `lease.rs::{token_for,grant,revoke,revoke_scope,clear}` (all `retain`/drop paths), `daemon.rs::serve` (ctrl-c `clear()`) | `daemon.rs::{a_sealed_env_lease_stops_injecting_when_it_expires,revoke_and_restart_both_end_a_sealed_env_window,a_run_once_sealed_env_rule_caches_nothing}`, `lease.rs::an_expired_cached_lease_stops_serving_its_values` |
+| A re-seal of the source (new `E`) misses the cached lease, so a stale plaintext is never injected after `source env set` | `daemon.rs::fulfill` (`LeaseBinding::cached(.., record.ephemeral_pub)`) | `lease.rs::a_reseal_of_the_source_misses_the_cached_lease` |
+| The `account` leg of the triple binding is live for a cached (sealed `env`) lease, where it carries the source name, and still empty for a plain gate, which has no account to bind. It cannot bind falsely: grant and lookup derive the label identically from one pinned `config.snapshot()` | `daemon.rs::fulfill` (`account_label` = `action.source_name` for a sealed env rule) | `lease.rs::lease_grant_lookup_and_scope_isolation` (a wrong account misses); the plain-gate case remains a constant, so reviewer finding **F5** is only partly closed |
+| Approval coalescing stays narrower than the lease (chain + cwd + argv), so one readout never settles a different command | `daemon.rs::fulfill` (`coalesce_key`, passed to `gate.decide`) | **UNPROVEN** by a dedicated test; the key derivation is byte-identical to the pre-rule-lease `gk` covered by `approve.rs` coalescing tests |
+| Command scopes and SSH scopes are domain-separated in the key, so no rule name can collide with an SSH sign scope | `lease.rs::{ScopeKind,grant_key}` (kind tag length-prefixed into the hash) | `lease.rs::request_kinds_live_in_separate_scope_namespaces` (closes reviewer finding **F4**) |
+| A lease-covered run is audited with the command it actually ran, not the rule | `daemon.rs::fulfill` (lease short-circuit logs `audit_label(describe(argv), scope)`, `via = "lease"`) | `daemon.rs::a_leased_run_audits_the_command_it_actually_ran` |
 | Leases expire on TTL and are purged (and zeroized) | `lease.rs::token_for`/`grant` (`retain(expires>now)`; token is `Zeroizing`) | `lease.rs::lease_expires_and_is_purged` |
-| Lockdown clears (zeroizes) every lease and refuses new requests | `daemon.rs::handle_conn` (`Lockdown`), `lease.rs::LeaseStore::clear`, `fulfill` (lockdown check first) | `lease.rs::lockdown_clears_all_leases`, `daemon.rs::lockdown_refuses_new_requests` |
+| `LeaseStore::clear()` drops and zeroizes every lease (the ctrl-c/restart path) | `lease.rs::LeaseStore::clear` | `lease.rs::clear_zeroizes_all_leases` |
 | Daemon restart / ctrl-c zeroizes leases | `daemon.rs::serve` (`core.leases.clear()` on ctrl-c) + RAM-only storage | **UNPROVEN** by test (process-exit path); RAM-only + `clear()` reviewed by inspection |
 | A revoke drops matching leases | `lease.rs::LeaseStore::revoke` | `lease.rs::revoke_by_grant_prefix` |
 | A **run-once** rule never leases, even if the approver returns a lease | `daemon.rs::fulfill` (`action.lease.clamp_secs(...)` gates both grant sites; `LeasePolicy::RunOnce.clamp_secs` → `None`), `request.rs::LeasePolicy` | `daemon.rs::run_once_rule_never_leases_even_when_a_lease_is_returned`, `request.rs::lease_policy_defaults_to_run_once_and_clamps` |
@@ -167,6 +183,52 @@ Residuals for the security-reviewer to weigh:
 | The bootstrap **rendezvous mailbox** is domain-separated and non-invertible: leaking it reveals nothing about the secret | `pairing.rs::rendezvous_mailbox` (`BLAKE2b(RENDEZVOUS_DOMAIN ‖ daemon.verifying ‖ daemon.agreement ‖ secret)`, distinct from `mailbox_id`/`fingerprint`/confirm-tag domains; secret is 256-bit CSPRNG so preimage-resistant) | reviewed by inspection (domain constants distinct; length-prefixed absorb is injective); **UNPROVEN** by a dedicated test, no negative test asserts domain separation of the rendezvous id |
 | Pairing message 1 (`PairingResponse`) travels the relay as MAC-authenticated plaintext carrying only public data (phone pubkey, nonce, tag); substitution is rejected | `pairing.rs::PairingResponse::verify`, `relay-client/src/rendezvous_ws.rs` (moves opaque strings only, no envelope/key handling) | the full `pairing_mitm.rs` suite (message 1 is exactly what it attacks) |
 | Persisting a pairing auto-selects the phone factor with no dev flag | `daemon.rs::{load_remote_pairing,build_gate}` (`Factor::Phone`) | `daemon.rs::build_gate_selects_the_phone_approver_from_a_persisted_config` |
+
+### 10a. The keystore file: default store and Secure-Enclave wrapping (2026-08-04)
+
+Behavior, not verdicts. **Independently reviewed 2026-08-04** (see the round-2
+verdict at the end of this document). The two rows the reviewer found overstated
+have since been corrected rather than argued: the `Zeroizing` claim now says
+exactly which buffers are covered and names the serde/base64 products as a
+residual (**R2-F2**), and the unrecognized-`SIGIL_KEYSTORE` case is no longer
+documented, or implemented, as a silent feature (**R2-F3**). The other findings
+in that round are addressed in the rows below and dated the same day.
+
+| Claim | Enforcing code | Proving test |
+|-------|----------------|--------------|
+| The default store is the portable 0600 file on EVERY platform, resolvable with no environment at all, so the daemon and a CLI in a plain shell can never disagree about where the pairing lives | `keystore.rs::for_host` | `keystore.rs::the_default_store_is_the_on_disk_file_with_no_environment_at_all`, `file_is_the_default_for_an_empty_or_unrecognized_value` |
+| An install under the older `dev-keystore.json` name is migrated in place (atomic rename, never overwriting an existing canonical file); the pairing survives with no re-pair | `keystore.rs::migrate_legacy_file_keystore` | `keystore.rs::{a_pre_default_dev_keystore_is_migrated_in_place,migration_never_overwrites_an_existing_canonical_store}` |
+| The pairing-authorization presence gate survived the storage change: it now asks the HOST (`LAContext`, which never needed the keychain) when the store cannot prove presence itself | `keystore.rs::{presence_plan,verify_host_presence}`, `pairing_store.rs::gate_presence` | `keystore.rs::presence_is_asked_of_the_host_when_the_store_cannot_prove_it` |
+| A wrapped (v2) keystore is classified ONCE at startup, before the control socket listens, and never re-read; a file swapped under a running daemon cannot become authoritative | `daemon.rs::read_seal_state`, `Core::seal` | reviewed by inspection (single call site in `Core::for_host`); the classification itself by `keystore_seal.rs` parse tests |
+| A sealed-but-unprovisioned daemon serves NOTHING (no gated command, no SSH signature) and explains itself without ever implying a lost pairing | `daemon.rs::fulfill` (top-of-function guard), `SshBackend::approve_and_sign`, `keystore_seal.rs::SealState::explain` | `daemon.rs::a_sealed_unprovisioned_daemon_serves_nothing_and_says_why` (asserts the text contains "keystore sealed" and does NOT contain "no pairing" or a re-pair instruction), `a_provisioned_seal_serves_normally_and_a_downgrade_never_does` |
+| Plaintext where wrapped was promised (including a VANISHED file) is a downgrade and refuses to serve | `keystore_seal.rs::SealState::resolve`, adoption marker | `keystore_seal.rs::seal_state_reads_the_file_and_the_marker_together`, `only_a_provisioned_seal_serves_and_a_downgrade_never_does` |
+| A v2 file wrapped to a DIFFERENT Enclave key than this machine adopted resolves `KeyChanged` and serves nothing: the marker's recorded `se_pub` is compared against the file's, so a substituted-but-well-formed keystore cannot present as the real one (R2-F1) | `keystore_seal.rs::{AdoptionMarker,read_adoption_marker,SealState::resolve}`, `daemon.rs::read_seal_state` | `keystore_seal.rs::a_keystore_wrapped_to_another_enclave_key_is_refused` (also asserts an unparseable marker records an empty key, which matches nothing, so corrupting it does not clear the tripwire) |
+| Only the signed Sigil app may provision, subscribe, or report an unwrap: the peer's code identity is verified live against Apple's anchor plus the RainnWorks team OU, not asserted | `peercode.rs` (+ `peercode.m`, Security.framework), `daemon.rs::{handle_provision,stream_keystore,handle_unwrap_done}` | `peercode.rs::{this_unsigned_test_binary_is_not_the_sigil_app,a_requirement_this_process_does_satisfy_passes,a_malformed_requirement_refuses_rather_than_passing,a_dead_pid_is_refused}`, `daemon.rs::{provisioning_is_refused_for_anyone_who_is_not_the_signed_app,the_keystore_streams_and_unwrap_reports_are_app_only}` |
+| Provisioned material must match what the file commits to (constant-time digest compare); the reply never echoes the expected digest | `daemon.rs::handle_provision`, `keystore_seal.rs::{digest,digests_equal}` | `keystore_seal.rs::the_digest_is_domain_separated_and_length_prefixed`, `daemon.rs::a_wrong_digest_provision_is_refused_and_does_not_latch` |
+| Provision is once per lifetime, but a REFUSED attempt does not latch (else one bad frame is a denial of service cheaper than the attack the limit prevents) | `daemon.rs::handle_provision` (`provisioned` set only on success) | `daemon.rs::a_wrong_digest_provision_is_refused_and_does_not_latch` |
+| Material never rides inside a JSON frame: it is raw bytes after the header, read into a `Zeroizing` buffer, and no `Frame` variant carries it | `local.rs::{recv_frame_with_tail,read_payload}`, `Frame::{KeystoreProvision,SealThreshold}` (lengths only) | reviewed by inspection (no material-typed field exists to serialize); the receive path by `daemon.rs::provisioning_is_refused_for_anyone_who_is_not_the_signed_app` (payload round trip) |
+| The payload buffer is pre-sized to the full declared length before any bytes are copied in, so no realloc abandons an un-wiped copy of the material (R2-F2a) | `local.rs::read_payload` (`Vec::with_capacity(len)`, then extend, then `drop(tail)`) | reviewed by inspection; the growth path no longer exists |
+| **Scope of zeroization, stated exactly (R2-F2b/c):** the TRANSPORT buffers are `Zeroizing`, and `KeystoreFile::parse` classifies via an `IgnoredAny` shape so a v1 file's blobs are never materialized as `String`s. `RamKeystore::from_material` still receives base64 through serde `String`s (it wipes them after decoding, but serde allocated them first), and `FileKeystore::read` shares that pattern on every load. So: transport buffers zeroized, decoded secrets zeroized, **serde/base64 parse products are a known residual**, inside the same-UID RAM reading this design already concedes | `local.rs` (buffers), `keystore_seal.rs::KeystoreFile::parse` (`IgnoredAny`), `keystore.rs::RamKeystore::from_material` (decode into `Zeroizing`, wipe the base64) | stated, not claimed clean |
+| While wrapped, NOTHING writes the keystore: the opened store refuses every mutation, and every pairing mutation refuses upfront, before any file is touched | `keystore.rs::RamKeystore::{store_blob,delete_blob}`, `pairing_store.rs::refuse_if_sealed` (first statement of `save`/`add_device`/`remove_device`/`remove`) | `daemon.rs::opened_material_becomes_the_live_read_only_keystore`, `pairing_store.rs::every_pairing_mutation_refuses_a_sealed_store_before_touching_a_file` (asserts `pairing.json` is byte-identical after four refused mutations) |
+| The commit flow for daemon-side mutations is DEFERRED, not forgotten: it has no trigger, because the daemon never writes the keystore and the CLI paths refuse upfront | `daemon.rs::stream_keystore` (documented), `PROTOCOL.md` | n/a: the claim is that no such path exists. Verified by inspection of every `store_blob`/`delete_blob` call site (all in `pairing_store`, all CLI-driven) |
+| De-adoption clears the adoption marker only on the app's reported success, and an invented or replayed nonce is refused | `daemon.rs::{handle_unwrap_request,handle_unwrap_done}`, `UnwrapRequests::resolve` | `daemon.rs::{an_unwrap_answer_must_quote_an_outstanding_nonce,an_unwrap_request_against_a_plain_store_is_a_no_op}` |
+| The honest delta is at-rest exfiltration ONLY: offline copies (backup, snapshot, stolen disk) stop being useful; a live same-UID attacker is unchanged, and the daemon is unsigned by design | `keystore_seal.rs` module docs, `cli.rs::cmd_keystore` wording | stated, not testable; the wording is asserted by `keystore_seal.rs::the_sealed_explanation_never_tells_anyone_to_re_pair` |
+
+**Residuals, stated rather than closed.** The adoption marker is a same-UID file,
+so an attacker who can swap the keystore can also delete the marker; it stops
+accidents and unsigned opportunists, not a determined local attacker (the app's
+enclave key still existing is the independent alarm). A file-WRITE attacker can
+still substitute a wholesale new keystore, exactly as under plaintext: what v2
+removes is file-READ exfiltration. The digest does not bind the pairing
+container's device-id set, so a file-write adversary could pair material with an
+older `pairing.json`; that is the same adversary and a recorded follow-up. The
+code-identity check names a process instance exactly (it binds the peer's audit
+token, not its pid), but cannot speak to a signed app that has been debugged or
+injected into at runtime. The requirement admits any binary this team signs,
+Apple Development certificates included, so a dev-signed build satisfies it; the
+trigger to narrow it (a bundle-identifier allowlist plus the Developer ID marker
+OID `certificate leaf[field.1.2.840.113635.100.6.1.13]`) is a second signed Mac
+product existing, which is not the case today (R2-F5).
 
 ## 11. The provider seam (any-CLI generalization, `ee49ee3`)
 
@@ -833,16 +895,88 @@ These are real and deliberately surfaced, not defects hidden.
    a plain `String`; zeroizing it would need a custom wrapper type. Low severity
    (same-process, requires scraping daemon memory).
 
-5. **Lease-window / approved-consumer misuse (by design).** A lease is a
-   time-boxed grant to a *caller code-identity + project + scope*. Within an
-   active lease, the same process tree can re-fetch **the same-scope secret**
-   without re-prompting; a compromised ancestor in that tree (e.g. `claude`) can
-   exploit its own lease for the exact secret it was already approved for. It
-   **cannot** widen scope: a different secret is a different `scope` string →
-   different grant key → fresh approval (`lease.rs::grant_key`,
-   `daemon.rs::fulfill`). The token itself never leaves the daemon, so the lease
-   cannot be exfiltrated, only re-exercised for its one scope. Bound by TTL and
-   killed by lockdown/restart.
+5. **Lease-window / approved-consumer misuse (by design, widened
+   2026-07-28).** A lease is a time-boxed grant to a *caller code-identity +
+   account + matched rule*. Within an active lease, the same process tree can run
+   **anything that rule matches, from any directory**, without re-prompting; it is
+   no longer limited to the exact argv that opened the window. A compromised
+   ancestor in that tree (e.g. `claude`) can therefore exercise the lease for any
+   command the rule covers, not only the one the human read on the phone. The
+   containment left is: the rule the user wrote (a narrow rule is a narrow lease),
+   the rule's own lease policy (run-once never leases), the caller chain (a
+   different or tampered tool tree is a different grant key), the account binding,
+   and the TTL. A different rule is still a fresh approval
+   (`lease.rs::grant_key`, `daemon.rs::fulfill`). The token itself never leaves
+   the daemon, so the lease cannot be exfiltrated, only re-exercised inside the
+   rule. Bound by TTL and killed by restart or revoke. This is a deliberate
+   fatigue-versus-breadth trade the sole user asked for.
+
+   **Independent reviewer amendment (2026-07-28).** The pass has now happened
+   (verdict below); three facts the paragraph above omits, each of which a reader
+   would need to size the residual honestly:
+
+   * *It is not one secret's window, it is the rule's whole match set.* The
+     approval sheet leads with one reference (`op://Engineering/.env`); with the
+     shipped rule shape (`match: {command: "op"}`, no subcommand) the window
+     covers every item in every vault that source can reach. Proven by reviewer
+     finding **F1**.
+   * *It is not "this process".* The grant key excludes pids, and every shim
+     alias is a symlink to the one `sigil` binary, so the chain leaf is identical
+     for every gated command and a second concurrent session with the same
+     ancestor executables rides the same window. The caller chain never
+     discriminated *which command*; after this change the rule name is the entire
+     command-discriminating boundary. Reviewer finding **F2**.
+   * *"Cannot widen its own scope" is true of the lease and false of the world
+     around it.* The scope is a rule *name*, and rules are unsigned user config
+     that hot-reloads; rewriting a rule mid-window widens a live lease. Reviewer
+     finding **F3**. This grants an attacker nothing new (config write already
+     defeats the gate via an `allow` rule) but it does mean a legitimate mid-window
+     edit silently inherits a wider grant than was approved.
+
+   The containment that genuinely survives all three: the TTL, the caller-chain
+   code identity as an *outer* fence, and `run-once` rules (which never lease at
+   all).
+
+   ~~and the fact that no credential is cached, so an expired window leaves
+   nothing behind.~~ **Struck by the reviewer 2026-08-04, this was true when
+   written and is now false.** Since `d3887ad` a sealed inline `env` rule caches
+   the unsealed values in lease RAM for the TTL, so a live window does hold a
+   credential and the third bullet above (F3, config edits not invalidating a
+   lease) stops being a judgment call. What still holds: the values are RAM-only,
+   zeroized on every removal path, and pinned to the sealed record's ephemeral
+   point, so a re-seal misses the lookup rather than injecting a stale plaintext.
+   Whether that is sufficient is a Part 2 question and is not settled here.
+
+   **Implementer note (2026-08-04), behavior change; not a verdict.** Two of the
+   three bullets above have moved, and the last sentence of that paragraph no
+   longer holds:
+
+   * **F3 is now enforced.** `Core::reload_config` revokes and zeroizes every
+     lease whose rule did not survive the reload byte-identical, and also when the
+     source that rule injects from changed. The reviewer's rewrite-to-`curl`
+     scenario is now a passing regression test
+     (`daemon.rs::a_rule_rewritten_mid_window_does_not_inherit_the_lease`), and a
+     re-seal of the source misses the cache via the lease's source-material
+     binding. What remains true: `config.json` is unsigned, so anyone who can
+     write it can still author an `allow` rule and defeat the gate outright.
+   * **A credential IS now cached, by decision.** A leasable rule over a sealed
+     inline `env` source retains the unsealed values in the lease's RAM slot, and
+     leased runs inject them with no phone round trip. So "an expired window
+     leaves nothing behind" is now a statement about *zeroization on every exit
+     path* (expiry, revoke, restart, config change, re-seal miss), not about the
+     window having held nothing. The blast radius of a live window on such a rule
+     is the values themselves, for the TTL, to any command the rule matches from
+     that caller chain. F1's point stands unchanged and gets larger: what the
+     human approves is a rule's whole match set, now with the values held ready.
+   * **F2's wrong comment and F4's missing domain separation are fixed**
+     (`daemon.rs::fulfill`'s chain comment; `lease::ScopeKind` hashed into the
+     grant key). **F5 is partly closed**: the account leg is live for cached
+     leases and still a constant for plain gates.
+
+   Not addressed here and still open for the next pass: **F1** (phone consent
+   copy) and **F7** (the phone's lease list and revoke button), both owned by the
+   phone surface; and `BlockDirective` ("deny and block") remains a wire type with
+   no daemon consumer, so nothing in the daemon ends a window on a block.
 
 6. **Metadata at the relay.** The relay learns that two anonymous mailbox
    parties exchange envelopes, and the sizes/timing of those envelopes. This is
@@ -994,9 +1128,21 @@ These are real and deliberately surfaced, not defects hidden.
     natural follow-up. **Residual B (default fail-closed for a mis-declared
     keystore):** the `Keystore::verify_presence` trait default returns `Err`, so a
     keystore that reports `is_biometric() == true` but omits the override refuses
-    to pair rather than passing unchecked. The dev keystores keep
-    `is_biometric() == false` (only reachable under `SIGIL_DEV_KEYSTORE`, behind
-    its loud warning) and are never asked, so headless dev and tests still pair.
+    to pair rather than passing unchecked. The non-hardware stores keep
+    `is_biometric() == false` and are never asked THAT way, so headless dev and
+    tests still pair.
+
+    **Behavior change (2026-08-04), keystore default.** The on-disk store is now
+    the default, and it is not hardware-backed, so tying this gate to the store
+    would have deleted it on every Mac. Storing blobs and proving presence are now
+    separate questions: `keystore::presence_plan` sends a hardware store to its own
+    `verify_presence`, sends the default file store to
+    `keystore::verify_host_presence` (macOS `LAContext.evaluatePolicy`, which never
+    needed the keychain, the Secure Enclave, or a signature), and sends the
+    in-memory store nowhere, which is what keeps tests headless. So `sigil pair` on
+    the default store still costs a live Touch ID. Proving test:
+    `keystore.rs::presence_is_asked_of_the_host_when_the_store_cannot_prove_it`
+    (the plan is pure and testable; the prompt itself stays manual-only).
     Enforcing code: `pairing_store.rs::save` (gate), `keystore.rs::verify_presence`
     (fail-closed default), `keystore_macos.rs::verify_presence` (SE probe). Proving
     tests: `pairing_store.rs::{a_declined_biometric_refuses_the_pairing_and_writes_nothing,
@@ -2369,3 +2515,1057 @@ pre-existing, out-of-scope, fail-closed parity residual (item 2: phone freshness
 window 90s vs daemon 150s) is recommended for a follow-up alignment; it is not a
 replay hole and does not block this change.**
 
+
+---
+
+## 2026-07-13 -- Independent review: v1 DEK / accounts / brokering teardown (commit `01e625b`)
+
+Reviewer: independent security-reviewer (did not write the code). Scope: the
+proto + daemon refactor retiring the v1 DEK, `accounts`, and credential
+brokering in favor of "gate, don't broker" -- everything at rest is
+threshold-sealed, openable only with the phone's per-request partial `Z_F`. Gate
+green at review time: `cargo test` (sigil/proto/softphone), `clippy -D warnings`,
+`fmt --check` all clean.
+
+### Teardown itself: SOUND
+
+1. **No secret at rest in the clear.** Env values seal only via
+   `seal_env_pairs` (cli.rs) -> `threshold::seal_secret` -> `ThresholdRecord::seal`;
+   values arrive on stdin only, are `Zeroizing`, and the store persists ciphertext +
+   public `E`. Opening REQUIRES the phone's partial: `fulfill` (daemon.rs ~1503)
+   fails closed if `outcome.zf` is `None` and again if the Mac share `m` is absent.
+   Disk alone (record + `m`) cannot open it (`a_wrong_or_missing_partial_fails_closed`).
+2. **DEK deletion complete + fail-closed.** `se_ecies.rs` deleted;
+   `Dek`/`seal_dek`/`open_dek`/`deliver_dek`/`receive_dek`/`wrapped_dek`/`dek()`/v1
+   `approve` gone from proto; keystore `ensure_dek`/`unwrap_dek`/`has_dek` gone. No
+   live references remain. Approve path is threshold-only (`approve_v2` / `approve_gate`);
+   `outcome_for` (remote.rs ~632) requires `partial_zf()` AND `account_id ==
+   challenge.account_id`, else collapses to Deny (remote.rs 933/1068).
+3. **Kept-vs-deleted correct.** Blob storage (`store_blob`/`load_blob`) still backs
+   the daemon identity keys and the Mac share `m`; `verify_presence` survived. No
+   pairing/identity regression from the deletion.
+4. **Threshold invariants intact.** R2 (E on-curve before scalar mult; F on-curve
+   at pairing), R3 (`require_v2` at decrypt), R4 (fresh unique `E` per seal +
+   `all_ephemerals_unique` enforced fail-closed across the whole store on `save`),
+   R5 (challenge carries id/label, daemon re-checks the returned partial's id). Env
+   re-home reuses the identical seal/combine core.
+5. **Fail-closed + zeroization.** `m`, `Z_M`, combined `K` are mlock'd +
+   zeroize-on-drop in `threshold::decrypt`; `m` dropped right after the one combine;
+   opened plaintext and injected env are `Zeroizing`. Local Touch-ID auto-approve is
+   removed; a local/control-socket approve carries `zf: None`, so even a same-UID
+   forged control approval can approve a plain gate but can NEVER open a sealed secret.
+6. **Provider path.** `OpProvider::run` injects nothing (splices caller fds to real
+   `op`). `needs_account` gone; the credential-injecting `OpSshSigner` and the
+   `credential` param on `sign()` deleted outright. No gate lost its approval;
+   unmatched commands fail closed, only an explicit user `Allow` rule runs ungated.
+
+### CONFIRMED HIGH -- `verify_presence` needs an entitlement the unsigned daemon lacks
+
+`MacKeystore::verify_presence` (keystore_macos.rs:163) mints a **persistent
+Secure Enclave key in the DataProtectionKeychain** via `ensure_presence_key`
+(92) -> `SecKey::generate` with `Token::SecureEnclave` +
+`Location::DataProtectionKeychain` + permanent + re-found by label
+(`find_se_private_key`). Creating a DataProtectionKeychain item requires the
+`keychain-access-groups` entitlement (=> app-bundle signing + provisioning
+profile), which the unsigned/portable daemon lacks: `SecKey::generate` fails
+errSecMissingEntitlement (-34018), or SIGKILL if signed with the group but no
+profile -- both empirically observed on this machine.
+
+Failure chain: production macOS -> `MacKeystore` with `is_biometric() == true`
+-> `sigil pair` after SAS confirm calls `arm_after_sas` (cli.rs:1001), which
+calls `verify_presence` with `?` -> generate fails -> pairing aborts. Pairing is
+the sole path that pins phone share `F` and provisions `m`, so the entire
+threshold model is unreachable in the unsigned posture. Approvals no longer call
+`verify_presence`, so the blast radius is specifically reaching a paired state.
+Blob storage is unaffected (legacy `set/get_generic_password`, no entitlement).
+
+This is not newly introduced (the pre-teardown `ensure_dek` used the same
+persistent-SE mechanism) but it is **reblessed** under a new name AND a new,
+false correctness claim: `docs/design/secret-model.md:35-36` states
+`verify_presence` "work[s] from the unsigned binary." That claim is **UNPROVEN /
+false** as implemented; the code's own NEEDS-VERIFICATION markers
+(keystore_macos.rs:17-20, 187-188) confirm it never ran on hardware.
+
+**Fix direction:** replace the SE-key presence probe with
+`LAContext.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics)`
+(LocalAuthentication -- no keychain item, no SE key, no entitlement; needs an
+objc2/Swift shim since `security-framework` does not expose LAContext).
+Alternatively a transient SE key (`kSecAttrIsPermanent = false`, no
+DataProtectionKeychain, regenerated per call, not re-found by label) MAY work
+unsigned but needs its own on-hardware proof. Recommend blocking the
+unsigned-daemon posture and correcting the secret-model.md claim to UNPROVEN in
+the same change.
+
+### Residual doc-drift (LOW, cosmetic, no runtime effect)
+
+- `daemon.rs:14` module doc still says "unwraps the DEK, decrypts the one token".
+- `daemon.rs:1256-1259` `fulfill` doc describes the deleted DEK/account flow and
+  carries a now-broken intra-doc link `[needs_account](crate::provider::SecretProvider::needs_account)`.
+- `request.rs:281-283` doc still references `wrapped_dek` / v1.
+- `daemon.rs:3835` test comment references `needs_account`.
+
+Recommend a doc-sweep. Nothing here blocks; the HIGH above does.
+
+**VERDICT: teardown SOUND; one CONFIRMED HIGH (`verify_presence` entitlement
+dependency) blocks the unsigned-daemon shipping posture until moved to
+LAContext.**
+
+---
+
+## 2026-07-13 - Review: presence gate moved to LAContext (commit 6892bab)
+
+Independent adversarial review (reviewer did not author the change) of the fix
+for the CONFIRMED HIGH above: `verify_presence` now calls
+`LAContext.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics)` through an
+ObjC shim (`crates/sigil/src/presence.m`, compiled by `crates/sigil/build.rs`),
+replacing the persistent Secure-Enclave key that an unsigned binary cannot mint.
+
+Scope reminder: this gate is presence-only. It unwraps/derives/delivers NOTHING;
+it forces a live biometric before `arm_after_sas` (cli.rs:1001) pins phone share
+`F` and provisions Mac share `m`. An attacker who can forge the shim's return is
+already executing in the daemon (out of scope).
+
+- **Policy strength - SOUND.** `LAPolicyDeviceOwnerAuthenticationWithBiometrics`
+  with `localizedFallbackTitle = @""` (presence.m:32,35) is biometry-only; it
+  cannot silently degrade to passcode/password. Correct choice for a "physical
+  presence" gate. Tradeoff residual: biometry lockout after repeated failures
+  (LAErrorBiometryLockout) has no passcode escape here, so a locked-out sensor
+  makes pairing impossible until the OS-level reset - fail-closed, acceptable
+  for a personal instrument, worth knowing.
+- **Fail-closed - SOUND.** The Rust match (keystore_macos.rs:96-107) maps ONLY
+  `1 => Ok`; every other value is `Err`: `0 => Declined`; `rc <= -1000 =>
+  Backend`; wildcard `rc => Backend`. `canEvaluatePolicy == false` returns
+  `-1000 + code` or `-1` (presence.m:41), and `reply(success=false)` returns `0`
+  (presence.m:50) - both land on Err arms. No path yields a false `Ok`. The
+  caller propagates with `?` (cli.rs:1004, pairing_store.rs:396) so any Err
+  aborts before anything is written.
+- **Thread safety - SOUND (with a doc nit).** The production caller is the
+  synchronous `sigil pair` CLI on its main thread; all `daemon.rs` invocations of
+  `arm_after_sas` are test-only no-ops, so no tokio worker blocks on the
+  semaphore in production. `LAContext.evaluatePolicy`'s reply block runs on
+  LAContext's own private queue (not the main run loop), so the
+  `dispatch_semaphore_wait(..., FOREVER)` cannot deadlock even on the main
+  thread; macOS Touch ID UI is presented out-of-process and needs no main-loop
+  pumping. The `__block int result` write precedes `dispatch_semaphore_signal`
+  inside the reply block (presence.m:52-53), and the waiter reads `result` only
+  after the wait returns - correctly ordered, no race. NIT: presence.m:47-48
+  claims the daemon "never" calls this from the main queue; the actual prod
+  caller IS a main thread (harmless here, but the comment's rationale is
+  imprecise).
+- **No secret / no spoofing - SOUND.** The shim returns a small int and reveals
+  nothing; `is_biometric()` is hardcoded `true` on Mac (keystore_macos.rs:85) so
+  the gate is always invoked. The only in-band bypass is `SIGIL_DEV_KEYSTORE`
+  making `is_biometric()` false - the intended, loud dev switch, out of scope.
+  `CString::new(reason).unwrap_or_default()` on an interior-NUL reason yields an
+  empty string that the shim replaces with a default prompt (presence.m:44-45);
+  `reason` is a fixed constant, no attacker input, no weakening.
+- **Build integrity - SOUND.** `build.rs` compiles the object solely from
+  `src/presence.m` via `cc` with `rerun-if-changed` on that file; pinning
+  `/usr/bin/ar` (only when it exists) only selects the archiver that bundles that
+  object, it introduces no path by which a different object is injected. The shim
+  and its `extern "C"` block are `#[cfg(target_os = "macos")]`-gated
+  (build.rs, lib.rs:22-23, keystore.rs:278), so non-macOS targets are unaffected.
+
+Residual carried forward: this closes the runtime HIGH, but the on-hardware
+evidence is the commit's own report (LAError -4 clamshell reaches the biometric
+subsystem; real prompt with lid open); the ignored round-trip test
+(`presence_check_prompts_a_real_touch_id`) is the standing manual proof.
+
+**VERDICT: SOUND. The CONFIRMED HIGH ("verify_presence entitlement dependency")
+is resolved; biometrics-only, fail-closed, no secret exposure, macOS-gated
+build. Doc nit (presence.m:47-48 "worker thread") only. Unsigned-daemon pairing
+posture is unblocked pending the standing manual hardware test.**
+
+## Independent review verdict: unsealed inline-env source degrades to a plain gate (2026-07-14)
+
+An inline `env` source that has KEY names declared in `config.json` but NO sealed
+record in the threshold store used to fail closed at dispatch ("inline env source
+'..' has no sealed values"). It now degrades to a PLAIN GATE: still phone-gated,
+but injects nothing (the missing var is simply unset). See
+`crates/sigil/src/daemon.rs` (`fulfill`: the `Gate(mut action)` arm clears
+`env_keys` when `store.get(name).is_none()`; `needs_sealed_env` becomes false; the
+main dispatch and the lease short-circuit both route the degraded `EnvProvider`
+through `run_passthrough`) and `cli.rs` (`config_export` /
+`reconcile_unsealed_env_sources` drops the dead keys in the exported VIEW only,
+never writing `config.json`).
+
+Reviewed independently (implementer did not self-certify). **VERDICT:
+SOUND-WITH-RESIDUALS**, no HIGH/CRITICAL.
+
+- **No leak, gate never bypassed (inv #2/#4/#5).** On the degraded path
+  `sealed_env` is `None`, `run_passthrough` injects nothing, no secret bytes enter
+  daemon RAM, and `core.gate.decide` is unconditionally reached unless a *prior*
+  live lease short-circuits. Deny still fails closed.
+- **Readout integrity (inv #3 / R5).** `env_keys` is cleared BEFORE the
+  `SourceView`, `describe`, `account_label`, and `ThresholdChallenge` are built, so
+  the phone consents to exactly the bare gate that runs; no keys are shown then
+  silently dropped.
+- **F1 (LOW, correctness, fixed same change).** The lease short-circuit initially
+  still called `provider.run(env: None)`, which for a degraded `EnvProvider` hit
+  its empty-env refusal and returned exit 1, bricking the leased second run (fails
+  closed, no leak). Fixed by routing that branch through `run_passthrough` too;
+  regression test `leased_unsealed_inline_env_source_runs_as_a_plain_gate`.
+- **F2 (LOW residual, design-intended).** An attacker who can delete the
+  `threshold.db` record but not `config.json` downgrades a secret-injecting rule to
+  a bare no-injection gate. This is not an escalation (the command runs with LESS
+  than intended, never a leak; previously such tampering DoS'd the command). The
+  readout honestly reflects the bare gate and approval is still required. For a
+  single-UID personal daemon the threshold.db/config.json write boundary is
+  artificial (whoever has one has the other). Accepted residual; matches the agreed
+  "unsealed env source is a plain gate" design.
+
+---
+
+## 2026-07-15 - Independent review: agent-operated Sigil change set (`8308fc8`, `7702fa9`, `f7e955d`, `c733b45`)
+
+Independent adversarial review (reviewer did not author these changes) of the
+agent-operated rework: serve-loop hardening + bounded teardown + ssh-sign log
+(`8308fc8`), the `sigil up` keystone with the installed binary, plist rewrite,
+and shim retarget (`7702fa9`), the Mac app auto-ensure (`f7e955d`), and the
+agent-facing skill (`c733b45`). Design rationale reviewed alongside:
+`docs/design/agent-operated-sigil.md`. Baseline held throughout: a same-UID
+attacker was already game over per every prior review (unauthenticated 0600
+control socket, user-writable plist, shim dir, and binaries); each finding below
+is judged relative to that baseline, not against a boundary that never existed.
+Tree at review: `cargo test -p sigil` green (246 passed, 0 failed, 6 ignored,
+the known manual/device tests).
+
+### Per-angle assessment
+
+- **Serve-loop non-fatal error handling - SOUND.** Every new non-fatal path
+  (listener accept error, `ready_conn` failure, concurrency-cap refusal) ends in
+  the connection being dropped with no reply, which the shim/client reads as
+  deny; `daemon.rs::ready_conn` errors are strictly per-connection (the macOS
+  EINVAL race is a property of the one dead peer). No served request skips
+  `gate.decide`; the approve/inject logic is untouched. A hostile same-UID
+  client can hold the 32-connection cap (pre-existing `ConnGate`), which
+  REFUSES further connections: starvation is availability-only and denies. The
+  previous behavior (whole-daemon death on a probe race, killing in-flight
+  approvals) was strictly worse for availability and no better for security.
+- **The ssh-sign log line - CLEAN.** `daemon.rs::log_ssh_sign_request` emits
+  key label, derived host, `SHA256:` fingerprint of the data-to-sign, and peer
+  pid. The fingerprint is the same digest the phone readout shows; the SSH
+  data-to-sign contains a random session id, so the hash is not invertible or
+  confirmable offline. No key material, no raw challenge bytes, no secret
+  values. Same metadata class as the pre-existing op-path `log_request`.
+- **`shutdown_timeout(2s)` teardown - SOUND, one residual (F7).** With accept
+  errors now non-fatal, the teardown path fires only on pre-loop bind failures
+  or ctrl-c. Abandoning in-flight blocking handlers cannot release a secret:
+  an abandoned handler writes no reply (client fails closed), an
+  already-approved child owns its fds and env exactly as after any crash, and
+  the gate state it held dies with the process.
+- **Installed binary + shim retarget - no change to the tamper surface.**
+  `~/.sigil/bin/sigil` is user-writable, and so was the old
+  `target/release/sigil` the plist pointed at, and so is the plist itself. The
+  security-relevant resolver `paths.rs::find_real` is unchanged: rule 2
+  (proxy-dir residency) already excludes anything in `~/.sigil/bin` from being
+  mistaken for the real tool, and rule 1's `proxy::alias_target` covers the
+  sibling runtime. `ShimStatus.resolves_to_current`'s new second arm is
+  diagnostics only (F4).
+- **Dev-keystore pin carry-forward - no new attacker capability, one real
+  visibility regression (F1).** An attacker who can plant the pin can rewrite
+  `ProgramArguments` outright; the plist was never a boundary.
+- **Unconditional KeepAlive - fail-closed preserved.** Daemon down is deny at
+  every consumer (shim exec-fallback excepted as ever, and that path injects
+  nothing). A daemon that fails at startup forever respawn-loops under
+  launchd's throttle (seconds apart, logs rotated at each start by
+  `rotate_logs`), a resource nuisance, never a release. `sigil stop` remains a
+  bootout, which KeepAlive does not resurrect. Interaction with RAM-only
+  lockdown noted as F2.
+- **The skill - accurate and safety-correct, one gap (F3).** Every taught verb
+  and flag was checked against `cli.rs`: `up`/`status`/`doctor`/`history`/
+  `pending`, `pair --relay`, `lease list|revoke`, `lockdown [--clear]`,
+  `ssh add-file --path --host` / `add-stored` (key on stdin) / `list` /
+  `remove` / `config --install`, `sshagent`, `shim add`, and the
+  `sigil-config` surface (`list`, `add --provider env`, `rule add --allow`
+  correctly described as a passthrough to avoid, `source env set --key|--stdin`
+  reading values from stdin only, `unset`, `remove`). The quoted ssh-sign log
+  format and `~/.sigil/logs/daemon.err.log` path match the code. The
+  secret-hygiene rules (human-run seal pipe, verify by structure, refuse pasted
+  secrets, no gated commands that print secrets into the transcript, no
+  `--dev-insecure`, no rule edits to bypass a gate) are consistent with
+  invariants 1-6 and give an agent no path to see a secret or weaken a gate.
+- **Probe/kickstart - no new capability.** `sigil up` kickstarts only when the
+  Status probe fails or the binary/plist changed; a locked-down but healthy
+  daemon answers Status and is NOT restarted. A restart at a chosen moment
+  zeroizes leases (RAM-only, deny-direction) and orphans pending approvals
+  (deny); it can never approve. A same-UID actor could always run `launchctl
+  kickstart` directly. The Mac app auto-ensure runs once per app launch and
+  never on a poll, so a Stop holds within an app session; a later app launch
+  or `sigil up` does resurrect the daemon, which is the intended always-on
+  contract but worth knowing about the Stop control's scope.
+
+### Findings (ranked; none HIGH or CRITICAL)
+
+- **F1 (MEDIUM, posture visibility, fix soon).** The `SIGIL_DEV_KEYSTORE` pin
+  is now self-perpetuating and invisible on the operator surface. `service.rs::
+  dev_keystore_pin` takes the installer env first, else carries forward the pin
+  in the existing plist; an empty env value is filtered out and falls back to
+  the plist, so there is NO CLI path that unpins: only hand-editing the plist,
+  which the skill (correctly, for daemon health) tells agents never to do. At
+  the same time the loud banner moved to once per daemon process
+  (`keystore.rs::warn_dev_keystore_once`) inside `daemon.err.log`, a file the
+  agent-operated model reads only during diagnosis, and neither `sigil up` nor
+  `status` nor `doctor` mentions the pin. Net: the plaintext-share posture
+  (`dev-keystore.json` holds the daemon identity and Mac share `m` in the
+  clear) is deliberate and honestly documented in
+  `docs/design/agent-operated-sigil.md` section 6, but its loudness contract
+  has quietly degraded to near-zero on the surfaces anyone actually looks at.
+  No attacker gain (same-UID could always write the plist). Fix: `sigil up`
+  should emit a visible note or action-needed style line whenever the rendered
+  plist carries the pin, until the planned keychain migration removes it.
+  Reviewer did not implement this (review-only role).
+- **F2 (LOW, residual).** Lockdown is a RAM-only `AtomicBool` and any daemon
+  exit clears it; this change set both automates restarts (up's kickstart, the
+  Mac app auto-ensure, unconditional KeepAlive) and converts the wedge into an
+  error exit (`8308fc8`), so a locked-down daemon that dies for any reason
+  comes back unlocked. The claims table never asserted lockdown survives
+  restart (section 8 asserts leases die on restart, which is the deny
+  direction), and post-restart every request still needs a phone approval, so
+  the exposure is a silent return from panic mode to normal gating, never a
+  release. The control-socket `Lockdown { clear }` was already unauthenticated
+  same-UID. Optional hardening: persist lockdown as a flag file honored at
+  startup, cleared only by an explicit `lockdown --clear`.
+- **F3 (LOW, skill gap).** `.claude/skills/sigil/SKILL.md` lists
+  `sigil lockdown [--clear]` in the surface map but the forbidden list
+  (`--allow` passthroughs, dev switches, rule edits) does not name lifting a
+  lockdown. An agent diagnosing "requests refused; locked down" could
+  helpfully clear the panic switch the human threw. Add lockdown clearing to
+  the human-decision-only list (the agent may run the command, but only when
+  the human explicitly asks).
+- **F4 (LOW, diagnostics blind spot, accepted).** `paths.rs::ShimStatus`'s new
+  second arm accepts a link resolving to `~/.sigil/bin/sigil` with no
+  freshness check, so `doctor` run from a build checkout no longer flags a
+  stale installed runtime (the old "shim points at a stale binary" catch).
+  Staleness detection moved to `sigil up`'s byte compare, which also fixes it
+  in the same run; the gate-relevant drifts (shim absent, real `op` winning on
+  PATH) are still caught, and `find_real` is unaffected. Acceptable given `up`
+  is now habit zero; noted so nobody mistakes ShimStatus for a tamper check.
+- **F5 (LOW, availability nit).** `service.rs::install_copy` is
+  unlink-then-copy, not copy-to-temp-plus-rename: a crash or a concurrent
+  launchd respawn inside the window can exec a missing or partially-written
+  binary. Both outcomes are a failed exec, daemon down, deny; `up` re-run
+  heals. Relatedly, an env-sourced pin value is embedded in the plist without
+  XML escaping; a malformed value yields a plist launchd refuses to load
+  (fail closed, and the value is operator-controlled). Suggest atomic rename
+  when convenient.
+- **F6 (INFO).** `ACCEPT_ERROR_BACKOFF` is awaited inline in the `select!`
+  arm, so a persistent accept-error condition on one listener also stalls the
+  other listener and ctrl-c by up to 200 ms per iteration. Availability-only
+  and bounded; fine for a personal daemon.
+- **F7 (INFO, residual).** The bounded teardown exits the process without
+  running drops on abandoned blocking tasks, so a `Zeroizing` buffer in flight
+  at that instant (a stored-key PEM mid-signature, a threshold partial) is not
+  wiped before exit. This is exactly the crash/SIGKILL case the model already
+  accepts: the kernel zeroes pages before reuse, and the swap residual
+  pre-exists. Already-spawned approved children keep running with their
+  injected env, identical to prior crash behavior; no unapproved path exists.
+
+### Needs on-device verification (cannot be settled statically)
+
+- Unconditional KeepAlive respawn behavior and launchd throttle pacing on a
+  daemon that error-exits repeatedly (log growth stays bounded by
+  `rotate_logs`).
+- The `up` reload path (bootout + bootstrap on a changed plist) and the
+  kickstart-then-reprobe heal loop against a genuinely wedged pid.
+- That the Mac app auto-ensure does not resurrect a deliberately stopped
+  daemon within an app session (and that Tom is comfortable that a fresh app
+  launch does).
+- The standing manual proofs carried forward from prior reviews (Touch ID
+  round trip, SE/keychain items) are unaffected by this set.
+
+**VERDICT: SOUND-WITH-RESIDUALS. No HIGH or CRITICAL findings; the gate is not
+weakened anywhere, fail-closed is preserved on every new path, the new log
+line is metadata-only, and the skill gives an agent no route to a secret. Act
+on F1 (surface the dev-keystore pin in `sigil up` output) ahead of the planned
+keychain migration, and fold F3's lockdown line into the skill.**
+
+### Addendum 2026-07-15: dead-peer EINVAL pin (`e777758`) and the host-unbound signature call
+
+Same independent reviewer, same baseline. Also verified (not authored):
+`ea561f4` resolves F1 (an always-shown `keystore` line in `sigil up` whenever
+the plist carries the pin, via `service.rs::installed_dev_keystore_pin`) and
+F3 (lockdown clearing added to the skill's human-only list) as specified.
+
+**Authorization call, host-unbound SSH signatures: CONCUR with ALLOW plus the
+honest label.** The reasoning holds under adversarial scrutiny:
+
+- `session-bind` is unauthenticated client input (`sshagent.rs::extension`
+  records the host key without verifying the host's signature over it, and
+  `derive_host`'s own doc calls the host line advisory). The only party who
+  can reach the agent socket is same-UID, and that party can present any real
+  host's PUBLIC key and render as impeccably bound to github.com. Deny-unbound
+  therefore stops the adversary zero times while breaking every honest pre-8.9
+  OpenSSH, Go x/crypto, libssh2, and JGit client. Worse, it would promote a
+  client-claimed field into a load-bearing gate condition, which is exactly
+  the decorative-identity trap invariant 6 forbids, and it would train the
+  human that "bound" means "safe" when it means nothing.
+- A daemon-side warn state buys nothing either: the daemon cannot distinguish
+  an honest legacy client from a liar, so any warning keyed on bind presence
+  has the same false-comfort failure mode, inverted.
+- Fail-closed is unaffected: bound or not, every signature still requires the
+  phone approval over the load-bearing fields (key label plus data
+  fingerprint, folded into the scope so distinct challenges never coalesce).
+- The real improvement is exactly where the implementer put it: the phone
+  rendering unbound and fingerprint-only destinations as suspicious (#75).
+
+- **F8 (LOW, protocol hygiene, do with #75).** The unbound state rides in-band
+  as the sentinel string `"(host not bound)"` inside `SshChallenge.host`,
+  multiplexing three states (known_hosts name, `SHA256:` fingerprint, unbound)
+  through one display string. The string is daemon-authored, so sentinel
+  forgery is same-UID baseline, but the phone cannot reliably key a
+  "destination unverified" rendering on string parsing across app versions.
+  Fold a structured discriminator into `SshChallenge` (e.g. `binding: named |
+  fingerprint | unbound`) in the same protocol change as #75; an added
+  optional field is a compatible migration under the durable-pairing
+  principle.
+
+**Silent dead-peer drops (`is_dead_peer`): SOUND.**
+
+- Nothing security-relevant is hidden. The daemon log was never a control
+  against the only party who can connect (0600 socket, same-UID), and the
+  events that matter still log loudly: the concurrency-cap refusal (the actual
+  exhaustion signal), every non-EINVAL ready-up failure, and every request
+  arrival. A connect-then-close flood holds no permit past the drop and could
+  previously only generate log noise; masking one's own noise is not a
+  capability.
+- Breadth check: `is_dead_peer` classifies ANY EINVAL from
+  `set_nonblocking`/`set_read_timeout` as a dead peer. A pathological
+  persistent EINVAL of some other origin would become log-silent, but not
+  invisible: `sigil up`'s Status probe holds its connection open, so a daemon
+  dropping live peers fails the probe and reports failed. Optional hardening,
+  not required: a rate-limited drop counter. (INFO)
+- Portability: on platforms where a closed peer does not EINVAL, the silent
+  arm never fires; behavior is unchanged there.
+- The two regression tests are sound and non-flaky as pinned. The
+  classification test is correctly `cfg(target_os = "macos")` (the EINVAL
+  behavior is macOS-specific and deterministic; the peer's close completes
+  in-kernel before the subsequent accept). The storm test is deliberately
+  portable: on a non-EINVAL platform the 50 probes pass ready-up and hit the
+  immediate-EOF `Err(_) => continue` arm instead, every read is bounded by
+  the 30 s `CONN_READ_TIMEOUT` so no hang is possible, and exactly one serve
+  is asserted. Both pass in the suite at review (248 passed, 0 failed).
+
+**ADDENDUM VERDICT: both items SOUND. Allow-and-label is the correct
+authorization shape for unbound signatures (deny-unbound is security theater
+against a same-UID adversary who can fake the bind); implement F8's structured
+binding field with the #75 phone rendering. The silent dead-peer drop hides
+nothing load-bearing and its tests pin the regression correctly.**
+
+### Addendum 2026-07-15: three-commit review (`a4fd422`, `e16b0da`, `293b848`)
+
+Independent adversarial review (reviewer did not author these commits) of the
+three commits atop `feat/config-rule-engine`. Gate reproduced green: `sigil`
+247 passed / 0 failed / 6 ignored, `sigil-proto` 21 passed / 0 failed.
+
+**`a4fd422` (keystore reframing) — SOUND, framing only. Crypto unchanged;
+verdict confirmed.** The diff touches only doc comments, notice strings, one
+CLI label, one `up` posture line, and the notice test. No cryptographic call
+changed. Confirmed independently:
+
+- The decrypt path (`daemon.rs::fulfill`, ~L1700-1725) fails closed if the
+  approval carries no threshold partial (`outcome.zf == None`), then loads `m`
+  and calls `threshold::decrypt(record, &m, zf)`. `m` alone opens nothing;
+  `threshold.rs::a_wrong_or_missing_partial_fails_closed` and
+  `a_wrong_mac_share_fails_closed` pin both halves. So the new "`m` is inert
+  without the phone's per-request partial" framing is TRUE.
+- No standalone DEK remains for sealed accounts: `pairing_store.rs` L368
+  confirms "there is no DEK fallback anymore"; sealed secrets are threshold-only.
+- `factor.rs` is untouched by all three commits (confirmed via `git show
+  --stat`); `DEV_INSECURE_WARNING` / `SIGIL_DEV_AUTOAPPROVE` keep the loud
+  multi-line `RISK` banner and the `> 5 lines` test. The de-escalation is
+  scoped to the keystore notice only, as claimed.
+- **F9 (LOW, residual honesty — messaging understates the coupled residual,
+  NOT a must-fix).** The notice frames the two on-disk blobs as separable
+  ("could impersonate the daemon ... but ... no data-decryption key here"). A
+  single file-read attacker holds BOTH `m` AND the daemon identity key at once,
+  which couples them: the attacker can lift the pair to their own machine,
+  impersonate the daemon to the phone (identity key), solicit an approval, and
+  combine the returned partial `Z_F` with the `m` they already hold to decrypt
+  locally — the Mac is no longer needed. The sole surviving gate is the human
+  correctly rejecting a phished approval on the phone, now defending against a
+  remote impersonator rather than a local Mac process. This does not falsify
+  the notice (there is genuinely no standalone decryption key, and every path
+  is still human-gated), and no crypto weakened, so it is a residual, not a
+  blocker. Recommend the notice/`up` line acknowledge that a file reader gets
+  `m` and the impersonation credential together, so a phished approval yields
+  decryption off-box. Same-UID file read was always the trust boundary here;
+  the residual is the honesty of the wording, not a new capability.
+
+**`e16b0da` (remove lockdown) — SOUND. Critical claim survives attack; moots
+prior residual F2.** The two deleted fail-closed checks (`fulfill` top,
+`approve_and_sign` top) were additive short-circuits that only fired when
+lockdown was engaged; with the engage path removed there is no state in which
+they would have fired, so removing them changes no default gating. Confirmed by
+inspection that both functions retain their real gates:
+
+- `fulfill` still fails closed on the proxy-recursion fuse (L1447), the
+  unconfigured/unmatched command (L1466 `None` arm), and the missing-partial
+  and decrypt-failure arms (L1705, L1724).
+- `approve_and_sign` still fails closed (`return None`) on a key it does not
+  serve (L579), and every signature still requires the phone approval over the
+  scoped key-label + data-fingerprint.
+- Grep confirms NO remaining code depends on a lockdown flag. `LeaseStore::clear()`
+  survives with a live caller: the ctrl-c/shutdown arm (`daemon.rs` L959-960,
+  "shutting down (leases zeroized)"), so the daemon-restart lease zeroize is
+  intact and still exercised by `lease.rs::clear_zeroizes_all_leases`.
+- Wire-compat decision confirmed: `StatusJson.locked_down` is retained,
+  hardwired `false` (`report.rs` L72, `json.rs` L359), so an older Mac app
+  decodes it fine. `RequestKind::LockdownClear` was daemon->phone only, so
+  dropping the variant needs no ignore-on-receive. `RequestKind` reserialization
+  is exercised by `json.rs::request_kind_str` tests.
+- **F10 (INFO, dead branch — cleanup, not security).** `cli.rs::cmd_status`
+  L313 still renders a `st.locked_down` head branch, now permanently
+  unreachable because the daemon hardwires the field to `false`. Harmless
+  (status display only, no gate), but dead; fold out when the Mac-app/phone
+  lockdown UI removal lands (#75). Prior F2 is now MOOTED (the feature it
+  described no longer exists); prior F3 (skill lockdown-clear line) is likewise
+  obsolete and should be dropped from `SKILL.md` with the phone/Mac follow-up.
+
+**`293b848` (structured `HostBinding` on `SshChallenge`) — SOUND. Implements
+prior residual F8 as specified.** Confirmed:
+
+- Additive optional field: `#[serde(default)]` + `#[derive(Default)]` with
+  `#[default] Unbound`, so an older peer that omits `binding` deserializes to
+  the fail-safe Unbound and `host: String` stays populated. Pinned by
+  `request.rs::ssh_challenge_host_binding_is_additive_and_defaults_unbound`
+  (asserts the legacy-JSON `"(host not bound)"` payload defaults to Unbound).
+- The binding is advisory context, NOT a security boundary, and the code says
+  so in both `request.rs` (`HostBinding` doc: "even a Named binding is advisory
+  ... a same-UID client can name any destination") and `sshagent.rs`
+  (`HostContext` / `derive_host`). Grep confirms `binding` is NEVER branched on
+  or gated on anywhere — it is set in `derive_host` and forwarded into the
+  sealed `SshChallenge` for display only. Nowhere is Named implied to mean
+  verified.
+- No hostile-relay extension is warranted: `HostBinding` is not a new message
+  type and adds no new trust-bearing decision. It rides inside the already
+  sealed+authenticated `ApprovalRequest`, so a hostile relay can neither forge
+  nor flip it undetected (covered by the existing envelope proofs); and even if
+  it could, the field drives no gate. Registered here explicitly rather than
+  silently skipping the suite.
+
+**THREE-COMMIT VERDICT: SOUND-WITH-RESIDUALS. No HIGH or CRITICAL findings. No
+crypto weakened; no path now serves a secret that previously would not; every
+default fail-closed gate is intact and independently re-confirmed. Must-fix:
+none. Residuals to act on: F9 (tighten the keystore-notice wording to admit the
+coupled `m`+identity-key file-read residual) and F10 (drop the dead
+`locked_down` CLI branch and the obsolete lockdown skill line with the #75
+follow-up).**
+
+## Independent review verdict: rule-scoped lease widening (uncommitted, `feat/config-rule-engine`, 2026-07-28)
+
+Scope reviewed: the uncommitted widening of the lease grant key from
+`BLAKE2b(caller chain ++ cwd ++ exact argv)` to `BLAKE2b(caller chain ++ "" ++
+matched-rule-name)`, across `crates/sigil/src/{daemon,lease,approve,cli,json}.rs`,
+`crates/sigil/PROTOCOL.md`, the phone approval sheet, and the three docs. Reviewer
+wrote none of this code. Suite green at review time (256 passed, 6 ignored).
+
+**VERDICT: SOUND-WITH-RESIDUALS on the enforcement code; BLOCKED on the consent
+copy as written.** The mechanism does exactly what it claims, the enforcement
+authority stayed in the daemon, and nothing in the change makes the daemon serve
+a secret it previously would not *without an approval*. What is not shippable as
+written is the human-facing description of the window: on the axis the approver
+is actually looking at (which secret), the caption is silent, and on the axis it
+does speak to ("from this process") it is false. Fix F1, F2, F6 and F7; F3 is a
+judgment call for Tom; F4, F5, F8 are residuals.
+
+Every HIGH finding here is about the *description* of the window, not its
+enforcement. That is the honest shape of this change: the code does what it
+claims, and what it claims to the human is narrower than what it does.
+
+### Findings
+
+**F1 — HIGH. The consent caption is silent on the axis the human is reading:
+which secret.** `approval-sheet.tsx` renders `<SecretReadout secrets={...}/>`
+prominently (e.g. `op://Engineering/.env`), and this change promotes "Keep
+approved for 15 min" to the *primary* capsule, captioned "Also covers matching op
+commands from this process, in any directory." The caption enumerates the two
+axes that widened least surprisingly (command shape, directory) and says nothing
+about the one under the reader's thumb: the window serves every other reference
+the rule matches. Reviewer proof (written, run, passing, then reverted): approve
+`op read op://Engineering/.env`, then run `op read op://Personal/bank/password` —
+the approver is consulted exactly once. *Required:* the caption must name the
+item axis (e.g. "…other commands and other items this rule matches…"). The exact
+wording is design-reviewer's; the requirement that "other items" appear is not
+negotiable, because "the readout is the consent" is a brief-level claim.
+
+**F2 — HIGH. "from this process" is false; the window is not process-, session-,
+or terminal-bound.** `lease.rs::grant_key` excludes pids deliberately
+(`grant_key_ignores_recycled_pids`) and binds only the *code identity* of the
+ancestor chain. A second concurrent agent session, in another terminal and
+another project, has the identical chain and therefore the identical grant key.
+Until this change, cwd and argv incidentally re-narrowed that; now nothing does.
+Compounding it: macOS `proc_pidpath` resolves symlinks (verified empirically —
+a symlink to `/bin/sleep` reports `/bin/sleep`), and every alias in `~/.sigil/bin`
+is a symlink to the single `sigil` binary (`proxy.rs::install_shim_for`; on disk
+`~/.sigil/bin/op -> ~/.sigil/bin/sigil`). So **the chain leaf is byte-identical
+for every gated command**. The comment at `daemon.rs:1561` — "The caller-chain
+binding is untouched and is now the whole boundary" — is therefore wrong in a
+load-bearing way: the chain never distinguished commands and cannot; the rule
+name is now the entire command-discriminating boundary, and the chain is only an
+outer fence. *Required:* correct the phone caption, that daemon comment, and the
+brief's "process tree key" phrasing.
+
+**F3 — MEDIUM-HIGH. A live lease is not invalidated by a config change.**
+`ConfigCell::store` (`daemon.rs:97`) swaps the rule set and `reload_config`
+(`daemon.rs:445`) never touches `core.leases`. The grant key names a *mutable
+rule* by a *string*, so rewriting a rule while its window is live transfers the
+window to the new match. Reviewer proof (passing): open a window on rule `op`,
+hot-swap a config whose rule of the same name matches `curl`, and
+`curl https://evil.example` runs with the approver consulted once — for
+`op read`. **Honest bounding, and it matters:** this is *not* an escalation for an
+attacker, because anyone who can write `~/.sigil/config.json` can add
+`mode: allow` and bypass the gate entirely (`config.rs::resolve` →
+`Resolution::Allow`). The real cost is a legitimate user editing their own rules
+mid-window and silently inheriting a broader grant than they approved.
+*Recommended:* `reload_config` calls `core.leases.clear()` on a successful swap —
+cheap, fail-closed, and consistent with "leases die when the world changes". If
+Tom declines, the claim row now added to §8 must stay. *Separately surfaced:* the
+gate's entire strength is bounded by the filesystem integrity of an unsigned
+`config.json` (`config.rs::load` performs no integrity check); that deserves to be
+stated in the residuals rather than left implicit.
+
+**F4 — LOW. No request-kind domain separation in the grant/coalesce key.** The
+SSH path (`daemon.rs:611`) and the command path (`daemon.rs:1566`, `1572`) now
+both call `grant_key(caller, "", scope)` into one unseparated scope namespace. A
+rule literally named `ssh-sign <label> <fp>`, or a command with empty cwd whose
+`argv[1..]` joins to that string, collides with an SSH coalesce key. Impact
+ceiling is one coalesced approval across request kinds — the lease store is
+unreachable from the SSH path, so no lease can ever serve a signature. Contrived
+and pre-existing; free to close by prefixing the scope with a kind tag
+(`cmd:` / `ssh:`).
+
+**F5 — LOW (documentation). The account leg of the triple binding is vacuous.**
+Every stored lease has `account == ""`. It cannot bind falsely (grant and lookup
+derive the label identically from one pinned `config.snapshot()`), and it is
+redundant rather than weak, since the rule name already determines the source.
+But "triple-scoped" reads as three live bindings and is today two-and-a-constant;
+§8 now says so. Consequence in the CLI: `cli.rs::lease_row`'s account column is
+suppressed whenever every lease has an empty account, i.e. always — harmless,
+but it is dead width in practice, not a conditional.
+
+**F6 — MEDIUM. Brief/code drift, ruled on (the lead's item 7).** The change
+edited the brief's lease paragraph but kept the claim that "the unwrapped
+credential is held in RAM only, scoped to that grant key, account, and rule". The
+code stores `zeroize::Zeroizing::new(Vec::new())` — an empty presence marker
+(`daemon.rs:1720`) — and a request that opens a sealed secret never leases at all
+(`!needs_sealed_env` guards both sites). `lease.rs`'s module doc is honest about
+this; the brief is not, and per CLAUDE.md the brief is the constitution.
+*Ruling as written:* rewrite the clause to what the code does — the lease holds an
+approval presence marker, no credential is cached, and sealed-secret requests
+never lease. Do **not** mark it design-not-yet-code: there is no work item that
+would make the sentence true, and a RAM-cached-credential lease is explicitly out
+of scope here.
+
+> **F6 SUPERSEDED (reviewer, 2026-08-04). Do not read the paragraph above as a
+> current statement of behaviour.** The drift was closed in the *opposite*
+> direction from my ruling: rather than the brief being corrected down to an empty
+> marker, the code moved up to match the brief. As of `d3887ad`, a sealed inline
+> `env` rule **does** lease and **does** cache the unsealed values in lease RAM for
+> the TTL (`daemon.rs::fulfill`, `sealed_plain` stored via `leases.grant`;
+> `lease.rs::Lease::token`), and the `!needs_sealed_env` guards I cited are gone.
+> The lease binding also grew a fourth leg (`lease::LeaseBinding`: account, scope,
+> and a `source` fingerprint over the sealed record's ephemeral point `E`).
+>
+> The claim row in §8 describing the RAM cache is the current, authoritative
+> statement; this F6 paragraph is retained only as the record of what was true when
+> the rule-scoped-lease review was written. Two consequences carry forward:
+>
+> * My §8 row asserting "no path caches a secret in a lease" was written under the
+>   old behaviour and has been replaced. Any surviving copy of that sentence
+>   anywhere in this document or the brief is now **false** and must go.
+> * Reviewer finding **F3** (a live lease is not invalidated when config
+>   hot-reloads) was raised as a judgment call for Tom while a lease held nothing.
+>   With a live plaintext credential in the window it is no longer optional, and
+>   the same is true of **F2**'s blast radius: the window now releases values, not
+>   just a skipped prompt.
+>
+> **This note reconciles the contradiction only. It certifies nothing about the
+> RAM-cache path**, which I have not yet reviewed adversarially. That verdict, and
+> the question of whether the BLOCKED-on-consent-copy state lifts, come in the
+> Part 2 pass over the settled combined change set.
+
+**F7 — HIGH. The phone's lease list and its revoke button are a mock, and the
+brief cites them as the mitigation for the widened window.** The brief's settings
+row was rewritten by this change to "active leases with live TTL countdowns and
+one-tap revoke, each naming the rule it covers and saying so (`launcher · op-eu,
+any matching command, 41m left`)". A matching UI landed in
+`apps/phone/app/(tabs)/(settings)/index.tsx` (`LeaseRow`, rendering exactly that
+breadth caption) *during* this review, from a concurrent agent. It is not wired to
+anything:
+
+* `AppState.leases` is written only by the demo seed (`state/demo.ts:246`,
+  `demoLeases`). No live-session path ever populates it, so the list can never
+  display a real daemon lease.
+* `store.revokeLease(id)` (`state/store.ts:130-132`) filters the row out of the
+  phone's own array and sends nothing. There is no wire message, no envelope, and
+  nothing reaches `LeaseStore::revoke`.
+
+A revoke control that silently does nothing is worse than an absent one: the
+brief's stated containment for a rule-wide window is that the human can see and
+kill it from the phone, and a user who taps it will believe the window closed
+while the daemon keeps honoring it for the rest of the TTL. *Required:* either
+wire the list and revoke to the daemon, or mark both the UI and the brief row
+`planned` and state plainly that revocation is `sigil lease revoke <prefix>` on
+the Mac, only. This finding is against work that arrived mid-review and is a
+moving target; re-review it once it settles.
+
+**F8 — LOW. The hostile-relay suite carries no lease case.**
+`crates/sigil-proto/tests/hostile_relay.rs` (32 tests) has zero lease coverage.
+Correctly, the wire did not change and `ApprovalResponse.lease` rides inside the
+sealed, counter-guarded envelope (`remote.rs::classify` → `env.open(...)`), so a
+relay can neither forge nor tamper `ttl_ms`, and the daemon clamps whatever
+arrives. But the blast radius of a forged grant just grew from one argv to a
+rule-wide window, so the suite should hold the negative proof rather than resting
+on inspection. Reviewer-owned follow-up; not a merge blocker.
+
+### Verified clean (the lead's checklist)
+
+- **Coalescing never widens (item 1): CONFIRMED.** Exactly two production
+  `gate.decide` call sites — `daemon.rs:1684` passes `coalesce_key`
+  (chain + cwd + argv, byte-identical to the pre-change key) and `daemon.rs:647`
+  passes the SSH per-signature key. `PendingRegistry` is keyed by uuidv7 request
+  id, never by any grant key, so the pending path cannot widen. `DevMode`
+  short-circuits inside `LocalApprover::decide_local`, i.e. *below* the gate, so
+  the dev-autoapprove path inherits the narrow coalesce key and its
+  `Decision::Lease` is still clamped by rule policy. Only `daemon.rs:1618`
+  (`token_for`) and `daemon.rs:1716` (`grant`) touch the wide key, both correct.
+- **Run-once and the TTL clamp (item 3): CONFIRMED post-change.**
+  `daemon.rs:1707-1714` is the sole grant site; `LeasePolicy::RunOnce.clamp_secs`
+  → `None`, so a compromised approver returning a lease on a run-once rule gets
+  the invocation approved and no window. Hostile `ttl_ms` extremes are safe in
+  both directions: `u64::MAX` ms saturates through `.min(u32::MAX)` then
+  `min(cap)`; `0` yields an already-expired lease that
+  `retain(expires > now)` purges on the next touch.
+- **SSH path unchanged (item 4): CONFIRMED byte-identical.** `git diff` touches
+  no line of `approve_and_sign`. Still `LeasePolicy::RunOnce`, still
+  `grant_key(caller, "", ssh_sign_scope(label, fingerprint))` folding the
+  data-to-sign fingerprint, still no `token_for` and no `grant` on that path.
+- **Audit on the lease short-circuit (item 8): CONFIRMED.** The short-circuit
+  records *before* spawning (`daemon.rs:1622-1631`) with
+  `audit_label(describe(argv), scope)` — the real argv, not the rule — and
+  `via = "lease"`; no return path sits between the lease hit and the record.
+  `a_leased_run_audits_the_command_it_actually_ran` proves both the label and the
+  marker. One honest caveat: `record_audit` is a no-op when `core.audit` is
+  `None`, so "the log cannot be skipped" holds only where auditing is configured
+  at all. Pre-existing, not a regression.
+- **TOCTOU between rule match and lease lookup: clean.** `config.snapshot()`
+  pins one `Arc` for the whole decision (`daemon.rs:1468`), `action.rule` is
+  cloned from it, and the lookup uses that clone, so a reload landing mid-decision
+  cannot retarget the request in flight. The *cross-request* version of this
+  problem is F3.
+- **Zeroization: nothing to leak.** The lease token is an empty
+  `Zeroizing<Vec<u8>>`; every removal path (`retain`, `clear`) drops it, and
+  `token_for` clones an empty vec.
+- **Store growth / DoS: strictly improved.** Grants happen only post-approval,
+  `grant` de-dupes on (grant, account, scope) and purges expired entries first,
+  and rule scoping collapses what used to be one lease per (argv, cwd) into one
+  per rule. No cap, but no attacker-driven growth either.
+- **Restart clears:** `serve` calls `core.leases.clear()` on ctrl-c
+  (`daemon.rs:963`); RAM-only otherwise. Invariant #8's "killed by lockdown"
+  clause remains vacuous because lockdown was removed in `e16b0da`, a prior
+  decision this change does not touch.
+
+### Reviewer proofs
+
+Two tests were written against the real `fulfill`, run green (i.e. **both attacks
+succeed**), and reverted rather than left in the implementer's file:
+
+- `reviewer_proof_lease_covers_a_secret_the_human_never_saw` — F1.
+- `reviewer_proof_lease_survives_a_config_edit_that_widens_its_rule` — F3.
+
+If F1's caption is fixed and F3 is accepted as a residual rather than closed,
+both belong in `daemon.rs` as permanent negative tests so the breadth is pinned
+by the suite instead of by prose.
+
+## Independent review verdict, round 2: rule-scoped leases + RAM cache + file-keystore default + SE wrapping (`ff926ef..`, WIP `d3887ad` plus uncommitted, 2026-08-04)
+
+Scope: the total diff since the round-1 verdict. The F1-F8 closures, the
+RAM-cached credential lease, the file-keystore default promotion, the
+Secure-Enclave wrapping as built against the reviewer's design-phase S1-S10, the
+relay origin hint, and §10a's claim rows. Reviewer wrote none of this code except
+the four hostile-relay lease tests noted below. Findings are numbered **R2-Fn** to
+avoid colliding with round-1's F1-F8 or the 2026-07-15 addendum's F9/F10.
+
+**VERDICT: SOUND-WITH-RESIDUALS. The round-1 BLOCK on consent copy is LIFTED.
+Nothing here blocks the landing.** No HIGH or CRITICAL findings. Every round-1
+finding is closed, three of them better than specified. The SE wrapping implements
+all ten design-phase items, and two of them (S1, S3) are resolved more soundly
+than the contract asked. The residuals below are real but none of them changes a
+threat class, and each is stated rather than hidden.
+
+### Rulings requested
+
+**The consent caption: BLOCK LIFTED.** It now reads "Also covers other {cmd}
+commands and secrets this rule matches, from anywhere on this Mac." That names the
+axis the human is actually looking at (other secrets, round-1 F1) and drops the
+false "from this process" (round-1 F2). It is now *over*-broad rather than
+under-broad: the window binds the caller chain's code identity, so a genuinely
+different tool tree does not ride it. That is the correct direction to err for a
+consent string, and the brief's mock-cap carries the precise version alongside.
+Both halves of the round-1 block are closed.
+
+**The source-fingerprint leg on `LeaseBinding`: SOUND, and better than what was
+asked for.** Binding the sealed record's ephemeral point `E` means a re-seal, which
+mints a fresh `E`, misses the cache instead of injecting a plaintext that no longer
+exists on disk. That closes a gap pure config-invalidation would have left open,
+because `source env set` need not touch `config.json` at all. It is also the right
+*shape*: a content fingerprint rather than a version counter, so a rollback cannot
+spoof it.
+
+**The bundle identifier left unpinned: SOUND for today, with a recorded trigger.**
+The rename argument is correct and a silent lockout would be worse than the
+exposure. But the gate's actual meaning should be stated plainly: it authorizes
+*any binary team 53W966FBFP ever signs*, not "the Sigil app". If RainnWorks ships a
+second Mac product, that product silently inherits keystore-provision authority.
+The rename-safe way to scope it is an allowlist rather than a pin
+(`identifier "works.rainn.latch" or identifier "works.rainn.sigil"`), which keeps
+a rename from ever being a lockout while still bounding the set. See R2-F5.
+
+**The ECIES variable-IV variant: CONFIRMED sound.**
+`.eciesEncryptionCofactorVariableIVX963SHA256AESGCM` is authenticated encryption
+(AES-GCM), and the variable-IV form is *safer* than the fixed-IV one, which uses an
+all-zero IV. The Enclave supports only the variable-IV variants, so this is a
+platform constraint rather than a preference. It is nonetheless a deviation from
+the libsodium-only house rule (P-256 ECDH + X9.63 KDF + AES-GCM), and the
+justification is sound and should be recorded as such: the entire point is to use
+hardware that speaks only its own algorithms, so every alternative means not using
+the Enclave at all.
+
+**The relay origin hint: display-only, CONFIRMED.** `Origin.ip` is rendered from a
+parsed `IpAddr`, so attacker-chosen free text can never reach a UI. `client_ip`
+indexes from the RIGHT of the forwarded chain, so a client prepending fake entries
+only pads the left and pushes its own real address into the chosen slot;
+`trusted_hops` defaults to `0`, at which the header is not read at all. It is not
+persisted, not logged, and dies with the item's TTL. The phone labels it "relay
+reported" and the session layer calls it "the carrier's unverified claim". Nothing
+anywhere branches on it. The one real risk is the misconfiguration the module doc
+already calls out loudly: `trusted_hops` set higher than the true proxy count puts
+the index inside client-written text.
+
+### Round-1 closures, verified
+
+- **F1, F2: closed** (see the ruling above).
+- **F3 (lease invalidation on config reload): closed.** `reload_config` now calls
+  `invalidate_leases_for_config_change`, which kills any lease whose rule did not
+  survive *identically* (whole-struct comparison, plus the resolved source), and
+  fails safe by treating anything it cannot pair up as changed. Residual race in
+  R2-F6.
+- **F4 (kind tags): closed, better than requested.** Rather than a string prefix,
+  `grant_key` takes a typed `lease::ScopeKind` (`Command` / `SshSignature`) and
+  hashes its tag length-prefixed alongside every other field. The two scope
+  namespaces can no longer collide by construction rather than by convention.
+- **F5 (vacuous account leg): closed by the RAM-cache path.** Sealed inline `env`
+  rules now lease, so `LeaseBinding.account` carries a real source name for exactly
+  the leases that hold values. The binding is no longer two-legs-and-a-constant.
+- **F6: superseded**, reconciled in place on 2026-08-04.
+- **F7 (phone lease list): closed, beyond what was asked.** The brief marks the
+  section `planned`; the phone renders no revoke control, shows sample rows only
+  under `DEMO`, and deliberately refuses to render "No active leases" because a
+  phone that cannot see the Mac's leases saying so is a false statement of fact.
+  Both surfaces name `sigil lease revoke <prefix>` as the real mechanism.
+- **F8 (hostile-relay lease case): closed by the reviewer in this pass.** Four
+  tests added to `crates/sigil-proto/tests/hostile_relay.rs`:
+  `relay_cannot_forge_a_lease_grant`, `relay_cannot_lengthen_a_lease_window`,
+  `relay_cannot_attach_a_lease_to_a_deny`, and
+  `a_lease_grant_cannot_be_replayed_to_reopen_an_expired_window`. Suite green at
+  22 tests.
+
+### The RAM-cached credential lease: SOUND
+
+- **Unseal-before-grant ordering is correct.** Every `fail_closed` in the threshold
+  open returns before `leases.grant`, so a failed open leaves no window behind.
+- **The per-run consent re-check is real, not decorative.** `leased_env` re-decodes
+  the cached blob on every leased run and re-runs `env_keys_match` against the rule
+  *as it stands at that moment*; a corrupt blob or a moved key set is refused, the
+  lease is dropped, and the run re-gates rather than injecting. A window can only
+  ever inject what a fresh approval would have injected.
+- **Invalidation is genuinely triple:** TTL, config change (F3), and re-seal (the
+  `E` fingerprint), plus explicit revoke and daemon restart.
+- **F2's blast radius, re-examined as instructed:** it is now larger in kind, not
+  just degree. A live window releases credential *values* rather than skipping a
+  prompt, so the caller-chain imitation residual costs unsealed secrets during the
+  window. This is exactly why F3 was mandatory, and F3 closed. The values remain
+  RAM-only, `Zeroizing`, and dead on every removal path.
+
+### The SE wrapping as built, against S1-S10
+
+All ten adopted. Two resolved better than the contract specified:
+
+- **S1 (write-back) is resolved by construction, not by machinery.** `RamKeystore`
+  refuses `store_blob`/`delete_blob` outright, and all four `pairing_store`
+  mutations call `refuse_if_sealed` as their first statement. I verified the
+  "by construction" claim independently: every `store_blob`/`delete_blob` call site
+  in the tree is in `pairing_store` or `threshold`, all CLI-driven, all reachable
+  only through those refusals or through the type's own `Sealed` error. Deferring
+  the commit flow because it has no trigger is the right call; machinery with no
+  trigger rots untested.
+- **S3's digest binds the exact wrapped bytes rather than a canonical
+  re-encoding.** This is better than what I recommended: it removes the
+  cross-implementation agreement problem (ordering, escaping, whitespace, forever)
+  entirely, and it commits to the bytes the daemon actually parses, which is the
+  thing that must be authentic.
+- S2 marker lives outside the file, with an honest same-UID residual. Worth stating
+  that **the app-side alarm is the stronger of the two detectors**: it keys off the
+  Enclave key's continued existence, which an attacker cannot delete without the
+  app's keychain ACL, whereas `~/.sigil/adopted` is a same-UID file. S4's four
+  sub-points are all present (peer gate first, once-per-lifetime checked *before*
+  the payload is read, no latch on failure, constant-time bare ok/fail). S5's
+  hardened runtime and `get-task-allow off` are configured in `project.yml`. S6
+  reads once in `Core::for_host` before `serve` binds the listener. S7's orderings
+  use fsync-then-atomic-rename, and `explain()` never says "re-pair" (pinned by
+  test). S8's binary framing is in place and `KeystoreFile` deliberately derives no
+  `Debug`. S9's at-rest framing is adopted verbatim and stated well. S10's field is
+  gone.
+
+### Findings
+
+**R2-F1 (MEDIUM). The adoption marker records `se_pub` and nothing ever compares
+it.** `set_adopted(se_pub)` writes the wrapping key's public half into
+`~/.sigil/adopted`, but `SealState::resolve(file, adopted)` takes only a `bool` and
+never compares the marker's `se_pub` against the file's. So substituting a v2
+keystore wrapped to an *attacker's* Enclave key yields `Sealed` with the attacker's
+expected digest, the attacker's app provisions it, and the daemon comes up paired
+to the attacker's phone with no alarm on either side (the app-side detector keys on
+its key still existing, which it does). This sits inside the already-admitted
+file-write class and changes no threat class, but it is the one place where the
+code collects exactly the evidence needed and then discards it. *Fix:* have
+`resolve` take the marker's recorded `se_pub` and yield `Downgraded` (or a distinct
+`KeyChanged`) on mismatch.
+
+**R2-F2 (MEDIUM-LOW). Zeroization does not cover the JSON/base64 intermediates, and
+one realloc frees material un-wiped.** Concretely: (a) `local.rs::read_payload`
+does `let mut out = tail; out.reserve_exact(more)`, and Vec growth copies the tail
+(for a single-`recvmsg` provision, the whole material) into a fresh allocation and
+frees the old one, which `Zeroizing` never sees; (b)
+`keystore.rs::RamKeystore::from_material` parses into `HashMap<String,String>`
+whose Strings hold base64 of the identity key and `m`, dropped un-zeroized; (c)
+`keystore_seal.rs::KeystoreFile::parse` materializes the same Strings through
+`serde_json::Value` when it only needs to test for key presence. `FileKeystore::read`,
+now the default store, shares the pattern on every load. Impact is modest, since
+same-UID RAM reading is already conceded. But the §10a row and `local.rs`'s own
+comment ("material never rests in a plain allocation") claim more than the code
+delivers. *Fix:* pre-size with `Vec::with_capacity(len)` in (a), and either narrow
+(b)/(c) or soften the claim to "the transport buffers are `Zeroizing`; the JSON and
+base64 parse products are not, a known residual".
+
+**R2-F3 (LOW). An unrecognized `SIGIL_KEYSTORE` value silently selects a different
+security posture.** `for_host`'s `_ =>` arm routes any unknown value to the file
+store with no notice, because `note_once` runs only on the recognized arms. So
+`SIGIL_KEYSTORE=keychian` silently yields a plaintext file store; the user then
+meets "no pairing" and, by this codebase's own hard-won principle, may re-pair and
+orphan the real one. §10a currently documents this as a feature. *Fix:* print the
+one-time notice for any unrecognized non-empty value, naming what was asked for and
+what was selected. The machinery exists: `legacy_keychain_notice` already handles
+the keychain-to-file case well, and is correctly wired into both the daemon and
+`up`.
+
+**R2-F4 (LOW). The code-identity gate could bind the audit token rather than the
+pid.** `peercode.m` resolves the guest via `kSecGuestAttributePid`, and both it and
+`peercode.rs` honestly document the pid-recycle limit as "the tightest binding this
+API offers". It is not: macOS exposes the peer's `audit_token_t` on a unix socket
+via `getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)`, and `SecCodeCopyGuestWithAttributes`
+accepts it as `kSecGuestAttributeAudit`. An audit token is not reusable, so it
+eliminates the race rather than narrowing it, and it is Apple's documented
+recommendation for exactly this case. Low severity given the window is tiny and the
+connection is held open, but the doc claim should change even if the code does not.
+
+**R2-F5 (LOW). The requirement admits any binary the team ever signs, including
+development-signed ones.** See the ruling above for the bundle-id trade. Separately:
+`certificate leaf[subject.OU]` matches Apple Development certificates as well as
+Developer ID, so a dev-signed build by anyone with team cert access satisfies the
+gate. Adding the Developer ID marker OID
+(`certificate leaf[field.1.2.840.113635.100.6.1.13]`) would restrict it to
+distribution builds. Optional for a single-developer team; the trigger to act is a
+second signed Mac product existing.
+
+**R2-F6 (LOW). Lease invalidation is not atomic with respect to in-flight
+approvals.** `fulfill` snapshots the config, blocks on the phone for up to the
+approval timeout, then grants. A config edit landing during that wait runs
+invalidation *before the lease exists*, and the grant then files a window under the
+rewritten rule with pre-edit material; if the rule's source is unchanged the
+`LeaseBinding` still matches, so the window is live under the new definition. Same
+file-write adversary as F3, so no new threat class, and the source-fingerprint leg
+catches every case where the sealed source moved. *Complete fix, cheap:* stamp a
+config generation counter (bumped on every successful `ConfigCell::store`) into
+`LeaseBinding`, so any reload during an approval invalidates that grant by
+construction.
+
+### Process note
+
+The tree was still being edited during this pass: `cli.rs` and `keystore.rs`
+churned underneath the review, and `cargo clippy` failed transiently with two
+different errors minutes apart before going clean. Gate as measured at completion:
+**512 rust tests pass, 0 failures; clippy clean; `cargo fmt --check` dirty only in
+`cli.rs` and `keystore.rs` from that in-flight work, not from the reviewer's
+addition** (`hostile_relay.rs` was formatted). The security-critical paths this
+verdict covers (`keystore_seal.rs`, `peercode.{rs,m}`, `lease.rs`, `daemon.rs`
+fulfil/provision/unwrap, `keystore.rs`) were stable throughout. Re-run the gate on
+the settled tree before landing; this verdict does not certify whatever `cli.rs`
+becomes.
+
+### Closure check: the R2 fix round (2026-08-04, same reviewer)
+
+Each fix verified against the code, not the report. Gate re-measured on the
+settled tree: **516 tests pass, 0 failures; clippy clean; `cargo fmt --check`
+clean.** The four hostile-relay lease tests from the verdict above still pass.
+**Nothing in the fix round regresses the verdict: it stands at
+SOUND-WITH-RESIDUALS, and the round-1 consent-copy block stays LIFTED.**
+
+- **R2-F1 CLOSED.** `SealState::resolve` now takes `Option<&AdoptionMarker>` and
+  compares the marker's recorded `se_pub` against the file's; a mismatch is
+  `KeyChanged`, which `blocks_serving` unconditionally and explains as a
+  substituted keystore. The corrupt-marker path is the part worth checking and it
+  is right: `read_adoption_marker` returns `Some` with an EMPTY `se_pub` rather
+  than `None`, so mangling the marker cannot decay "adopted, key unknown" into
+  "never adopted" and clear the tripwire; an empty key matches nothing and
+  resolves to refusal. The first-run `(V2, None)` case still accepts any wrapped
+  file, which is correct and necessary for adoption to ever happen, and leaves the
+  already-recorded residual (marker deletion is the same same-UID file write) 
+  unchanged.
+- **R2-F4 CLOSED.** `require_sigil_app` reads the peer's `audit_token_t` via
+  `getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)` and evaluates it through
+  `kSecGuestAttributeAudit`. There is no pid fallback: an unreadable token is
+  `NoPeer`, a refusal. `pid_satisfies` survives only as a test entry point, and
+  the negative/positive/malformed-requirement tests were kept alongside a new one
+  proving a real socketpair yields a token and a non-socket fd does not. The race
+  is eliminated rather than narrowed, so the honest-limit wording in both
+  `peercode.rs` and `peercode.m` was corrected too.
+- **R2-F6 CLOSED, and more conservatively than requested.** `ConfigCell` carries a
+  generation bumped on every store, and `fulfill` stamps the generation of the
+  snapshot *this decision resolved against* into `LeaseBinding`. Since the same
+  binding is used for both the lookup and the grant, the practical effect is
+  broader than the race I raised: **any** config write now makes **every** live
+  window unusable, not only those whose rule moved. That errs closed and is fine
+  here, but it is a real behavioral change worth knowing: editing one rule ends
+  unrelated windows. Note the two mechanisms are complementary rather than
+  redundant, and both should stay: the generation stamp makes a stale grant
+  *unusable*, while `invalidate_leases_for_config_change` makes it *gone*, which
+  matters because a stale sealed-`env` lease holds cached plaintext that would
+  otherwise sit in RAM until its TTL. `a_reload_during_an_approval_kills_the_grant_that_lands_after_it`
+  pins exactly the flagged ordering, storing an identical config so the selective
+  matrix deliberately keeps the lease and only the stamp refuses it.
+- **R2-F2 CLOSED (a), MITIGATED AND HONESTLY STATED (b/c).** `read_payload`
+  pre-sizes with `Vec::with_capacity(len)`, extends from the tail, and drops the
+  tail, so the abandoning realloc no longer exists; the exact-fit path was also
+  tightened from `>` to `>=` so a tail that exactly fills the payload no longer
+  falls into the growth branch. `KeystoreFile::parse` classifies through
+  `serde::de::IgnoredAny`, so a v1 file's blobs are never materialized.
+  `RamKeystore::from_material` still receives base64 through serde `String`s but
+  wipes them after decoding, with a comment saying plainly that serde allocated
+  them first. The §10a row now states the scope exactly instead of claiming the
+  material never rests in a plain allocation. That is the right resolution: the
+  claim matches the code, and the remainder sits inside the same-UID RAM reading
+  this design already concedes.
+- **R2-F3 CLOSED.** Any unrecognized non-empty value that is not `file` now prints
+  a one-time notice naming what was asked for and what was selected, and warns
+  that a pairing made under another store will not be found. The silent posture
+  change is gone, and §10a no longer documents it as a feature.
+- **R2-F5 CLOSED as a recorded residual**, with the trigger stated (a second signed
+  Mac product existing) and the two tightening options noted. Correct disposition
+  for a single-developer team; no action needed today.
+
+House-rule check: the implementer's edits to this document add behavior rows to
+§10a only and contain no verdict language, and the round-2 verdict section above
+is untouched. Nothing further is outstanding from rounds 1 or 2; this reviewer has
+no objection to the landing.

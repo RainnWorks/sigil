@@ -14,7 +14,7 @@ export default function PairingStack() {
         contentStyle: { backgroundColor: p.bg },
       }}
     >
-      <Stack.Screen name="index" options={{ title: "Pair a device" }} />
+      <Stack.Screen name="index" options={{ title: "Pair your Mac" }} />
       <Stack.Screen name="keys" options={{ title: "This phone is the key" }} />
       <Stack.Screen name="scan" options={{ title: "Scan the Mac", headerTransparent: true, headerStyle: { backgroundColor: "transparent" } }} />
       <Stack.Screen name="confirm" options={{ title: "Confirm", gestureEnabled: false }} />

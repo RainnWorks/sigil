@@ -6,7 +6,7 @@ keystore / config / `~/.sigil` and are therefore **not** daemon capabilities:
 the Mac app shells out to `sigil … --json` for them and decodes the shapes here.
 
 Everything the daemon *reports or controls at runtime* (status, doctor, leases,
-pending, history, lockdown, approve/deny, the live pending subscription) is the
+pending, history, approve/deny, the live pending subscription) is the
 **daemon control socket protocol**, specified in `PROTOCOL.md` — not `--json`.
 The DTOs for both live in `crates/sigil/src/json.rs`.
 

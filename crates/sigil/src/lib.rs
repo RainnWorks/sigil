@@ -21,11 +21,13 @@ pub mod json;
 pub mod keystore;
 #[cfg(target_os = "macos")]
 pub mod keystore_macos;
+pub mod keystore_seal;
 pub mod lease;
 pub mod local;
 pub mod pair;
 pub mod pairing_store;
 pub mod paths;
+pub mod peercode;
 pub mod provider;
 pub mod proxy;
 pub mod push_store;
@@ -38,8 +40,10 @@ pub mod settings;
 pub mod setup;
 pub mod shim;
 pub mod sshagent;
+pub mod sshconfig;
 pub mod style;
 pub mod threshold;
+pub mod up;
 
 /// A process-wide lock serializing tests that mutate global environment
 /// variables (`SIGIL_HOME` in particular). Cargo runs a crate's tests in

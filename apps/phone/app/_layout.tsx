@@ -16,16 +16,18 @@ import {
   watchPushTokenRotation,
 } from "@/src/lib/push";
 import {
+  demoRelayOrigin,
   demoReadRequest,
   demoRoutineRequest,
   demoSshRequest,
   demoThresholdRequest,
+  demoUnboundSshRequest,
 } from "@/src/state/demo";
 
 /**
  * Root layout. A Stack holding the tab group plus the modal surfaces: the
- * approval sheet (form sheet with detents, glass on iOS 26), lockdown (a form
- * sheet you hold to seal), and the pairing ceremony (its own stack).
+ * approval sheet (form sheet with detents, glass on iOS 26) and the pairing
+ * ceremony (its own stack).
  */
 export default function RootLayout() {
   const scheme = useColorScheme();
@@ -55,12 +57,18 @@ export default function RootLayout() {
     // Demo seed is OFF unless the explicit dev flag is set, so no Release build
     // ever shows canned pending requests. Exercises the same crypto path as real.
     if (DEMO && store.getState().pending.length === 0) {
-      store.seedPending([
-        demoReadRequest(),
-        demoThresholdRequest(),
-        demoSshRequest(),
-        demoRoutineRequest(),
-      ]);
+      store.seedPending(
+        [
+          demoReadRequest(),
+          demoThresholdRequest(),
+          demoSshRequest(),
+          demoUnboundSshRequest(),
+          demoRoutineRequest(),
+        ],
+        // Stands in for the relay's origin hint so the sheet's `network` row is
+        // reachable without a relay. Demo builds only.
+        demoRelayOrigin,
+      );
     }
   }, []);
 
@@ -115,16 +123,6 @@ export default function RootLayout() {
                 sheetGrabberVisible: true,
                 sheetAllowedDetents: [0.6, 1.0],
                 sheetLargestUndimmedDetentIndex: -1,
-                contentStyle: { backgroundColor: p.bg },
-                headerShown: false,
-              }}
-            />
-            <Stack.Screen
-              name="lockdown"
-              options={{
-                presentation: "formSheet",
-                sheetGrabberVisible: true,
-                sheetAllowedDetents: [0.45],
                 contentStyle: { backgroundColor: p.bg },
                 headerShown: false,
               }}

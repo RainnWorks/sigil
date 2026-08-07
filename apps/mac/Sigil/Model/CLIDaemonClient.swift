@@ -2,9 +2,9 @@
 //  Drives the `sigil` binary the same way a human would from a shell. Its live
 //  role is the shell-out half of SocketDaemonClient: the CLI-only keystore/config
 //  mutations that the least-privilege split (PROTOCOL.md) keeps out of the daemon
-//  — account add/rotate/remove + list, settings, wipe, mac-approvals, shim
-//  install, unpair, and the pairing NDJSON ceremony. Those `--json` shapes are
-//  specified in crates/sigil/JSON.md.
+//  — rule/source authoring, settings, wipe, shim install, unpair, and the
+//  pairing NDJSON ceremony. Those `--json` shapes are specified in
+//  crates/sigil/JSON.md.
 //
 //  It still conforms to the full DaemonClient (its status/doctor/leases/history/
 //  pending/control verbs shell out too) so it remains a usable headless client on
@@ -15,7 +15,7 @@
 //
 //  `sigil <cmd> --json` outputs (stdout, one JSON value, no ANSI). The v4
 //  rework split configuration mutation into a second binary, `sigil-config`
-//  (task #42): account/settings/mac-approvals/wipe live there now, so the
+//  (task #42): rule/source authoring, settings, and wipe live there now, so the
 //  runtime/pairing verbs below run against `binaryURL` (`run`) and the config
 //  verbs run against `configBinaryURL` (`runConfig`) — see `resolveSigilConfig`.
 //
@@ -23,7 +23,7 @@
 //      { "daemon_up": bool, "socket": str, "shim": {"kind": "healthy|drift|not_installed|unknown",
 //        "path": str?, "issue": str?}, "op": {"found": bool, "path": str?},
 //        "accounts": int, "factor": {"kind":"phone|biometric|fail_closed","relay":str?},
-//        "relay_reachable": bool?, "relay_url": str?, "locked_down": bool }
+//        "relay_reachable": bool?, "relay_url": str? }
 //    sigil doctor --json   -> [ {"label": str, "ok": bool, "hint": str}, ... ]
 //    sigil-config export -> {version, sources:[{name,provider,account?,path?,
 //        keys?:[str]}], rules:[...]}   (the whole config; env sources carry KEY
@@ -31,7 +31,7 @@
 //    sigil-config source add <name> --provider env --json -> {"ok":bool,"lines":[str]}
 //    sigil-config source remove <name> --json -> {"ok":bool,"lines":[str]}
 //    sigil-config source env set <name> --stdin --json   (KEY=VALUE lines on
-//        stdin, sealed under the DEK) -> {"ok":bool,"lines":[str]}
+//        stdin, threshold-sealed) -> {"ok":bool,"lines":[str]}
 //    sigil-config source env unset <name> --key <KEY> --json -> {"ok":bool,"lines":[str]}
 //    sigil lease list --json -> [ {"grant_hex":str,"caller":str,"account":str,
 //        "scope":str,"granted_ms":int,"expires_ms":int}, ... ]
@@ -43,7 +43,6 @@
 //        (NEW verb; menubar needs to enumerate what the daemon is holding)
 //    sigil approve --local --id <id> [--lease] --json -> {"ok":bool,"lines":[str]}
 //    sigil deny --local --id <id> --json -> {"ok":bool,"lines":[str]}
-//    sigil lockdown [--clear] --json -> {"ok":bool,"lines":[str]}
 //    sigil pair list --json -> {"paired": {"name":str,"sas_words":[str],
 //        "relay_url":str,"paired_ms":int} | null }
 //    sigil pair --relay <url> --json  (streams NDJSON ceremony events on stdout:
@@ -54,8 +53,6 @@
 //        one line of our stdin and proceeds only if it reads "confirm" — see
 //        `confirmPairing(match:)`.
 //    sigil unpair --json -> {"ok":bool,"lines":[str]}
-//    sigil-config mac-approvals --enable|--phone-only --json -> {"ok":bool}
-//        (mints or drops the Mac Secure Enclave envelope. Pairs with the SE seam.)
 //    sigil shim install --json -> {"ok":bool,"lines":[str]}
 //    sigil-config settings get --json / sigil-config settings set --json <patch>
 //    sigil-config wipe --force --json -> {"ok":bool,"lines":[str]}
@@ -67,8 +64,8 @@ import Foundation
 struct CLIDaemonClient: DaemonClient {
     var binaryURL: URL
     /// `sigil-config`, the sibling binary the v4 rework split config mutation
-    /// into (task #42): account/settings/mac-approvals/wipe. Resolved next to
-    /// `binaryURL` since the two ship together.
+    /// into (task #42): rule/source authoring, settings, and wipe. Resolved next
+    /// to `binaryURL` since the two ship together.
     var configBinaryURL: URL
     /// The stdin pipe of the currently running `pair --json` ceremony (if any),
     /// so `confirmPairing` can reach it. A class because `CLIDaemonClient` is a
@@ -82,17 +79,15 @@ struct CLIDaemonClient: DaemonClient {
         self.configBinaryURL = CLIDaemonClient.resolveSigilConfig(besideSigil: sigil)
     }
 
-    /// Environment for every `sigil` invocation. `SIGIL_DEV_KEYSTORE=file` is
-    /// temporary: until the Secure Enclave DEK wrap is wired into the daemon
-    /// (task #24), the real keystore dies with "secure enclave path not yet
-    /// verified on hardware", so pairing and account mutations need the
-    /// dev file-backed keystore to run at all. `OP_SERVICE_ACCOUNT_TOKEN`, if
-    /// present in the app's own environment, already passes through via
-    /// ProcessInfo — nothing extra to do for it.
+    /// Environment for every `sigil` invocation. Deliberately bare: the file
+    /// keystore at `~/.sigil/keystore.json` is the default now, so nothing here
+    /// pins a backend. The old `SIGIL_DEV_KEYSTORE=file` pin is gone with the
+    /// mismatch it used to paper over, where an app-launched CLI and the daemon
+    /// could disagree about which store held the pairing and report a false
+    /// "re-pair needed".
     private static func env() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         env["NO_COLOR"] = "1"
-        env["SIGIL_DEV_KEYSTORE"] = "file"
         return env
     }
 
@@ -151,7 +146,7 @@ struct CLIDaemonClient: DaemonClient {
         try await execute(binaryURL, args, stdin: stdin)
     }
 
-    /// Run `sigil-config <args>` (account/settings/mac-approvals/wipe — the
+    /// Run `sigil-config <args>` (rule/source authoring, settings, wipe — the
     /// config-mutation verbs the v4 rework split into their own binary).
     private func runConfig(_ args: [String], stdin: Data? = nil) async throws -> Data {
         try await execute(configBinaryURL, args, stdin: stdin)
@@ -256,8 +251,8 @@ struct CLIDaemonClient: DaemonClient {
     }
 
     /// Seal every pair in one `source env set --stdin` call: the VALUES ride on
-    /// stdin as KEY=VALUE lines (never argv, which `ps` would leak), so one DEK
-    /// unwrap covers the whole batch. Core takes the VALUE verbatim after the
+    /// stdin as KEY=VALUE lines (never argv, which `ps` would leak), so the whole
+    /// batch is threshold-sealed together. Core takes the VALUE verbatim after the
     /// first `=`, so a value may itself contain `=`.
     func sealEnv(source: String, secrets: [EnvSecret]) async throws {
         let body = secrets.map { "\($0.key)=\($0.value)" }.joined(separator: "\n")
@@ -294,13 +289,6 @@ struct CLIDaemonClient: DaemonClient {
 
     func deny(id: String) async throws -> ControlResult {
         try controlResult(await run(["deny", "--local", "--id", id, "--json"]))
-    }
-
-    func lockdown(clear: Bool) async throws -> ControlResult {
-        var args = ["lockdown"]
-        if clear { args.append("--clear") }
-        args.append("--json")
-        return try controlResult(await run(args))
     }
 
     func pairedDevice() async throws -> PairedDevice? {
@@ -356,13 +344,123 @@ struct CLIDaemonClient: DaemonClient {
 
     func unpair() async throws -> ControlResult { try controlResult(await run(["unpair", "--json"])) }
 
-    func setMacApprovals(_ mode: MacApprovalsMode) async throws {
-        let flag = mode == .enabled ? "--enable" : "--phone-only"
-        _ = try await runConfig(["mac-approvals", flag, "--json"])
-    }
-
     func installShim() async throws -> ControlResult {
         try controlResult(await run(["shim", "install", "--json"]))
+    }
+
+    // MARK: daemon lifecycle (launchd agent + control socket)
+    //
+    // The service verbs print human lines (no `--json`), so the mutators here
+    // ignore stdout on success and let a non-zero exit surface as
+    // DaemonError.cli(stderr) through `execute`.
+
+    /// Connect-probe the control socket: listening = running. Resolves the socket
+    /// path the same way SocketDaemonClient does and reuses its connect helper, so
+    /// this stays a usable standalone client. Sends nothing.
+    func daemonRunning() async -> Bool {
+        daemonSocketReachable(path: SocketDaemonClient.defaultSocketPath())
+    }
+
+    /// `sigil version` -> "sigil <semver>", trimmed. nil if the binary would not run.
+    func daemonVersion() async -> String? {
+        guard let data = try? await run(["version"]),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    func daemonBinaryPath() -> String? {
+        FileManager.default.isExecutableFile(atPath: binaryURL.path) ? binaryURL.path : nil
+    }
+
+    /// The self-healing keystone: everything the old Start and Install/Repair
+    /// buttons pieced together (binary install, plist, bootstrap, shim), plus
+    /// wedge detection and healing, as one idempotent verb. Non-interactive by
+    /// design: pairing is only ever REPORTED as action needed (the ceremony is
+    /// driven by the Pairing pane), so this never hangs without a TTY.
+    func ensureUp() async throws { _ = try await run(["up"]) }
+    func stopDaemon() async throws { _ = try await run(["stop"]) }
+    func restartDaemon() async throws { _ = try await run(["restart"]) }
+
+    // MARK: SSH agent (served keys + managed ~/.ssh/config routing)
+    //
+    // The `sigil ssh …` verbs have no `--json` mode (they print human lines), so
+    // the mutators here ignore stdout on success and let a non-zero exit surface
+    // as DaemonError.cli(stderr) through `execute`. The reads decode the on-disk
+    // files directly, respecting SIGIL_HOME the same way the CLI does so the
+    // dev-loop and the shipped install both resolve to the right store.
+
+    /// `~/.sigil` (or `$SIGIL_HOME`), matching crate::paths::sigil_home.
+    private static func sigilHome() -> URL {
+        let env = ProcessInfo.processInfo.environment
+        if let home = env["SIGIL_HOME"], !home.isEmpty {
+            return URL(fileURLWithPath: home)
+        }
+        return URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".sigil")
+    }
+
+    /// The user's `~/.ssh/config`, or `$SIGIL_SSH_USER_CONFIG` (dev-loop / tests),
+    /// matching crate::sshconfig::user_ssh_config_path.
+    private static func userSshConfigURL() -> URL {
+        let env = ProcessInfo.processInfo.environment
+        if let path = env["SIGIL_SSH_USER_CONFIG"], !path.isEmpty {
+            return URL(fileURLWithPath: path)
+        }
+        return URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".ssh/config")
+    }
+
+    /// The literal marker `sigil ssh config --install` writes; its presence is the
+    /// routing-on signal (crates/sigil/src/sshconfig.rs BLOCK_START).
+    private static let sshManagedMarker = "# >>> sigil ssh (managed) >>>"
+
+    func sshKeys() async throws -> SshKeyStore {
+        let url = Self.sigilHome().appendingPathComponent("ssh-keys.json")
+        guard let data = try? Data(contentsOf: url) else {
+            return SshKeyStore()   // absent file = empty store
+        }
+        do { return try JSONDecoder().decode(SshKeyStore.self, from: data) }
+        catch { throw DaemonError.cli("could not parse ~/.sigil/ssh-keys.json: \(error)") }
+    }
+
+    func addSshOnePasswordKey(vault: String, item: String, field: String,
+                              comment: String, hosts: [String], publicKey: String) async throws {
+        var args = ["ssh", "add", "--vault", vault, "--item", item]
+        if !field.trimmed.isEmpty { args += ["--field", field] }
+        if !comment.trimmed.isEmpty { args += ["--comment", comment] }
+        for host in hosts { args += ["--host", host] }
+        args.append("--pubkey-stdin")
+        _ = try await run(args, stdin: Data(publicKey.utf8))
+    }
+
+    func addSshFileKey(path: String, comment: String, hosts: [String]) async throws {
+        var args = ["ssh", "add-file", "--path", path]
+        if !comment.trimmed.isEmpty { args += ["--comment", comment] }
+        for host in hosts { args += ["--host", host] }
+        _ = try await run(args)
+    }
+
+    func removeSshKey(item: String) async throws {
+        _ = try await run(["ssh", "remove", item])
+    }
+
+    func installSshRouting() async throws {
+        _ = try await run(["ssh", "config", "--install"])
+    }
+
+    func uninstallSshRouting() async throws {
+        _ = try await run(["ssh", "config", "--uninstall"])
+    }
+
+    func sshRoutingInstalled() async -> Bool {
+        guard let text = try? String(contentsOf: Self.userSshConfigURL(), encoding: .utf8) else {
+            return false
+        }
+        return text.contains(Self.sshManagedMarker)
+    }
+
+    func generatedSshConfig() async -> String? {
+        let url = Self.sigilHome().appendingPathComponent("ssh/config")
+        return try? String(contentsOf: url, encoding: .utf8)
     }
 
     func settings() async throws -> AppSettings {
@@ -422,7 +520,10 @@ struct StatusDTO: Decodable {
     let factor: FactorDTO
     let relay_reachable: Bool?
     let relay_url: String?
-    let locked_down: Bool
+    // Optional on purpose: a daemon built before keystore wrapping omits them
+    // entirely, and the app must still decode its status.
+    let keystore_sealed: Bool?
+    let keystore_provisioned: Bool?
 
     func model() -> StatusReport {
         let shimKind: ShimState.Kind = switch shim.kind {
@@ -438,7 +539,8 @@ struct StatusDTO: Decodable {
                             shim: ShimState(kind: shimKind, path: shim.path, issue: shim.issue),
                             opFound: op.found, opPath: op.path,
                             factor: f, relayReachable: relay_reachable, relayURL: relay_url,
-                            lockedDown: locked_down)
+                            keystoreSealed: keystore_sealed,
+                            keystoreProvisioned: keystore_provisioned)
     }
 }
 

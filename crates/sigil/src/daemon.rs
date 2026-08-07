@@ -6,26 +6,32 @@
 //! this process's memory. What is new is the gate in front of it. For each op
 //! request the daemon:
 //!
-//! 1. resolves the account for the requested vault (routing table in the store);
+//! 1. resolves the matching rule for the command (gate or allow);
 //! 2. measures the caller itself (peer pid, kernel-side ancestry) and derives a
-//!    lease grant key it fully controls;
-//! 3. if a live lease covers this grant key, uses its in-RAM token; otherwise
-//!    requires a fresh approval (coalescing identical in-flight requests);
-//! 4. on approval, unwraps the DEK, decrypts the one token, spawns `op` with the
-//!    token in the child env, splices child stdout onto the caller fd, then
-//!    zeroizes the DEK and token;
-//! 5. on deny, timeout, or lockdown, fails closed: the shim exits like real `op`.
+//!    lease grant key it fully controls, over that caller chain plus the matched
+//!    RULE (not the argv, and not the cwd);
+//! 3. if a live lease covers this grant key, runs without a fresh prompt, so one
+//!    approval covers any command that rule matches for that caller until the TTL
+//!    ends; otherwise requires a fresh approval (coalescing only in-flight
+//!    requests that are identical in argv and cwd, so one readout never settles a
+//!    different command);
+//! 4. on approval, spawns the command on the caller's descriptors. `op` brings
+//!    its own auth (Sigil injects no credential); an inline-`env` rule opens its
+//!    threshold-sealed values with the phone's partial and injects them, then
+//!    zeroizes;
+//! 5. on deny or timeout, fails closed: the shim exits like real `op`.
 //!
-//! Control commands (local approve/deny, lockdown, lease list/revoke) arrive on
+//! Control commands (local approve/deny, lease list/revoke) arrive on
 //! the same socket and mutate this shared state.
 
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -44,7 +50,7 @@ use crate::local::{self, Frame, Reply};
 use crate::paths::ShimStatus;
 use crate::provider::{ProviderRegistry, ProviderRun};
 use crate::remote::RemoteApprover;
-use crate::secrets::{self, AccountStore};
+use crate::secrets::Token;
 use crate::service;
 use crate::sshagent::{self, ServedIdentity, SignRequest, SshBackend, SshSigner};
 
@@ -74,24 +80,56 @@ const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// `Arc`. Because a decision holds its own `Arc` for its full duration, a reload
 /// that lands mid-decision is invisible to it (no torn read): the decision sees
 /// either the entire old config or, next time, the entire new one, never a blend.
-struct ConfigCell(std::sync::RwLock<Arc<Config>>);
+struct ConfigCell(std::sync::RwLock<Arc<ConfigSnapshot>>);
+
+/// One config plus the generation it was stored under.
+///
+/// The generation exists because a lease outlives the decision that created it.
+/// `fulfill` snapshots the config, then blocks on the phone for as long as the
+/// human takes; a config edit landing during that wait runs invalidation BEFORE
+/// the lease exists, so the grant afterwards would file a window under a rule
+/// that has since been rewritten. Stamping the generation into the lease binding
+/// makes that impossible by construction: a lease granted against generation N
+/// simply does not match lookups after a reload, whatever the rule now says.
+///
+/// It travels WITH the config rather than beside it so a decision cannot read
+/// one and then the other across a swap.
+struct ConfigSnapshot {
+    config: Config,
+    generation: u64,
+}
+
+impl std::ops::Deref for ConfigSnapshot {
+    type Target = Config;
+    fn deref(&self) -> &Config {
+        &self.config
+    }
+}
 
 impl ConfigCell {
     fn new(cfg: Config) -> Self {
-        Self(std::sync::RwLock::new(Arc::new(cfg)))
+        Self(std::sync::RwLock::new(Arc::new(ConfigSnapshot {
+            config: cfg,
+            generation: 0,
+        })))
     }
 
     /// A consistent snapshot for one gating decision. Clone-and-release, so a
     /// concurrent [`store`](Self::store) can never change the config under a
     /// `resolve` in progress.
-    fn snapshot(&self) -> Arc<Config> {
+    fn snapshot(&self) -> Arc<ConfigSnapshot> {
         self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Atomically replace the live config. The brief write lock means every
-    /// reader observes either the whole old `Arc` or the whole new one.
+    /// Atomically replace the live config, bumping the generation. The brief
+    /// write lock means every reader observes either the whole old `Arc` or the
+    /// whole new one.
     fn store(&self, cfg: Config) {
-        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(cfg);
+        let mut w = self.0.write().unwrap_or_else(|e| e.into_inner());
+        *w = Arc::new(ConfigSnapshot {
+            config: cfg,
+            generation: w.generation.saturating_add(1),
+        });
     }
 }
 
@@ -101,13 +139,156 @@ impl From<Config> for ConfigCell {
     }
 }
 
+/// A hot-swappable holder for the built SSH signers, the same shape and rationale
+/// as [`ConfigCell`], so `sigil ssh add|remove` takes effect without a daemon
+/// restart: the watcher rebuilds the signers from `~/.sigil/ssh-keys.json` on a
+/// change. A signing request takes a *snapshot* (clone the `Arc`, release the
+/// lock, then route and sign against that one set); a reload takes a *store*
+/// (swap in a freshly built set). Because a request holds its own `Arc` for its
+/// whole, possibly long, phone-approval duration, a reload mid-request is
+/// invisible to it: it serves the entire old set or, next time, the entire new
+/// one, never a blend.
+struct SshSignersCell(std::sync::RwLock<Arc<Vec<Box<dyn SshSigner>>>>);
+
+impl SshSignersCell {
+    fn new(signers: Vec<Box<dyn SshSigner>>) -> Self {
+        Self(std::sync::RwLock::new(Arc::new(signers)))
+    }
+
+    /// A consistent snapshot for one signing request.
+    fn snapshot(&self) -> Arc<Vec<Box<dyn SshSigner>>> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Atomically replace the live signer set.
+    fn store(&self, signers: Vec<Box<dyn SshSigner>>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(signers);
+    }
+}
+
+/// A hot-swappable keystore, same shape and rationale as [`ConfigCell`].
+///
+/// A wrapped daemon starts with a store that can read nothing (the file is
+/// ciphertext) and swaps in the opened material when the app provisions it. A
+/// request takes a snapshot (clone the `Arc`, release the lock) so a provision
+/// landing mid-request cannot change the store underneath it.
+struct KeystoreCell(std::sync::RwLock<Arc<dyn Keystore>>);
+
+impl KeystoreCell {
+    fn new(ks: Arc<dyn Keystore>) -> Self {
+        Self(std::sync::RwLock::new(ks))
+    }
+
+    fn snapshot(&self) -> Arc<dyn Keystore> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Swap in the opened store. The previous one drops here, which wipes it if
+    /// it held material.
+    fn store(&self, ks: Arc<dyn Keystore>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = ks;
+    }
+}
+
+/// One outstanding de-adoption request, and the machinery to wake the app's
+/// subscription when one appears.
+///
+/// Deliberately tiny: a de-adoption is a rare, human-initiated ceremony, so this
+/// holds at most a handful of nonces and nothing secret.
+#[derive(Default)]
+struct UnwrapRequests {
+    inner: Mutex<UnwrapInner>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct UnwrapInner {
+    /// Nonces the app has not answered yet.
+    open: Vec<String>,
+    /// Bumped on every change so a subscriber can block until something moves.
+    version: u64,
+    /// The last outcome, for the CLI that asked.
+    last: Option<(String, bool, String)>,
+}
+
+impl UnwrapRequests {
+    /// Ask the app to unwrap. Returns the nonce the answer must quote.
+    fn request(&self) -> String {
+        let nonce = uuid::Uuid::now_v7().to_string();
+        let mut inner = self.inner.lock().expect("unwrap requests poisoned");
+        inner.open.push(nonce.clone());
+        inner.version += 1;
+        self.changed.notify_all();
+        nonce
+    }
+
+    fn version(&self) -> u64 {
+        self.inner.lock().expect("unwrap requests poisoned").version
+    }
+
+    /// The events a subscriber should see: one per outstanding request.
+    fn pending_events(&self) -> Vec<serde_json::Value> {
+        let inner = self.inner.lock().expect("unwrap requests poisoned");
+        inner
+            .open
+            .iter()
+            .map(|n| serde_json::json!({"kind": "unwrap", "nonce": n}))
+            .collect()
+    }
+
+    /// Record the app's answer. `false` when no such request is outstanding,
+    /// which is how a replayed or invented nonce is refused.
+    fn resolve(&self, nonce: &str, ok: bool, reason: &str) -> bool {
+        let mut inner = self.inner.lock().expect("unwrap requests poisoned");
+        let Some(pos) = inner.open.iter().position(|n| n == nonce) else {
+            return false;
+        };
+        inner.open.remove(pos);
+        inner.last = Some((nonce.to_string(), ok, reason.to_string()));
+        inner.version += 1;
+        self.changed.notify_all();
+        true
+    }
+
+    /// Wait for the answer to `nonce`, up to `timeout`. `None` on timeout.
+    fn wait_for(&self, nonce: &str, timeout: Duration) -> Option<(bool, String)> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut inner = self.inner.lock().expect("unwrap requests poisoned");
+        loop {
+            if let Some((n, ok, reason)) = &inner.last {
+                if n == nonce {
+                    return Some((*ok, reason.clone()));
+                }
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let (guard, _) = self
+                .changed
+                .wait_timeout(inner, left)
+                .expect("unwrap requests poisoned");
+            inner = guard;
+        }
+    }
+
+    fn wait_for_change(&self, version: u64, timeout: Duration) {
+        let inner = self.inner.lock().expect("unwrap requests poisoned");
+        if inner.version != version {
+            return;
+        }
+        let _ = self.changed.wait_timeout(inner, timeout);
+    }
+}
+
 /// Shared daemon state, cloned (via `Arc`) into every connection worker.
 pub struct Core {
-    keystore: Arc<dyn Keystore>,
-    accounts: Mutex<AccountStore>,
-    /// The v2 (threshold) account catalogue, loaded once at arm time, exactly as
-    /// [`accounts`](Self::accounts) is. A record here is opened by the two-party
-    /// combine, never a DEK; its presence (by version) chooses the decrypt path.
+    /// The keystore, swappable because a wrapped daemon starts unable to read
+    /// anything and gains its material when the app provisions.
+    keystore: KeystoreCell,
+    /// The store of threshold-sealed secrets (inline-`env` source values), loaded
+    /// once at arm time. A record here is opened by the two-party combine (the
+    /// phone's partial `Z_F` plus the Mac share `m`), never a key at rest.
     threshold: Mutex<crate::threshold::ThresholdStore>,
     leases: LeaseStore,
     gate: ApprovalGate,
@@ -120,7 +301,6 @@ pub struct Core {
     /// approvers the ToDaemon owner loops drive; read-only here. A single-device
     /// daemon holds exactly one, behaving as before.
     remote: Vec<Arc<RemoteApprover>>,
-    lockdown: AtomicBool,
     proc_table: Box<dyn ProcessTable + Send + Sync>,
     /// The provider registry: a command's config names a provider by id, and the
     /// daemon dispatches the run to it. 1Password and env-file ship by default;
@@ -136,15 +316,30 @@ pub struct Core {
     /// The approving factor resolved at arm time (residual #1 mitigation).
     factor: Factor,
     /// The pluggable SSH key sources this daemon serves on the agent socket,
-    /// resolved from `~/.sigil/ssh-keys.json` at arm time. Empty means the agent
-    /// advertises no keys (and `ssh-add -l` shows none). Sigil is the phone-gate
-    /// regardless of which signer holds the key.
-    ssh_signers: Vec<Box<dyn SshSigner>>,
+    /// resolved from `~/.sigil/ssh-keys.json` and hot-reloaded on change (so
+    /// `sigil ssh add|remove` needs no restart). Empty means the agent advertises
+    /// no keys (and `ssh-add -l` shows none). Sigil is the phone-gate regardless
+    /// of which signer holds the key.
+    ssh_signers: SshSignersCell,
     /// Audit logging: `Some(retention_days)` appends a metadata-only line per
     /// decision to `history.jsonl` (pruned to the window); `None` disables it.
     /// The real daemon enables it; tests leave it off so they never write to a
     /// developer's `~/.sigil`.
     audit: Option<u32>,
+    /// What the keystore file was at startup: plaintext, Secure-Enclave wrapped,
+    /// or a downgrade (plaintext where wrapped was promised).
+    ///
+    /// Read ONCE, before the control socket listens, and never re-read. A file
+    /// swapped underneath a running daemon must not become authoritative, and
+    /// every later answer (status, doctor, a provision's digest check) has to come
+    /// from the same snapshot this daemon armed against.
+    seal: crate::keystore_seal::SealState,
+    /// Set once the Sigil app has handed over material matching [`Self::seal`]'s
+    /// expected digest. A wrapped daemon serves nothing until this is true, and a
+    /// plaintext daemon ignores it entirely.
+    provisioned: AtomicBool,
+    /// Outstanding de-adoption requests, waiting for the app to answer.
+    unwrap_requests: UnwrapRequests,
 }
 
 /// A persisted daemon<->phone pairing: everything needed to reach the phone as
@@ -212,7 +407,7 @@ fn load_remote_pairing(ks: &Arc<dyn Keystore>) -> Vec<RemotePairingConfig> {
 fn build_gate(
     factor: Factor,
     remote: Vec<RemotePairingConfig>,
-    keystore: &Arc<dyn Keystore>,
+    _keystore: &Arc<dyn Keystore>,
     pending: &Arc<PendingRegistry>,
 ) -> anyhow::Result<(ApprovalGate, Vec<Arc<RemoteApprover>>, Vec<DirectAcceptor>)> {
     let mut acceptors: Vec<DirectAcceptor> = Vec::new();
@@ -295,14 +490,11 @@ fn build_gate(
         }
         // The biometric unwrap is the only gate; an unresolved decision fails
         // closed (no control socket, no dev switch).
-        Factor::Biometric => (
-            Box::new(LocalApprover::new(keystore.clone(), pending.clone())),
-            Vec::new(),
-        ),
+        Factor::Biometric => (Box::new(LocalApprover::new(pending.clone())), Vec::new()),
         // The one place the forgeable dev paths are wired.
         Factor::DevInsecure => (
             Box::new(
-                LocalApprover::new(keystore.clone(), pending.clone())
+                LocalApprover::new(pending.clone())
                     .with_dev(DevMode::from_env())
                     .with_control_socket(true),
             ),
@@ -335,9 +527,23 @@ impl Core {
         dev_insecure: bool,
     ) -> anyhow::Result<(Self, Vec<Arc<RemoteApprover>>, Vec<DirectAcceptor>)> {
         let keystore = keystore::for_host();
-        let accounts = AccountStore::load().context("loading account store")?;
-        // The v2 threshold accounts (if any). A missing/unreadable store is
-        // logged and treated as empty so the daemon still arms on its v1 accounts.
+        // If an older build left this machine's pairing in the login keychain,
+        // say so once at startup. Nothing is moved automatically (a keychain read
+        // can raise a system prompt, and a daemon that blocks on a dialog is not a
+        // daemon), but silence here would read as "the pairing vanished".
+        if let Some(note) = keystore::legacy_keychain_notice(keystore.as_ref()) {
+            eprintln!("{note}");
+        }
+        // Classify the keystore file ONCE, here, before anything listens. A read
+        // this daemon does later could see a file swapped underneath it; this one
+        // cannot, and it is the snapshot every later answer refers to.
+        let seal = read_seal_state();
+        if let Some(why) = seal.explain(false) {
+            eprintln!("sigil daemon: {why}");
+        }
+        // The threshold-sealed secrets (inline-`env` source values). A
+        // missing/unreadable store is logged and treated as empty so the daemon
+        // still arms (env-backed rules then refuse until their values are set).
         let threshold = match crate::threshold::ThresholdStore::load() {
             Ok(s) => s,
             Err(e) => {
@@ -358,10 +564,10 @@ impl Core {
             build_gate(factor, remote, &keystore, &pending)?;
 
         // Load the served SSH identities from ~/.sigil/ssh-keys.json and build a
-        // signer per source (op-fetch + file-based). A bad config is logged and
+        // signer per source (file-based today). A bad config is logged and
         // treated as "no keys" so the daemon still arms.
         let ssh_signers = match sshagent::SshKeyConfig::load() {
-            Ok(cfg) => build_ssh_signers(&cfg, None),
+            Ok(cfg) => build_ssh_signers(&cfg),
             Err(e) => {
                 eprintln!("sigil daemon: ignoring an unreadable ssh-keys config: {e}");
                 Vec::new()
@@ -380,40 +586,100 @@ impl Core {
         };
 
         let core = Self {
-            keystore,
-            accounts: Mutex::new(accounts),
+            keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(threshold),
             leases: LeaseStore::new(),
             gate,
             pending,
             remote: remote_listeners.clone(),
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(SysProcessTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
             lease_ttl: DEFAULT_LEASE_TTL,
             factor,
-            ssh_signers,
+            ssh_signers: SshSignersCell::new(ssh_signers),
             audit: Some(
                 crate::settings::Settings::load()
                     .map(|s| s.retention_days)
                     .unwrap_or(30),
             ),
+            seal,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
         };
         Ok((core, remote_listeners, direct_acceptors))
     }
 
     /// The full status report, the daemon's answer to `Frame::Status`. It is the
-    /// source of truth: the host-side facts from [`crate::report`] plus the
-    /// daemon's own runtime state (lockdown + live lease count).
+    /// source of truth for the host-side facts from [`crate::report`].
     fn status_report(&self) -> crate::json::StatusJson {
-        crate::report::status(
-            true,
-            crate::report::Runtime {
-                locked_down: self.lockdown.load(Ordering::SeqCst),
-                leases: self.leases.active(),
-            },
-        )
+        let mut s = crate::report::status(true);
+        // Only the daemon can answer these: it classified the keystore once at
+        // startup and knows whether the app has provisioned it. Anyone else would
+        // be guessing at a file they may not be allowed to read.
+        let provisioned = self.provisioned.load(Ordering::SeqCst);
+        s.keystore_sealed = Some(matches!(
+            self.seal,
+            crate::keystore_seal::SealState::Sealed { .. }
+        ));
+        s.keystore_provisioned = Some(provisioned);
+        s
+    }
+
+    /// The doctor checks, plus the one only the daemon can answer: whether the
+    /// sealed store it is serving from still matches the one on disk.
+    ///
+    /// This exists because the stale-armed-store bug was invisible from outside.
+    /// `sigil status` reads `threshold.db` fresh and said "1 sealed secret(s)"
+    /// while the running daemon held none, and the only symptom downstream was a
+    /// gated command quietly running with nothing injected. With
+    /// [`Self::reload_threshold`] wired into the watcher this state should not
+    /// occur, which is exactly what makes it a doctor check: it is the regression
+    /// alarm, not a routine condition.
+    fn doctor_report(&self) -> Vec<crate::json::CheckJson> {
+        let mut checks = crate::report::doctor(true);
+        let (ok, hint) = self.sealed_store_drift();
+        checks.push(crate::json::CheckJson {
+            label: "sealed store matches the armed daemon".to_string(),
+            ok,
+            hint,
+        });
+        checks
+    }
+
+    /// Compare the armed sealed records against `threshold.db`. Returns the check
+    /// verdict and its hint. An unreadable store is a failure, not a pass: the
+    /// daemon cannot tell whether it is serving stale records.
+    fn sealed_store_drift(&self) -> (bool, String) {
+        let armed = self.armed_sealed_fingerprint();
+        let disk = match crate::threshold::ThresholdStore::load() {
+            Ok(s) => s,
+            Err(e) => return (false, format!("the sealed store could not be read: {e}")),
+        };
+        let mut on_disk: Vec<(String, String)> = disk
+            .secrets
+            .iter()
+            .map(|r| (r.account_id.clone(), r.ephemeral_pub.clone()))
+            .collect();
+        on_disk.sort();
+        if armed == on_disk {
+            return (true, format!("{} sealed secret(s)", armed.len()));
+        }
+        let hint = if armed.len() != on_disk.len() {
+            format!(
+                "the daemon armed {} sealed secret(s); the store on disk holds {}. \
+                 Gated runs may inject nothing. Resync: sigil restart",
+                armed.len(),
+                on_disk.len()
+            )
+        } else {
+            format!(
+                "the daemon armed {} sealed secret(s) but they were re-sealed since. \
+                 Resync: sigil restart",
+                armed.len()
+            )
+        };
+        (false, hint)
     }
 
     /// Reload the rule/source config from disk into the hot cell (#59).
@@ -427,11 +693,114 @@ impl Core {
     fn reload_config(&self) -> Result<(), String> {
         match Config::load() {
             Ok(cfg) => {
+                let old = self.config.snapshot();
                 self.config.store(cfg);
+                self.invalidate_leases_for_config_change(&old, &self.config.snapshot());
                 Ok(())
             }
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    /// Kill every lease whose covering rule did not survive the reload unchanged.
+    ///
+    /// A lease names its rule by a *string*, and that string points at mutable
+    /// config. Without this, rewriting a rule while its window is live transfers
+    /// the window to the new definition: a rule renamed to match `curl` inherits
+    /// an approval the human gave for `op`, and with a sealed `env` rule that is
+    /// the cached credential injected into a command nobody approved. So a lease
+    /// survives a reload only if its rule is still there and still *identical*.
+    ///
+    /// Three things invalidate:
+    ///
+    /// 1. the rule is gone;
+    /// 2. the rule differs in any field (match, mode, source, lease policy,
+    ///    timeout) by a whole-struct comparison, not a name check;
+    /// 3. the SOURCE the rule injects from differs in any field, since the lease
+    ///    may be holding that source's values.
+    ///
+    /// Fails safe by construction: anything it cannot pair up is treated as
+    /// changed. A re-seal that leaves config.json byte-identical is caught
+    /// elsewhere, by the lease's source-material binding.
+    fn invalidate_leases_for_config_change(&self, old: &Config, new: &Config) {
+        if self.leases.active() == 0 {
+            return;
+        }
+        for rule in &old.rules {
+            let survived = new.rules.iter().any(|r| r == rule)
+                && source_for(old, rule) == source_for(new, rule);
+            if survived {
+                continue;
+            }
+            let killed = self.leases.revoke_scope(&rule.name);
+            if killed > 0 {
+                eprintln!(
+                    "sigil daemon: config changed under rule '{}'; revoked {killed} lease(s) \
+                     (any cached values zeroized)",
+                    rule.name
+                );
+            }
+        }
+    }
+
+    /// Rebuild the SSH signers from `~/.sigil/ssh-keys.json` and swap them in, so
+    /// `sigil ssh add|remove` is served without a restart. Fail-closed like
+    /// [`Self::reload_config`]: on an unreadable/malformed store it returns `Err`
+    /// and the last-good signer set stays live (the watcher logs and keeps
+    /// serving), never dropping to no keys on a transient half-written file.
+    fn reload_ssh_signers(&self) -> Result<(), String> {
+        match sshagent::SshKeyConfig::load() {
+            Ok(cfg) => {
+                self.ssh_signers.store(build_ssh_signers(&cfg));
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Reload the threshold-sealed store from disk into the hot cell.
+    ///
+    /// Without this the daemon read `threshold.db` exactly once, at arm time, and
+    /// never again: sealing a value into an inline `env` source while the daemon
+    /// was already up left the armed store empty, every gated run took the
+    /// degrade-to-plain-gate path in [`fulfill`], and nothing was injected until a
+    /// restart. config.json and ssh-keys.json already hot-reloaded; this closes
+    /// the third file.
+    ///
+    /// Fail-closed on the same terms as [`Self::reload_config`]: the swap is
+    /// reached ONLY on the `Ok` arm, so a malformed or half-written store leaves
+    /// the last-good records in force rather than silently dropping injection.
+    /// Returns the number of records now armed, for the caller's log line.
+    ///
+    /// No lease invalidation is needed here. A lease that caches values binds to
+    /// the ephemeral point `E` of the exact record they came from (see
+    /// [`lease::LeaseBinding::cached`]), which is fresh on every re-seal, so a
+    /// reload that replaces a record makes the lease lookup miss and the run
+    /// re-approves; a reload that drops one degrades the rule to a plain gate.
+    fn reload_threshold(&self) -> Result<usize, String> {
+        match crate::threshold::ThresholdStore::load() {
+            Ok(store) => {
+                let n = store.secrets.len();
+                *self.threshold.lock().expect("threshold store poisoned") = store;
+                Ok(n)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// The armed sealed records as `(id, ephemeral_pub)` pairs, sorted. The
+    /// ephemeral point is public and is what makes a re-seal visible: it is fresh
+    /// on every seal, so two stores with the same ids but different points are
+    /// genuinely different stores. Used only to compare against disk.
+    fn armed_sealed_fingerprint(&self) -> Vec<(String, String)> {
+        let store = self.threshold.lock().expect("threshold store poisoned");
+        let mut v: Vec<(String, String)> = store
+            .secrets
+            .iter()
+            .map(|r| (r.account_id.clone(), r.ephemeral_pub.clone()))
+            .collect();
+        v.sort();
+        v
     }
 
     /// The audit `via` label for a fresh grant under the resolved factor.
@@ -484,29 +853,13 @@ fn ssh_sign_scope(label: &str, data_fingerprint: &str) -> String {
     format!("ssh-sign {label} {data_fingerprint}")
 }
 
-/// The vault segment of an `op://<vault>/<item>/<field>` reference, for account
-/// routing on the SSH sign path.
-fn vault_of_ref(reference: &str) -> Option<String> {
-    reference
-        .strip_prefix("op://")?
-        .split('/')
-        .find(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
-/// Build one SSH signer per configured key source: the op-fetch signer for
-/// 1Password-backed keys, and the file signer for local key files. Either may be
-/// empty; together they form the aggregate the agent serves. `op_path` overrides
-/// `op` discovery for the op signer (tests point it at a fake `op`).
-fn build_ssh_signers(
-    cfg: &sshagent::SshKeyConfig,
-    op_path: Option<std::path::PathBuf>,
-) -> Vec<Box<dyn SshSigner>> {
+/// Build one SSH signer per in-source key source. The file signer (local key
+/// files) is the only in-source signer; the 1Password case is a plain gated
+/// command now, not an SSH signer. The threshold-stored source is NOT an
+/// [`SshSigner`] (its sign needs the phone's partial and the Mac share); it is
+/// served and signed inline in [`Core`] via the threshold store.
+fn build_ssh_signers(cfg: &sshagent::SshKeyConfig) -> Vec<Box<dyn SshSigner>> {
     let mut signers: Vec<Box<dyn SshSigner>> = Vec::new();
-    let op_ids = cfg.served_identities();
-    if !op_ids.is_empty() {
-        signers.push(Box::new(sshagent::OpSshSigner::new(op_ids, op_path)));
-    }
     let file_keys = cfg.file_keys();
     if !file_keys.is_empty() {
         signers.push(Box::new(sshagent::FileSshSigner::new(file_keys)));
@@ -514,46 +867,85 @@ fn build_ssh_signers(
     signers
 }
 
+/// The threshold-stored SSH identities configured on disk, each with the id its
+/// sealed private key lives under in the threshold store. Read fresh from
+/// `~/.sigil/ssh-keys.json` (a bad/absent config yields none) so `sigil ssh
+/// add-stored | remove` is reflected without a daemon restart, mirroring the file
+/// signer's hot reload. Holds no key material.
+fn stored_ssh_identities() -> Vec<(ServedIdentity, String)> {
+    sshagent::SshKeyConfig::load()
+        .map(|cfg| cfg.stored_keys())
+        .unwrap_or_default()
+}
+
 impl SshBackend for Core {
     fn identities(&self) -> Vec<ServedIdentity> {
-        self.ssh_signers
+        let mut ids: Vec<ServedIdentity> = self
+            .ssh_signers
+            .snapshot()
             .iter()
             .flat_map(|s| s.identities())
-            .collect()
+            .collect();
+        // Advertise the threshold-stored keys alongside the in-source signers.
+        ids.extend(stored_ssh_identities().into_iter().map(|(id, _)| id));
+        ids
     }
 
-    /// Gate one SSH signature on the phone and, on approval, delegate to the
-    /// signer that owns the key. Sigil is the phone-gate regardless of key source:
-    /// the gate here is the same approval path as an `op` secret, with two
+    /// Gate one SSH signature on the phone and, on approval, produce it from the
+    /// source that owns the key. Sigil is the phone-gate regardless of key source:
+    /// the gate here is the same approval path as an injected secret, with two
     /// differences the security review must weigh (see `sshagent` module docs):
-    /// every signature is gated (no lease short-circuit in v1), and for the
-    /// op-fetch signer the private key is briefly in daemon RAM for the one
-    /// signature. A file signer sources the key from a local file instead; either
-    /// way the key never reaches the SSH client.
+    /// every signature is gated (no lease short-circuit), and the private key is
+    /// briefly in daemon RAM for the one signature. Two sources are handled:
+    ///
+    /// * **file** — an [`SshSigner`] reads the key from a local file, signs, wipes.
+    /// * **threshold-stored** — the sealed private key is opened per-signature by
+    ///   combining the phone's returned partial `Z_F` with the Mac share `m` (the
+    ///   same two-party combine as an inline env secret), decoded, signed, and
+    ///   zeroized. This request carries a [`ThresholdChallenge`] so the phone
+    ///   produces `Z_F`; an approve with no partial (e.g. a local factor) fails
+    ///   closed rather than emitting a signature.
+    ///
+    /// Either way the key never reaches the SSH client.
     fn approve_and_sign(&self, req: SignRequest<'_>) -> Option<Vec<u8>> {
-        if self.lockdown.load(Ordering::SeqCst) {
-            eprintln!("sigil daemon: ssh sign refused; sigil is locked down");
+        // Same gate as the command path: a sealed keystore this daemon has not
+        // been handed material for cannot sign anything, and must not pretend to.
+        let provisioned = self.provisioned.load(Ordering::SeqCst);
+        if self.seal.blocks_serving(provisioned) {
+            if let Some(why) = self.seal.explain(provisioned) {
+                eprintln!("sigil daemon: ssh sign refused; {why}");
+            }
+            return None;
+        }
+        // Route the request to the source that owns this identity. Hold the file
+        // signer snapshot for the whole request so a mid-approval reload cannot
+        // swap the set under us. A stored key resolves to its sealed record, held
+        // for both the challenge and the per-signature decrypt.
+        let signers = self.ssh_signers.snapshot();
+        let file_signer = signers.iter().find(|s| s.owns(&req.id.key_blob));
+        let sealed = self.stored_record_for(&req.id.key_blob);
+        if file_signer.is_none() && sealed.is_none() {
+            // A sign request for a key we do not serve (or whose sealed record is
+            // missing): fail closed.
             return None;
         }
 
-        // Route the request to the signer that owns this identity.
-        let signer = self.ssh_signers.iter().find(|s| s.owns(&req.id.key_blob))?;
-
-        // Route the account only when the signer needs a stored credential (the
-        // op-fetch signer); clone what we need before the (possibly long) approval
-        // wait so the store lock is released. A file signer needs no account.
-        let account = if signer.needs_account() {
-            let vault = vault_of_ref(&req.id.key_ref);
-            let store = self.accounts.lock().expect("accounts poisoned");
-            let acct = store.route(vault.as_deref()).ok()?;
-            Some((acct.label.clone(), acct.ciphertext().ok()?))
-        } else {
-            None
-        };
-        let account_label = account.as_ref().map(|(l, _)| l.clone()).unwrap_or_default();
+        // No account credential concept: a source opens its own key. Sigil is only
+        // the phone-gate here.
+        let account_label = String::new();
 
         // The approval screen shows a hash of the data to sign, never raw bytes.
         let data_fingerprint = sshagent::sha256_fingerprint(req.data);
+        // The same one-line request log the op path gets (`log_request`), so a
+        // sign request is always visible in the daemon log the moment it
+        // arrives, before the phone answers. Metadata only: key label, derived
+        // host, and the data hash the approver will see; never key material.
+        log_ssh_sign_request(
+            &req.id.label,
+            &req.host.host,
+            &data_fingerprint,
+            req.caller_pid,
+        );
         // The data fingerprint is folded into the scope so the gate's grant-key
         // coalescing can never let two DIFFERENT challenges share one approval: a
         // signature is a distinct auth event over distinct data, and the human
@@ -561,13 +953,26 @@ impl SshBackend for Core {
         // deterministic, so the same signature) may coalesce.
         let scope = ssh_sign_scope(&req.id.label, &data_fingerprint);
         let caller = lease::walk_ancestry(self.proc_table.as_ref(), req.caller_pid.unwrap_or(-1));
-        let gk = lease::grant_key(&caller, "", &scope);
+        let gk = lease::grant_key(&caller, lease::ScopeKind::SshSignature, "", &scope);
 
         let challenge = SshChallenge {
             key_label: req.id.label.clone(),
             host: req.host.host.clone(),
+            binding: req.host.binding,
             fingerprint: data_fingerprint,
         };
+        // A stored key carries its threshold challenge to the phone (the base point
+        // E it key-agrees against), exactly like an inline env secret; a file key
+        // sources its own material and carries none.
+        let threshold = sealed
+            .as_ref()
+            .map(|record| sigil_proto::ThresholdChallenge {
+                account_id: record.account_id.clone(),
+                label: req.id.label.clone(),
+                ephemeral_pub: record.ephemeral_pub.clone(),
+                se_key_id: record.se_key_id.clone(),
+                ecdh_algo: crate::threshold::ecdh_algo_tag(record.ecdh_algo).to_string(),
+            });
         let ctx = ApprovalContext {
             id: uuid::Uuid::now_v7().to_string(),
             account: account_label.clone(),
@@ -578,11 +983,10 @@ impl SshBackend for Core {
             command: vec!["ssh-sign".to_string(), req.id.label.clone()],
             secret_refs: Vec::new(),
             kind: sigil_proto::RequestKind::SshSignature,
-            // Every signature is gated afresh (no lease short-circuit in v1).
+            // Every signature is gated afresh (no lease short-circuit).
             lease: LeasePolicy::RunOnce,
             ssh: Some(challenge),
-            // SSH keys are v1-only for now (op-fetch / file signers).
-            threshold: None,
+            threshold,
         };
 
         let outcome = self.gate.decide(gk, &ctx);
@@ -590,29 +994,79 @@ impl SshBackend for Core {
             return None;
         }
 
-        // For a signer that needs an account, unwrap the DEK (phone-delivered on
-        // approve, else from the keystore), decrypt the one token, and drop the
-        // DEK at once. The credential is handed to the signer, which holds the key
-        // material for the one signature (op-fetch) or reads it from a file.
-        let credential = match &account {
-            Some((label, ciphertext)) => {
-                let dek = match outcome.dek {
-                    Some(dek) => dek,
-                    None => self
-                        .keystore
-                        .unwrap_dek(&format!("Sign with {} for {label}", req.id.label))
-                        .ok()?,
-                };
-                let token = secrets::decrypt_token(&dek, ciphertext).ok()?;
-                drop(dek);
-                Some(token)
-            }
-            None => None,
-        };
+        // The gate approved. A stored key is opened per-signature via the two-party
+        // combine (phone partial Z_F + Mac share m), decoded, signed, and wiped; a
+        // file key is signed from its local file.
+        if let Some(record) = &sealed {
+            return self.sign_stored(record, req.data, &outcome);
+        }
+        // A file signer sources its own key and holds it only for the one signature.
+        file_signer?.sign(req.id, req.data)
+    }
+}
 
-        let sig = signer.sign(req.id, req.data, credential.as_ref());
-        drop(credential); // zeroized here (Token is Zeroizing)
-        sig
+impl Core {
+    /// The sealed threshold record for the stored SSH key advertising `key_blob`,
+    /// or `None` if no stored entry serves it (then it is a file key or unknown).
+    /// Reads `~/.sigil/ssh-keys.json` for the entry and `~/.sigil/threshold.db` for
+    /// its sealed record; a missing store or record yields `None` (fail closed).
+    fn stored_record_for(
+        &self,
+        key_blob: &[u8],
+    ) -> Option<sigil_proto::threshold::ThresholdRecord> {
+        let account_id = stored_ssh_identities()
+            .into_iter()
+            .find(|(id, _)| id.key_blob == key_blob)
+            .map(|(_, account_id)| account_id)?;
+        let store = crate::threshold::ThresholdStore::load().ok()?;
+        store.get(&account_id).cloned()
+    }
+
+    /// Open a threshold-stored SSH private key with the phone's partial `Z_F` and
+    /// the Mac share `m`, sign `data`, and zeroize. `outcome` is the approval that
+    /// carried `Z_F`. The two-party combine and per-request `K` handling are the
+    /// reviewed [`crate::threshold::decrypt`]; the opened key is the OpenSSH PEM,
+    /// decoded and signed by [`sshagent::sign_openssh_ed25519`] in a
+    /// zeroize-on-drop buffer, matching the file signer's custody. Fails closed on
+    /// any missing input (no partial, no Mac share, a wrong combine) rather than
+    /// emitting a signature.
+    fn sign_stored(
+        &self,
+        record: &sigil_proto::threshold::ThresholdRecord,
+        data: &[u8],
+        outcome: &crate::approve::ApprovalOutcome,
+    ) -> Option<Vec<u8>> {
+        // The approve must carry the phone's partial Z_F; a local/dev factor cannot
+        // produce one, so a stored key cannot be opened without the phone.
+        let Some(zf) = outcome.zf.as_deref() else {
+            eprintln!(
+                "sigil daemon: ssh sign refused; approval carried no threshold partial (no phone factor?)"
+            );
+            return None;
+        };
+        let ks = self.keystore.snapshot();
+        let m = match crate::threshold::load_mac_share(ks.as_ref()) {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                eprintln!("sigil daemon: ssh sign refused; no Mac threshold share (re-pair)");
+                return None;
+            }
+            Err(e) => {
+                eprintln!("sigil daemon: ssh sign refused; {e}");
+                return None;
+            }
+        };
+        // K = combine(Z_M, Z_F, E, id); open the sealed PEM into a wiped buffer.
+        let pem = match crate::threshold::decrypt(record, &m, zf) {
+            Ok(pem) => pem,
+            Err(e) => {
+                eprintln!("sigil daemon: ssh sign refused; stored key decrypt failed: {e}");
+                return None;
+            }
+        };
+        drop(m); // the Mac share is held only for the one combine
+                 // Decode and sign inside sshagent; `pem` (Zeroizing) is wiped on drop here.
+        sshagent::sign_openssh_ed25519(&pem, data)
     }
 }
 
@@ -678,9 +1132,62 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     let core = Arc::new(core);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
+        .enable_time()
         .build()
         .context("building tokio runtime")?;
-    rt.block_on(serve(core, remote_listeners, direct_acceptors))
+    let result = rt.block_on(serve(core, remote_listeners, direct_acceptors));
+    // Bound the teardown instead of joining it. `Runtime::drop` waits for
+    // in-flight blocking tasks, and a long-lived connection handler (the Mac
+    // app's `subscribe_pending` stream never returns while its client stays
+    // connected) can pin that join forever. That exact wedge shipped: serve()
+    // bailed, both listeners dropped, and the process sat alive-but-deaf for a
+    // day while launchd's KeepAlive saw a healthy pid and never respawned it.
+    // A bounded shutdown abandons stragglers so an erroring daemon EXITS and
+    // launchd brings up a clean one within seconds.
+    rt.shutdown_timeout(Duration::from_secs(2));
+    result
+}
+
+/// How long the accept loop pauses after a listener-level `accept` error
+/// before retrying, so a persistent condition (fd exhaustion) cannot spin the
+/// loop hot. Errors on an individual accepted connection do not wait.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Ready one accepted connection for its blocking handler: back to a std,
+/// blocking stream with the read timeout armed.
+///
+/// An error here is a property of the ONE connection, never of the listener.
+/// The caller drops the connection and MUST keep accepting; propagating this
+/// out of the serve loop shipped as a daemon-killing bug (five probe races =
+/// five full daemon deaths in one day's log).
+fn ready_conn(stream: tokio::net::UnixStream) -> io::Result<UnixStream> {
+    ready_std_conn(stream.into_std()?)
+}
+
+/// The std half of [`ready_conn`], split out so the dead-peer behavior is
+/// directly testable without a tokio reactor.
+///
+/// On macOS, `setsockopt(SO_RCVTIMEO)` on a unix-stream socket whose peer has
+/// FULLY disconnected fails with EINVAL, deterministically: an empirical
+/// probe on macOS 26 measured 2000/2000 EINVAL for a closed peer, 0/2000 for
+/// a live peer, and 0/500 for a half-closed (shutdown-write) peer. EINVAL
+/// here is therefore a precise dead-peer detector, never a live client's
+/// error, and a dead peer's connection is worthless by definition. It is also
+/// ROUTINE traffic: the Mac app's `daemonRunning()` liveness probe and
+/// `sigil up`'s socket checks are connect-then-close by design, every few
+/// seconds. The caller treats EINVAL as a silent normal drop and logs
+/// anything else loudly.
+fn ready_std_conn(std_stream: UnixStream) -> io::Result<UnixStream> {
+    std_stream.set_nonblocking(false)?;
+    std_stream.set_read_timeout(Some(CONN_READ_TIMEOUT))?;
+    Ok(std_stream)
+}
+
+/// True when a [`ready_conn`] failure is the deterministic dead-peer EINVAL
+/// (see [`ready_std_conn`]): the peer hung up before we could serve it, which
+/// liveness probes do by design. Silent drop; anything else deserves a log.
+fn is_dead_peer(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EINVAL)
 }
 
 async fn serve(
@@ -719,14 +1226,14 @@ async fn serve(
         factor::warn_dev_insecure();
     }
 
-    let accounts = core
-        .accounts
+    let sealed = core
+        .threshold
         .lock()
-        .expect("accounts poisoned")
-        .accounts
+        .expect("threshold store poisoned")
+        .secrets
         .len();
     eprintln!(
-        "sigil daemon: armed on {} · {accounts} account(s) · factor: {}",
+        "sigil daemon: armed on {} · {sealed} sealed secret(s) · factor: {}",
         sock.display(),
         core.factor.label()
     );
@@ -804,18 +1311,33 @@ async fn serve(
                 break;
             }
             accepted = listener.accept() => {
-                let (stream, _) = accepted.context("accept")?;
+                // A listener-level accept error (fd exhaustion, a torn-down
+                // socket) must not end the daemon: log, breathe, keep serving.
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        eprintln!("sigil daemon: control accept error: {e}");
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                        continue;
+                    }
+                };
                 let Some(permit) = conns.try_enter() else {
                     eprintln!(
                         "sigil daemon: refusing a control connection: at the concurrency cap ({MAX_CONCURRENT_CONNS})"
                     );
                     continue; // dropping `stream` closes it
                 };
-                let std_stream = stream.into_std().context("into_std")?;
-                std_stream.set_nonblocking(false).context("set_nonblocking")?;
-                std_stream
-                    .set_read_timeout(Some(CONN_READ_TIMEOUT))
-                    .context("set_read_timeout")?;
+                // A failed ready-up is the one connection's problem; drop it
+                // and keep accepting. A dead-peer EINVAL is a liveness probe
+                // that already hung up (routine, every few seconds): silent.
+                let std_stream = match ready_conn(stream) {
+                    Ok(s) => s,
+                    Err(e) if is_dead_peer(&e) => continue,
+                    Err(e) => {
+                        eprintln!("sigil daemon: dropping a control connection: {e}");
+                        continue;
+                    }
+                };
                 let core = core.clone();
                 // Per-connection work is blocking syscalls (recvmsg, spawn,
                 // waitpid) plus a possibly long approval wait; keep it off the
@@ -828,18 +1350,28 @@ async fn serve(
                 });
             }
             accepted = ssh_listener.accept() => {
-                let (stream, _) = accepted.context("ssh accept")?;
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        eprintln!("sigil daemon: ssh accept error: {e}");
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                        continue;
+                    }
+                };
                 let Some(permit) = conns.try_enter() else {
                     eprintln!(
                         "sigil daemon: refusing an ssh-agent connection: at the concurrency cap ({MAX_CONCURRENT_CONNS})"
                     );
                     continue;
                 };
-                let std_stream = stream.into_std().context("ssh into_std")?;
-                std_stream.set_nonblocking(false).context("ssh set_nonblocking")?;
-                std_stream
-                    .set_read_timeout(Some(CONN_READ_TIMEOUT))
-                    .context("ssh set_read_timeout")?;
+                let std_stream = match ready_conn(stream) {
+                    Ok(s) => s,
+                    Err(e) if is_dead_peer(&e) => continue,
+                    Err(e) => {
+                        eprintln!("sigil daemon: dropping an ssh-agent connection: {e}");
+                        continue;
+                    }
+                };
                 let core = core.clone();
                 // An SSH connection is also blocking (per-signature fetch, spawn,
                 // approval wait); serve it on the blocking pool with the Core as
@@ -892,6 +1424,11 @@ fn config_mtime(path: &Path) -> Option<SystemTime> {
 /// so a malformed or half-written file leaves the last-good rules in force and we
 /// log a warning here rather than downgrade gating.
 ///
+/// Two more files ride the same tick, on the same fail-closed terms:
+/// `ssh-keys.json` (so `sigil ssh add|remove` is served without a restart) and
+/// `threshold.db` (so sealing a value into an inline `env` source takes effect on
+/// the next request instead of on the next restart).
+///
 /// Runs on its own thread and exits when `shutdown` is set. Returns `None` (no
 /// thread) when there is no resolvable config path (no HOME), which only happens
 /// in degenerate environments.
@@ -900,28 +1437,77 @@ fn spawn_config_watcher(
     shutdown: Arc<AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let path = Config::path()?;
+    // The SSH key store is watched on the same tick so `sigil ssh add|remove`
+    // takes effect without a restart, mirroring the rule-config hot-reload.
+    let ssh_path = sshagent::SshKeyConfig::path();
+    // And the sealed store, so `sigil-config source env set` applies live. The
+    // daemon-mediated seal already updates the armed store synchronously; this
+    // covers every other writer (a CLI-local seal against a stopped-then-started
+    // daemon, the Mac app, a restored backup).
+    let threshold_path = crate::threshold::ThresholdStore::path().ok();
     let handle = std::thread::Builder::new()
         .name("sigil-config-watcher".into())
         .spawn(move || {
             let mut last = config_mtime(&path);
+            let mut last_ssh = ssh_path.as_deref().map(config_mtime);
+            let mut last_threshold = threshold_path.as_deref().map(config_mtime);
             while !shutdown.load(Ordering::SeqCst) {
                 std::thread::sleep(CONFIG_POLL_INTERVAL);
                 if shutdown.load(Ordering::SeqCst) {
                     break;
                 }
                 let current = config_mtime(&path);
-                if current == last {
-                    continue;
-                }
-                last = current;
-                match core.reload_config() {
-                    Ok(()) => {
-                        eprintln!("sigil daemon: reloaded config from {}", path.display());
+                if current != last {
+                    last = current;
+                    match core.reload_config() {
+                        Ok(()) => {
+                            eprintln!("sigil daemon: reloaded config from {}", path.display());
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "sigil daemon: config reload failed, keeping last-good rules: {e}"
+                            );
+                        }
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "sigil daemon: config reload failed, keeping last-good rules: {e}"
-                        );
+                }
+                if let Some(ssh_path) = ssh_path.as_deref() {
+                    let current_ssh = Some(config_mtime(ssh_path));
+                    if current_ssh != last_ssh {
+                        last_ssh = current_ssh;
+                        match core.reload_ssh_signers() {
+                            Ok(()) => {
+                                eprintln!(
+                                    "sigil daemon: reloaded SSH keys from {}",
+                                    ssh_path.display()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "sigil daemon: SSH key reload failed, keeping last-good keys: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+                if let Some(threshold_path) = threshold_path.as_deref() {
+                    let current_threshold = Some(config_mtime(threshold_path));
+                    if current_threshold != last_threshold {
+                        last_threshold = current_threshold;
+                        match core.reload_threshold() {
+                            Ok(n) => {
+                                eprintln!(
+                                    "sigil daemon: reloaded the sealed store from {} \
+                                     ({n} sealed secret(s))",
+                                    threshold_path.display()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "sigil daemon: sealed store reload failed, \
+                                     keeping the last-good records: {e}"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -947,17 +1533,34 @@ fn handle_conn(core: Arc<Core>, mut stream: UnixStream) -> anyhow::Result<()> {
     // The kernel-verified peer pid, read before we touch any passed fds.
     let peer = lease::peer_pid(stream.as_raw_fd());
 
-    let (frame, fds) = match local::recv_frame(&stream) {
+    // Read the frame AND whatever arrived behind it: the keystore verbs put raw
+    // material immediately after their header, and one recvmsg can deliver both.
+    // The tail buffer is `Zeroizing`, so material never rests in a plain
+    // allocation even for the frames that turn out not to carry any.
+    let (frame, fds, tail) = match local::recv_frame_with_tail(&stream) {
         Ok(v) => v,
         // A probe connects then hangs up; not an error.
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
         Err(e) => return Err(e.into()),
     };
 
-    // The pending subscription streams many replies on this one connection, so
-    // it is handled outside the single-reply match below.
+    // The subscriptions stream many replies on this one connection, so they are
+    // handled outside the single-reply match below.
     if matches!(frame, Frame::SubscribePending) {
         return stream_pending(&core, &mut stream);
+    }
+    if matches!(frame, Frame::SubscribeKeystore) {
+        return stream_keystore(&core, &mut stream);
+    }
+    // The material-carrying verbs read their payload here, where the tail is in
+    // scope, rather than inside the reply match.
+    if let Frame::KeystoreProvision { len } = frame {
+        let reply = handle_provision(&core, &mut stream, tail, len);
+        return local::send_reply(&mut stream, &reply).map_err(Into::into);
+    }
+    if let Frame::SealThreshold { id, len } = &frame {
+        let reply = handle_seal_threshold(&core, &mut stream, tail, id, *len);
+        return local::send_reply(&mut stream, &reply).map_err(Into::into);
     }
 
     let reply = match frame {
@@ -1018,37 +1621,363 @@ fn handle_conn(core: Arc<Core>, mut stream: UnixStream) -> anyhow::Result<()> {
                 },
             )
         }
-        Frame::Lockdown { clear } => {
-            if clear {
-                core.lockdown.store(false, Ordering::SeqCst);
-                control_reply(true, "lockdown cleared; requests will route again")
-            } else {
-                core.lockdown.store(true, Ordering::SeqCst);
-                let n = core.leases.clear();
-                control_reply(
-                    true,
-                    &format!("locked down; {n} lease(s) zeroized, new requests refused"),
-                )
-            }
-        }
         Frame::LeaseRevoke { prefix } => {
             let n = core.leases.revoke(&prefix);
             control_reply(n > 0, &format!("revoked {n} lease(s)"))
         }
         Frame::Status => json_reply(&core.status_report()),
-        Frame::Doctor => json_reply(&crate::report::doctor(true)),
+        Frame::Doctor => json_reply(&core.doctor_report()),
         Frame::LeaseList => json_reply(&leases_json(&core)),
         Frame::Pending => json_reply(&pending_json(&core)),
         Frame::History => {
             let entries: Vec<_> = crate::audit::load().iter().map(|e| e.to_json()).collect();
             json_reply(&entries)
         }
-        // Handled above via an early return; the match stays exhaustive.
-        Frame::SubscribePending => unreachable!("subscribe streams before the match"),
+        Frame::KeystoreUnwrapRequest => handle_unwrap_request(&core),
+        Frame::KeystoreUnwrapDone { nonce, ok, reason } => {
+            handle_unwrap_done(&core, stream.as_raw_fd(), &nonce, ok, &reason)
+        }
+        // All handled above via an early return; the match stays exhaustive.
+        Frame::SubscribePending
+        | Frame::SubscribeKeystore
+        | Frame::KeystoreProvision { .. }
+        | Frame::SealThreshold { .. } => {
+            unreachable!("streamed or payload-carrying frames return before the match")
+        }
     };
 
     local::send_reply(&mut stream, &reply)?;
     Ok(())
+}
+
+/// Accept the material for a wrapped keystore from the signed Sigil app.
+///
+/// The order here is the security of the thing:
+///
+/// 1. **Who is calling.** The peer must be the signed Sigil app
+///    ([`crate::peercode`]), checked against the live socket. A same-UID process
+///    can reach this socket as easily as the app can, so without this the "only
+///    the app holds the material" property is a comment, not a control.
+/// 2. **Is this daemon even wrapped.** A plaintext daemon has nothing to
+///    provision and says so, rather than accepting material into a state where it
+///    would be ignored.
+/// 3. **Once per lifetime.** A second accepted provision would be a
+///    material-swap primitive, so it is refused AND logged: the app has no reason
+///    to provision twice, and something that tries is worth seeing. A *failed*
+///    attempt deliberately does not latch, or a malformed frame from anyone would
+///    wedge the daemon into never being provisionable (a denial of service that
+///    is easier to mount than the attack it would prevent).
+/// 4. **Is it the right material.** Digest what arrived and compare, constant
+///    time, against the expectation read from the file at startup. The reply is a
+///    bare ok/fail and never echoes the expected digest: a caller who does not
+///    already have the material learns nothing from trying.
+fn handle_provision(
+    core: &Core,
+    stream: &mut UnixStream,
+    tail: zeroize::Zeroizing<Vec<u8>>,
+    len: u64,
+) -> Reply {
+    let refuse = |line: &str| Reply::Control {
+        ok: false,
+        lines: vec![line.to_string()],
+    };
+
+    if let Err(e) = crate::peercode::require_sigil_app(stream.as_raw_fd()) {
+        eprintln!("sigil daemon: keystore provision REFUSED; {e}");
+        return refuse("refused: this verb is only callable by the signed Sigil app");
+    }
+    let crate::keystore_seal::SealState::Sealed { expected, se_pub } = &core.seal else {
+        return refuse(
+            "refused: this daemon's keystore is not sealed, so there is nothing to open",
+        );
+    };
+    if core.provisioned.load(Ordering::SeqCst) {
+        // Not a mistake anyone makes twice by accident.
+        eprintln!(
+            "sigil daemon: keystore provision REFUSED; already provisioned this lifetime. \
+             Something tried to replace live keystore material."
+        );
+        return refuse("refused: this daemon is already provisioned");
+    }
+
+    let material = match local::read_payload(stream, tail, len) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("sigil daemon: keystore provision failed to read material: {e}");
+            return refuse("refused: the material could not be read");
+        }
+    };
+    let got = crate::keystore_seal::digest(se_pub, &material);
+    if !crate::keystore_seal::digests_equal(&got, expected) {
+        eprintln!(
+            "sigil daemon: keystore provision REFUSED; the material does not match what the \
+             keystore file commits to. Nothing was loaded."
+        );
+        return refuse("refused: the material does not match this keystore");
+    }
+    let opened = match crate::keystore::RamKeystore::from_material(&material) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("sigil daemon: keystore provision REFUSED; material is unusable: {e}");
+            return refuse("refused: the material is not a keystore");
+        }
+    };
+    let count = opened.len();
+    drop(material); // wiped here; the RAM store owns its own zeroizing copies
+
+    core.keystore.store(Arc::new(opened));
+    core.provisioned.store(true, Ordering::SeqCst);
+    // Only now is this machine known to serve a wrapped store, so only now is a
+    // later plaintext file a downgrade rather than a normal state.
+    if let Err(e) = crate::keystore_seal::set_adopted(se_pub) {
+        eprintln!("sigil daemon: could not write the adoption marker: {e}");
+    }
+    eprintln!("sigil daemon: keystore opened by the Sigil app ({count} blob(s)); serving.");
+    Reply::Control {
+        ok: true,
+        lines: vec!["keystore opened".to_string()],
+    }
+}
+
+/// Seal bytes into the threshold store on a caller's behalf.
+///
+/// This exists because under a wrapped keystore the CLI cannot read the Mac share
+/// it needs to seal with, and the daemon can. `len == 0` removes the record
+/// instead, matching what the CLI does with an empty input.
+///
+/// Peer gating is same-UID only, deliberately: the caller is `sigil-config`, an
+/// unsigned CLI, so there is no code identity to demand. That is the same
+/// boundary every other CLI control verb has always had (a 0600 socket), and it
+/// is not weakened here: the values being sealed are supplied BY that caller.
+///
+/// The armed store is updated as part of the write, under the same lock, so a
+/// seal takes effect on the very next request rather than on the watcher's next
+/// tick. The lock is held across load, mutate, and save, which makes the whole
+/// read-modify-write atomic against every other reader of the armed store: no
+/// request can observe a store that was saved to disk but not yet armed, and a
+/// failed save leaves the armed store exactly as it was.
+fn handle_seal_threshold(
+    core: &Core,
+    stream: &mut UnixStream,
+    tail: zeroize::Zeroizing<Vec<u8>>,
+    id: &str,
+    len: u64,
+) -> Reply {
+    let fail = |line: String| Reply::Control {
+        ok: false,
+        lines: vec![line],
+    };
+    let provisioned = core.provisioned.load(Ordering::SeqCst);
+    if core.seal.blocks_serving(provisioned) {
+        return fail(
+            core.seal
+                .explain(provisioned)
+                .unwrap_or("the keystore is not available")
+                .to_string(),
+        );
+    }
+
+    let plaintext = match local::read_payload(stream, tail, len) {
+        Ok(p) => p,
+        Err(e) => return fail(format!("the value could not be read: {e}")),
+    };
+
+    // Taken before the load and held to the end: everything below is one
+    // read-modify-write against both disk and the armed store.
+    let mut armed = core.threshold.lock().expect("threshold store poisoned");
+    let mut store = match crate::threshold::ThresholdStore::load() {
+        Ok(s) => s,
+        Err(e) => return fail(format!("loading the threshold store: {e}")),
+    };
+
+    if plaintext.is_empty() {
+        store.remove(id);
+        return match store.save() {
+            Ok(()) => {
+                *armed = store;
+                eprintln!(
+                    "sigil daemon: removed the sealed record for '{id}'; {} armed",
+                    armed.secrets.len()
+                );
+                Reply::Control {
+                    ok: true,
+                    lines: vec![format!("removed {id}")],
+                }
+            }
+            Err(e) => fail(format!("saving the threshold store: {e}")),
+        };
+    }
+
+    let ks = core.keystore.snapshot();
+    let phone = match crate::pairing_store::load(ks.as_ref()) {
+        Ok(Some(pc)) => match pc.phone_share {
+            Some(s) => s,
+            None => return fail("this pairing has no phone Secure-Enclave share; re-pair".into()),
+        },
+        Ok(None) => return fail("no phone is paired; run `sigil pair` first".into()),
+        Err(e) => return fail(format!("loading the pairing: {e}")),
+    };
+    let m = match crate::threshold::load_mac_share(ks.as_ref()) {
+        Ok(Some(m)) => m,
+        Ok(None) => return fail("no Mac threshold share on this daemon; re-pair".into()),
+        Err(e) => return fail(format!("loading the Mac share: {e}")),
+    };
+    if let Err(e) = crate::threshold::seal_secret(&mut store, id, &m, &phone, &plaintext) {
+        return fail(format!("sealing: {e}"));
+    }
+    drop(m);
+    drop(plaintext);
+    match store.save() {
+        Ok(()) => {
+            // Live from here: the next gated run under a rule naming this source
+            // opens the record just sealed, with no restart and no watcher tick.
+            *armed = store;
+            // The arm line reports a sealed-secret count and this is the only
+            // thing that changes it mid-life, so it belongs in the same log. Its
+            // absence is what left the daemon's log showing "0 sealed secret(s)"
+            // with no record of the seal that had just happened.
+            eprintln!(
+                "sigil daemon: sealed '{id}'; {} sealed secret(s) armed",
+                armed.secrets.len()
+            );
+            Reply::Control {
+                ok: true,
+                lines: vec![format!("sealed {id}")],
+            }
+        }
+        Err(e) => fail(format!("saving the threshold store: {e}")),
+    }
+}
+
+/// Stream keystore ceremony events to the Sigil app.
+///
+/// Only de-adoption events flow here today. The commit flow the contract sketches
+/// (the daemon asking the app to re-wrap after a keystore mutation) is
+/// deliberately NOT built: while the store is wrapped, nothing mutates it. The
+/// daemon never wrote the keystore in the first place (every write is CLI-side,
+/// in `pairing_store`), and those CLI paths now refuse upfront against a sealed
+/// store. So there is no mutation to commit, and machinery with no trigger is
+/// machinery that rots untested. When daemon-side mutations exist, this is the
+/// stream they announce themselves on.
+fn stream_keystore(core: &Core, stream: &mut UnixStream) -> anyhow::Result<()> {
+    if let Err(e) = crate::peercode::require_sigil_app(stream.as_raw_fd()) {
+        eprintln!("sigil daemon: keystore subscription REFUSED; {e}");
+        let _ = local::send_reply(
+            stream,
+            &Reply::Control {
+                ok: false,
+                lines: vec!["refused: this stream is only for the signed Sigil app".into()],
+            },
+        );
+        return Ok(());
+    }
+    loop {
+        let version = core.unwrap_requests.version();
+        let body = serde_json::to_string(&core.unwrap_requests.pending_events())
+            .unwrap_or_else(|_| "[]".to_string());
+        if local::send_reply(stream, &Reply::Event { body }).is_err() {
+            return Ok(()); // the app hung up
+        }
+        core.unwrap_requests
+            .wait_for_change(version, Duration::from_secs(30));
+    }
+}
+
+/// A human asked to de-adopt. Raise the request for the app and wait for it.
+///
+/// The daemon cannot do this itself: unwrapping needs the enclave key, which
+/// only the app has. So this is a relay with a deadline, and every way it can go
+/// wrong leaves the store wrapped, which is the direction that cannot lose data.
+fn handle_unwrap_request(core: &Core) -> Reply {
+    /// Long enough for a human to bring the app forward and for an enclave
+    /// decrypt plus a durable write; short enough that a CLI does not hang.
+    const UNWRAP_WAIT: Duration = Duration::from_secs(75);
+
+    if !matches!(core.seal, crate::keystore_seal::SealState::Sealed { .. }) {
+        return Reply::Control {
+            ok: false,
+            lines: vec!["this keystore is not sealed; there is nothing to unwrap".into()],
+        };
+    }
+    let nonce = core.unwrap_requests.request();
+    eprintln!("sigil daemon: de-adoption requested; waiting for the Sigil app");
+    match core.unwrap_requests.wait_for(&nonce, UNWRAP_WAIT) {
+        Some((true, _)) => Reply::Control {
+            ok: true,
+            lines: vec![
+                "the Sigil app returned the keystore to plaintext".into(),
+                "restart the daemon to serve from it: sigil up".into(),
+            ],
+        },
+        Some((false, reason)) => Reply::Control {
+            ok: false,
+            lines: vec![format!("the Sigil app could not unwrap it: {reason}")],
+        },
+        None => {
+            core.unwrap_requests.resolve(&nonce, false, "timed out");
+            Reply::Control {
+                ok: false,
+                lines: vec![
+                    "the Sigil app did not answer; the keystore is still sealed".into(),
+                    "make sure the app is running, then try again".into(),
+                ],
+            }
+        }
+    }
+}
+
+/// The app reports what happened to an unwrap it was asked to perform.
+///
+/// The daemon does not verify the plaintext write itself: the app wrote and
+/// fsynced it, and the daemon has no key to check it with. What the daemon does
+/// own is the adoption marker, and clearing it is what makes the now-plaintext
+/// file a legitimate state rather than a downgrade. So the marker is cleared ONLY
+/// on a reported success, and the ordering (app writes and fsyncs plaintext,
+/// THEN reports, THEN the marker clears) means a crash anywhere leaves a machine
+/// that still refuses to serve, never one that silently accepts plaintext.
+fn handle_unwrap_done(
+    core: &Core,
+    fd: std::os::fd::RawFd,
+    nonce: &str,
+    ok: bool,
+    reason: &str,
+) -> Reply {
+    if let Err(e) = crate::peercode::require_sigil_app(fd) {
+        eprintln!("sigil daemon: unwrap report REFUSED; {e}");
+        return Reply::Control {
+            ok: false,
+            lines: vec!["refused: this verb is only callable by the signed Sigil app".into()],
+        };
+    }
+    if !core.unwrap_requests.resolve(nonce, ok, reason) {
+        return Reply::Control {
+            ok: false,
+            lines: vec![format!("no unwrap request {nonce} is outstanding")],
+        };
+    }
+    if !ok {
+        eprintln!("sigil daemon: the app could not unwrap the keystore: {reason}");
+        return Reply::Control {
+            ok: true,
+            lines: vec!["recorded".into()],
+        };
+    }
+    match crate::keystore_seal::clear_adopted() {
+        Ok(()) => {
+            eprintln!(
+                "sigil daemon: keystore de-adopted; it is plaintext again. \
+                 Restart the daemon to serve from it."
+            );
+            Reply::Control {
+                ok: true,
+                lines: vec!["de-adopted".into()],
+            }
+        }
+        Err(e) => Reply::Control {
+            ok: false,
+            lines: vec![format!("could not clear the adoption marker: {e}")],
+        },
+    }
 }
 
 /// Stream the pending set to a subscriber: emit the current snapshot, then
@@ -1226,18 +2155,119 @@ fn remote_pending_json(p: crate::remote::RemotePending) -> crate::json::PendingJ
     }
 }
 
+/// How long the degrade-to-plain-gate notice stays quiet for a given rule+source
+/// after it has been printed once. Long enough that a busy tool tree does not
+/// flood the log, short enough that a human who goes looking will see it again.
+const DEGRADED_NOTICE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// The one line that says a gate rule is injecting nothing, or `None` if the same
+/// rule+source was already announced within [`DEGRADED_NOTICE_INTERVAL`].
+///
+/// A rule that declares env keys whose source has no sealed record still gates
+/// (the approval happens) but injects nothing, and the tool then falls back to
+/// whatever auth it has of its own. That is the intended degrade, but doing it
+/// silently means the failure looks like "Sigil is fine and the tool is broken".
+/// This names both halves so the fix (`source env set`) is obvious.
+///
+/// Rate-limit state is process-global rather than a `Core` field: it is a log
+/// detail with no bearing on any decision, and every gated request funnels
+/// through one daemon process.
+fn degraded_gate_notice(rule: &str, source: &str, plain_count: usize) -> Option<String> {
+    if !notice_due(&format!("degraded\u{1f}{rule}\u{1f}{source}")) {
+        return None;
+    }
+    // A source can legitimately carry non-secret vars and no sealed value at all;
+    // when it does, "injecting nothing" would be the wrong alarm, so say what is
+    // actually still being injected.
+    let injecting = match plain_count {
+        0 => "injecting nothing".to_string(),
+        1 => "injecting only its 1 plain env var".to_string(),
+        n => format!("injecting only its {n} plain env vars"),
+    };
+    Some(format!(
+        "sigil daemon: rule '{rule}' declares env keys but source '{source}' has no sealed \
+         record; running as a plain gate and {injecting}. Seal it with: \
+         sigil-config source env set {source} --stdin"
+    ))
+}
+
+/// The one line naming plain env vars a sealed value of the same name will
+/// override, or `None` if this rule+source was already announced within
+/// [`DEGRADED_NOTICE_INTERVAL`].
+///
+/// A shadowed plain var is config that looks live in `sigil-config list` and does
+/// nothing at run time. Sealed winning is the right precedence (the protected
+/// value is the one the human deliberately sealed), but taking it silently is how
+/// a one-line misconfiguration turns into an afternoon.
+fn shadowed_plain_notice(rule: &str, source: &str, shadowed: &[String]) -> Option<String> {
+    if !notice_due(&format!("shadowed\u{1f}{rule}\u{1f}{source}")) {
+        return None;
+    }
+    Some(format!(
+        "sigil daemon: rule '{rule}' source '{source}' sets {} as both a sealed value and a \
+         plain env var; the sealed value wins and the plain one is not injected. Drop it with: \
+         sigil-config source env unset-plain {source} --key {}",
+        shadowed.join(", "),
+        shadowed[0]
+    ))
+}
+
+/// Whether a rate-limited daemon notice keyed by `key` is due, i.e. it has not
+/// been emitted within [`DEGRADED_NOTICE_INTERVAL`]. Records the emission.
+///
+/// State is process-global rather than a `Core` field: these are log details with
+/// no bearing on any decision, and every gated request funnels through one daemon
+/// process.
+fn notice_due(key: &str) -> bool {
+    static LAST_SEEN: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    let seen = LAST_SEEN.get_or_init(Default::default);
+    let now = std::time::Instant::now();
+    let mut map = seen.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = map.get(key) {
+        if now.duration_since(*at) < DEGRADED_NOTICE_INTERVAL {
+            return false;
+        }
+    }
+    map.insert(key.to_string(), now);
+    true
+}
+
+/// Split a source's plain env vars into the ones to inject and the NAMES a sealed
+/// value of the same name will set instead.
+///
+/// Sealed wins: the human sealed that name deliberately, and a cleartext entry
+/// must never be able to override a protected one. The caller announces what it
+/// dropped.
+fn split_shadowed_plain(
+    plain: &[(String, String)],
+    sealed_keys: &[String],
+) -> (Vec<(String, String)>, Vec<String>) {
+    let sealed: std::collections::BTreeSet<&str> = sealed_keys.iter().map(String::as_str).collect();
+    let mut inject = Vec::with_capacity(plain.len());
+    let mut shadowed = Vec::new();
+    for (k, v) in plain {
+        if sealed.contains(k.as_str()) {
+            shadowed.push(k.clone());
+        } else {
+            inject.push((k.clone(), v.clone()));
+        }
+    }
+    (inject, shadowed)
+}
+
 /// The gated fulfillment path for `sigil <cmd>` (and the shim alias / `sigil run`).
 /// Returns the exit code to mirror to the caller. Every failure path here fails
 /// closed (a non-zero code with a stderr line), so the caller behaves like a
 /// denied invocation.
 ///
 /// The command's config selects the provider; the provider decides the injection
-/// shape. `op` (and any provider that [`needs_account`](crate::provider::SecretProvider::needs_account))
-/// routes a 1Password account, unwraps the DEK, decrypts the one token, and
-/// injects it; a direct-injection provider (`env-file`) needs no account and is
-/// gated on every run (no leasing, so resolved values never sit in RAM across a
-/// TTL). An *unconfigured* command is refused with a pointer to `sigil-config
-/// add`, never run ungated.
+/// shape. `op` is a plain gated command: Sigil injects no credential and op does
+/// its own auth. An inline-`env` rule opens its threshold-sealed values with the
+/// phone's partial and injects them, gated on every run (no leasing, so resolved
+/// values never sit in RAM across a TTL). An *unconfigured* command is refused
+/// with a pointer to `sigil-config add`, never run ungated.
 #[allow(clippy::too_many_arguments)]
 fn fulfill(
     core: &Core,
@@ -1249,10 +2279,6 @@ fn fulfill(
     stdout: Option<OwnedFd>,
     stderr: Option<OwnedFd>,
 ) -> i32 {
-    if core.lockdown.load(Ordering::SeqCst) {
-        return fail_closed(stderr, "sigil is locked down; no secrets served\n");
-    }
-
     // Proxy recursion fuse: the caller's depth reached us over the socket (the
     // daemon has no other view of it). If it is already at the limit, a runaway
     // alias -> daemon -> tool -> alias loop is in progress; fail closed rather
@@ -1265,6 +2291,22 @@ fn fulfill(
     }
     // The depth the spawned child (and anything it re-invokes) will carry.
     let child_depth = proxy_depth.saturating_add(1);
+
+    // A sealed-but-unprovisioned keystore (or a downgraded one) serves NOTHING.
+    // Checked before the rules are even consulted: without the material this
+    // daemon cannot open a sealed secret or sign as itself to the phone, so
+    // running anything gated would be theatre. The message says exactly why, and
+    // never that a pairing is missing.
+    if let Some(why) = core
+        .seal
+        .explain(core.provisioned.load(Ordering::SeqCst))
+        .filter(|_| {
+            core.seal
+                .blocks_serving(core.provisioned.load(Ordering::SeqCst))
+        })
+    {
+        return fail_closed(stderr, &format!("sigil: {why}\n"));
+    }
 
     let Some(cmd) = argv.first() else {
         return fail_closed(stderr, "sigil: empty command\n");
@@ -1306,16 +2348,54 @@ fn fulfill(
             return crate::provider::run_passthrough(crate::provider::ProviderRun {
                 command: argv,
                 cwd,
-                credential: None,
                 source: "",
                 stdin,
                 stdout,
                 stderr,
                 proxy_depth: child_depth,
                 env: None,
+                // An allow rule names no source, so there is nothing configured
+                // to inject: a passthrough runs the command as the user's shell
+                // would have.
+                plain: &[],
             });
         }
-        Some(crate::config::Resolution::Gate(action)) => action,
+        Some(crate::config::Resolution::Gate(mut action)) => {
+            // An inline `env` source with no sealed record is inert dead config
+            // (its value was never sealed, or a migration dropped it). Rather than
+            // fail closed on every invocation, the daemon treats it as the plain
+            // gate it now behaves as: still gated (approval required), but injects
+            // nothing. Clearing the effective env keys here, before the readout is
+            // built, keeps the approval honest (it shows no env, matching what will
+            // be set) and routes the rest of dispatch down the plain-gate path.
+            // config.json is untouched, so `source env set` re-seals it and
+            // restores injection.
+            //
+            // It is also logged. Silence here is what turned a one-line
+            // misconfiguration into a long hunt: the command ran, exit code 0, and
+            // the only evidence that nothing had been injected was the tool
+            // falling back to its own auth.
+            if let Some(provider) = core.providers.get(&action.provider) {
+                if provider.needs_sealed_env() {
+                    let store = core.threshold.lock().expect("threshold store poisoned");
+                    if store.get(&action.source_name).is_none() {
+                        let declared = !action.env_keys.is_empty();
+                        action.env_keys.clear();
+                        drop(store);
+                        if declared {
+                            if let Some(line) = degraded_gate_notice(
+                                &action.rule,
+                                &action.source_name,
+                                action.plain_env.len(),
+                            ) {
+                                eprintln!("{line}");
+                            }
+                        }
+                    }
+                }
+            }
+            action
+        }
     };
     let Some(provider) = core.providers.get(&action.provider) else {
         return fail_closed(
@@ -1327,8 +2407,20 @@ fn fulfill(
         );
     };
     let source = action.source_path.as_deref().unwrap_or("");
-    let needs_account = provider.needs_account();
-    let needs_sealed_env = provider.needs_sealed_env();
+    // The source's NON-SECRET vars, minus any name a sealed value will also set.
+    // Computed after the degrade above, so a source whose values were never sealed
+    // still injects its plain vars: gate plus plain env is a legitimate
+    // configuration, not dead config.
+    let (plain_env, shadowed) = split_shadowed_plain(&action.plain_env, &action.env_keys);
+    if !shadowed.is_empty() {
+        if let Some(line) = shadowed_plain_notice(&action.rule, &action.source_name, &shadowed) {
+            eprintln!("{line}");
+        }
+    }
+    // An env provider only needs a sealed open when it still has keys to inject;
+    // an unsealed env source had its keys cleared above and behaves as a plain
+    // gate.
+    let needs_sealed_env = provider.needs_sealed_env() && !action.env_keys.is_empty();
     // What `describe` reads: the env-file path or the inline env KEY names. Names
     // only; no secret value is read here (pre-approval, zero-knowledge readout).
     let view = crate::provider::SourceView {
@@ -1336,78 +2428,51 @@ fn fulfill(
         keys: &action.env_keys,
     };
 
+    // Two different scopes, deliberately:
+    //
+    // * `scope` is this invocation's own arguments. It is what the approval
+    //   screen, the daemon log, and the audit line say, so the human always sees
+    //   and the log always records the ACTUAL command, never a rule name.
+    // * `lease_scope` is the matched RULE's name, and the lease grant key is
+    //   derived from it with an EMPTY project root. So one approval on a leasable
+    //   rule opens a window in which the same caller chain may run any command
+    //   that rule matches, from any directory, until the TTL runs out. Narrowing
+    //   the window back down is a matter of writing a narrower rule (or making it
+    //   run-once), not of retyping the same argv from the same cwd.
+    //
+    // The caller chain is an OUTER fence, not the command boundary. Every gated
+    // command arrives through a `~/.sigil/bin` symlink to the one `sigil` binary
+    // and macOS resolves that symlink, so the chain leaf is byte-identical for
+    // `op`, `curl`, and everything else: the chain tells tool trees apart, never
+    // commands. The rule name in the scope is the whole command-discriminating
+    // boundary, which is why a config change has to kill the leases it covers
+    // (see `Core::reload_config`).
     let scope = argv.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
+    let lease_scope = action.rule.clone();
     let caller = lease::walk_ancestry(core.proc_table.as_ref(), peer.unwrap_or(-1));
-    let gk = lease::grant_key(&caller, cwd, &scope);
+    let gk = lease::grant_key(&caller, lease::ScopeKind::Command, "", &lease_scope);
+    // Coalescing stays per-invocation (chain + cwd + argv, the pre-rule-lease
+    // key). It must NOT widen with the lease: two different commands racing under
+    // one rule are two distinct readouts, and a human approving one of them must
+    // never silently release the other. Only byte-identical concurrent requests
+    // ride one decision.
+    let coalesce_key = lease::grant_key(&caller, lease::ScopeKind::Command, cwd, &scope);
 
-    // Route the account only for providers that inject a stored token. Routing is
-    // the source's configured account label (or a legacy vault name) — never argv
-    // archaeology, so the core stays provider-agnostic.
-    let vault = if needs_account {
-        action.account.clone()
-    } else {
-        None
-    };
-
-    // A v2 (threshold) account takes precedence: its token is opened per request
-    // by the two-party combine (Mac share m + the phone's partial Z_F), never a
-    // DEK. The decrypt path is chosen HERE, from the at-rest record (R3: never
-    // from any wire field). When v1 accounts coexist (a migration store) v2 claims
-    // only an EXACT vault match, so it never over-captures a v1 request; once the
-    // store is fully v2 (no v1 accounts) v2 also serves the single-account
-    // fallback. v1 accounts keep the byte-identical DEK path.
-    let v2 = if needs_account {
-        let v1_empty = core
-            .accounts
-            .lock()
-            .expect("accounts poisoned")
-            .accounts
-            .is_empty();
+    // For the inline `env` provider, fetch its threshold-sealed record now. The
+    // record is public (ciphertext plus the base point E), safe to hold across the
+    // approval wait; it is opened only AFTER the grant, by combining the phone's
+    // partial Z_F with the Mac share m, so no plaintext value crosses the wait. A
+    // source with no sealed values fails closed rather than injecting nothing.
+    let sealed_record = if needs_sealed_env {
         let store = core.threshold.lock().expect("threshold store poisoned");
-        let picked = store.route_exact(vault.as_deref()).or_else(|| {
-            if v1_empty {
-                store.route(vault.as_deref())
-            } else {
-                None
-            }
-        });
-        picked.map(|a| (a.label().to_string(), a.record.clone()))
-    } else {
-        None
-    };
-
-    // Clone what we need so the store lock is released before the approval wait.
-    let (account_label, ciphertext) = match &v2 {
-        // v2: the label comes from the record; there is no v1 ciphertext/DEK.
-        Some((label, _)) => (label.clone(), None),
-        None if needs_account => {
-            let store = core.accounts.lock().expect("accounts poisoned");
-            match store.route(vault.as_deref()) {
-                Ok(acct) => match acct.ciphertext() {
-                    Ok(ct) => (acct.label.clone(), Some(ct)),
-                    Err(e) => return fail_closed(stderr, &format!("sigil account error: {e}\n")),
-                },
-                Err(e) => return fail_closed(stderr, &format!("sigil: {e}\n")),
-            }
-        }
-        None => (String::new(), None),
-    };
-
-    // For the inline `env` provider, fetch its sealed value blob now (ciphertext,
-    // safe to hold across the approval wait) and release the store lock. It is
-    // decrypted only AFTER the grant, so no plaintext value crosses the wait. A
-    // source with no values set fails closed rather than injecting nothing.
-    let sealed_ct = if needs_sealed_env {
-        let store = core.accounts.lock().expect("accounts poisoned");
-        match store.env_blob(&action.source_name) {
-            Some(Ok(ct)) => Some(ct),
-            Some(Err(e)) => return fail_closed(stderr, &format!("sigil env store error: {e}\n")),
+        match store.get(&action.source_name) {
+            Some(rec) => Some(rec.clone()),
             None => {
                 return fail_closed(
                     stderr,
                     &format!(
                         "sigil: inline env source '{0}' has no sealed values; set them with: \
-                         sigil-config source env set {0} --key <KEY>\n",
+                         sigil-config source env set {0} --stdin\n",
                         action.source_name
                     ),
                 )
@@ -1417,45 +2482,103 @@ fn fulfill(
         None
     };
 
-    // A live lease short-circuits the approval — only for account-backed
-    // providers, whose credential is what a lease holds. Direct-injection
-    // providers are gated on every run.
-    if needs_account {
-        if let Some(token) = core.leases.token_for(&gk, &account_label, &scope) {
-            let refs = provider.describe(argv, &view);
-            core.record_audit(
-                &uuid::Uuid::now_v7().to_string(),
-                provider.kind(argv),
-                &audit_label(&refs, &scope),
-                &account_label,
-                &caller.provenance(),
-                cwd,
-                "approved",
-                "lease",
-            );
-            return provider.run(ProviderRun {
-                command: argv,
-                cwd,
-                credential: Some(&token),
-                source,
-                stdin,
-                stdout,
-                stderr,
-                proxy_depth: child_depth,
-                env: None,
-            });
+    // The label shown in the audit/approval for an env source is the source name;
+    // a plain gate (`op`, `env-file`) has none.
+    let account_label = if needs_sealed_env {
+        action.source_name.clone()
+    } else {
+        String::new()
+    };
+
+    // The four legs a lease must match: the grant key (chain + rule), the account
+    // label, the rule scope, and, when the lease caches values, a fingerprint of
+    // the exact sealed record they came from. The fingerprint is the record's
+    // ephemeral point `E`, which is fresh on every re-seal, so `source env set`
+    // during a live window makes the lookup miss and the run re-approves rather
+    // than injecting values that no longer exist on disk.
+    let binding = lease::LeaseBinding::cached(
+        &account_label,
+        &lease_scope,
+        sealed_record
+            .as_ref()
+            .map(|r| r.ephemeral_pub.as_str())
+            .unwrap_or(""),
+        // The generation of the very snapshot this decision resolved against, so
+        // a reload during the approval wait cannot leave this grant live.
+        config.generation,
+    );
+
+    // A live lease short-circuits the approval: a leasable rule may open an
+    // auto-approve window so a burst of work under that rule costs one glance,
+    // whatever the individual commands are. What the lease releases depends on the
+    // rule:
+    //
+    // * A plain gate (`op`, `env-file`, or an inline `env` source degraded to one)
+    //   holds an empty presence marker. The run is gated-but-uninjected either
+    //   way, so this only skips the phone round trip.
+    // * A sealed inline `env` rule holds the unsealed values themselves, and the
+    //   run injects them from RAM with no phone round trip and no second combine.
+    //   This is the credential cache the design brief describes; it is why the
+    //   window dies on expiry, revoke, restart, a config edit to the rule, and a
+    //   re-seal of the source.
+    //
+    // A cached blob that no longer decodes, or whose KEY set is not exactly what
+    // the rule now consents to, is refused as a cache hit: the lease is dropped
+    // and the run falls through to a fresh approval rather than injecting anything
+    // the human did not agree to.
+    if let Some(cached) = core.leases.token_for(&gk, &binding) {
+        match leased_env(&cached, needs_sealed_env, &action.env_keys) {
+            Ok(leased) => {
+                let refs = provider.describe(argv, &view);
+                core.record_audit(
+                    &uuid::Uuid::now_v7().to_string(),
+                    provider.kind(argv),
+                    &audit_label(&refs, &scope),
+                    &account_label,
+                    &caller.provenance(),
+                    cwd,
+                    "approved",
+                    "lease",
+                );
+                let code = run_provider(
+                    provider,
+                    ProviderRun {
+                        command: argv,
+                        cwd,
+                        source,
+                        stdin,
+                        stdout,
+                        stderr,
+                        proxy_depth: child_depth,
+                        env: leased.as_ref(),
+                        plain: &plain_env,
+                    },
+                );
+                drop(leased); // zeroized here (EnvVars is Zeroizing)
+                return code;
+            }
+            Err(why) => {
+                // Fail-closed on a cache we cannot trust: drop it, log why, and
+                // gate this run afresh. Nothing is injected from the bad blob.
+                core.leases.revoke_scope(&lease_scope);
+                eprintln!(
+                    "sigil daemon: dropping the lease on rule '{lease_scope}' ({why}); \
+                     re-approving this run"
+                );
+            }
         }
     }
 
-    // For a v2 account, carry the threshold challenge to the phone: the base
-    // point E it key-agrees against, plus the account binding it shows and
+    // For an inline `env` request, carry the threshold challenge to the phone: the
+    // base point E it key-agrees against, plus the source-name binding it shows and
     // consents to (R5). E is public and authenticated by the enclosing signed
-    // envelope; the phone validates it on-curve before its Secure-Enclave op.
-    let threshold = v2
+    // envelope; the phone validates it on-curve before its Secure-Enclave op. A
+    // plain gate (`op`, `env-file`) carries no challenge.
+    let threshold = sealed_record
         .as_ref()
-        .map(|(label, record)| sigil_proto::ThresholdChallenge {
+        .map(|record| sigil_proto::ThresholdChallenge {
             account_id: record.account_id.clone(),
-            label: label.clone(),
+            label: account_label.clone(),
             ephemeral_pub: record.ephemeral_pub.clone(),
             se_key_id: record.se_key_id.clone(),
             ecdh_algo: crate::threshold::ecdh_algo_tag(record.ecdh_algo).to_string(),
@@ -1477,19 +2600,8 @@ fn fulfill(
         ssh: None,
         threshold,
     };
-    let outcome = core.gate.decide(gk, &ctx);
+    let outcome = core.gate.decide(coalesce_key, &ctx);
     let decision = outcome.decision;
-    // Enforce the rule's lease policy as the SOLE authority on leasing: a
-    // run-once rule yields no lease even if the approver returned one, and a
-    // leasable rule is clamped to its per-rule cap. Computed once here so every
-    // grant site below honors it (defense in depth: the phone should only offer a
-    // lease when allowed, but the daemon never trusts that and re-checks).
-    let lease_secs = decision.lease_ttl().and_then(|ttl| {
-        action
-            .lease
-            .clamp_secs(ttl.as_secs().min(u32::MAX as u64) as u32)
-    });
-    let lease_ttl = lease_secs.map(|s| Duration::from_secs(u64::from(s)));
     if !decision.is_grant() {
         core.record_audit(
             &ctx.id,
@@ -1504,109 +2616,58 @@ fn fulfill(
         return fail_closed(stderr, "request denied\n");
     }
 
-    // What each provider shape needs on approval: an account-backed provider
-    // needs the decrypted token (`credential`); the inline `env` provider needs
-    // its sealed values opened (`sealed_env`); `env-file` needs neither. These
-    // are mutually exclusive arms of one if/else so each may consume the
-    // approval's key material (`outcome.dek` / `outcome.zf`) without a move
-    // conflict.
+    // On approval the inline `env` provider needs its sealed values opened; `op`
+    // and `env-file` need nothing. The env open is the two-party combine: the
+    // phone returned its partial Z_F with the approval, and the daemon combines it
+    // with its Mac share m (loaded into mlock'd memory for this one op) to derive
+    // the key and decrypt. No key at rest is ever assembled; m and the derived key
+    // are zeroized here, and the plaintext is zeroized when this request ends or,
+    // if the approval opened a window, when that window does.
     //
-    // v2 accounts open the token by the two-party combine: the phone returned its
-    // partial Z_F with the approval, and the daemon combines it with its Mac share
-    // m (loaded into mlock'd memory for this one op) to derive K and decrypt. No
-    // full private key is ever assembled; m, K, and the token are all zeroized.
+    // This happens BEFORE the grant below so a failed open leaves no lease behind:
+    // every `fail_closed` here returns with the store untouched.
     let mut sealed_env: Option<crate::provider::EnvVars> = None;
-    let credential = if let Some((_, record)) = &v2 {
+    let mut sealed_plain: Option<Token> = None;
+    if let Some(record) = &sealed_record {
         let zf = match outcome.zf.as_deref() {
             Some(zf) => zf,
-            // An approve with no partial cannot open a v2 token (e.g. the local
-            // factor cannot produce Z_F): fail closed rather than serving nothing.
+            // An approve with no partial cannot open a sealed secret (e.g. the
+            // local factor cannot produce Z_F): fail closed rather than serving
+            // nothing.
             None => {
                 return fail_closed(
                     stderr,
-                    "sigil: v2 approval carried no threshold partial; no phone factor?\n",
+                    "sigil: approval carried no threshold partial; no phone factor?\n",
                 )
             }
         };
-        let m = match crate::threshold::load_mac_share(core.keystore.as_ref()) {
+        let ks = core.keystore.snapshot();
+        let m = match crate::threshold::load_mac_share(ks.as_ref()) {
             Ok(Some(m)) => m,
             Ok(None) => {
                 return fail_closed(
                     stderr,
-                    "sigil: no Mac threshold share on this daemon; re-pair for v2\n",
+                    "sigil: no Mac threshold share on this daemon; re-pair\n",
                 )
             }
             Err(e) => return fail_closed(stderr, &format!("sigil: {e}\n")),
         };
-        let token = match crate::threshold::decrypt(record, &m, zf) {
-            Ok(t) => t,
-            Err(e) => return fail_closed(stderr, &format!("sigil token decrypt failed: {e}\n")),
-        };
-        drop(m); // the Mac share is held only for the one combine
-        if let Some(ttl) = lease_ttl {
-            core.leases
-                .grant(gk, &account_label, &scope, token.clone(), ttl);
-        }
-        Some(token)
-    } else if let Some(ciphertext) = &ciphertext {
-        let dek = match outcome.dek {
-            Some(dek) => dek,
-            None => match core
-                .keystore
-                .unwrap_dek(&format!("Approve {scope} for {account_label}"))
-            {
-                Ok(dek) => dek,
-                Err(e) => {
-                    return fail_closed(stderr, &format!("sigil could not unwrap the key: {e}\n"))
-                }
-            },
-        };
-        let token = match secrets::decrypt_token(&dek, ciphertext) {
-            Ok(t) => t,
-            Err(e) => return fail_closed(stderr, &format!("sigil token decrypt failed: {e}\n")),
-        };
-        drop(dek);
-        if let Some(ttl) = lease_ttl {
-            core.leases
-                .grant(gk, &account_label, &scope, token.clone(), ttl);
-        }
-        Some(token)
-    } else if let Some(ct) = &sealed_ct {
-        // Inline `env`: open the sealed value blob now that the request is
-        // granted. The DEK arrives with the phone approval (or is unwrapped from
-        // the keystore on a local approval, the same as `op`), is used for this
-        // one decrypt, and is dropped at once. No lease: like env-file, resolved
-        // values must never persist across a TTL.
-        let dek = match outcome.dek {
-            Some(dek) => dek,
-            None => match core.keystore.unwrap_dek(&format!("Approve {scope}")) {
-                Ok(dek) => dek,
-                Err(e) => {
-                    return fail_closed(stderr, &format!("sigil could not unwrap the key: {e}\n"))
-                }
-            },
-        };
-        let plain = match secrets::decrypt_token(&dek, ct) {
+        let plain = match crate::threshold::decrypt(record, &m, zf) {
             Ok(p) => p,
             Err(e) => return fail_closed(stderr, &format!("sigil env decrypt failed: {e}\n")),
         };
-        drop(dek);
+        drop(m); // the Mac share is held only for the one combine
         match crate::provider::decode_env_pairs(&plain) {
             Some(pairs) => {
                 // Readout integrity (invariant #3): the approver consented to
                 // exactly the KEY set the readout/audit was built from
-                // (`action.env_keys`, i.e. `describe`). The sealed blob must inject
-                // that same set and nothing else. A divergence would silently set a
-                // key the human never saw; it can arise from a crash between the two
-                // saves in `cli::seal_env_pairs` (blob updated, config not) or an
-                // import that kept the source NAME but changed its keys while a stale
-                // blob under that name survived. Fail closed on any mismatch rather
-                // than inject what was not approved.
-                let injected: std::collections::BTreeSet<&str> =
-                    pairs.iter().map(|(k, _)| k.as_str()).collect();
-                let consented: std::collections::BTreeSet<&str> =
-                    action.env_keys.iter().map(String::as_str).collect();
-                if injected != consented {
+                // (`action.env_keys`, i.e. `describe`). The sealed record must
+                // inject that same set and nothing else. A divergence would
+                // silently set a key the human never saw; fail closed on any
+                // mismatch rather than inject what was not approved. The same
+                // check runs again on every leased run, against the rule as it
+                // stands then.
+                if !env_keys_match(&pairs, &action.env_keys) {
                     return fail_closed(
                         stderr,
                         "sigil: inline env keys do not match what was approved; \
@@ -1614,13 +2675,35 @@ fn fulfill(
                     );
                 }
                 sealed_env = Some(pairs);
+                sealed_plain = Some(plain);
             }
             None => return fail_closed(stderr, "sigil: inline env blob is corrupt; re-set it\n"),
         }
-        None
-    } else {
-        None
-    };
+    }
+
+    // Enforce the rule's lease policy as the SOLE authority on leasing: a run-once
+    // rule yields no lease even if the approver returned one, and a leasable rule
+    // is clamped to its per-rule cap. The grant is filed under the rule, so it
+    // covers the rule's whole match set for this caller chain, not just the argv
+    // that opened it.
+    //
+    // What gets stored is what a later run under this window will need: for a
+    // sealed `env` rule the just-unsealed plaintext, so the burst injects from RAM
+    // without another phone round trip; for a plain gate an empty marker, because
+    // there is nothing to inject. The plaintext copy lives only in the store's
+    // `Zeroizing` token and dies with the lease.
+    let lease_ttl = decision
+        .lease_ttl()
+        .and_then(|ttl| {
+            action
+                .lease
+                .clamp_secs(ttl.as_secs().min(u32::MAX as u64) as u32)
+        })
+        .map(|s| Duration::from_secs(u64::from(s)));
+    if let Some(ttl) = lease_ttl {
+        let cached = sealed_plain.unwrap_or_else(|| zeroize::Zeroizing::new(Vec::new()));
+        core.leases.grant(gk, &binding, cached, ttl);
+    }
 
     core.record_audit(
         &ctx.id,
@@ -1633,25 +2716,116 @@ fn fulfill(
         core.grant_via(),
     );
 
-    // Run through the provider: it injects the credential (op), the env-file's
-    // own values, or the inline env's decrypted pairs, and streams output straight
-    // to the caller's fds. For op the daemon holds only the credential; for the
-    // direct-injection shapes the resolved values transit only as the child's
+    // Run through the provider: `op` runs the gated command injecting nothing, the
+    // env-file provider injects its own file's values, and the inline env provider
+    // injects the decrypted pairs. Output streams straight to the caller's fds; for
+    // the direct-injection shapes the resolved values transit only as the child's
     // spawn env (see the provider module docs).
-    let code = provider.run(ProviderRun {
-        command: argv,
-        cwd,
-        credential: credential.as_ref(),
-        source,
-        stdin,
-        stdout,
-        stderr,
-        proxy_depth: child_depth,
-        env: sealed_env.as_ref(),
-    });
-    drop(credential); // zeroized here (Token is Zeroizing) when present
+    //
+    // An inline `env` source that had no sealed record degraded to a plain gate
+    // above (its keys were cleared), so there is nothing to inject;
+    // [`run_provider`] routes that case through the passthrough runner.
+    let code = run_provider(
+        provider,
+        ProviderRun {
+            command: argv,
+            cwd,
+            source,
+            stdin,
+            stdout,
+            stderr,
+            proxy_depth: child_depth,
+            env: sealed_env.as_ref(),
+            plain: &plain_env,
+        },
+    );
     drop(sealed_env); // zeroized here (EnvVars is Zeroizing) when present
     code
+}
+
+/// Classify the keystore file against the adoption marker, once, at startup.
+///
+/// Fails CLOSED in the literal sense: an unreadable or self-contradictory file is
+/// not "probably fine, carry on". If this machine has ever served a wrapped store
+/// it is treated as a downgrade; otherwise the daemon still arms (so `status` and
+/// pairing work) and the store's own read errors surface per operation.
+fn read_seal_state() -> crate::keystore_seal::SealState {
+    use crate::keystore_seal::{read_adoption_marker, KeystoreFile, SealState};
+    let marker = read_adoption_marker();
+    match KeystoreFile::read(&keystore::file_keystore_path()) {
+        Ok(file) => SealState::resolve(&file, marker.as_ref()),
+        Err(e) => {
+            eprintln!("sigil daemon: keystore file is unreadable: {e}");
+            if marker.is_some() {
+                SealState::Downgraded
+            } else {
+                SealState::Plain
+            }
+        }
+    }
+}
+
+/// The source a rule injects from, in `cfg`. `None` for an allow rule (which
+/// names none) or a dangling reference; two `None`s compare equal, which is
+/// correct here: a rule that never named a source cannot have its source change.
+fn source_for<'a>(
+    cfg: &'a Config,
+    rule: &crate::config::Rule,
+) -> Option<&'a crate::config::Source> {
+    cfg.source(&rule.action.source)
+}
+
+/// Run one gated invocation through its provider.
+///
+/// The one wrinkle is the inline `env` provider: with nothing to inject (a source
+/// whose values were never sealed, degraded to a plain gate) `EnvProvider::run`
+/// refuses an empty env, which for a REAL env request is the correct fail-closed
+/// bug. Route that case through the passthrough runner instead: same gated exec
+/// discipline, no injection, exactly like `op`. Shared by the fresh-approval and
+/// the leased paths so they cannot drift.
+fn run_provider(provider: &dyn crate::provider::SecretProvider, run: ProviderRun<'_>) -> i32 {
+    if run.env.is_none() && provider.id() == crate::provider::EnvProvider::ID {
+        crate::provider::run_passthrough(run)
+    } else {
+        provider.run(run)
+    }
+}
+
+/// Whether the decoded pairs carry exactly the KEY set the rule consents to.
+///
+/// The approval readout is built from the rule's key names, so this is the check
+/// that "what was shown is what is set". Order and duplicates are irrelevant; the
+/// SET must be equal, both ways.
+fn env_keys_match(pairs: &crate::provider::EnvVars, consented: &[String]) -> bool {
+    let injected: std::collections::BTreeSet<&str> =
+        pairs.iter().map(|(k, _)| k.as_str()).collect();
+    let consented: std::collections::BTreeSet<&str> =
+        consented.iter().map(String::as_str).collect();
+    injected == consented
+}
+
+/// What a lease's cached token releases for this run, or why it cannot be used.
+///
+/// A plain-gate lease caches nothing and injects nothing. A sealed `env` lease
+/// caches the encoded pairs the approval unsealed; they are decoded here and
+/// re-checked against the KEY set the rule consents to RIGHT NOW, so a window can
+/// only ever inject what a fresh approval would have injected. Anything else
+/// (corrupt blob, a key set that has moved) is refused, and the caller drops the
+/// lease and re-gates rather than injecting it.
+fn leased_env(
+    cached: &Token,
+    needs_sealed_env: bool,
+    consented: &[String],
+) -> Result<Option<crate::provider::EnvVars>, &'static str> {
+    if !needs_sealed_env {
+        return Ok(None);
+    }
+    let pairs =
+        crate::provider::decode_env_pairs(cached).ok_or("its cached values no longer decode")?;
+    if !env_keys_match(&pairs, consented) {
+        return Err("its cached keys are not the keys the rule now names");
+    }
+    Ok(Some(pairs))
 }
 
 /// The brightest audit label for an op request: the first secret ref's item
@@ -1670,6 +2844,22 @@ fn fail_closed(stderr: Option<OwnedFd>, msg: &str) -> i32 {
         let _ = f.write_all(msg.as_bytes());
     }
     1
+}
+
+/// Log one SSH sign request's metadata: key label, derived host, and the
+/// data-to-sign hash (never raw bytes or key material). The sign path's
+/// counterpart to [`log_request`]; without it a sign request that dies on the
+/// phone leg leaves no daemon-side trace at all, which made "did the request
+/// ever fire?" undiagnosable from the log.
+fn log_ssh_sign_request(label: &str, host: &str, data_fingerprint: &str, peer: Option<i32>) {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    eprintln!(
+        "sigil daemon: [{ts}] ssh-sign {label} \u{b7} host {host} \u{b7} data {data_fingerprint} \u{b7} pid {}",
+        peer.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+    );
 }
 
 /// Log request metadata: argv (item names, not secret values), cwd, peer pid.
@@ -1715,14 +2905,89 @@ mod tests {
     /// A fake `op` that emits a known secret only when the expected token
     /// reached its env. Proves both the approval gate and the token-in-env
     /// delivery without ever printing the token itself.
-    fn write_fake_op(dir: &Path, expected_token: &str, secret: &str) -> PathBuf {
+    // `op` is a plain gated command now: Sigil injects nothing, runs the real op,
+    // and streams its output to the caller. The fake op emits `secret` on its own
+    // (as the real op would resolve and stream a secret), proving the gated child's
+    // output reaches the caller without transiting the daemon (invariant #2). The
+    // `_expected_token` arg is retained so callers need no signature change.
+    fn write_fake_op(dir: &Path, _expected_token: &str, secret: &str) -> PathBuf {
         let path = dir.join("op");
-        let script = format!(
-            "#!/bin/sh\nif [ \"$OP_SERVICE_ACCOUNT_TOKEN\" = \"{expected_token}\" ]; then printf '{secret}'; else printf 'NOTOKEN'; fi\n"
-        );
+        let script = format!("#!/bin/sh\nprintf '{secret}'\n");
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    // --- per-connection ready-up: the dead-peer EINVAL must never kill serve ---
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_peer_that_hung_up_before_serving_reads_as_a_dead_peer() {
+        // macOS returns EINVAL from setsockopt(SO_RCVTIMEO) on a unix socket
+        // whose peer fully disconnected; deterministic (probe: 2000/2000).
+        // This is the exact shape the Mac app's connect-then-close liveness
+        // probe produces every few seconds, and the ?-propagation of it out of
+        // serve() shipped as a daemon-killing bug. It must classify as a
+        // dead peer (silent drop), never as an error worth ending anything.
+        let dir = std::env::temp_dir().join(format!("sigil-deadpeer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("probe.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        let client = UnixStream::connect(&sock).unwrap();
+        drop(client); // the peer is gone before we serve it
+        let (accepted, _) = listener.accept().unwrap();
+        let err = ready_std_conn(accepted).expect_err("a closed peer must fail ready-up");
+        assert!(is_dead_peer(&err), "EINVAL classifies as dead peer: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_live_peer_readies_cleanly_and_a_dead_peer_storm_does_not_starve_it() {
+        // The accept-loop pattern: dead peers are dropped, live clients are
+        // served. 50 connect-then-close probes (each one a potential EINVAL)
+        // followed by a real client must leave the real client fully served.
+        let dir = std::env::temp_dir().join(format!("sigil-conjstorm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("storm.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        let served = Arc::new(AtomicUsize::new(0));
+        let served2 = served.clone();
+        let acceptor = std::thread::spawn(move || {
+            // Serve until the live client's one byte has been echoed.
+            loop {
+                let (accepted, _) = listener.accept().unwrap();
+                let mut s = match ready_std_conn(accepted) {
+                    Ok(s) => s,
+                    Err(e) if is_dead_peer(&e) => continue, // the serve-loop pattern
+                    Err(e) => panic!("unexpected ready-up error: {e}"),
+                };
+                let mut buf = [0u8; 1];
+                match std::io::Read::read_exact(&mut s, &mut buf) {
+                    Ok(()) => {
+                        s.write_all(&buf).unwrap();
+                        served2.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
+                    // A probe that raced past ready-up but sent nothing.
+                    Err(_) => continue,
+                }
+            }
+        });
+
+        for _ in 0..50 {
+            let c = UnixStream::connect(&sock).unwrap();
+            drop(c);
+        }
+        let mut live = UnixStream::connect(&sock).unwrap();
+        live.write_all(b"x").unwrap();
+        let mut echo = [0u8; 1];
+        std::io::Read::read_exact(&mut live, &mut echo).unwrap();
+        assert_eq!(&echo, b"x", "the live client is served after the storm");
+        acceptor.join().unwrap();
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A minimal rule/source config that gates `op` to the 1Password provider
@@ -1738,6 +3003,7 @@ mod tests {
             account: None,
             path: None,
             keys: Vec::new(),
+            plain: Default::default(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -1779,6 +3045,7 @@ mod tests {
             account: None,
             path: Some(path.into()),
             keys: Vec::new(),
+            plain: Default::default(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -1795,44 +3062,6 @@ mod tests {
             },
         })
         .unwrap();
-        cfg
-    }
-
-    /// The coexistence config: two op rules routing by an argv marker to two op
-    /// sources, one hinting the v2 vault (`Engineering`) and one the v1 vault
-    /// (`Legacy`). It stands in for the old argv `--vault` routing so the
-    /// v1/v2 coexistence test still drives each token down its own path.
-    fn coexist_config() -> Config {
-        use crate::config::{Action, Match, Rule, RuleMode, Source};
-        let mut cfg = Config::default();
-        for (name, account, marker) in [
-            ("v2", "Engineering", "Engineering"),
-            ("v1", "Legacy", "Legacy"),
-        ] {
-            cfg.add_source(Source {
-                name: name.into(),
-                provider: OpProvider::ID.into(),
-                account: Some(account.into()),
-                path: None,
-                keys: Vec::new(),
-            })
-            .unwrap();
-            cfg.add_rule(Rule {
-                name: name.into(),
-                match_: Match {
-                    command: Some("op".into()),
-                    argv_contains: vec![marker.into()],
-                    ..Match::default()
-                },
-                action: Action {
-                    mode: RuleMode::Gate,
-                    source: name.into(),
-                    lease: LeasePolicy::RunOnce,
-                    timeout_sec: None,
-                },
-            })
-            .unwrap();
-        }
         cfg
     }
 
@@ -1859,30 +3088,23 @@ mod tests {
         timeout: Duration,
         config: Config,
     ) -> (Arc<Core>, Arc<PendingRegistry>) {
-        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::with_dek());
-        let dek = keystore.unwrap_dek("seed").unwrap();
-        let mut accounts = AccountStore::default();
-        accounts
-            .add("Rowm", &dek, token.as_bytes(), vec!["Engineering".into()])
-            .unwrap();
-        drop(dek);
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let _ = (token, secret);
 
         let pending = Arc::new(PendingRegistry::new());
         // These tests exercise the dev-insecure configuration, so the dev switch
         // and the control-socket park are both enabled.
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(dev)
             .with_control_socket(true)
             .with_timeout(timeout);
         let core = Core {
             remote: Vec::new(),
-            keystore,
-            accounts: Mutex::new(accounts),
+            keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending: pending.clone(),
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
@@ -1890,8 +3112,11 @@ mod tests {
             config: config.into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
+            seal: crate::keystore_seal::SealState::Plain,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
         };
         (Arc::new(core), pending)
     }
@@ -1993,26 +3218,18 @@ mod tests {
         // decision/account/via.
         let _home = HomeGuard::new("audit-approve");
         let dir = tmpdir("audit");
-        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::with_dek());
-        let dek = keystore.unwrap_dek("seed").unwrap();
-        let mut accounts = AccountStore::default();
-        accounts
-            .add("Rowm", &dek, b"tok", vec!["Engineering".into()])
-            .unwrap();
-        drop(dek);
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Core {
             remote: Vec::new(),
-            keystore,
-            accounts: Mutex::new(accounts),
+            keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(&dir, "tok", "secret-1"),
@@ -2020,8 +3237,11 @@ mod tests {
             config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: Some(30),
+            seal: crate::keystore_seal::SealState::Plain,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
         };
 
         let (read_end, write_end) = pipe();
@@ -2040,7 +3260,8 @@ mod tests {
         let hist = crate::audit::load();
         assert_eq!(hist.len(), 1, "one decision, one audit line");
         assert_eq!(hist[0].decision, "approved");
-        assert_eq!(hist[0].account, "Rowm");
+        // `op` is a plain gate: no source/account label to record.
+        assert_eq!(hist[0].account, "");
         assert_eq!(hist[0].via, "dev");
         assert_eq!(hist[0].kind, "secret_read");
         std::fs::remove_dir_all(&dir).ok();
@@ -2205,6 +3426,262 @@ mod tests {
         // keepalive interval (a non-joined thread does not delay process exit).
         drop(client);
         drop(h);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An approver that counts how often it is consulted and always grants a
+    /// lease. A test can then prove a later run was served by a LIVE LEASE (the
+    /// count did not move) rather than by another approval, which
+    /// [`DevMode::Lease`] alone cannot show.
+    struct CountingApprover {
+        calls: Arc<AtomicUsize>,
+        ttl: Duration,
+        /// The threshold partial a phone would return. `None` stands in for a
+        /// local factor, which can approve a plain gate but cannot open a sealed
+        /// secret; `Some` stands in for the phone.
+        zf: Option<zeroize::Zeroizing<[u8; 32]>>,
+    }
+
+    impl CountingApprover {
+        fn new(calls: Arc<AtomicUsize>, ttl: Duration) -> Self {
+            Self {
+                calls,
+                ttl,
+                zf: None,
+            }
+        }
+
+        fn with_partial(mut self, zf: zeroize::Zeroizing<[u8; 32]>) -> Self {
+            self.zf = Some(zf);
+            self
+        }
+    }
+
+    impl Approver for CountingApprover {
+        fn decide(&self, _ctx: &ApprovalContext) -> crate::approve::ApprovalOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.zf {
+                Some(zf) => crate::approve::ApprovalOutcome::with_partial(
+                    Decision::Lease(self.ttl),
+                    zf.clone(),
+                ),
+                None => crate::approve::ApprovalOutcome::local(Decision::Lease(self.ttl)),
+            }
+        }
+    }
+
+    /// A core gating `op` per `config`, whose approver counts its calls. Returns
+    /// the core and that counter. `audit` is the retention window in days when
+    /// the test wants the audit log written (it lands under `$SIGIL_HOME`).
+    fn counting_core(
+        dir: &Path,
+        config: Config,
+        audit: Option<u32>,
+    ) -> (Arc<Core>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let core = Core {
+            remote: Vec::new(),
+            keystore: KeystoreCell::new(Arc::new(MemoryKeystore::new())),
+            threshold: Mutex::new(Default::default()),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(CountingApprover::new(
+                calls.clone(),
+                Duration::from_secs(60),
+            ))),
+            pending: Arc::new(PendingRegistry::new()),
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
+                write_fake_op(dir, "tok-abc", "secret-A"),
+            ))]),
+            config: config.into(),
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::DevInsecure,
+            ssh_signers: SshSignersCell::new(Vec::new()),
+            audit,
+            seal: crate::keystore_seal::SealState::Plain,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
+        };
+        (Arc::new(core), calls)
+    }
+
+    /// Two gate rules over the same `op` source, split by subcommand, so a test
+    /// can prove a lease on one rule does not cover the other.
+    fn two_op_rules() -> Config {
+        use crate::config::{Action, Match, Rule, RuleMode, Source};
+        let mut cfg = Config::default();
+        cfg.add_source(Source {
+            name: "op".into(),
+            provider: OpProvider::ID.into(),
+            account: None,
+            path: None,
+            keys: Vec::new(),
+            plain: Default::default(),
+        })
+        .unwrap();
+        for sub in ["read", "item"] {
+            cfg.add_rule(Rule {
+                name: format!("op-{sub}"),
+                match_: Match {
+                    command: Some("op".into()),
+                    subcommand: Some(sub.into()),
+                    ..Match::default()
+                },
+                action: Action {
+                    mode: RuleMode::Gate,
+                    source: "op".into(),
+                    lease: LeasePolicy::Leasable { max_secs: 900 },
+                    timeout_sec: None,
+                },
+            })
+            .unwrap();
+        }
+        cfg
+    }
+
+    #[test]
+    fn a_lease_covers_any_command_the_same_rule_matches() {
+        // The rule-scoped lease: one approval on a leasable rule opens a window
+        // for the whole rule, so a DIFFERENT command under it runs with no second
+        // approval. The counter is the proof (an argv-scoped lease would have
+        // re-prompted).
+        let dir = tmpdir("lease-rulewide");
+        let (core, calls) = counting_core(&dir, op_config(), None);
+
+        let (r1, w1) = pipe();
+        let first = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
+        assert_eq!(fulfill(&core, &first, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(read_all(r1), "secret-A");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the first run is approved");
+        assert_eq!(core.leases.active(), 1);
+
+        let (r2, w2) = pipe();
+        let second = vec!["op".into(), "item".into(), "get".into(), "Deploy".into()];
+        assert_eq!(
+            fulfill(&core, &second, "", None, 0, None, Some(w2), None),
+            0
+        );
+        assert_eq!(read_all(r2), "secret-A");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a different command under the same rule must ride the live lease"
+        );
+        assert_eq!(core.leases.active(), 1, "and must not open a second lease");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_lease_survives_a_change_of_directory() {
+        // The project root is no longer in the grant key, so `cd` does not cost a
+        // fresh approval. Real directories, since the child is spawned in them.
+        let dir = tmpdir("lease-cwd");
+        let (core, calls) = counting_core(&dir, op_config(), None);
+        let one = dir.join("one");
+        let two = dir.join("two");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
+
+        let (r1, w1) = pipe();
+        let a = one.to_str().unwrap();
+        assert_eq!(fulfill(&core, &argv, a, None, 0, None, Some(w1), None), 0);
+        assert_eq!(read_all(r1), "secret-A");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let (r2, w2) = pipe();
+        let b = two.to_str().unwrap();
+        assert_eq!(fulfill(&core, &argv, b, None, 0, None, Some(w2), None), 0);
+        assert_eq!(read_all(r2), "secret-A");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the same rule from another directory must ride the live lease"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_lease_on_one_rule_does_not_cover_another_rule() {
+        // Breadth stops at the rule boundary: a lease opened by `op read` must not
+        // auto-approve `op item`, which a different rule gates.
+        let dir = tmpdir("lease-rulesplit");
+        let (core, calls) = counting_core(&dir, two_op_rules(), None);
+
+        let (r1, w1) = pipe();
+        let read = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
+        assert_eq!(fulfill(&core, &read, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(read_all(r1), "secret-A");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let (r2, w2) = pipe();
+        let item = vec!["op".into(), "item".into(), "get".into(), "Deploy".into()];
+        assert_eq!(fulfill(&core, &item, "", None, 0, None, Some(w2), None), 0);
+        assert_eq!(read_all(r2), "secret-A");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the other rule must be approved on its own"
+        );
+        assert_eq!(core.leases.active(), 2, "each rule holds its own lease");
+        // And the two leases are filed under the rules, one each.
+        let mut scopes: Vec<String> = core.leases.list().into_iter().map(|l| l.scope).collect();
+        scopes.sort();
+        assert_eq!(scopes, vec!["op-item".to_string(), "op-read".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_leased_run_audits_the_command_it_actually_ran() {
+        // The lease is filed under the rule, but the audit log must still name the
+        // real invocation: a rule-wide window must not blur what was run under it.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("lease-audit");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var_os("SIGIL_HOME");
+        std::env::set_var("SIGIL_HOME", &home);
+        let (core, calls) = counting_core(&dir, op_config(), Some(30));
+
+        let (r1, w1) = pipe();
+        let first = vec!["op".into(), "read".into(), "op://Engineering/first".into()];
+        assert_eq!(fulfill(&core, &first, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(read_all(r1), "secret-A");
+
+        let (r2, w2) = pipe();
+        let second = vec!["op".into(), "read".into(), "op://Engineering/second".into()];
+        assert_eq!(
+            fulfill(&core, &second, "", None, 0, None, Some(w2), None),
+            0
+        );
+        assert_eq!(read_all(r2), "secret-A");
+
+        let entries = crate::audit::load();
+        match prev_home {
+            Some(v) => std::env::set_var("SIGIL_HOME", v),
+            None => std::env::remove_var("SIGIL_HOME"),
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the second run rode the lease"
+        );
+        assert_eq!(entries.len(), 2, "both runs are audited");
+        let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
+        assert!(
+            labels.iter().any(|l| l.contains("first"))
+                && labels.iter().any(|l| l.contains("second")),
+            "each spawn is logged with the command it actually ran, got {labels:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.label.contains("second") && e.via == "lease"),
+            "the lease-covered run is recorded as lease-covered"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2375,28 +3852,6 @@ mod tests {
     }
 
     #[test]
-    fn lockdown_refuses_new_requests() {
-        let dir = tmpdir("lockdown");
-        let (core, _) = test_core(
-            &dir,
-            "tok",
-            "secret",
-            DevMode::Approve,
-            Duration::from_millis(50),
-        );
-        core.lockdown.store(true, Ordering::SeqCst);
-
-        let (read_end, write_end) = pipe();
-        let argv = vec!["op".into(), "read".into(), "op://Engineering/x".into()];
-        assert_eq!(
-            fulfill(&core, &argv, "/p", None, 0, None, Some(write_end), None),
-            1
-        );
-        assert_eq!(read_all(read_end), "");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn unconfigured_command_is_refused_with_a_config_hint() {
         // The invocation-model contract: a command with no config is never run
         // ungated; it fails closed with the exact command to configure it.
@@ -2452,26 +3907,27 @@ mod tests {
 
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let config = env_file_config("faketool", env_path.to_str().unwrap());
         let core = Arc::new(Core {
             remote: Vec::new(),
-            keystore,
-            accounts: Mutex::new(AccountStore::default()),
+            keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
+            seal: crate::keystore_seal::SealState::Plain,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
         });
 
         // Prepend (not replace) bindir so system binaries stay reachable for any
@@ -2518,6 +3974,7 @@ mod tests {
             account: None,
             path: None,
             keys: keys.iter().map(|k| k.to_string()).collect(),
+            plain: Default::default(),
         })
         .unwrap();
         cfg.add_rule(Rule {
@@ -2538,190 +3995,53 @@ mod tests {
     }
 
     #[test]
-    fn inline_env_command_runs_gated_and_injects_sealed_values() {
-        // End to end through the daemon: a configured inline `env` command is
-        // gated, the daemon opens the DEK-sealed values on approval, and the child
-        // sees the exact KEY=VALUEs — no account and no lease, values only in RAM.
+    fn inline_env_with_no_sealed_values_runs_as_a_plain_gate() {
+        // An inline env source whose value was never sealed is inert dead config.
+        // Rather than fail closed on every invocation with a cryptic error, the
+        // daemon treats it as the plain gate it now behaves as: the command is
+        // still gated (approved here via DevMode), then run with NO injection
+        // (the missing env var is simply unset), exactly like `op`. config.json is
+        // untouched, so a later `source env set` re-seals it and restores
+        // injection. This keeps a torn-down or never-set source from bricking the
+        // command it gates.
         let _lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = tmpdir("envinline");
+        let dir = tmpdir("envinline-empty");
         let bindir = dir.join("bin");
         std::fs::create_dir_all(&bindir).unwrap();
         let tool = bindir.join("faketool");
-        std::fs::write(
-            &tool,
-            "#!/bin/sh\nprintf 'tok=%s region=%s' \"$TOKEN\" \"$REGION\"\n",
-        )
-        .unwrap();
+        // Prints the (unset) TOKEN so we can prove nothing was injected.
+        std::fs::write(&tool, "#!/bin/sh\nprintf 'tok=[%s]' \"$TOKEN\"\n").unwrap();
         std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
 
-        // Seal the values under the keystore DEK, exactly as `sigil-config source
-        // env set` would, and stash the ciphertext in the account store.
-        let keystore = MemoryKeystore::with_dek();
-        let dek = keystore.unwrap_dek("test").unwrap();
-        let pairs = vec![
-            ("TOKEN".to_string(), Zeroizing::new("sealed-9".to_string())),
-            ("REGION".to_string(), Zeroizing::new("eu".to_string())),
-        ];
-        let encoded = crate::provider::encode_env_pairs(&pairs);
-        let ct = crate::secrets::encrypt_token(&dek, &encoded).unwrap();
-        drop(dek);
-        let mut accounts = AccountStore::default();
-        accounts.set_env_blob("faketool", &ct);
-
-        let keystore: Arc<dyn Keystore> = Arc::new(keystore);
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Arc::new(Core {
             remote: Vec::new(),
-            keystore,
-            accounts: Mutex::new(accounts),
+            keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
-            proc_table: Box::new(EmptyTable),
-            providers: ProviderRegistry::with_defaults(),
-            config: env_inline_config("faketool", &["TOKEN", "REGION"]).into(),
-            lease_ttl: Duration::from_secs(60),
-            factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
-            audit: None,
-        });
-
-        let prev = std::env::var_os("PATH");
-        let mut search = vec![bindir.clone()];
-        if let Some(p) = &prev {
-            search.extend(std::env::split_paths(p));
-        }
-        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
-        let (read_end, write_end) = pipe();
-        let code = fulfill(
-            &core,
-            &["faketool".into()],
-            "",
-            None,
-            0,
-            None,
-            Some(write_end),
-            None,
-        );
-        match prev {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
-
-        assert_eq!(code, 0);
-        assert_eq!(read_all(read_end), "tok=sealed-9 region=eu");
-        // Like every direct-injection shape, the inline env provider never leases.
-        assert_eq!(core.leases.active(), 0);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn inline_env_with_no_sealed_values_fails_closed() {
-        // A configured inline env source whose values were never set must refuse,
-        // not run the child with a blank environment.
-        let dir = tmpdir("envinline-empty");
-        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::with_dek());
-        let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
-            .with_dev(DevMode::Approve)
-            .with_control_socket(true);
-        let core = Arc::new(Core {
-            remote: Vec::new(),
-            keystore,
-            accounts: Mutex::new(AccountStore::default()), // no sealed blob
-            threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
-            gate: ApprovalGate::new(Box::new(approver)),
-            pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
             config: env_inline_config("faketool", &["TOKEN"]).into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
+            seal: crate::keystore_seal::SealState::Plain,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
         });
 
-        let (read_end, write_end) = pipe();
-        let code = fulfill(
-            &core,
-            &["faketool".into()],
-            "",
-            None,
-            0,
-            None,
-            Some(write_end),
-            None,
-        );
-        assert_ne!(code, 0, "an unset inline env source must fail closed");
-        assert_eq!(read_all(read_end), "", "no output on a refused run");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn inline_env_blob_keys_must_match_the_approved_set_or_fail_closed() {
-        // Readout integrity: the sealed blob carries an EXTRA key (BAR) the config
-        // (and therefore the approval readout) never listed. Injecting it would set
-        // a var the human never consented to, so fulfill must refuse and inject
-        // nothing, even though the crypto opens fine.
-        let _lock = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = tmpdir("envinline-drift");
-        let bindir = dir.join("bin");
-        std::fs::create_dir_all(&bindir).unwrap();
-        let tool = bindir.join("faketool");
-        std::fs::write(
-            &tool,
-            "#!/bin/sh\nprintf 'tok=%s bar=%s' \"$TOKEN\" \"$BAR\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
-
-        // Seal TWO keys, but configure the source (and thus the readout) with ONE.
-        let keystore = MemoryKeystore::with_dek();
-        let dek = keystore.unwrap_dek("test").unwrap();
-        let pairs = vec![
-            ("TOKEN".to_string(), Zeroizing::new("sealed".to_string())),
-            ("BAR".to_string(), Zeroizing::new("hidden".to_string())),
-        ];
-        let encoded = crate::provider::encode_env_pairs(&pairs);
-        let ct = crate::secrets::encrypt_token(&dek, &encoded).unwrap();
-        drop(dek);
-        let mut accounts = AccountStore::default();
-        accounts.set_env_blob("faketool", &ct);
-
-        let keystore: Arc<dyn Keystore> = Arc::new(keystore);
-        let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
-            .with_dev(DevMode::Approve)
-            .with_control_socket(true);
-        let core = Arc::new(Core {
-            remote: Vec::new(),
-            keystore,
-            accounts: Mutex::new(accounts),
-            threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
-            gate: ApprovalGate::new(Box::new(approver)),
-            pending,
-            lockdown: AtomicBool::new(false),
-            proc_table: Box::new(EmptyTable),
-            providers: ProviderRegistry::with_defaults(),
-            config: env_inline_config("faketool", &["TOKEN"]).into(), // readout: TOKEN only
-            lease_ttl: Duration::from_secs(60),
-            factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
-            audit: None,
-        });
-
+        // The daemon's own env must not carry TOKEN, or the child would inherit it
+        // and blur the "nothing injected" assertion.
+        std::env::remove_var("TOKEN");
         let prev = std::env::var_os("PATH");
         let mut search = vec![bindir.clone()];
         if let Some(p) = &prev {
@@ -2743,11 +4063,1122 @@ mod tests {
             Some(v) => std::env::set_var("PATH", v),
             None => std::env::remove_var("PATH"),
         }
-        assert_ne!(
+
+        assert_eq!(
             code, 0,
-            "a blob whose keys diverge from the readout must refuse"
+            "an unsealed inline env source runs as a plain gate"
         );
-        assert_eq!(read_all(read_end), "", "nothing injected on a refused run");
+        assert_eq!(
+            read_all(read_end),
+            "tok=[]",
+            "the missing value is not injected (TOKEN stays unset)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_gate_with_only_plain_vars_injects_them_end_to_end() {
+        // The configuration this feature exists for: nothing sealed, but the gated
+        // tool is handed the non-secret switches that stop it falling back to an
+        // ambient auth channel the daemon cannot open. It must run as a live gate
+        // (approve, inject, exec), not as the dead config an unsealed declared key
+        // would be.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("envinline-plainonly");
+        let bindir = dir.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = bindir.join("faketool");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\nprintf 'bio=[%s] tok=[%s]' \"$OP_BIOMETRIC_UNLOCK_ENABLED\" \"$TOKEN\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut cfg = env_inline_config("faketool", &[]);
+        cfg.sources[0].plain.insert(
+            "OP_BIOMETRIC_UNLOCK_ENABLED".to_string(),
+            "false".to_string(),
+        );
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let pending = Arc::new(PendingRegistry::new());
+        let approver = LocalApprover::new(pending.clone())
+            .with_dev(DevMode::Approve)
+            .with_control_socket(true);
+        let core = Arc::new(Core {
+            remote: Vec::new(),
+            keystore: KeystoreCell::new(keystore),
+            threshold: Mutex::new(Default::default()),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(approver)),
+            pending,
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::with_defaults(),
+            config: cfg.into(),
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::DevInsecure,
+            ssh_signers: SshSignersCell::new(Vec::new()),
+            audit: None,
+            seal: crate::keystore_seal::SealState::Plain,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
+        });
+
+        std::env::remove_var("TOKEN");
+        std::env::remove_var("OP_BIOMETRIC_UNLOCK_ENABLED");
+        let prev = std::env::var_os("PATH");
+        let mut search = vec![bindir.clone()];
+        if let Some(p) = &prev {
+            search.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
+        let (read_end, write_end) = pipe();
+        let code = fulfill(
+            &core,
+            &["faketool".into()],
+            "",
+            None,
+            0,
+            None,
+            Some(write_end),
+            None,
+        );
+        match prev {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert_eq!(code, 0, "a plain-only source is a live gate");
+        assert_eq!(
+            read_all(read_end),
+            "bio=[false] tok=[]",
+            "the plain var is injected and nothing else is"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A daemon wired to a REAL sealed inline `env` source, with a software
+    /// stand-in for the phone: the values are threshold-sealed under a fresh Mac
+    /// share and a software SE key, and the approver returns the matching partial
+    /// `Z_F`, so the whole two-party open runs headlessly. `lease_ttl` is what the
+    /// approver asks for. Returns the core, the approval counter, and the temp
+    /// dir holding the fake tool (already on `PATH` by the caller).
+    fn sealed_env_core(
+        source: &str,
+        keys: &[(&str, &str)],
+        lease: LeasePolicy,
+        lease_ttl: Duration,
+    ) -> (Arc<Core>, Arc<AtomicUsize>) {
+        use crate::config::{Action, Match, Rule, RuleMode, Source};
+        use sigil_proto::threshold::{EcdhAlgo, MacShare};
+
+        // Software phone (f, F) and this daemon's Mac share m.
+        let f = MacShare::generate();
+        let f_x963 = *f.public_point().as_x963();
+        let phone = crate::threshold::PhoneShare::from_x963("phone-se.v2", &f_x963, EcdhAlgo::RawX)
+            .expect("a valid software phone share");
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let m = crate::threshold::load_or_create_mac_share(keystore.as_ref())
+            .expect("a fresh Mac share");
+
+        // Seal the values exactly as `sigil-config source env set` does.
+        let pairs: Vec<(String, zeroize::Zeroizing<String>)> = keys
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), zeroize::Zeroizing::new((*v).to_string())))
+            .collect();
+        let plain = crate::provider::encode_env_pairs(&pairs);
+        let mut store = crate::threshold::ThresholdStore::default();
+        crate::threshold::seal_secret(&mut store, source, &m, &phone, &plain)
+            .expect("sealing the inline env values");
+
+        // The partial the phone would return for this record.
+        let record = store.get(source).expect("the sealed record").clone();
+        let e_point = record.ephemeral_point().unwrap();
+        let zf = f.partial(&e_point, record.ecdh_algo, e_point.as_x963());
+
+        let mut config = Config::default();
+        config
+            .add_source(Source {
+                name: source.into(),
+                provider: crate::provider::EnvProvider::ID.into(),
+                account: None,
+                path: None,
+                keys: keys.iter().map(|(k, _)| (*k).to_string()).collect(),
+                plain: Default::default(),
+            })
+            .unwrap();
+        config
+            .add_rule(Rule {
+                name: source.into(),
+                match_: Match {
+                    command: Some(source.into()),
+                    ..Match::default()
+                },
+                action: Action {
+                    mode: RuleMode::Gate,
+                    source: source.into(),
+                    lease,
+                    timeout_sec: None,
+                },
+            })
+            .unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let core = Core {
+            remote: Vec::new(),
+            keystore: KeystoreCell::new(keystore),
+            threshold: Mutex::new(store),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(
+                CountingApprover::new(calls.clone(), lease_ttl).with_partial(zf),
+            )),
+            pending: Arc::new(PendingRegistry::new()),
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::with_defaults(),
+            config: config.into(),
+            lease_ttl,
+            factor: Factor::DevInsecure,
+            ssh_signers: SshSignersCell::new(Vec::new()),
+            audit: None,
+            seal: crate::keystore_seal::SealState::Plain,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
+        };
+        (Arc::new(core), calls)
+    }
+
+    /// Write `#!/bin/sh` at `dir/bin/<name>` echoing `$TOKEN`, and prepend that
+    /// bin dir to `PATH`. Returns the previous `PATH` for the caller to restore.
+    /// The caller must hold `TEST_ENV_LOCK`.
+    fn fake_env_tool(dir: &Path, name: &str) -> Option<std::ffi::OsString> {
+        let bindir = dir.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = bindir.join(name);
+        std::fs::write(&tool, "#!/bin/sh\nprintf 'tok=[%s]' \"$TOKEN\"\n").unwrap();
+        std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::remove_var("TOKEN");
+        let prev = std::env::var_os("PATH");
+        let mut search = vec![bindir];
+        if let Some(p) = &prev {
+            search.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
+        prev
+    }
+
+    fn restore_path(prev: Option<std::ffi::OsString>) {
+        match prev {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+
+    /// Run the sealed `faketool` once and return (exit code, what it printed).
+    fn run_sealed(core: &Arc<Core>, args: &[&str]) -> (i32, String) {
+        let mut argv = vec!["faketool".to_string()];
+        argv.extend(args.iter().map(|a| (*a).to_string()));
+        let (r, w) = pipe();
+        let code = fulfill(core, &argv, "", None, 0, None, Some(w), None);
+        (code, read_all(r))
+    }
+
+    #[test]
+    fn sealing_while_the_daemon_is_armed_takes_effect_with_no_restart() {
+        // The live-fire bug. The daemon read threshold.db once, at arm time, and
+        // never again: a value sealed into an inline `env` source while it was
+        // already up never reached the armed store, so every gated run took the
+        // degrade-to-plain-gate path, injected nothing, and the tool fell back to
+        // its own auth. `sigil status` read the file fresh and disagreed with the
+        // running daemon. Only a restart fixed it.
+        //
+        // HomeGuard holds TEST_ENV_LOCK and points SIGIL_HOME at a temp dir, so
+        // ThresholdStore::save writes exactly where reload_threshold reads.
+        let _home = HomeGuard::new("seal-hot");
+        let dir = tmpdir("seal-hot");
+        let prev = fake_env_tool(&dir, "faketool");
+        let (core, _calls) = sealed_env_core(
+            "faketool",
+            &[("TOKEN", "sealed-after-arming")],
+            LeasePolicy::RunOnce,
+            Duration::from_secs(60),
+        );
+
+        // Reproduce the state the daemon was in: the record is on disk, the armed
+        // store is empty because the seal happened after arming.
+        {
+            let mut armed = core.threshold.lock().expect("threshold store");
+            let store = std::mem::take(&mut *armed);
+            store.save().expect("writing the sealed store to disk");
+        }
+
+        let (code, out) = run_sealed(&core, &[]);
+        assert_eq!(code, 0, "the stale daemon still gates and still runs");
+        assert_eq!(
+            out, "tok=[]",
+            "but injects nothing: the symptom that sent the tool to its own auth"
+        );
+
+        // One watcher tick, without the sleep.
+        assert_eq!(
+            core.reload_threshold().expect("a clean reload"),
+            1,
+            "the reload arms the record that was sealed after startup"
+        );
+
+        let (code, out) = run_sealed(&core, &[]);
+        restore_path(prev);
+        assert_eq!(code, 0);
+        assert_eq!(
+            out, "tok=[sealed-after-arming]",
+            "and the very next run injects, with no restart"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_malformed_sealed_store_keeps_the_last_good_records() {
+        // Fail-closed on the same terms as reload_config: a truncated or garbled
+        // threshold.db must not disarm a daemon that is serving fine.
+        let _home = HomeGuard::new("seal-badreload");
+        let dir = tmpdir("seal-badreload");
+        let (core, _calls) = sealed_env_core(
+            "faketool",
+            &[("TOKEN", "still-here")],
+            LeasePolicy::RunOnce,
+            Duration::from_secs(60),
+        );
+        let path = crate::threshold::ThresholdStore::path().expect("a store path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        assert!(
+            core.reload_threshold().is_err(),
+            "a malformed store is an error, not an empty store"
+        );
+        assert!(
+            core.threshold
+                .lock()
+                .expect("threshold store")
+                .get("faketool")
+                .is_some(),
+            "and the last-good record stays armed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A core that can serve `Frame::SealThreshold`: a v2 pairing (so there is a
+    /// phone share `F` to seal to) and this daemon's Mac share `m`, both held in a
+    /// `MemoryKeystore`. The caller must hold a `HomeGuard`, since the pairing and
+    /// the sealed store are written under `SIGIL_HOME`.
+    fn seal_ready_core(dir: &Path) -> Arc<Core> {
+        use sigil_proto::threshold::{EcdhAlgo, MacShare};
+        let (core, _) = test_core(
+            dir,
+            "tok",
+            "secret",
+            DevMode::Approve,
+            Duration::from_millis(50),
+        );
+        let ks = core.keystore.snapshot();
+        let f = MacShare::generate();
+        let daemon_id = DeviceIdentity::generate();
+        let daemon_pub = daemon_id.peer_identity();
+        let phone = DeviceIdentity::generate().peer_identity();
+        pairing_store::save(
+            ks.as_ref(),
+            &NewPairing {
+                daemon_identity: daemon_id,
+                phone,
+                relay_url: "ws://127.0.0.1:1".into(),
+                sas_words: sas_of(&daemon_pub, &phone),
+                paired_at: REMOTE_NOW,
+                phone_share: Some(crate::pairing_store::NewPhoneShare {
+                    se_key_id: "phone-se.v2".into(),
+                    f_x963: f.public_point().as_x963().to_vec(),
+                    ecdh_algo: EcdhAlgo::RawX,
+                }),
+            },
+        )
+        .expect("persisting the pairing");
+        crate::threshold::load_or_create_mac_share(ks.as_ref()).expect("a fresh Mac share");
+        core
+    }
+
+    #[test]
+    fn a_daemon_mediated_seal_arms_the_record_immediately() {
+        // Sealing routes through the daemon whenever one is listening, and that
+        // path wrote the file without touching the armed store: the seal was on
+        // disk and invisible to the very process that had just performed it. It
+        // must be live on return, not on the watcher's next tick.
+        let _home = HomeGuard::new("seal-mediated");
+        let dir = tmpdir("seal-mediated");
+        let core = seal_ready_core(&dir);
+
+        let pairs = vec![(
+            "TOKEN".to_string(),
+            zeroize::Zeroizing::new("mediated-value".to_string()),
+        )];
+        let payload = crate::provider::encode_env_pairs(&pairs);
+        let reply = control_round_trip(
+            &core,
+            &Frame::SealThreshold {
+                id: "prod".into(),
+                len: payload.len() as u64,
+            },
+            &payload,
+        );
+        assert!(control_ok(&reply), "{}", control_lines(&reply));
+        assert!(
+            core.threshold
+                .lock()
+                .expect("threshold store")
+                .get("prod")
+                .is_some(),
+            "the armed store holds it, so the next request injects"
+        );
+        assert!(
+            crate::threshold::ThresholdStore::load()
+                .unwrap()
+                .get("prod")
+                .is_some(),
+            "and so does disk"
+        );
+
+        // A removal is equally immediate: no window where the daemon keeps
+        // injecting values the human just deleted.
+        let reply = control_round_trip(
+            &core,
+            &Frame::SealThreshold {
+                id: "prod".into(),
+                len: 0,
+            },
+            b"",
+        );
+        assert!(control_ok(&reply), "{}", control_lines(&reply));
+        assert!(core
+            .threshold
+            .lock()
+            .expect("threshold store")
+            .get("prod")
+            .is_none());
+        assert!(crate::threshold::ThresholdStore::load()
+            .unwrap()
+            .get("prod")
+            .is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_degrade_to_a_plain_gate_announces_itself_once_per_window() {
+        // The silence is what made this a long hunt: a rule declaring env keys
+        // whose source has no sealed record gated, ran, exited 0, and injected
+        // nothing, with not one line to say so. The notice names both halves and
+        // the fix, and repeats at most once per window so a busy tool tree cannot
+        // drown the log.
+        let first = degraded_gate_notice("rule-alpha", "src-alpha", 0)
+            .expect("the first degraded run is announced");
+        assert!(first.contains("rule-alpha"), "{first}");
+        assert!(first.contains("src-alpha"), "{first}");
+        assert!(first.contains("injecting nothing"), "{first}");
+        assert!(
+            first.contains("sigil-config source env set src-alpha"),
+            "and says how to fix it: {first}"
+        );
+        assert!(
+            degraded_gate_notice("rule-alpha", "src-alpha", 0).is_none(),
+            "a burst of gated runs does not repeat it"
+        );
+        assert!(
+            degraded_gate_notice("rule-alpha", "src-beta", 0).is_some(),
+            "but a different source is its own notice"
+        );
+    }
+
+    #[test]
+    fn the_degrade_notice_says_what_is_still_being_injected() {
+        // "injecting nothing" would be a lie for a source that carries non-secret
+        // vars, and a lie in the one line a human reads while debugging is worse
+        // than silence.
+        let line = degraded_gate_notice("rule-plain", "src-plain", 2)
+            .expect("the first degraded run is announced");
+        assert!(
+            line.contains("injecting only its 2 plain env vars"),
+            "{line}"
+        );
+        let one = degraded_gate_notice("rule-plain-1", "src-plain-1", 1).unwrap();
+        assert!(one.contains("injecting only its 1 plain env var"), "{one}");
+    }
+
+    #[test]
+    fn a_plain_var_shadowed_by_a_sealed_key_is_dropped_and_announced() {
+        // Sealed wins, because the human sealed that name deliberately and
+        // cleartext config must never override a protected value. The dropped
+        // entry is named, because config that reads as live and does nothing is
+        // the failure mode this whole area is built against.
+        let plain = vec![
+            ("TOKEN".to_string(), "cleartext".to_string()),
+            ("OP_CONFIG_DIR".to_string(), "/tmp/x".to_string()),
+        ];
+        let (inject, shadowed) = split_shadowed_plain(&plain, &["TOKEN".to_string()]);
+        assert_eq!(
+            inject,
+            vec![("OP_CONFIG_DIR".to_string(), "/tmp/x".to_string())]
+        );
+        assert_eq!(shadowed, vec!["TOKEN".to_string()]);
+
+        let line = shadowed_plain_notice("rule-s", "src-s", &shadowed)
+            .expect("the first shadowed run is announced");
+        assert!(line.contains("TOKEN"), "{line}");
+        assert!(line.contains("the sealed value wins"), "{line}");
+        assert!(
+            line.contains("sigil-config source env unset-plain src-s --key TOKEN"),
+            "and says how to fix it: {line}"
+        );
+        assert!(
+            shadowed_plain_notice("rule-s", "src-s", &shadowed).is_none(),
+            "a burst of gated runs does not repeat it"
+        );
+    }
+
+    #[test]
+    fn nothing_is_shadowed_when_the_names_do_not_collide() {
+        let plain = vec![("OP_CONFIG_DIR".to_string(), "/tmp/x".to_string())];
+        let (inject, shadowed) = split_shadowed_plain(&plain, &["TOKEN".to_string()]);
+        assert_eq!(inject, plain);
+        assert!(shadowed.is_empty());
+    }
+
+    /// The doctor check that compares the armed sealed store against disk.
+    fn drift_check(core: &Arc<Core>) -> crate::json::CheckJson {
+        let checks: Vec<crate::json::CheckJson> =
+            serde_json::from_str(&json_body(query_reply(core.clone(), Frame::Doctor))).unwrap();
+        checks
+            .into_iter()
+            .find(|c| c.label == "sealed store matches the armed daemon")
+            .expect("the drift check is in the doctor report")
+    }
+
+    #[test]
+    fn doctor_catches_a_daemon_armed_with_a_stale_sealed_store() {
+        // With the hot reload in place this state should be unreachable, which is
+        // precisely why it belongs in doctor: it is the regression alarm for the
+        // one condition nothing else could see.
+        let _home = HomeGuard::new("doctor-drift");
+        let dir = tmpdir("doctor-drift");
+        let (core, _calls) = sealed_env_core(
+            "faketool",
+            &[("TOKEN", "v")],
+            LeasePolicy::RunOnce,
+            Duration::from_secs(60),
+        );
+
+        // Armed with one record, nothing on disk: a count mismatch either way is
+        // the same bug, and the hint has to name the fix.
+        let drift = drift_check(&core);
+        assert!(!drift.ok, "a count mismatch fails the check");
+        assert!(drift.hint.contains("sigil restart"), "{}", drift.hint);
+
+        // Agreement passes, and says how many records are armed.
+        core.threshold
+            .lock()
+            .expect("threshold store")
+            .save()
+            .expect("writing the armed store to disk");
+        let agreed = drift_check(&core);
+        assert!(agreed.ok, "{}", agreed.hint);
+        assert!(agreed.hint.contains('1'), "{}", agreed.hint);
+
+        // A re-seal keeps the count and changes the record. Comparing ids alone
+        // would call that agreement, so the fingerprint carries the ephemeral
+        // point, which is fresh on every seal. (A second core seals the same
+        // source name afresh; only its store is used here.)
+        let (resealed, _) = sealed_env_core(
+            "faketool",
+            &[("TOKEN", "v")],
+            LeasePolicy::RunOnce,
+            Duration::from_secs(60),
+        );
+        resealed
+            .threshold
+            .lock()
+            .expect("threshold store")
+            .save()
+            .expect("writing the re-sealed store");
+        let resealed_check = drift_check(&core);
+        assert!(!resealed_check.ok, "a re-seal is drift too");
+        assert!(
+            resealed_check.hint.contains("re-sealed"),
+            "{}",
+            resealed_check.hint
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_sealed_env_lease_injects_from_ram_with_no_second_approval() {
+        // The RAM-cache path end to end. The first run is a real two-party open
+        // (phone partial + Mac share) and its plaintext is retained in the lease;
+        // a later run under the same rule injects those values straight from RAM,
+        // with a different argv, and never reaches the approver.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("sealed-lease");
+        let prev = fake_env_tool(&dir, "faketool");
+        let (core, calls) = sealed_env_core(
+            "faketool",
+            &[("TOKEN", "sealed-value-42")],
+            LeasePolicy::Leasable { max_secs: 900 },
+            Duration::from_secs(60),
+        );
+
+        let (c1, out1) = run_sealed(&core, &[]);
+        assert_eq!(c1, 0);
+        assert_eq!(out1, "tok=[sealed-value-42]", "the first run unseals");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(core.leases.active(), 1, "the approval opened a window");
+
+        let (c2, out2) = run_sealed(&core, &["--other-args"]);
+        restore_path(prev);
+        assert_eq!(c2, 0);
+        assert_eq!(
+            out2, "tok=[sealed-value-42]",
+            "the leased run injects the cached values"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "and does it with no phone round trip"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_run_once_sealed_env_rule_caches_nothing() {
+        // Run-once still means run-once with a cache in play: the values are
+        // injected for the run that was approved and nothing is retained, so the
+        // next run is gated afresh.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("sealed-runonce");
+        let prev = fake_env_tool(&dir, "faketool");
+        let (core, calls) = sealed_env_core(
+            "faketool",
+            &[("TOKEN", "sealed-value-42")],
+            LeasePolicy::RunOnce,
+            Duration::from_secs(60),
+        );
+
+        let (c1, out1) = run_sealed(&core, &[]);
+        assert_eq!((c1, out1.as_str()), (0, "tok=[sealed-value-42]"));
+        assert_eq!(
+            core.leases.active(),
+            0,
+            "a run-once rule retains nothing, even though the approver asked"
+        );
+
+        let (c2, _) = run_sealed(&core, &[]);
+        restore_path(prev);
+        assert_eq!(c2, 0);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "so the next run needs its own approval"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_sealed_env_lease_stops_injecting_when_it_expires() {
+        // Expiry is the outer bound on the cache: once the window lapses the
+        // values are purged and the next run goes back to the phone.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("sealed-expiry");
+        let prev = fake_env_tool(&dir, "faketool");
+        let (core, calls) = sealed_env_core(
+            "faketool",
+            &[("TOKEN", "sealed-value-42")],
+            LeasePolicy::Leasable { max_secs: 900 },
+            Duration::from_secs(1),
+        );
+
+        let (_, out1) = run_sealed(&core, &[]);
+        assert_eq!(out1, "tok=[sealed-value-42]");
+        assert_eq!(core.leases.active(), 1);
+
+        std::thread::sleep(Duration::from_millis(1_200));
+        assert_eq!(core.leases.active(), 0, "the window lapsed and was purged");
+
+        let (c2, out2) = run_sealed(&core, &[]);
+        restore_path(prev);
+        assert_eq!(c2, 0);
+        assert_eq!(out2, "tok=[sealed-value-42]", "re-approved, re-opened");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the run after expiry took a fresh approval"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn revoke_and_restart_both_end_a_sealed_env_window() {
+        // The two manual kill switches over cached values: `sigil lease revoke`
+        // (by grant-key prefix) and the daemon restart / ctrl-c path
+        // (`LeaseStore::clear`). After either, the next run is gated again.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("sealed-revoke");
+        let prev = fake_env_tool(&dir, "faketool");
+        let (core, calls) = sealed_env_core(
+            "faketool",
+            &[("TOKEN", "sealed-value-42")],
+            LeasePolicy::Leasable { max_secs: 900 },
+            Duration::from_secs(60),
+        );
+
+        run_sealed(&core, &[]);
+        let grant = core.leases.list()[0].grant_hex.clone();
+        assert_eq!(
+            core.leases.revoke(&grant[..8]),
+            1,
+            "revoke drops the window"
+        );
+        assert_eq!(core.leases.active(), 0);
+        let (_, out2) = run_sealed(&core, &[]);
+        assert_eq!(out2, "tok=[sealed-value-42]");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the run after a revoke took a fresh approval"
+        );
+
+        // And the restart path: clear() is what ctrl-c runs.
+        assert_eq!(core.leases.clear(), 1);
+        let (_, out3) = run_sealed(&core, &[]);
+        restore_path(prev);
+        assert_eq!(out3, "tok=[sealed-value-42]");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "a daemon that lost its leases comes up cold"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_cached_lease_is_only_used_when_it_still_matches_the_rule() {
+        // What the leased path will and will not inject. The consent check is the
+        // same one the fresh-approval path runs, re-run against the rule as it
+        // stands now, so a window can never inject a key set the human did not
+        // agree to. Anything it cannot vouch for is an error, and the caller drops
+        // the lease and re-gates instead of injecting.
+        let keys = |ks: &[&str]| ks.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        let blob = |pairs: &[(&str, &str)]| {
+            let owned: Vec<(String, zeroize::Zeroizing<String>)> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), zeroize::Zeroizing::new((*v).to_string())))
+                .collect();
+            crate::provider::encode_env_pairs(&owned)
+        };
+
+        // A plain gate caches nothing and injects nothing, whatever it holds.
+        let marker: Token = zeroize::Zeroizing::new(Vec::new());
+        assert!(leased_env(&marker, false, &[]).unwrap().is_none());
+
+        // The happy path: the cached keys are exactly the rule's keys.
+        let good = blob(&[("TOKEN", "v"), ("OTHER", "w")]);
+        let got = leased_env(&good, true, &keys(&["OTHER", "TOKEN"]))
+            .expect("a matching cache is usable")
+            .expect("and carries values");
+        assert_eq!(got.len(), 2, "order does not matter, the SET does");
+
+        // A key set that has drifted either way is refused, not injected.
+        assert!(
+            leased_env(&good, true, &keys(&["TOKEN"])).is_err(),
+            "a cache with an EXTRA key must not be injected"
+        );
+        assert!(
+            leased_env(&good, true, &keys(&["TOKEN", "OTHER", "THIRD"])).is_err(),
+            "a cache MISSING a consented key must not be injected"
+        );
+
+        // A corrupt blob is refused rather than half-parsed.
+        let corrupt: Token = zeroize::Zeroizing::new(vec![0xff, 0xff, 0xff, 0xff, 0x01]);
+        assert!(leased_env(&corrupt, true, &keys(&["TOKEN"])).is_err());
+
+        // And an empty marker where values are expected (a rule that gained keys
+        // while a plain-gate window was live) is refused too.
+        assert!(leased_env(&marker, true, &keys(&["TOKEN"])).is_err());
+    }
+
+    #[test]
+    fn a_rule_rewritten_mid_window_does_not_inherit_the_lease() {
+        // The reviewer's F3 scenario, with the cache that made it mandatory: open
+        // a window on the rule that gates `faketool`, then hot-swap a config whose
+        // rule of the SAME NAME matches `curl` instead. Without invalidation the
+        // live window (and the sealed values it holds) would transfer to `curl`
+        // and inject a credential into a command nobody approved. The reload must
+        // kill it, so the `curl` run is gated on its own.
+        use crate::config::{Action, Match, Rule, RuleMode, Source};
+        let _home = HomeGuard::new("lease-config-swap");
+        let dir = tmpdir("lease-config-swap");
+        let prev = fake_env_tool(&dir, "faketool");
+        // A fake `curl` alongside it, so the rewritten rule has something to run.
+        let curl = dir.join("bin").join("curl");
+        std::fs::write(&curl, "#!/bin/sh\nprintf 'curl-tok=[%s]' \"$TOKEN\"\n").unwrap();
+        std::fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (core, calls) = sealed_env_core(
+            "faketool",
+            &[("TOKEN", "sealed-value-42")],
+            LeasePolicy::Leasable { max_secs: 900 },
+            Duration::from_secs(60),
+        );
+        let (_, out1) = run_sealed(&core, &[]);
+        assert_eq!(out1, "tok=[sealed-value-42]");
+        assert_eq!(core.leases.active(), 1, "the window is open on 'faketool'");
+
+        // The rewrite: same rule name, same source, different match.
+        let mut swapped = Config::default();
+        swapped
+            .add_source(Source {
+                name: "faketool".into(),
+                provider: crate::provider::EnvProvider::ID.into(),
+                account: None,
+                path: None,
+                keys: vec!["TOKEN".into()],
+                plain: Default::default(),
+            })
+            .unwrap();
+        swapped
+            .add_rule(Rule {
+                name: "faketool".into(),
+                match_: Match {
+                    command: Some("curl".into()),
+                    ..Match::default()
+                },
+                action: Action {
+                    mode: RuleMode::Gate,
+                    source: "faketool".into(),
+                    lease: LeasePolicy::Leasable { max_secs: 900 },
+                    timeout_sec: None,
+                },
+            })
+            .unwrap();
+        swapped.save().expect("writing the rewritten config");
+        core.reload_config().expect("a clean reload");
+
+        assert_eq!(
+            core.leases.active(),
+            0,
+            "the window must not survive the rule being rewritten under it"
+        );
+
+        // And the newly matched command is gated on its own, not auto-approved.
+        let (r, w) = pipe();
+        let code = fulfill(
+            &core,
+            &["curl".into(), "https://example.invalid".into()],
+            "",
+            None,
+            0,
+            None,
+            Some(w),
+            None,
+        );
+        let out = read_all(r);
+        restore_path(prev);
+        assert_eq!(code, 0);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "curl took its own approval; it did not ride the op window"
+        );
+        assert_eq!(out, "curl-tok=[sealed-value-42]");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_reload_during_an_approval_kills_the_grant_that_lands_after_it() {
+        // Invalidation-on-reload cannot cover a lease that does not exist yet. An
+        // approval blocks on the phone for as long as the human takes; a config
+        // edit landing in that window is invalidated BEFORE the grant is filed,
+        // so without the generation stamp the window would go live under a rule
+        // that had already been rewritten. The stamp makes the late grant unusable
+        // by construction, whatever the rule now says.
+        let dir = tmpdir("lease-generation");
+        let (core, calls) = counting_core(&dir, op_config(), None);
+        let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
+
+        // A run under generation 0 opens a window.
+        let (r1, w1) = pipe();
+        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(read_all(r1), "secret-A");
+        assert_eq!(core.leases.active(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Simulate the ordering of the race: the config is swapped (bumping the
+        // generation) and the lease survives invalidation because the rule text
+        // did not change. That is exactly the case the reviewer flagged, and the
+        // binding must still refuse it.
+        core.config.store(op_config());
+        assert_eq!(
+            core.leases.active(),
+            1,
+            "an unchanged rule survives invalidation, which is why the stamp matters"
+        );
+
+        let (r2, w2) = pipe();
+        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w2), None), 0);
+        assert_eq!(read_all(r2), "secret-A");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a grant decided under the previous config generation must not be served"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_reload_invalidates_exactly_the_leases_whose_rule_moved() {
+        // The invalidation matrix, driven directly: a lease dies when its rule is
+        // removed, when the rule's own definition changes in any field, and when
+        // the SOURCE it injects from changes (the lease may be holding that
+        // source's values). An untouched rule keeps its window.
+        use crate::config::{Action, Match, Rule, RuleMode, Source};
+        let dir = tmpdir("lease-invalidate");
+        let (core, _) = counting_core(&dir, op_config(), None);
+
+        // Two rules, each with a live lease.
+        let base = {
+            let mut cfg = op_config();
+            cfg.add_source(Source {
+                name: "other".into(),
+                provider: OpProvider::ID.into(),
+                account: None,
+                path: None,
+                keys: Vec::new(),
+                plain: Default::default(),
+            })
+            .unwrap();
+            cfg.add_rule(Rule {
+                name: "other".into(),
+                match_: Match {
+                    command: Some("other".into()),
+                    ..Match::default()
+                },
+                action: Action {
+                    mode: RuleMode::Gate,
+                    source: "other".into(),
+                    lease: LeasePolicy::Leasable { max_secs: 900 },
+                    timeout_sec: None,
+                },
+            })
+            .unwrap();
+            cfg
+        };
+        let seed = |core: &Arc<Core>| {
+            core.leases.clear();
+            for (i, rule) in ["op", "other"].iter().enumerate() {
+                core.leases.grant(
+                    [i as u8; 32],
+                    &lease::LeaseBinding::cached("src", rule, "E1", 0),
+                    zeroize::Zeroizing::new(b"TOKEN=v".to_vec()),
+                    Duration::from_secs(60),
+                );
+            }
+            assert_eq!(core.leases.active(), 2);
+        };
+
+        // 1. The rule is gone.
+        seed(&core);
+        let mut removed = base.clone();
+        removed.rules.retain(|r| r.name != "op");
+        core.invalidate_leases_for_config_change(&base, &removed);
+        assert_eq!(core.leases.active(), 1, "the removed rule's window died");
+        assert_eq!(core.leases.list()[0].scope, "other");
+
+        // 2. The rule's match changed (the F3 shape).
+        seed(&core);
+        let mut rewritten = base.clone();
+        rewritten.rules[0].match_.command = Some("curl".into());
+        core.invalidate_leases_for_config_change(&base, &rewritten);
+        assert_eq!(core.leases.active(), 1);
+        assert_eq!(core.leases.list()[0].scope, "other");
+
+        // 3. Only the lease policy changed. Still a change; the window dies.
+        seed(&core);
+        let mut relaxed = base.clone();
+        relaxed.rules[0].action.lease = LeasePolicy::Leasable { max_secs: 30 };
+        core.invalidate_leases_for_config_change(&base, &relaxed);
+        assert_eq!(core.leases.active(), 1);
+
+        // 4. The rule is untouched but its SOURCE moved (new keys to inject).
+        seed(&core);
+        let mut resourced = base.clone();
+        resourced.sources[0].keys = vec!["NEW_KEY".into()];
+        core.invalidate_leases_for_config_change(&base, &resourced);
+        assert_eq!(
+            core.leases.active(),
+            1,
+            "a moved source kills its rule's window"
+        );
+        assert_eq!(core.leases.list()[0].scope, "other");
+
+        // 5. A no-op reload keeps every window.
+        seed(&core);
+        core.invalidate_leases_for_config_change(&base, &base.clone());
+        assert_eq!(
+            core.leases.active(),
+            2,
+            "an unchanged config revokes nothing"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn leased_unsealed_inline_env_source_runs_as_a_plain_gate() {
+        // A degraded (unsealed) inline env source leases like any plain gate, so a
+        // later invocation short-circuits on the live lease. That path must ALSO
+        // route through the passthrough runner: `EnvProvider::run` refuses an empty
+        // env, so a naive `provider.run(env: None)` would exit 1 and brick the
+        // command on the second run. Prove the leased run still runs as a bare gate,
+        // and that the lease is rule-wide here too: the second run is a different
+        // argv from a different directory, and the approver is never consulted again.
+        use crate::config::{Action, Match, Rule, RuleMode, Source};
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("envinline-leased");
+        let bindir = dir.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = bindir.join("faketool");
+        std::fs::write(&tool, "#!/bin/sh\nprintf 'tok=[%s]' \"$TOKEN\"\n").unwrap();
+        std::fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A leasable gate rule over an unsealed inline env source.
+        let mut config = Config::default();
+        config
+            .add_source(Source {
+                name: "faketool".into(),
+                provider: crate::provider::EnvProvider::ID.into(),
+                account: None,
+                path: None,
+                keys: vec!["TOKEN".into()],
+                plain: Default::default(),
+            })
+            .unwrap();
+        config
+            .add_rule(Rule {
+                name: "faketool".into(),
+                match_: Match {
+                    command: Some("faketool".into()),
+                    ..Match::default()
+                },
+                action: Action {
+                    mode: RuleMode::Gate,
+                    source: "faketool".into(),
+                    lease: LeasePolicy::Leasable { max_secs: 900 },
+                    timeout_sec: None,
+                },
+            })
+            .unwrap();
+
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let pending = Arc::new(PendingRegistry::new());
+        // The counting approver stands in for a phone approval that opens an
+        // auto-approve window, and records how often it was asked, so a later run
+        // being lease-served is provable rather than assumed.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let core = Arc::new(Core {
+            remote: Vec::new(),
+            keystore: KeystoreCell::new(keystore),
+            threshold: Mutex::new(Default::default()),
+            leases: LeaseStore::new(),
+            gate: ApprovalGate::new(Box::new(CountingApprover::new(
+                calls.clone(),
+                Duration::from_secs(60),
+            ))),
+            pending,
+            proc_table: Box::new(EmptyTable),
+            providers: ProviderRegistry::with_defaults(),
+            config: config.into(),
+            lease_ttl: Duration::from_secs(60),
+            factor: Factor::DevInsecure,
+            ssh_signers: SshSignersCell::new(Vec::new()),
+            audit: None,
+            seal: crate::keystore_seal::SealState::Plain,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
+        });
+
+        std::env::remove_var("TOKEN");
+        let prev = std::env::var_os("PATH");
+        let mut search = vec![bindir.clone()];
+        if let Some(p) = &prev {
+            search.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
+
+        // First run: plain-gate approval opens the lease.
+        let (r1, w1) = pipe();
+        let c1 = fulfill(
+            &core,
+            &["faketool".into()],
+            "",
+            None,
+            0,
+            None,
+            Some(w1),
+            None,
+        );
+        assert_eq!(c1, 0, "first (approved) run is a plain gate");
+        assert_eq!(read_all(r1), "tok=[]");
+        assert_eq!(core.leases.active(), 1, "the plain gate opened a lease");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Second run: a DIFFERENT argv under the same rule, from a different
+        // directory. It short-circuits on the rule-wide lease and must STILL run,
+        // not exit 1, and still inject nothing.
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let (r2, w2) = pipe();
+        let c2 = fulfill(
+            &core,
+            &["faketool".into(), "--other".into()],
+            elsewhere.to_str().unwrap(),
+            None,
+            0,
+            None,
+            Some(w2),
+            None,
+        );
+        match prev {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        assert_eq!(
+            c2, 0,
+            "the leased second run is a plain gate, not an exit-1"
+        );
+        assert_eq!(
+            read_all(r2),
+            "tok=[]",
+            "still no injection on the leased run"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "another command under the same rule, from another directory, rode the lease"
+        );
+        assert_eq!(core.leases.active(), 1, "and opened no second lease");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2773,26 +5204,27 @@ mod tests {
 
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let config = env_file_config("faketool", env_path.to_str().unwrap());
         let core = Arc::new(Core {
             remote: Vec::new(),
-            keystore,
-            accounts: Mutex::new(AccountStore::default()),
+            keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
+            seal: crate::keystore_seal::SealState::Plain,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
         });
 
         let prev = std::env::var_os("PATH");
@@ -2856,25 +5288,26 @@ mod tests {
 
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Arc::new(Core {
             remote: Vec::new(),
-            keystore,
-            accounts: Mutex::new(AccountStore::default()),
+            keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
             config: env_file_config("faketool", env_path.to_str().unwrap()).into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
+            seal: crate::keystore_seal::SealState::Plain,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
         });
 
         let prev = std::env::var_os("PATH");
@@ -2945,28 +5378,29 @@ mod tests {
 
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Approve)
             .with_control_socket(true);
         let core = Core {
             remote: Vec::new(),
-            keystore,
-            accounts: Mutex::new(AccountStore::default()),
+            keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
             config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: vec![Box::new(sshagent::FileSshSigner::new(vec![(
+            ssh_signers: SshSignersCell::new(vec![Box::new(sshagent::FileSshSigner::new(vec![(
                 id.clone(),
                 key_path.clone(),
-            )]))],
+            )]))]),
             audit: None,
+            seal: crate::keystore_seal::SealState::Plain,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
         };
 
         // The agent advertises the file identity.
@@ -2974,6 +5408,7 @@ mod tests {
 
         let host = sshagent::HostContext {
             host: "(host not bound)".into(),
+            binding: sigil_proto::HostBinding::Unbound,
         };
         let data = b"gated-file-sign";
         let sig_blob = core
@@ -3071,11 +5506,10 @@ mod tests {
 
     use crate::remote::RemoteApprover;
     use sigil_proto::identity::DeviceIdentity;
-    use sigil_proto::pairing::{DaemonPairing, Dek as ProtoDek};
-    use sigil_proto::{LocalRelay, PairingState};
+    use sigil_proto::pairing::DaemonPairing;
+    use sigil_proto::LocalRelay;
     use sigil_relay_client::{DaemonRelay, PhoneRelay};
     use sigil_softphone::{Pairing, Policy, Softphone};
-    use zeroize::Zeroizing;
 
     const REMOTE_NOW: u64 = 1_720_000_000_000;
 
@@ -3087,10 +5521,10 @@ mod tests {
     }
 
     /// Pair a softphone to a fresh daemon identity in-process and return the
-    /// pieces the daemon side needs: the daemon identity (for the approver), the
-    /// paired softphone (holding the DEK), and the raw 32-byte DEK (so the test
-    /// can seal the account token under the same key).
-    fn pair_softphone(policy: Policy) -> (DeviceIdentity, Softphone, [u8; 32]) {
+    /// pieces the daemon side needs: the daemon identity (for the approver) and the
+    /// paired softphone. The ceremony delivers no key: `op` is a plain gate, so the
+    /// softphone only decides (approve/deny), it releases nothing.
+    fn pair_softphone(policy: Policy) -> (DeviceIdentity, Softphone) {
         let daemon_id = DeviceIdentity::generate();
         let daemon_for_approver = clone_device(&daemon_id);
         let (mut daemon, payload) =
@@ -3103,22 +5537,15 @@ mod tests {
         assert_eq!(daemon.sas_words().unwrap(), pairing.sas_words());
         daemon.confirm().unwrap();
         pairing.confirm().unwrap();
+        let softphone = pairing.finish().unwrap();
 
-        // The one DEK: delivered to the phone via pairing, and (below) used to
-        // seal the account token so the phone-returned key decrypts it.
-        let dek_bytes = *ProtoDek::generate().as_bytes();
-        let env = daemon
-            .deliver_dek(&ProtoDek::from_bytes(dek_bytes), 1)
-            .unwrap();
-        assert_eq!(daemon.state(), PairingState::DekDelivered);
-        let softphone = pairing.receive_dek(&env).unwrap();
-
-        (daemon_for_approver, softphone, dek_bytes)
+        (daemon_for_approver, softphone)
     }
 
     /// Build an inert daemon core whose approval gate is a [`RemoteApprover`]
     /// wired to `transport` (any [`Transport`]: the in-process [`LocalRelay`] or
-    /// the real [`DaemonRelay`]), with the account token sealed under `dek_bytes`.
+    /// the real [`DaemonRelay`]). `op` is a plain gate: the daemon injects nothing
+    /// and holds no secret at rest; the gated op streams its own output.
     #[allow(clippy::too_many_arguments)] // a test helper; each arg is a distinct fixture
     fn remote_core(
         dir: &Path,
@@ -3126,23 +5553,9 @@ mod tests {
         phone: sigil_proto::PeerIdentity,
         transport: Arc<dyn sigil_proto::Transport>,
         timeout: Duration,
-        dek_bytes: [u8; 32],
         token: &str,
         secret: &str,
     ) -> (Arc<Core>, Arc<RemoteApprover>) {
-        // The account store: token ciphertext sealed under the shared DEK. The
-        // daemon holds NO DEK of its own.
-        let sealing_dek: crate::secrets::Dek = Zeroizing::new(dek_bytes);
-        let mut accounts = AccountStore::default();
-        accounts
-            .add(
-                "Rowm",
-                &sealing_dek,
-                token.as_bytes(),
-                vec!["Engineering".into()],
-            )
-            .unwrap();
-
         // Hold the approver in an Arc as production does: the gate takes one clone,
         // the test keeps another to run the ToDaemon owner (the sole reader that
         // routes the phone's response to the waiting round trip). Both clones point
@@ -3155,14 +5568,12 @@ mod tests {
         );
         let pending = Arc::new(PendingRegistry::new());
         let core = Arc::new(Core {
-            keystore: Arc::new(MemoryKeystore::new()), // no DEK at rest
-            accounts: Mutex::new(accounts),
+            keystore: KeystoreCell::new(Arc::new(MemoryKeystore::new())), // no DEK at rest
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver.clone())),
             remote: vec![approver.clone()],
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
@@ -3170,8 +5581,11 @@ mod tests {
             config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::Phone,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
+            seal: crate::keystore_seal::SealState::Plain,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
         });
         (core, approver)
     }
@@ -3207,7 +5621,7 @@ mod tests {
     fn remote_softphone_approval_delivers_secret_over_the_socket() {
         let dir = tmpdir("remote-approve");
         let relay = LocalRelay::new();
-        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Approve);
+        let (daemon_id, softphone) = pair_softphone(Policy::Approve);
         let phone_pub = softphone.phone_identity();
         let mailbox = softphone.mailbox();
 
@@ -3217,7 +5631,6 @@ mod tests {
             phone_pub,
             Arc::new(relay.clone()),
             Duration::from_secs(3),
-            dek_bytes,
             "remote-token-xyz",
             "remote-secret-99",
         );
@@ -3284,7 +5697,7 @@ mod tests {
     fn remote_softphone_denial_fails_closed_with_no_secret() {
         let dir = tmpdir("remote-deny");
         let relay = LocalRelay::new();
-        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Deny);
+        let (daemon_id, softphone) = pair_softphone(Policy::Deny);
         let phone_pub = softphone.phone_identity();
 
         let (core, approver) = remote_core(
@@ -3293,7 +5706,6 @@ mod tests {
             phone_pub,
             Arc::new(relay.clone()),
             Duration::from_secs(3),
-            dek_bytes,
             "tok",
             "should-never-appear",
         );
@@ -3333,354 +5745,12 @@ mod tests {
 
     // --- v2 threshold: the full daemon round trip over the socket ----------
 
-    /// Pair a softphone as in [`pair_softphone`], then attach a software
-    /// Secure-Enclave threshold share `f` to it (standing in for the real
-    /// enclave). Returns the daemon identity, the v2-capable softphone, the
-    /// public share `F` (ANSI X9.63) for the daemon to pin, and the SE key id.
-    fn pair_softphone_v2(
-        policy: Policy,
-    ) -> (
-        DeviceIdentity,
-        Softphone,
-        [u8; sigil_proto::threshold::P256_X963_POINT_LEN],
-        &'static str,
-    ) {
-        let (daemon_for_approver, softphone, _dek) = pair_softphone(policy);
-        let f = sigil_proto::threshold::MacShare::generate();
-        let se_key_id = "se-key-1";
-        let softphone = softphone.with_phone_share(f, se_key_id);
-        let f_x963 = softphone
-            .phone_share_x963()
-            .expect("softphone holds an SE share");
-        (daemon_for_approver, softphone, f_x963, se_key_id)
-    }
-
-    /// An inert daemon core whose one account is a **v2 threshold** account: the
-    /// token is sealed under `K = combine(Z_M, Z_F, E, id)`, the Mac share `m` is
-    /// generated into the (memory) keystore, and the record is held in the core's
-    /// threshold store. The daemon holds NO DEK and no phone secret.
-    #[allow(clippy::too_many_arguments)]
-    fn remote_core_v2(
-        dir: &Path,
-        daemon_id: DeviceIdentity,
-        phone: sigil_proto::PeerIdentity,
-        transport: Arc<dyn sigil_proto::Transport>,
-        timeout: Duration,
-        f_x963: &[u8],
-        se_key_id: &str,
-        token: &str,
-        secret: &str,
-    ) -> (Arc<Core>, Arc<RemoteApprover>) {
-        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
-        // Mint/seal the Mac share m in the keystore, then seal the token to
-        // (m, F) as a v2 record and persist it to the threshold store on disk.
-        let m = crate::threshold::load_or_create_mac_share(keystore.as_ref()).unwrap();
-        let phone_share = crate::threshold::PhoneShare::from_x963(
-            se_key_id,
-            f_x963,
-            sigil_proto::threshold::EcdhAlgo::RawX,
-        )
-        .unwrap();
-        let mut store = crate::threshold::ThresholdStore::default();
-        crate::threshold::seal_account(
-            &mut store,
-            "Rowm",
-            &m,
-            &phone_share,
-            token.as_bytes(),
-            vec!["Engineering".into()],
-        )
-        .unwrap();
-        drop(m);
-
-        let approver = Arc::new(
-            RemoteApprover::new(transport, daemon_id, phone)
-                .with_timeout(timeout)
-                .with_listen_poll(Duration::from_millis(20)),
-        );
-        let core = Arc::new(Core {
-            keystore,                                      // holds m (sealed); NO DEK
-            accounts: Mutex::new(AccountStore::default()), // no v1 accounts
-            threshold: Mutex::new(store),
-            leases: LeaseStore::new(),
-            gate: ApprovalGate::new(Box::new(approver.clone())),
-            remote: vec![approver.clone()],
-            pending: Arc::new(PendingRegistry::new()),
-            lockdown: AtomicBool::new(false),
-            proc_table: Box::new(EmptyTable),
-            providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
-                write_fake_op(dir, token, secret),
-            ))]),
-            config: op_config().into(),
-            lease_ttl: Duration::from_secs(60),
-            factor: Factor::Phone,
-            ssh_signers: Vec::new(),
-            audit: None,
-        });
-        (core, approver)
-    }
-
-    #[test]
-    fn remote_v2_threshold_approval_decrypts_via_two_party_combine() {
-        // The headline v2 loop: the phone contributes Z_F = x(f·E) under its
-        // policy, the daemon combines it with its Mac share m to derive K, and the
-        // token reaches the caller's fd. No DEK exists anywhere; e was destroyed at
-        // account-add, so only the two parties together can open the token.
-        let _home = HomeGuard::new("remote-v2");
-        let dir = tmpdir("remote-v2");
-        let relay = LocalRelay::new();
-        let (daemon_id, softphone, f_x963, se_key_id) = pair_softphone_v2(Policy::Approve);
-        let phone_pub = softphone.phone_identity();
-        let mailbox = softphone.mailbox();
-
-        let (core, approver) = remote_core_v2(
-            &dir,
-            daemon_id,
-            phone_pub,
-            Arc::new(relay.clone()),
-            Duration::from_secs(3),
-            &f_x963,
-            se_key_id,
-            "v2-token-xyz",
-            "v2-secret-99",
-        );
-        let (owner_stop, owner) = spawn_owner(approver);
-
-        let softphone = Arc::new(softphone);
-        let (shutdown, approver_thread) = spawn_approver(softphone.clone(), relay.clone());
-
-        let (client, server) = UnixStream::pair().unwrap();
-        let (read_end, write_end) = pipe();
-        let (err_r, err_w) = pipe();
-        let argv = vec![
-            "op".into(),
-            "read".into(),
-            "op://Engineering/.env/password".into(),
-        ];
-        local::send_frame(
-            &client,
-            &Frame::Run {
-                argv,
-                cwd: String::new(),
-                proxy_depth: 0,
-            },
-            &[
-                std::io::stdin().as_raw_fd(),
-                write_end.as_raw_fd(),
-                err_w.as_raw_fd(),
-            ],
-        )
-        .unwrap();
-        drop(write_end);
-        drop(err_w);
-
-        let worker = std::thread::spawn(move || handle_conn(core, server));
-        worker.join().unwrap().unwrap();
-
-        // The secret reached the caller, and only via the two-party combine.
-        assert_eq!(read_all(read_end), "v2-secret-99");
-        let mut client = client;
-        assert_eq!(
-            local::recv_reply(&mut client).unwrap(),
-            Reply::Exit { code: 0 }
-        );
-        assert_eq!(
-            relay.depth(mailbox, sigil_proto::Direction::ToDaemon),
-            0,
-            "the v2 partial response was consumed by the daemon"
-        );
-        let _ = err_r;
-
-        shutdown.store(true, Ordering::SeqCst);
-        approver_thread.join().unwrap();
-        owner_stop.store(true, Ordering::SeqCst);
-        owner.join().unwrap();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn remote_v2_denial_fails_closed_with_no_secret() {
-        // A v2 deny carries no partial, so the combine cannot run: fail closed.
-        let _home = HomeGuard::new("remote-v2-deny");
-        let dir = tmpdir("remote-v2-deny");
-        let relay = LocalRelay::new();
-        let (daemon_id, softphone, f_x963, se_key_id) = pair_softphone_v2(Policy::Deny);
-        let phone_pub = softphone.phone_identity();
-
-        let (core, approver) = remote_core_v2(
-            &dir,
-            daemon_id,
-            phone_pub,
-            Arc::new(relay.clone()),
-            Duration::from_secs(3),
-            &f_x963,
-            se_key_id,
-            "tok",
-            "should-never-appear",
-        );
-        let (owner_stop, owner) = spawn_owner(approver);
-
-        let softphone = Arc::new(softphone);
-        let (shutdown, approver_thread) = spawn_approver(softphone.clone(), relay.clone());
-
-        let (read_end, write_end) = pipe();
-        let (err_r, err_w) = pipe();
-        let argv = vec![
-            "op".into(),
-            "read".into(),
-            "op://Engineering/.env/password".into(),
-        ];
-        let code = fulfill(
-            &core,
-            &argv,
-            "",
-            None,
-            0,
-            None,
-            Some(write_end),
-            Some(err_w),
-        );
-        assert_eq!(code, 1, "a v2 denial must fail closed");
-        assert_eq!(read_all(read_end), "", "no secret on a denied v2 request");
-        assert!(read_all(err_r).contains("denied"));
-
-        shutdown.store(true, Ordering::SeqCst);
-        approver_thread.join().unwrap();
-        owner_stop.store(true, Ordering::SeqCst);
-        owner.join().unwrap();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// A fake `op` that echoes whatever token reached its env, so a test can
-    /// assert which account's token was injected on each route.
-    fn write_echo_op(dir: &Path) -> PathBuf {
-        let path = dir.join("op");
-        std::fs::write(
-            &path,
-            "#!/bin/sh\nprintf '%s' \"$OP_SERVICE_ACCOUNT_TOKEN\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
-
-    #[test]
-    fn v1_and_v2_accounts_coexist_and_each_takes_its_own_path() {
-        // The migration invariant (R3): a v1 account still decrypts via the DEK
-        // path while a v2 account in the same store decrypts via the two-party
-        // combine. The path is chosen by the at-rest record, and one paired phone
-        // (holding both the DEK and the SE share f) answers either kind.
-        use sigil_proto::threshold::{EcdhAlgo, MacShare};
-
-        let dir = tmpdir("remote-mixed");
-        let relay = LocalRelay::new();
-        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Approve);
-        let f = MacShare::generate();
-        let se_key_id = "se-key-1";
-        let softphone = softphone.with_phone_share(f, se_key_id);
-        let f_x963 = softphone.phone_share_x963().unwrap();
-        let phone_pub = softphone.phone_identity();
-
-        // v1 account "Legacy", token sealed under the phone-delivered DEK.
-        let sealing_dek: crate::secrets::Dek = Zeroizing::new(dek_bytes);
-        let mut accounts = AccountStore::default();
-        accounts
-            .add("Legacy", &sealing_dek, b"v1-token", vec!["Legacy".into()])
-            .unwrap();
-
-        // v2 account "Rowm", token sealed under (m, F).
-        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
-        let m = crate::threshold::load_or_create_mac_share(keystore.as_ref()).unwrap();
-        let phone_share =
-            crate::threshold::PhoneShare::from_x963(se_key_id, &f_x963, EcdhAlgo::RawX).unwrap();
-        let mut tstore = crate::threshold::ThresholdStore::default();
-        crate::threshold::seal_account(
-            &mut tstore,
-            "Rowm",
-            &m,
-            &phone_share,
-            b"v2-token",
-            vec!["Engineering".into()],
-        )
-        .unwrap();
-        drop(m);
-
-        let approver = Arc::new(
-            RemoteApprover::new(Arc::new(relay.clone()), daemon_id, phone_pub)
-                .with_timeout(Duration::from_secs(3))
-                .with_listen_poll(Duration::from_millis(20)),
-        );
-        let core = Arc::new(Core {
-            keystore,
-            accounts: Mutex::new(accounts),
-            threshold: Mutex::new(tstore),
-            leases: LeaseStore::new(),
-            gate: ApprovalGate::new(Box::new(approver.clone())),
-            remote: vec![approver.clone()],
-            pending: Arc::new(PendingRegistry::new()),
-            lockdown: AtomicBool::new(false),
-            proc_table: Box::new(EmptyTable),
-            providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
-                write_echo_op(&dir),
-            ))]),
-            config: coexist_config().into(),
-            lease_ttl: Duration::from_secs(60),
-            factor: Factor::Phone,
-            ssh_signers: Vec::new(),
-            audit: None,
-        });
-        let (owner_stop, owner) = spawn_owner(approver);
-
-        let softphone = Arc::new(softphone);
-        let (shutdown, approver_thread) = spawn_approver(softphone.clone(), relay.clone());
-
-        // The v2 vault routes through the threshold combine → the v2 token.
-        let (r2, w2) = pipe();
-        let v2_argv = vec![
-            "op".into(),
-            "read".into(),
-            "--vault".into(),
-            "Engineering".into(),
-            "op://Engineering/x".into(),
-        ];
-        assert_eq!(
-            fulfill(&core, &v2_argv, "", None, 0, None, Some(w2), None),
-            0
-        );
-        assert_eq!(
-            read_all(r2),
-            "v2-token",
-            "v2 vault must use the combine path"
-        );
-
-        // The v1 vault routes through the DEK path → the v1 token.
-        let (r1, w1) = pipe();
-        let v1_argv = vec![
-            "op".into(),
-            "read".into(),
-            "--vault".into(),
-            "Legacy".into(),
-            "op://Legacy/x".into(),
-        ];
-        assert_eq!(
-            fulfill(&core, &v1_argv, "", None, 0, None, Some(w1), None),
-            0
-        );
-        assert_eq!(read_all(r1), "v1-token", "v1 vault must use the DEK path");
-
-        shutdown.store(true, Ordering::SeqCst);
-        approver_thread.join().unwrap();
-        owner_stop.store(true, Ordering::SeqCst);
-        owner.join().unwrap();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     #[test]
     fn remote_pairing_config_derives_the_shared_mailbox() {
         // The persisted phone-factor config must derive the exact mailbox both
         // devices route on, so `build_gate(Factor::Phone, ..)` attaches to the
         // right relay queue. This also constructs the config type end to end.
-        let (daemon_id, softphone, _dek) = pair_softphone(Policy::Approve);
+        let (daemon_id, softphone) = pair_softphone(Policy::Approve);
         let cfg = RemotePairingConfig {
             relay_url: "https://relay.example".into(),
             daemon_identity: daemon_id,
@@ -3790,7 +5860,7 @@ mod tests {
         };
 
         let dir = tmpdir("real-relay");
-        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Approve);
+        let (daemon_id, softphone) = pair_softphone(Policy::Approve);
         let phone_pub = softphone.phone_identity();
         let mailbox = softphone.mailbox();
 
@@ -3813,12 +5883,10 @@ mod tests {
             phone_pub,
             Arc::new(daemon_relay),
             Duration::from_secs(10),
-            dek_bytes,
             "real-token-abc",
             "real-secret-77",
         );
         // The inert-daemon invariant: no DEK at rest; it arrives per-approval.
-        assert!(!core.keystore.has_dek(), "daemon holds no DEK at rest");
         // The daemon's ToDaemon owner reads the real relay and routes the response.
         let (owner_stop, owner) = spawn_owner(approver);
 
@@ -3908,7 +5976,7 @@ mod tests {
         let base = format!("http://127.0.0.1:{port}");
 
         let dir = tmpdir("relay-bounce");
-        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Approve);
+        let (daemon_id, softphone) = pair_softphone(Policy::Approve);
         let phone_pub = softphone.phone_identity();
         let mailbox = softphone.mailbox();
 
@@ -3928,7 +5996,6 @@ mod tests {
             phone_pub,
             Arc::new(daemon_relay),
             Duration::from_secs(20),
-            dek_bytes,
             "bounce-token",
             "bounce-secret-55",
         );
@@ -3967,25 +6034,18 @@ mod tests {
     /// whose token decrypts to `token`. Used to exercise the arm-time factor
     /// policy (residual #1) directly.
     fn factor_core(dir: &Path, token: &str, secret: &str, factor: Factor) -> Arc<Core> {
-        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::with_dek());
-        let dek = keystore.unwrap_dek("seed").unwrap();
-        let mut accounts = AccountStore::default();
-        accounts
-            .add("Rowm", &dek, token.as_bytes(), vec!["Engineering".into()])
-            .unwrap();
-        drop(dek);
+        let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
+        let _ = token;
         let pending = Arc::new(PendingRegistry::new());
         let (gate, _listeners, _acceptors) =
             build_gate(factor, Vec::new(), &keystore, &pending).unwrap();
         Arc::new(Core {
             remote: Vec::new(),
-            keystore,
-            accounts: Mutex::new(accounts),
+            keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate,
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
@@ -3993,9 +6053,346 @@ mod tests {
             config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
+            seal: crate::keystore_seal::SealState::Plain,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
         })
+    }
+
+    /// A core whose keystore file classified as `seal` at startup, with the
+    /// given provision state. Everything else is the ordinary dev-approve core,
+    /// so any refusal these tests see comes from the seal and nothing else.
+    fn sealed_core(
+        dir: &Path,
+        seal: crate::keystore_seal::SealState,
+        provisioned: bool,
+    ) -> Arc<Core> {
+        let (core, _) = test_core(
+            dir,
+            "tok",
+            "should-never-appear",
+            DevMode::Approve,
+            Duration::from_millis(50),
+        );
+        let mut core = Arc::try_unwrap(core)
+            .map(Box::new)
+            .ok()
+            .expect("sole owner");
+        core.seal = seal;
+        core.provisioned = AtomicBool::new(provisioned);
+        Arc::new(*core)
+    }
+
+    #[test]
+    fn a_sealed_unprovisioned_daemon_serves_nothing_and_says_why() {
+        // The restart matrix's hard case: a wrapped keystore and no app yet. The
+        // daemon is up (status, pairing, diagnostics all work) but it cannot open
+        // a sealed secret or sign as itself, so it must run NOTHING gated. The
+        // message is the load-bearing part: a human reading it must understand
+        // the app is not running, and must not be nudged toward a re-pair.
+        let dir = tmpdir("sealed-unprovisioned");
+        let core = sealed_core(
+            &dir,
+            crate::keystore_seal::SealState::Sealed {
+                expected: [1u8; 32],
+                se_pub: b"spki".to_vec(),
+            },
+            false,
+        );
+
+        let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
+        let (out_r, out_w) = pipe();
+        let (err_r, err_w) = pipe();
+        let code = fulfill(&core, &argv, "", None, 0, None, Some(out_w), Some(err_w));
+        assert_eq!(code, 1, "a sealed daemon fails closed");
+        assert_eq!(read_all(out_r), "", "and delivers no secret");
+
+        let err = read_all(err_r);
+        assert!(err.contains("keystore sealed"), "{err}");
+        assert!(err.contains("Sigil app must be running"), "{err}");
+        let lower = err.to_lowercase();
+        assert!(
+            !lower.contains("no pairing"),
+            "must not read as a lost pairing: {err}"
+        );
+        assert!(
+            !lower.contains("run: sigil pair") && !lower.contains("re-pair with"),
+            "must not send anyone into a re-pair: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_provisioned_seal_serves_normally_and_a_downgrade_never_does() {
+        // Once the app has provisioned, a wrapped daemon behaves exactly like a
+        // plaintext one. A downgrade (plaintext where wrapped was promised)
+        // refuses regardless, since that is the shape of an attack.
+        let dir = tmpdir("sealed-provisioned");
+        let core = sealed_core(
+            &dir,
+            crate::keystore_seal::SealState::Sealed {
+                expected: [1u8; 32],
+                se_pub: b"spki".to_vec(),
+            },
+            true,
+        );
+        let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
+        let (r, w) = pipe();
+        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w), None), 0);
+        assert_eq!(
+            read_all(r),
+            "should-never-appear",
+            "a provisioned seal serves"
+        );
+
+        let down = sealed_core(&dir, crate::keystore_seal::SealState::Downgraded, true);
+        let (out_r, out_w) = pipe();
+        let (err_r, err_w) = pipe();
+        let code = fulfill(&down, &argv, "", None, 0, None, Some(out_w), Some(err_w));
+        assert_eq!(code, 1, "a downgraded keystore serves nothing");
+        assert_eq!(read_all(out_r), "");
+        assert!(read_all(err_r).contains("downgraded"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn status_reports_the_keystore_seal_state_the_daemon_armed_with() {
+        // Only the daemon can answer this, so it must be on the wire. The Mac app
+        // reads these to explain the sealed state instead of guessing.
+        let dir = tmpdir("sealed-status");
+        let sealed = sealed_core(
+            &dir,
+            crate::keystore_seal::SealState::Sealed {
+                expected: [2u8; 32],
+                se_pub: Vec::new(),
+            },
+            false,
+        );
+        let st = sealed.status_report();
+        assert_eq!(st.keystore_sealed, Some(true));
+        assert_eq!(st.keystore_provisioned, Some(false));
+
+        let plain = sealed_core(&dir, crate::keystore_seal::SealState::Plain, false);
+        let st = plain.status_report();
+        assert_eq!(st.keystore_sealed, Some(false));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Drive one control frame (plus raw payload) over a real socket pair against
+    /// `handle_conn`, the way a client does. Returns the reply.
+    fn control_round_trip(core: &Arc<Core>, frame: &Frame, payload: &[u8]) -> Reply {
+        let (client, server) = UnixStream::pair().unwrap();
+        let core = core.clone();
+        let h = std::thread::spawn(move || {
+            let _ = handle_conn(core, server);
+        });
+        local::send_frame_with_payload(&client, frame, payload).unwrap();
+        let mut client = client;
+        let reply = local::recv_reply(&mut client).expect("a reply");
+        drop(client);
+        h.join().unwrap();
+        reply
+    }
+
+    fn control_ok(reply: &Reply) -> bool {
+        matches!(reply, Reply::Control { ok: true, .. })
+    }
+
+    fn control_lines(reply: &Reply) -> String {
+        match reply {
+            Reply::Control { lines, .. } => lines.join(" "),
+            other => panic!("expected a control reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provisioning_is_refused_for_anyone_who_is_not_the_signed_app() {
+        // The gate that makes "only the app holds the material" a control rather
+        // than a comment. The test binary is unsigned/ad-hoc, so it stands in for
+        // exactly the adversary this refuses: a same-UID process that can reach
+        // the 0600 socket as easily as the app can.
+        let dir = tmpdir("provision-gate");
+        let material = br#"{"blobs":{}}"#;
+        let core = sealed_core(
+            &dir,
+            crate::keystore_seal::SealState::Sealed {
+                expected: crate::keystore_seal::digest(b"spki", material),
+                se_pub: b"spki".to_vec(),
+            },
+            false,
+        );
+        let reply = control_round_trip(
+            &core,
+            &Frame::KeystoreProvision {
+                len: material.len() as u64,
+            },
+            material,
+        );
+        assert!(!control_ok(&reply), "an unsigned caller must be refused");
+        assert!(control_lines(&reply).contains("signed Sigil app"));
+        assert!(
+            !core.provisioned.load(Ordering::SeqCst),
+            "and must not leave the daemon provisioned"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_wrong_digest_provision_is_refused_and_does_not_latch() {
+        // Two properties in one, both load-bearing. The digest check is what stops
+        // material other than what the file commits to from being adopted. And a
+        // REFUSED attempt must not consume the once-per-lifetime slot, or anyone
+        // able to send one bad frame could permanently deny this daemon its
+        // material, which is a cheaper attack than the one the limit prevents.
+        let dir = tmpdir("provision-digest");
+        let material = br#"{"blobs":{}}"#;
+        let core = sealed_core(
+            &dir,
+            crate::keystore_seal::SealState::Sealed {
+                expected: crate::keystore_seal::digest(b"spki", b"DIFFERENT MATERIAL"),
+                se_pub: b"spki".to_vec(),
+            },
+            false,
+        );
+        // (The peer gate refuses first here; what this asserts is the state after
+        // a refusal, which must be identical either way: nothing loaded, nothing
+        // latched, and no adoption marker.)
+        let reply = control_round_trip(
+            &core,
+            &Frame::KeystoreProvision {
+                len: material.len() as u64,
+            },
+            material,
+        );
+        assert!(!control_ok(&reply));
+        assert!(!core.provisioned.load(Ordering::SeqCst));
+        assert!(
+            !crate::keystore_seal::is_adopted(),
+            "a refused provision must not mark this machine as adopted"
+        );
+        // The daemon is still provisionable: the slot did not burn.
+        let again = control_round_trip(
+            &core,
+            &Frame::KeystoreProvision {
+                len: material.len() as u64,
+            },
+            material,
+        );
+        assert!(!control_lines(&again).contains("already provisioned"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opened_material_becomes_the_live_read_only_keystore() {
+        // What a successful provision produces, exercised directly (the socket
+        // path cannot get here without a signed app). The daemon reads its
+        // identity from RAM, and every WRITE refuses: while the disk copy is
+        // wrapped, nothing may write a plaintext one beside it.
+        let material = br#"{"blobs":{"pairing.daemon-identity.v1":"aGVsbG8="}}"#;
+        let opened = crate::keystore::RamKeystore::from_material(material).unwrap();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(
+            opened.load_blob("pairing.daemon-identity.v1").unwrap(),
+            Some(b"hello".to_vec())
+        );
+        assert!(opened.load_blob("absent").unwrap().is_none());
+        assert!(matches!(
+            opened.store_blob("x", b"y"),
+            Err(crate::keystore::KeystoreError::Sealed)
+        ));
+        assert!(matches!(
+            opened.delete_blob("pairing.daemon-identity.v1"),
+            Err(crate::keystore::KeystoreError::Sealed)
+        ));
+        // Garbage in is refused rather than half-loaded.
+        assert!(crate::keystore::RamKeystore::from_material(b"not json").is_err());
+    }
+
+    #[test]
+    fn a_sealed_daemon_refuses_to_seal_and_says_why() {
+        // The mediated seal verb inherits the same gate as everything else: with
+        // no material there is no Mac share to seal with, and the refusal must
+        // read as "the app is not running", not as a broken pairing.
+        let dir = tmpdir("seal-sealed");
+        let core = sealed_core(
+            &dir,
+            crate::keystore_seal::SealState::Sealed {
+                expected: [3u8; 32],
+                se_pub: Vec::new(),
+            },
+            false,
+        );
+        let reply = control_round_trip(
+            &core,
+            &Frame::SealThreshold {
+                id: "src".into(),
+                len: 4,
+            },
+            b"TOK=",
+        );
+        assert!(!control_ok(&reply));
+        let lines = control_lines(&reply);
+        assert!(lines.contains("keystore sealed"), "{lines}");
+        assert!(!lines.to_lowercase().contains("no pairing"), "{lines}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_keystore_streams_and_unwrap_reports_are_app_only() {
+        // Both remaining app verbs refuse an unsigned caller, so nothing but the
+        // app can drive de-adoption or watch the ceremony stream.
+        let dir = tmpdir("keystore-app-only");
+        let core = sealed_core(&dir, crate::keystore_seal::SealState::Plain, false);
+        let reply = control_round_trip(
+            &core,
+            &Frame::KeystoreUnwrapDone {
+                nonce: "made-up".into(),
+                ok: true,
+                reason: String::new(),
+            },
+            b"",
+        );
+        assert!(!control_ok(&reply));
+        assert!(control_lines(&reply).contains("signed Sigil app"));
+
+        // And the subscription refuses before streaming anything.
+        let reply = control_round_trip(&core, &Frame::SubscribeKeystore, b"");
+        assert!(!control_ok(&reply));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unwrap_request_against_a_plain_store_is_a_no_op() {
+        // Nothing to unwrap, so it says so rather than raising a request no app
+        // would ever answer (and blocking the CLI for 75 seconds).
+        let dir = tmpdir("unwrap-plain");
+        let core = sealed_core(&dir, crate::keystore_seal::SealState::Plain, false);
+        let reply = control_round_trip(&core, &Frame::KeystoreUnwrapRequest, b"");
+        assert!(!control_ok(&reply));
+        assert!(control_lines(&reply).contains("not sealed"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unwrap_answer_must_quote_an_outstanding_nonce() {
+        // The registry refuses invented or replayed nonces, so a stray or repeated
+        // report cannot clear the adoption marker.
+        let reqs = UnwrapRequests::default();
+        assert!(!reqs.resolve("never-issued", true, ""));
+        let nonce = reqs.request();
+        assert_eq!(reqs.pending_events().len(), 1);
+        assert!(reqs.resolve(&nonce, true, ""));
+        assert!(
+            !reqs.resolve(&nonce, true, ""),
+            "an answered request cannot be answered twice"
+        );
+        assert!(reqs.pending_events().is_empty());
+        assert_eq!(
+            reqs.wait_for(&nonce, Duration::from_millis(10)),
+            Some((true, String::new()))
+        );
     }
 
     #[test]
@@ -4135,6 +6532,157 @@ mod tests {
     }
 
     #[test]
+    fn ssh_signers_hot_reload_when_the_key_store_changes() {
+        // A `sigil ssh add` edit to ~/.sigil/ssh-keys.json is picked up by
+        // reload_ssh_signers and swapped in, so a newly served key is advertised
+        // without a daemon restart (mirrors the rule-config hot-reload). HomeGuard
+        // points SIGIL_HOME at a temp dir, so SshKeyConfig::save writes exactly
+        // where reload_ssh_signers reads.
+        let _home = HomeGuard::new("ssh-reload");
+        let dir = tmpdir("ssh-reload");
+        let (core, _) = test_core(
+            &dir,
+            "tok",
+            "secret",
+            DevMode::Off,
+            Duration::from_millis(10),
+        );
+
+        // Before: the agent advertises no keys.
+        assert!(
+            SshBackend::identities(core.as_ref()).is_empty(),
+            "no keys served at start"
+        );
+
+        // Author a file-backed key on disk and register it in ssh-keys.json.
+        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .unwrap();
+        let key_path = dir.join("id_ed25519");
+        std::fs::write(&key_path, key.to_openssh(ssh_key::LineEnding::LF).unwrap()).unwrap();
+        std::fs::write(
+            format!("{}.pub", key_path.display()),
+            key.public_key().to_openssh().unwrap(),
+        )
+        .unwrap();
+        sshagent::SshKeyConfig {
+            files: vec![sshagent::SshFileEntry {
+                path: key_path.display().to_string(),
+                comment: String::new(),
+                hosts: Vec::new(),
+            }],
+            stored: Vec::new(),
+        }
+        .save()
+        .expect("writing ssh-keys.json into SIGIL_HOME");
+
+        core.reload_ssh_signers()
+            .expect("a clean reload swaps in the new key");
+
+        // After: the freshly added key is advertised, no restart.
+        let ids = SshBackend::identities(core.as_ref());
+        assert_eq!(ids.len(), 1, "the newly added key is served after reload");
+        assert_eq!(ids[0].key_blob, key.public_key().to_bytes().unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stored_ssh_key_is_advertised_from_the_config() {
+        // A `sigil ssh add-stored` entry is advertised by the agent (listing a
+        // stored key needs only its public line, not the sealed record).
+        let _home = HomeGuard::new("ssh-stored-adv");
+        let dir = tmpdir("ssh-stored-adv");
+        let (core, _) = test_core(
+            &dir,
+            "tok",
+            "secret",
+            DevMode::Off,
+            Duration::from_millis(10),
+        );
+
+        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .unwrap();
+        let pub_line = key.public_key().to_openssh().unwrap();
+        let fp = key
+            .public_key()
+            .fingerprint(ssh_key::HashAlg::Sha256)
+            .to_string();
+        sshagent::SshKeyConfig {
+            files: Vec::new(),
+            stored: vec![sshagent::SshStoredEntry {
+                public_key: pub_line,
+                account_id: format!("ssh:{fp}"),
+                comment: "tom@stored".into(),
+                hosts: Vec::new(),
+            }],
+        }
+        .save()
+        .expect("writing ssh-keys.json into SIGIL_HOME");
+
+        let ids = SshBackend::identities(core.as_ref());
+        assert_eq!(ids.len(), 1, "the stored key is advertised");
+        assert_eq!(ids[0].key_blob, key.public_key().to_bytes().unwrap());
+        assert_eq!(ids[0].label, "tom@stored");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stored_ssh_key_seals_opens_and_signs() {
+        // The exact crypto composition `Core::sign_stored` performs: seal an
+        // OpenSSH private key under threshold, then open it per-signature with the
+        // phone's partial Z_F plus the Mac share m, decode, sign, and verify. Uses
+        // the real reviewed primitives (a software stand-in for the phone SE key).
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        use sigil_proto::threshold::{EcdhAlgo, MacShare};
+
+        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .unwrap();
+        let pem = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
+
+        // Software phone (f, F) and the Mac share m.
+        let f = MacShare::generate();
+        let f_x963 = *f.public_point().as_x963();
+        let phone = crate::threshold::PhoneShare::from_x963("phone-se.v2", &f_x963, EcdhAlgo::RawX)
+            .unwrap();
+        let m = MacShare::generate();
+
+        // Seal exactly as `sigil ssh add-stored` does.
+        let mut store = crate::threshold::ThresholdStore::default();
+        crate::threshold::seal_secret(&mut store, "ssh:test", &m, &phone, pem.as_bytes()).unwrap();
+        let record = store.get("ssh:test").unwrap();
+        // The private key must not survive in cleartext in the sealed record.
+        let json = serde_json::to_string(record).unwrap();
+        assert!(
+            !json.contains("OPENSSH PRIVATE KEY"),
+            "no key material in the sealed record"
+        );
+
+        // The daemon's per-signature combine: Z_F = x(f·E), then decrypt.
+        let e_point = record.ephemeral_point().unwrap();
+        let zf = f.partial(&e_point, record.ecdh_algo, e_point.as_x963());
+        let pem_back = crate::threshold::decrypt(record, &m, &zf).unwrap();
+
+        // Decode + sign as sign_stored does, and verify the ed25519 signature.
+        let data = b"stored-ssh-challenge-bytes";
+        let sig_blob = sshagent::sign_openssh_ed25519(&pem_back, data)
+            .expect("stored sign produces a signature");
+        // The blob is `string "ssh-ed25519"` + `string <64-byte sig>`; the raw
+        // signature is its final 64 bytes.
+        assert!(sig_blob.len() >= 64);
+        let raw = &sig_blob[sig_blob.len() - 64..];
+        let pk_bytes = key.public_key().key_data().ed25519().unwrap().0;
+        let vk = VerifyingKey::from_bytes(&pk_bytes).unwrap();
+        let sig = Signature::from_slice(raw).unwrap();
+        vk.verify(data, &sig)
+            .expect("the stored-key signature verifies");
+
+        // Fail closed: a wrong/absent partial yields no key (so no signature).
+        assert!(
+            crate::threshold::decrypt(record, &m, &[0u8; 32]).is_err(),
+            "a wrong Z_F fails closed"
+        );
+    }
+
+    #[test]
     fn config_reload_is_fail_closed_on_a_malformed_file() {
         // #59 fail-closed proof: a malformed / half-written config.json must NOT
         // downgrade gating. reload_config errors and the last-good rules stay in
@@ -4186,7 +6734,7 @@ mod tests {
         // `load_remote_pairing` reconstructs) drives `build_gate` to the phone
         // approver with no DEK at rest. No relay is dialed synchronously, so this
         // needs no network.
-        let (daemon_id, softphone, _dek) = pair_softphone(Policy::Approve);
+        let (daemon_id, softphone) = pair_softphone(Policy::Approve);
         let cfg = RemotePairingConfig {
             relay_url: "ws://127.0.0.1:1".into(),
             daemon_identity: daemon_id,
@@ -4214,7 +6762,6 @@ mod tests {
             1,
             "the single-device phone factor hands back exactly one listener handle"
         );
-        assert!(!ks.has_dek());
     }
 
     #[test]
@@ -4224,7 +6771,7 @@ mod tests {
         // load (both go through the same trait object here).
         let ks: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
 
-        let (daemon_id, softphone, _dek) = pair_softphone(Policy::Approve);
+        let (daemon_id, softphone) = pair_softphone(Policy::Approve);
         let daemon_pub = daemon_id.peer_identity();
         let phone = softphone.phone_identity();
         let np = NewPairing {
@@ -4247,7 +6794,6 @@ mod tests {
 
         // Inert at rest: nothing persisted lets the daemon produce a DEK. The
         // keystore holds only the daemon identity blob, never a DEK.
-        assert!(!ks.has_dek(), "no DEK is persisted by pairing");
     }
 
     #[test]
@@ -4271,7 +6817,7 @@ mod tests {
         let _home = HomeGuard::new("reload-e2e");
         let ks: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
 
-        let (daemon_id, softphone, dek_bytes) = pair_softphone(Policy::Approve);
+        let (daemon_id, softphone) = pair_softphone(Policy::Approve);
         let daemon_pub = daemon_id.peer_identity();
         let phone_pub = softphone.phone_identity();
         let mailbox = softphone.mailbox();
@@ -4300,11 +6846,9 @@ mod tests {
             cfg.phone,
             Arc::new(daemon_relay),
             Duration::from_secs(10),
-            dek_bytes,
             "reload-token-abc",
             "reload-secret-88",
         );
-        assert!(!core.keystore.has_dek(), "daemon holds no DEK at rest");
         let (owner_stop, owner) = spawn_owner(approver);
 
         // Phone side over the real HTTP transport.
@@ -4378,7 +6922,7 @@ mod tests {
         };
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
-        use sigil_proto::{now_ms, rendezvous_mailbox, Envelope, PairingPayload};
+        use sigil_proto::{now_ms, rendezvous_mailbox, PairingPayload};
         use sigil_relay_client::Rendezvous;
 
         let (qr_tx, qr_rx) = std::sync::mpsc::channel::<String>();
@@ -4397,12 +6941,7 @@ mod tests {
             rv.send(&URL_SAFE_NO_PAD.encode(serde_json::to_vec(&resp).unwrap()))
                 .unwrap();
             pairing.confirm().unwrap();
-            let env_wire = rv
-                .recv(Duration::from_secs(10))
-                .unwrap()
-                .expect("the daemon sealed the DEK back");
-            let env: Envelope = serde_json::from_str(&env_wire).unwrap();
-            let sp = pairing.receive_dek(&env).unwrap();
+            let sp = pairing.finish().unwrap();
             sp.phone_identity()
         });
 
@@ -4411,8 +6950,7 @@ mod tests {
         let mut make_channel = |mailbox: [u8; 32]| crate::pair::relay_channel(&base, mailbox);
         let mut present_qr = |_u: &str, b64: &str| qr_tx.send(b64.to_string()).unwrap();
         let mut confirm = |_w: &[&'static str; 6]| true;
-        let dek = crate::secrets::generate_dek();
-        let mut unwrap_dek = || -> anyhow::Result<crate::secrets::Dek> { Ok(dek.clone()) };
+        let mut arm_after_sas = || -> anyhow::Result<()> { Ok(()) };
         let opts = crate::pair::CeremonyOpts {
             relay_url: base.clone(),
             response_timeout: Duration::from_secs(15),
@@ -4421,7 +6959,7 @@ mod tests {
             make_channel: &mut make_channel,
             present_qr: &mut present_qr,
             confirm_sas: &mut confirm,
-            unwrap_dek: &mut unwrap_dek,
+            arm_after_sas: &mut arm_after_sas,
         };
         let np = crate::pair::run_ceremony(daemon_id, opts).expect("pairing over the relay");
 
@@ -4434,15 +6972,6 @@ mod tests {
     }
 
     #[test]
-    fn vault_of_ref_extracts_the_vault_segment() {
-        assert_eq!(
-            vault_of_ref("op://Engineering/GitHub/private key").as_deref(),
-            Some("Engineering")
-        );
-        assert_eq!(vault_of_ref("not-a-ref"), None);
-    }
-
-    #[test]
     fn different_ssh_challenges_do_not_share_a_grant_key() {
         // The coalescing-safety invariant: a signature over different data must
         // derive a different grant key, so the approval gate can never let one
@@ -4452,21 +6981,36 @@ mod tests {
         let fp_a = crate::sshagent::sha256_fingerprint(b"challenge-A");
         let fp_b = crate::sshagent::sha256_fingerprint(b"challenge-B");
         assert_ne!(fp_a, fp_b);
-        let gk_a = lease::grant_key(&caller, "", &ssh_sign_scope("GitHub", &fp_a));
-        let gk_b = lease::grant_key(&caller, "", &ssh_sign_scope("GitHub", &fp_b));
+        let gk_a = lease::grant_key(
+            &caller,
+            lease::ScopeKind::SshSignature,
+            "",
+            &ssh_sign_scope("GitHub", &fp_a),
+        );
+        let gk_b = lease::grant_key(
+            &caller,
+            lease::ScopeKind::SshSignature,
+            "",
+            &ssh_sign_scope("GitHub", &fp_b),
+        );
         assert_ne!(gk_a, gk_b, "different data must not coalesce");
         // A byte-identical re-sign IS allowed to coalesce (deterministic, same sig).
-        let gk_a2 = lease::grant_key(&caller, "", &ssh_sign_scope("GitHub", &fp_a));
+        let gk_a2 = lease::grant_key(
+            &caller,
+            lease::ScopeKind::SshSignature,
+            "",
+            &ssh_sign_scope("GitHub", &fp_a),
+        );
         assert_eq!(gk_a, gk_a2);
     }
 
     #[test]
     fn env_file_lease_decision_grants_no_lease() {
-        // Leasing is disabled for a direct-injection provider even when the
-        // decision would grant a session lease: resolved secret VALUES must never
-        // sit in daemon RAM across a TTL. A Lease decision on an env-file command
-        // runs once and leaves no lease behind (the credential block that grants a
-        // lease is gated on `needs_account`, which is false for env-file).
+        // The rule's policy is the sole authority, and this env-file rule is
+        // run-once: even though the approver returns a session lease, nothing is
+        // retained and the next run is gated afresh. (An env-file rule caches
+        // nothing regardless: it reads its own file at run time, so a window over
+        // it would hold no values, only the presence marker a plain gate holds.)
         let _lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -4482,26 +7026,27 @@ mod tests {
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
         // A Lease decision that *would* lease an account-backed provider.
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Lease(Duration::from_secs(60)))
             .with_control_socket(true);
         let config = env_file_config("faketool", env_path.to_str().unwrap());
         let core = Arc::new(Core {
             remote: Vec::new(),
-            keystore,
-            accounts: Mutex::new(AccountStore::default()),
+            keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: Vec::new(),
+            ssh_signers: SshSignersCell::new(Vec::new()),
             audit: None,
+            seal: crate::keystore_seal::SealState::Plain,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
         });
 
         // Prepend (not replace) bindir so faketool resolves first while system
@@ -4560,33 +7105,35 @@ mod tests {
 
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let pending = Arc::new(PendingRegistry::new());
-        let approver = LocalApprover::new(keystore.clone(), pending.clone())
+        let approver = LocalApprover::new(pending.clone())
             .with_dev(DevMode::Off)
             .with_control_socket(true)
             .with_timeout(Duration::from_millis(50));
         let core = Core {
             remote: Vec::new(),
-            keystore,
-            accounts: Mutex::new(AccountStore::default()),
+            keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
             leases: LeaseStore::new(),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            lockdown: AtomicBool::new(false),
             proc_table: Box::new(EmptyTable),
             providers: ProviderRegistry::with_defaults(),
             config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
             factor: Factor::DevInsecure,
-            ssh_signers: vec![Box::new(sshagent::FileSshSigner::new(vec![(
+            ssh_signers: SshSignersCell::new(vec![Box::new(sshagent::FileSshSigner::new(vec![(
                 id.clone(),
                 key_path.clone(),
-            )]))],
+            )]))]),
             audit: None,
+            seal: crate::keystore_seal::SealState::Plain,
+            provisioned: AtomicBool::new(false),
+            unwrap_requests: UnwrapRequests::default(),
         };
 
         let host = sshagent::HostContext {
             host: "(host not bound)".into(),
+            binding: sigil_proto::HostBinding::Unbound,
         };
         let out = core.approve_and_sign(sshagent::SignRequest {
             id: &id,

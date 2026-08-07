@@ -80,6 +80,22 @@ pub fn config_from_env() -> Config {
         apns_identity: push::ApnsIdentity::from_env(),
         apns_host: push::APNS_HOST.to_string(),
         long_poll_ms,
+        trusted_proxy_hops: resolve_trusted_proxy_hops(),
+    }
+}
+
+/// Resolve `TRUSTED_PROXY_HOPS`, the count of trusted reverse proxies in front
+/// of this relay. Default and fallback is `0`: read only the socket peer and
+/// ignore `X-Forwarded-For` entirely. That is the safe direction to fail, since
+/// an over-large value would let a client choose the address the phone is shown
+/// (see [`p::client_ip`]), which is worse than showing nothing.
+fn resolve_trusted_proxy_hops() -> usize {
+    match std::env::var("TRUSTED_PROXY_HOPS") {
+        Ok(s) if !s.is_empty() => s.parse::<usize>().unwrap_or_else(|_| {
+            eprintln!("relay: TRUSTED_PROXY_HOPS {s:?} is not a number, using 0");
+            0
+        }),
+        _ => 0,
     }
 }
 
@@ -98,7 +114,10 @@ pub async fn serve(state: Arc<AppState>, listener: TcpListener) {
     });
 
     loop {
-        let (stream, _) = match listener.accept().await {
+        // The peer address is the one piece of provenance a client cannot forge,
+        // so it is taken here, from the accept itself, and carried into the
+        // handler. It is never logged; see `protocol::Origin`.
+        let (stream, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("relay: accept failed: {e}");
@@ -108,7 +127,7 @@ pub async fn serve(state: Arc<AppState>, listener: TcpListener) {
         let io = TokioIo::new(stream);
         let st = state.clone();
         tokio::spawn(async move {
-            let service = service_fn(move |req| handle(st.clone(), req));
+            let service = service_fn(move |req| handle(st.clone(), peer, req));
             // A client hanging up mid-long-poll returns an error here; it is
             // routine, not a fault, so it is swallowed. Dropping this future
             // drops the handler future, whose WaiterGuard reaps the waiter.

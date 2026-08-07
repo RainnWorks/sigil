@@ -35,6 +35,12 @@ enum DaemonError: LocalizedError {
 /// The full surface the configurator and menubar drive. All async; a real
 /// implementation shells out or opens the unix socket, a mock returns fixtures.
 protocol DaemonClient: Sendable {
+    /// True only for the fixture client. The app asks so that previews and the
+    /// fixtures build never reach for the real keystore file or this Mac's Secure
+    /// Enclave: a preview that minted an Enclave key would be a preview with side
+    /// effects on the developer's machine.
+    var isFixtureClient: Bool { get }
+
     // Status / diagnostics
     func status() async throws -> StatusReport
     /// The doctor's ordered checks, each a (label, ok, hint) triple.
@@ -62,11 +68,11 @@ protocol DaemonClient: Sendable {
     func importConfig(_ config: SigilConfig) async throws
 
     // Inline env values (write-once, never read back). Each pair's VALUE is
-    // sealed under the DEK the moment it is set; only its KEY name survives in
-    // `config()`. Setting a value unwraps the DEK, so it presents Touch ID.
+    // threshold-sealed the moment it is set; only its KEY name survives in
+    // `config()`. The ciphertext is opened per-approval with the phone's partial.
     /// `sigil-config source env set <name> --stdin` with the KEY=VALUE pairs on
-    /// stdin (never argv), sealing every value in one DEK unwrap. An existing KEY
-    /// is replaced in place; a new KEY is appended.
+    /// stdin (never argv). An existing KEY is replaced in place; a new KEY is
+    /// appended.
     func sealEnv(source: String, secrets: [EnvSecret]) async throws
     /// `sigil-config source env unset <name> --key <KEY>`: drop one sealed KEY.
     func unsealEnv(source: String, key: String) async throws
@@ -88,8 +94,28 @@ protocol DaemonClient: Sendable {
     func approve(id: String, lease: Bool) async throws -> ControlResult
     func deny(id: String) async throws -> ControlResult
 
-    // Daemon-wide controls
-    func lockdown(clear: Bool) async throws -> ControlResult
+    // Daemon lifecycle (the local launchd agent + its control socket). The app
+    // owns the local daemon: whether it is listening, and start / stop / restart /
+    // install it. These mirror the `sigil` service verbs (start/stop/restart) and
+    // the shim+launchd half of `setup`.
+    /// A lightweight liveness probe: a connect to the control socket succeeds
+    /// (daemon listening) or is refused/absent (stopped). Sends no frame, so it
+    /// never perturbs the daemon. Never throws.
+    func daemonRunning() async -> Bool
+    /// `sigil version`, trimmed; nil when the binary could not be run.
+    func daemonVersion() async -> String?
+    /// The resolved `sigil` binary path, for display; nil when none is found.
+    func daemonBinaryPath() -> String?
+    /// `sigil up`: the idempotent, self-healing keystone. Installs the binary
+    /// and launchd agent, heals a dead or wedged daemon, wires the shim, and
+    /// checks pairing, reporting what it fixed. The app runs this on launch
+    /// (auto-ensure) instead of offering a Start button: the human never
+    /// manages the daemon.
+    func ensureUp() async throws
+    /// `sigil stop`: bootout the launchd agent.
+    func stopDaemon() async throws
+    /// `sigil restart`: `launchctl kickstart -k` the agent.
+    func restartDaemon() async throws
 
     // Pairing
     func pairedDevice() async throws -> PairedDevice?
@@ -98,14 +124,55 @@ protocol DaemonClient: Sendable {
     func beginPairing(relayURL: String) -> AsyncStream<PairingCeremony>
     /// The human's decision once the ceremony reaches `.confirmSAS`: this is
     /// the actual MITM backstop, so it must only fire from a real tap after the
-    /// six words were compared on both screens. The DEK is not sealed or sent
+    /// six words were compared on both screens. The pairing is not completed
     /// until `match: true` reaches the ceremony; `false` (or never calling this)
     /// fails it closed. A no-op outside an active `.confirmSAS` state.
     func confirmPairing(match: Bool)
     func unpair() async throws -> ControlResult
-    /// Toggle whether the Mac Secure Enclave envelope exists (Enable Mac
-    /// approvals) vs hardened phone-only.
-    func setMacApprovals(_ mode: MacApprovalsMode) async throws
+
+    // SSH agent (served keys + managed ~/.ssh/config routing). Reads decode
+    // ~/.sigil/ssh-keys.json directly; writes shell out to `sigil ssh …`, which
+    // owns all validation (ed25519, dedupe, safe host tokens). A key add/remove
+    // needs a daemon restart to take effect; the CLI says so.
+    /// The served-key store as `~/.sigil/ssh-keys.json` holds it (empty if absent).
+    func sshKeys() async throws -> SshKeyStore
+    /// `sigil ssh add --vault <V> --item <I> [--field <f>] [--comment <c>]
+    /// [--host <h> …] --pubkey-stdin` with the public-key line piped on stdin.
+    func addSshOnePasswordKey(vault: String, item: String, field: String,
+                              comment: String, hosts: [String], publicKey: String) async throws
+    /// `sigil ssh add-file --path <p> [--comment <c>] [--host <h> …]`. The CLI
+    /// reads the sibling `<p>.pub` for the public key.
+    func addSshFileKey(path: String, comment: String, hosts: [String]) async throws
+    /// `sigil ssh remove <item>` (matches a 1Password item name).
+    func removeSshKey(item: String) async throws
+    /// `sigil ssh config --install`: write the managed `~/.ssh/config` block.
+    func installSshRouting() async throws
+    /// `sigil ssh config --uninstall`: remove it, restoring the normal agent.
+    func uninstallSshRouting() async throws
+    /// Whether the managed block is currently present in `~/.ssh/config` (read
+    /// directly; the marker line is the source of truth). Never throws.
+    func sshRoutingInstalled() async -> Bool
+    /// The generated `~/.sigil/ssh/config` contents, or nil when absent (routing
+    /// not installed). Read directly for the "View block" affordance.
+    func generatedSshConfig() async -> String?
+
+    // Keystore wrapping (Mac only; see KeystoreCoordinator). The daemon cannot
+    // hold a Secure Enclave key, so the signed app wraps the keystore file and
+    // hands the material back over the socket. These three verbs are the whole
+    // channel.
+    /// `keystore_provision`: a JSON header naming a byte count, then that many raw
+    /// material bytes. No digest rides along; the daemon recomputes over what it
+    /// received and compares against the v2 file it read at startup. RAM-only on
+    /// the daemon side, accepted once per daemon lifetime, and a mismatch is a
+    /// refusal rather than a silent acceptance.
+    func provisionKeystore(material: Data) async throws -> ControlResult
+    /// `subscribe_keystore`: the long-lived channel the daemon relays de-adoption
+    /// requests on. Also reports each successful (re)connection, which is how a
+    /// daemon restart is detected. Yields nothing on clients with no push channel.
+    func subscribeKeystoreEvents() -> AsyncStream<KeystoreEvent>
+    /// `keystore_unwrap_done`: how the waiting CLI learns whether the Touch ID
+    /// was given and the file actually went back to plaintext.
+    func reportKeystoreUnwrap(nonce: String, ok: Bool, reason: String) async throws -> ControlResult
 
     // Shim
     func installShim() async throws -> ControlResult
@@ -116,7 +183,44 @@ protocol DaemonClient: Sendable {
     func wipe() async throws -> ControlResult
 }
 
+/// What arrives on the `subscribe_keystore` stream. The nonce is echoed back so
+/// the daemon can match an answer to the invocation waiting on it.
+enum KeystoreEvent: Equatable, Sendable {
+    /// The subscription connected. Synthesized by the client, not sent by the
+    /// daemon: it means "this is a daemon that has not been provisioned yet",
+    /// which after a restart is exactly true.
+    case connected
+    /// `sigil keystore unwrap` is asking for de-adoption. Touch ID, then rewrite.
+    ///
+    /// There is deliberately no `commit` case. A write-back was designed for the
+    /// day the daemon mutates the keystore itself, but the production daemon never
+    /// writes it: every mutation is CLI-side, and while the store is wrapped those
+    /// are refused up front with "unwrap first". The generic re-wrap that a commit
+    /// would use still exists (`KeystoreWrapper.wrap` takes arbitrary material and
+    /// is what adoption already calls), so wiring one later is a stream case and a
+    /// fetch verb, not a redesign.
+    case unwrap(nonce: String)
+}
+
 extension DaemonClient {
+    var isFixtureClient: Bool { false }
+
+    // The keystore channel exists only over the control socket. The CLI half and
+    // the mock answer honestly rather than pretending: a client with no socket
+    // cannot provision, and saying so leaves the coordinator in an explicit
+    // unprovisioned state instead of a falsely sealed one.
+    func provisionKeystore(material: Data) async throws -> ControlResult {
+        throw DaemonError.notImplemented("keystore provisioning needs the daemon control socket")
+    }
+
+    func subscribeKeystoreEvents() -> AsyncStream<KeystoreEvent> {
+        AsyncStream { $0.finish() }
+    }
+
+    func reportKeystoreUnwrap(nonce: String, ok: Bool, reason: String) async throws -> ControlResult {
+        throw DaemonError.notImplemented("keystore unwrap needs the daemon control socket")
+    }
+
     /// Fallback pending feed for clients without a push channel: poll `pending()`
     /// on a short interval. SocketDaemonClient overrides this with the daemon's
     /// live event stream. Iterating stops the poll (via onTermination).

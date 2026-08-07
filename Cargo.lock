@@ -1376,6 +1376,7 @@ dependencies = [
  "anyhow",
  "base64",
  "blake2",
+ "cc",
  "core-foundation",
  "ed25519-dalek",
  "libc",

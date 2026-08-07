@@ -3,47 +3,59 @@
 //  no daemon running. This mirrors the phone app's mock transport: the app is
 //  fully exercisable in a dev build and in SwiftUI previews.
 //
-//  The mock keeps mutable in-memory state so approve/deny/lockdown/pair actually
-//  change what the screens show, making the whole flow demoable end to end.
+//  The mock keeps mutable in-memory state so approve/deny/pair actually change
+//  what the screens show, making the whole flow demoable end to end.
 
 import Foundation
 
 /// A tunable scenario so previews and the running app can select a state (armed,
-/// pending, hardened, locked down, fail-closed).
+/// pending, fail-closed).
 enum MockScenario: Sendable {
     case armedIdle          // paired, armed, nothing pending
     case pendingRequests    // two requests waiting
-    case hardenedPhoneOnly  // paired but Mac approvals off
     case biometricOnly      // no phone; biometric factor
     case failClosed         // no factor at all
-    case lockedDown
 }
 
 actor MockDaemonClient: DaemonClient {
+    /// Fixtures: the app must not read the real keystore or mint a real Secure
+    /// Enclave key behind a preview.
+    nonisolated var isFixtureClient: Bool { true }
+
     private var scenario: MockScenario
     private var leasesStore: [Lease]
     private var historyStore: [HistoryEntry]
     private var pendingStore: [PendingRequest]
     private var paired: PairedDevice?
-    private var macMode: MacApprovalsMode
-    private var locked: Bool
     private var appSettings: AppSettings
     private var configStore: SigilConfig
+    /// The in-memory SSH store and its routing state, so the SSH pane's list,
+    /// add/remove, and the routing toggle all mutate faithfully in previews and
+    /// the dev build.
+    private var sshStore: SshKeyStore
+    private var sshRouting: Bool
+    /// Whether the local daemon process is listening. Start/Stop/Restart/Install
+    /// flip this so the lifecycle card visibly changes in previews and the dev
+    /// build. Defaults to running for every scenario except fail-closed.
+    private var running: Bool
     /// Sealed inline env values, by source name: the mock's stand-in for the
-    /// DEK-sealed blob. Never read back to the UI (the readout is keys-only via
-    /// the source's `keys`); kept only so set/unset and edits behave faithfully.
+    /// threshold-sealed blob. Never read back to the UI (the readout is keys-only
+    /// via the source's `keys`); kept only so set/unset and edits behave faithfully.
     private var envValues: [String: [(String, String)]] = [:]
 
-    init(scenario: MockScenario = .armedIdle, config: SigilConfig = Fixtures.config) {
+    init(scenario: MockScenario = .armedIdle, config: SigilConfig = Fixtures.config,
+         sshKeys: SshKeyStore = Fixtures.sshKeys, sshRouting: Bool = false,
+         running: Bool? = nil) {
         self.scenario = scenario
+        self.running = running ?? (scenario != .failClosed)
         self.leasesStore = Fixtures.leases
         self.historyStore = Fixtures.history
         self.pendingStore = (scenario == .pendingRequests) ? Fixtures.pending : []
         self.paired = (scenario == .biometricOnly || scenario == .failClosed) ? nil : Fixtures.paired
-        self.macMode = (scenario == .hardenedPhoneOnly) ? .hardenedPhoneOnly : .enabled
-        self.locked = (scenario == .lockedDown)
         self.appSettings = Fixtures.settings
         self.configStore = config
+        self.sshStore = sshKeys
+        self.sshRouting = sshRouting
         for src in configStore.sources where src.provider == envProviderID {
             envValues[src.name] = src.keys.map { ($0, "sealed") }
         }
@@ -59,7 +71,7 @@ actor MockDaemonClient: DaemonClient {
 
     func status() -> StatusReport {
         StatusReport(
-            daemonUp: scenario != .failClosed || locked,
+            daemonUp: scenario != .failClosed,
             socketPath: "/var/folders/xy/sigil/daemon.sock",
             shim: scenario == .failClosed
                 ? ShimState(kind: .drift, path: "~/.sigil/bin/op", issue: "another op wins on PATH (/opt/homebrew/bin/op)")
@@ -68,8 +80,7 @@ actor MockDaemonClient: DaemonClient {
             opPath: "/opt/homebrew/bin/op",
             factor: factor,
             relayReachable: paired != nil ? true : nil,
-            relayURL: paired?.relayURL,
-            lockedDown: locked
+            relayURL: paired?.relayURL
         )
     }
 
@@ -163,7 +174,7 @@ actor MockDaemonClient: DaemonClient {
 
     func importConfig(_ config: SigilConfig) { configStore = config }
 
-    func leases() -> [Lease] { locked ? [] : leasesStore }
+    func leases() -> [Lease] { leasesStore }
 
     func revokeLease(grantPrefix: String) -> ControlResult {
         let before = leasesStore.count
@@ -174,7 +185,7 @@ actor MockDaemonClient: DaemonClient {
 
     func history() -> [HistoryEntry] { historyStore }
 
-    func pending() -> [PendingRequest] { locked ? [] : pendingStore }
+    func pending() -> [PendingRequest] { pendingStore }
 
     func approve(id: String, lease: Bool) -> ControlResult {
         guard let req = pendingStore.first(where: { $0.id == id }) else {
@@ -184,11 +195,14 @@ actor MockDaemonClient: DaemonClient {
         historyStore.insert(.init(id: id, kind: req.kind, label: req.title,
                                   account: "Rowm work", process: req.provenance.processChain.joined(separator: " > "),
                                   cwd: req.provenance.cwd, decision: .approved, note: nil,
-                                  at: Date(), via: "biometric"), at: 0)
+                                  at: Date(), via: "phone"), at: 0)
         if lease {
             leasesStore.insert(.init(grantHex: String(UUID().uuidString.prefix(12)).lowercased(),
                                      caller: req.provenance.processChain.last ?? "op",
-                                     account: "Rowm work", scope: req.title,
+                                     // The daemon scopes the lease to the matched
+                                     // rule; the fixture rules are named after the
+                                     // command they gate, so stand in with that.
+                                     account: "Rowm work", scope: req.command.first ?? "rule",
                                      grantedAt: Date(), expiresAt: Date().addingTimeInterval(900)), at: 0)
         }
         return .ok(lines: ["approved\(lease ? " (session lease)" : "")"])
@@ -202,13 +216,8 @@ actor MockDaemonClient: DaemonClient {
         historyStore.insert(.init(id: id, kind: req.kind, label: req.title, account: "Rowm work",
                                   process: req.provenance.processChain.joined(separator: " > "),
                                   cwd: req.provenance.cwd, decision: .denied, note: "denied at the Mac",
-                                  at: Date(), via: "biometric"), at: 0)
+                                  at: Date(), via: "phone"), at: 0)
         return .ok(lines: ["denied"])
-    }
-
-    func lockdown(clear: Bool) -> ControlResult {
-        locked = !clear
-        return .ok(lines: [clear ? "unsealed" : "sealed: denied everything pending, refusing new"])
     }
 
     func pairedDevice() -> PairedDevice? { paired }
@@ -243,26 +252,84 @@ actor MockDaemonClient: DaemonClient {
         return .ok(lines: ["phone unpaired; the daemon will fail closed until you pair again"])
     }
 
-    func setMacApprovals(_ mode: MacApprovalsMode) { macMode = mode }
-
     func installShim() -> ControlResult {
         .ok(lines: ["shim installed", "~/.sigil/bin/op -> /usr/local/bin/sigil"])
     }
 
+    // MARK: daemon lifecycle
+    // The mock flips an in-memory `running` flag so the auto-ensure and the
+    // Restart/Stop controls visibly change the lifecycle card in previews and
+    // the dev build.
+
+    func daemonRunning() -> Bool { running }
+    func daemonVersion() -> String? { "sigil 0.5.0" }
+    nonisolated func daemonBinaryPath() -> String? { "~/.sigil/bin/sigil" }
+    func ensureUp() { running = true }
+    func stopDaemon() { running = false }
+    func restartDaemon() { running = true }
+
     func settings() -> AppSettings { appSettings }
     func saveSettings(_ settings: AppSettings) { appSettings = settings }
     func wipe() -> ControlResult { .ok(lines: ["wiped: tokens, pairing, leases, history"]) }
+
+    // MARK: SSH agent (served keys + managed ~/.ssh/config routing)
+    // The mock mirrors the CLI loosely enough that the pane's happy path and its
+    // dedupe refusal both demo: a duplicate item/path throws, everything else
+    // mutates the in-memory store.
+
+    func sshKeys() -> SshKeyStore { sshStore }
+
+    func addSshOnePasswordKey(vault: String, item: String, field: String,
+                              comment: String, hosts: [String], publicKey: String) throws {
+        guard !sshStore.keys.contains(where: { $0.vault == vault && $0.item == item }) else {
+            throw DaemonError.cli("op://\(vault)/\(item) is already served (remove it first to replace)")
+        }
+        sshStore.keys.append(SshKeyEntry(
+            publicKey: publicKey, vault: vault, item: item,
+            field: field.isEmpty ? "private key" : field, comment: comment, hosts: hosts))
+    }
+
+    func addSshFileKey(path: String, comment: String, hosts: [String]) throws {
+        guard !sshStore.files.contains(where: { $0.path == path }) else {
+            throw DaemonError.cli("\(path) is already served (remove it first to replace)")
+        }
+        sshStore.files.append(SshFileEntry(path: path, comment: comment, hosts: hosts))
+    }
+
+    func removeSshKey(item: String) {
+        // The real CLI `remove <item>` matches 1Password items only; the mock
+        // mirrors that but also drops a file path so previews can demo a removal.
+        sshStore.keys.removeAll { $0.item == item }
+        sshStore.files.removeAll { $0.path == item }
+    }
+
+    func installSshRouting() { sshRouting = true }
+    func uninstallSshRouting() { sshRouting = false }
+    func sshRoutingInstalled() -> Bool { sshRouting }
+
+    func generatedSshConfig() -> String? {
+        guard sshRouting else { return nil }
+        let sock = "/var/folders/xy/sigil/ssh-agent.sock"
+        var out = "# Generated by sigil ssh config. Do not edit; edit your keys and re-run.\n\n"
+        for key in sshStore.served where key.isRouted {
+            out += "Host \(key.hosts.joined(separator: " "))\n"
+            out += "  IdentityAgent \(sock)\n"
+            out += "  IdentitiesOnly yes\n\n"
+        }
+        return out
+    }
 }
 
 // MARK: - Fixtures
 
 enum Fixtures {
     static let leases: [Lease] = [
+        // `scope` is a rule name (see Fixtures.config), never a command line.
         Lease(grantHex: "9f3c1a77be20", caller: "claude", account: "Rowm work",
-              scope: "Engineering/.env", grantedAt: Date().addingTimeInterval(-300),
+              scope: "op", grantedAt: Date().addingTimeInterval(-300),
               expiresAt: Date().addingTimeInterval(600)),
         Lease(grantHex: "2b8ee410c9d1", caller: "rowm launcher", account: "Rowm work",
-              scope: "op read op://Engineering/graphql-api/credential",
+              scope: "gcloud",
               grantedAt: Date().addingTimeInterval(-90), expiresAt: Date().addingTimeInterval(90)),
     ]
 
@@ -331,6 +398,36 @@ enum Fixtures {
     static let settings = AppSettings(approvalTimeoutSec: 120, notificationsEnabled: true,
                                       historyRetentionDays: 30, relayURL: "https://relay.rainn.works",
                                       reduceMotion: false)
+
+    /// A representative SSH store: a 1Password "GitHub" key routed to github.com
+    /// and gist.github.com, and a local key file that is served but not routed.
+    /// The public-key line is a valid ed25519 blob so a fingerprint renders. Built
+    /// by decoding the on-disk JSON shape so the fixture exercises the same path a
+    /// real read does.
+    static let sshKeys: SshKeyStore = {
+        let json = """
+        {
+          "keys": [
+            {
+              "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl tom@studio",
+              "vault": "Engineering",
+              "item": "GitHub",
+              "field": "private key",
+              "comment": "tom@studio",
+              "hosts": ["github.com", "gist.github.com"]
+            }
+          ],
+          "files": [
+            {
+              "path": "~/.ssh/id_ed25519",
+              "comment": "personal",
+              "hosts": []
+            }
+          ]
+        }
+        """
+        return (try? JSONDecoder().decode(SshKeyStore.self, from: Data(json.utf8))) ?? SshKeyStore()
+    }()
 
     /// A representative pairing payload (base64) for QR rendering in mock/preview.
     static let qrPayloadBase64 =

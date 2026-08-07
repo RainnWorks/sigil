@@ -1,22 +1,16 @@
 /**
- * The device keystore seam for a completed pairing. It persists two things at two
- * security tiers, matching the profile's request-read vs release split:
+ * The device keystore seam for a completed pairing. It persists the phone's
+ * passcode-tier identity record: the phone's device identity, the pinned daemon
+ * identity, the steady-state mailbox, the relay base, and the pinned Secure
+ * Enclave share id. This is what the session needs to OPEN and display an inbound
+ * request (a passcode-tier read), so it is stored without a biometric prompt and
+ * loaded at app start.
  *
- *   - IDENTITY (passcode-tier): the phone's device identity, the pinned daemon
- *     identity, the steady-state mailbox, and the relay base. This is what the
- *     session needs to OPEN and display an inbound request (a passcode-tier read),
- *     so it is stored without a biometric prompt and loaded at app start.
- *   - DEK (biometric-tier): the data-encryption key recovered at pairing. This is
- *     what AUTHORIZES a secret release, so it is stored `requireAuthentication`
- *     and only ever read behind a fresh Face ID gate at approve time.
- *
- * NEEDS VERIFICATION (on device): expo-secure-store maps `requireAuthentication`
- * onto a Keychain item gated by the current biometric set (Secure Enclave on
- * iOS). Confirm the DEK item prompts Face ID on read and is invalidated when the
- * enrolled biometrics change. The deeper goal of an SE-held X25519 agreement key
- * that never surfaces in JS is the keystore NEEDS-VERIFICATION already tracked in
- * docs/design/pairing.md; this seam stores the private bytes in the biometric
- * Keychain until that native module lands.
+ * There is no at-rest release key here. Authorizing a secret release is the
+ * per-request Secure-Enclave key-agreement (the threshold partial `Z_F`), which
+ * never surfaces the private `f` in JS: the Face ID gate is on that enclave
+ * agreement, not on any bytes this seam stores. The private `f` lives in the
+ * Secure Enclave, referenced only by the `seKeyId` recorded below.
  */
 import * as SecureStore from "expo-secure-store";
 
@@ -28,7 +22,6 @@ import {
 } from "@/src/protocol";
 
 const IDENTITY_KEY = "sigil.pairing.identity";
-const DEK_KEY = "sigil.pairing.dek";
 
 /** The passcode-tier record: everything needed to read (not release). */
 export interface StoredPairing {
@@ -92,13 +85,9 @@ function decodeIdentity(j: IdentityJson): StoredPairing {
   };
 }
 
-/** Persist the pairing: identity passcode-tier, DEK biometric-tier. */
-export async function savePairing(p: StoredPairing, dek: Uint8Array): Promise<void> {
+/** Persist the pairing: the passcode-tier identity record. No at-rest release key. */
+export async function savePairing(p: StoredPairing): Promise<void> {
   await SecureStore.setItemAsync(IDENTITY_KEY, JSON.stringify(encodeIdentity(p)));
-  await SecureStore.setItemAsync(DEK_KEY, toBase64(dek), {
-    requireAuthentication: true,
-    authenticationPrompt: "Confirm to store the unwrap key",
-  });
 }
 
 /** Load the passcode-tier pairing record, or null if this phone is unpaired. */
@@ -118,30 +107,12 @@ export async function loadPairing(): Promise<StoredPairing | null> {
   }
 }
 
-/**
- * Read the DEK. This prompts Face ID (the item is `requireAuthentication`), so it
- * is the biometric-tier release path and must only be called after the approval
- * gate. Returns the raw 32-byte key, or null if absent / the gate was refused.
- */
-export async function loadDek(prompt = "Approve secret release"): Promise<Uint8Array | null> {
-  try {
-    const b64 = await SecureStore.getItemAsync(DEK_KEY, { authenticationPrompt: prompt });
-    if (!b64) return null;
-    const bytes = fromBase64(b64);
-    return bytes.length === 32 ? bytes : null;
-  } catch {
-    // A refused or failed biometric throws; fail closed to no key.
-    return null;
-  }
-}
-
 /** Whether this phone has a stored pairing (cheap, passcode-tier). */
 export async function isPaired(): Promise<boolean> {
   return (await SecureStore.getItemAsync(IDENTITY_KEY)) !== null;
 }
 
-/** Remove both records (unpair / reset). */
+/** Remove the stored pairing (unpair / reset). */
 export async function clearPairing(): Promise<void> {
   await SecureStore.deleteItemAsync(IDENTITY_KEY);
-  await SecureStore.deleteItemAsync(DEK_KEY);
 }

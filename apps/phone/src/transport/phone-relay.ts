@@ -29,7 +29,7 @@ import {
 } from "@/src/protocol";
 import { type ConnectionRung } from "@/src/domain/types";
 import { RelayMailbox } from "./relay-http";
-import { type Transport, type TransportStatus } from "./transport";
+import { type EnvelopeListener, type Transport, type TransportStatus } from "./transport";
 
 /**
  * Foreground backstop cadence: how often to drain `to-phone` in case a push
@@ -45,9 +45,13 @@ export interface PhoneRelayConfig {
   mailbox: Uint8Array;
   /** Machine label for the status readout (display only). */
   machine?: string;
+  /**
+   * Called with each drain result: true when the relay answered, false when a
+   * drain failed. Transport liveness only, for the UI's link dot; it says
+   * nothing about the Mac on the far side.
+   */
+  onStatus?: (connected: boolean) => void;
 }
-
-type EnvelopeListener = (e: Envelope) => void;
 
 export class PhoneRelay implements Transport {
   private readonly mailbox: RelayMailbox;
@@ -130,6 +134,7 @@ export class PhoneRelay implements Transport {
         // A transient relay error just means the next backstop tick (or the
         // next push) tries again.
         this.connected = false;
+        this.cfg.onStatus?.(false);
       }
     })();
     this.inFlight = attempt;
@@ -145,20 +150,26 @@ export class PhoneRelay implements Transport {
     await this.mailbox.send(JSON.stringify(envelopeToWire(e)));
   }
 
-  /** Drain `to-phone`, decode, and fan out. One malformed entry is dropped, not fatal. */
+  /**
+   * Drain `to-phone`, decode, and fan out. One malformed entry is dropped, not
+   * fatal. Each envelope carries along the relay's unverified note of the
+   * address it saw the deposit from, for the sheet to show as a soft tell; it is
+   * passed beside the envelope, never merged into it, and it gates nothing here.
+   */
   private async drainOnce(): Promise<void> {
     const batch = await this.mailbox.drain();
     this.connected = true;
+    this.cfg.onStatus?.(true);
     if (batch.length > 0) this.lastSeenAt = Date.now();
-    for (const s of batch) {
+    for (const d of batch) {
       let env: Envelope;
       try {
-        env = envelopeFromWire(JSON.parse(s) as EnvelopeWire);
+        env = envelopeFromWire(JSON.parse(d.env) as EnvelopeWire);
       } catch {
         // An undecodable entry is dropped; fail closed on that one.
         continue;
       }
-      for (const l of this.listeners) l(env);
+      for (const l of this.listeners) l(env, d.relayOrigin);
     }
   }
 }

@@ -119,3 +119,10 @@ ed25519-dalek = { workspace = true }
 security-framework = { version = "2", features = ["OSX_10_15"] }
 security-framework-sys = "2"
 core-foundation = "0.9"
+
+# cc compiles the tiny LocalAuthentication ObjC shim (src/presence.m) on macOS so
+# the daemon's Touch-ID presence gate uses LAContext.evaluatePolicy, which needs
+# no keychain entitlement and works from the unsigned binary (unlike a Secure
+# Enclave key). See build.rs; the shim is macOS-only.
+[build-dependencies]
+cc = "1"

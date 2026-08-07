@@ -14,9 +14,9 @@
  *
  * The phone never sees a service-account token or a resolved secret value. A
  * request carries only metadata to display; a response carries the decision and,
- * on approve, the DEK the daemon needs to decrypt the one stored credential.
- * The whole response is sealed in an envelope, so `wrappedDek` is the plain
- * base64 of the raw 32-byte DEK, confidential by virtue of the enclosing seal.
+ * on an approve that opens a threshold-sealed secret, the phone's per-request
+ * partial `Z_F`. The whole response is sealed in an envelope, so `partial.zf` is
+ * confidential by virtue of the enclosing seal. A plain gate carries no partial.
  */
 
 /**
@@ -24,7 +24,7 @@
  * layout, never how the daemon fulfills the request (that is the provider seam's
  * job). Serializes snake_case to match the Rust enum.
  */
-export type RequestKind = "secret_read" | "ssh_signature" | "resume" | "lockdown_clear";
+export type RequestKind = "secret_read" | "ssh_signature" | "resume";
 
 /**
  * A provider-agnostic reference to one requested secret. `reference` is OPAQUE:
@@ -63,10 +63,30 @@ export interface LeasePolicy {
   maxSecs: number;
 }
 
-/** An SSH signature: the two things worth verifying. */
+/**
+ * The trust level of an SSH challenge's `host`, mirroring proto `HostBinding`
+ * (serde snake_case). Additive and defaulted to `unbound` so an older daemon
+ * that omits it is treated as unverified (fail-safe). Render the destination's
+ * trust off THIS, never by parsing the `host` string.
+ *   named       - a session-bind host key matched ~/.ssh/known_hosts; `host` is that name.
+ *   fingerprint - a host key was captured but matched nothing; `host` is its SHA256:… fingerprint.
+ *   unbound     - no session-bind was sent; the destination is unverified and `host` is a marker only.
+ */
+export type HostBinding = "named" | "fingerprint" | "unbound";
+
+/** An SSH signature: the things worth verifying before signing. */
 export interface SshChallenge {
   keyLabel: string;
+  /**
+   * Best-effort destination string. Its trust level is {@link binding}; render
+   * "destination unverified" off that, never by parsing this string.
+   */
   host: string;
+  /**
+   * Structured host-binding state. Optional/defaulted to `"unbound"` so a request
+   * that predates the field is treated as unverified.
+   */
+  binding?: HostBinding;
   /** Challenge fingerprint, e.g. "SHA256:….". */
   fingerprint: string;
 }
@@ -106,10 +126,10 @@ export interface ThresholdChallenge {
 
 /**
  * The phone's ECDH partial for a v2 account, mirroring proto `ThresholdPartial`:
- * `Z_F = x(f·E)`, the value the Secure Enclave emits under Face ID. For v2
- * accounts it replaces `wrappedDek` — the phone no longer holds a self-sufficient
- * DEK, only its share. Confidential ONLY by virtue of the enclosing sealed
- * envelope, exactly as v1's `wrappedDek` was.
+ * `Z_F = x(f·E)`, the value the Secure Enclave emits under Face ID. The phone
+ * holds no self-sufficient at-rest key, only this per-request share; the daemon
+ * combines it with its Mac share `m` to open the one secret. Confidential ONLY by
+ * virtue of the enclosing sealed envelope.
  */
 export interface ThresholdPartial {
   /** Echoes the challenge's account id, correlating the partial to its request. */
@@ -137,7 +157,7 @@ export interface ApprovalRequest {
   command: string[];
   /**
    * Provider-agnostic references to the secrets this command will resolve.
-   * Empty for kinds that read no secret (resume, lockdown_clear).
+   * Empty for kinds that read no secret (resume).
    */
   secrets: SecretRef[];
   /** Present for "ssh_signature". */
@@ -146,9 +166,10 @@ export interface ApprovalRequest {
   /** One optional display-only heads-up line (e.g. "Production vault."). */
   reason?: string;
   /**
-   * The v2 threshold challenge for a v2 account; absent on v1 requests and on
-   * kinds that read no secret, so a v1 peer never sees it. Present => this
-   * approve must produce a `ThresholdPartial` (Z_F) instead of a DEK.
+   * The threshold challenge for a request that opens a threshold-sealed secret;
+   * absent on plain gates and on kinds that read no secret. Present => this approve
+   * must produce a `ThresholdPartial` (Z_F); absent => a plain gate approve that
+   * carries no partial.
    */
   threshold?: ThresholdChallenge;
   /**
@@ -170,16 +191,11 @@ export interface ApprovalResponse {
   requestId: string;
   decision: Decision;
   /**
-   * On a v1 approve: standard-base64 of the raw 32-byte DEK. Absent on deny and
-   * on v2 approves, so a denial cannot release a token. Confidential by virtue of
-   * the enclosing seal.
-   */
-  wrappedDek?: string;
-  /**
-   * On a v2 approve: the phone's threshold partial `Z_F`, replacing `wrappedDek`.
-   * Absent on deny and on v1 approves. Exactly one of `wrappedDek` / `partial` is
-   * populated per approve, selected by the account's record version (R3), never by
-   * a wire field.
+   * On an approve of a request that opens a threshold-sealed secret: the phone's
+   * threshold partial `Z_F`. Absent on deny and on a plain gate approve (which
+   * releases no sealed secret), so a denial can never release a token. The daemon
+   * combines it with its Mac share `m` to open the one secret. Confidential by
+   * virtue of the enclosing seal.
    */
   partial?: ThresholdPartial | null;
   /**

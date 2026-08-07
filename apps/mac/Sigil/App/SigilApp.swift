@@ -21,8 +21,7 @@ struct SigilApp: App {
         .windowResizability(.contentMinSize)
         .windowToolbarStyle(.unified)
 
-        // The menubar pulse: the four shape states, a pending list, quick
-        // lockdown, and Open Sigil.
+        // The menubar pulse: the shape states, a pending list, and Open Sigil.
         MenuBarExtra {
             MenubarContent(openConfigurator: { openConfigurator() })
                 .environment(model)
@@ -54,10 +53,9 @@ struct SigilApp: App {
     private static func makeModel() -> AppModel {
         let useMock = ProcessInfo.processInfo.environment["SIGIL_MOCK"] == "1"
         if useMock {
-            return AppModel(daemon: MockDaemonClient(scenario: .pendingRequests),
-                            approver: MockApprover())
+            return AppModel(daemon: MockDaemonClient(scenario: .pendingRequests))
         }
-        return AppModel(daemon: SocketDaemonClient(), approver: SecureEnclaveApprover())
+        return AppModel(daemon: SocketDaemonClient())
     }
 }
 

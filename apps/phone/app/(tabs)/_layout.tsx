@@ -6,8 +6,8 @@ import { useSelector } from "@/src/state/store";
 
 /**
  * The four native tabs. Home carries a brass badge with the count of live
- * pending requests. Admin surfaces (pairing, lockdown, leases) are reached from
- * inside these tabs, not as tabs of their own.
+ * pending requests. Admin surfaces (pairing, leases) are reached from inside
+ * these tabs, not as tabs of their own.
  */
 export default function TabsLayout() {
   const scheme = useScheme();

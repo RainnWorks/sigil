@@ -34,7 +34,7 @@ enum Palette {
     static let brass = Color(srgb: 205, 154, 80)
     /// Approved.
     static let seaGreen = Color(srgb: 50, 134, 102)
-    /// Denied and lockdown. Oxidized rust.
+    /// Denied. Oxidized rust.
     static let rust = Color(srgb: 178, 64, 61)
 
     /// Terminal ground, used behind mono content wells (history, provenance).
@@ -49,7 +49,6 @@ enum StateTone {
     case approved
     case denied
     case expired
-    case lockedDown
     case neutral     // idle / informational
     case warn        // needs attention, not yet failed
 
@@ -57,7 +56,7 @@ enum StateTone {
         switch self {
         case .armed, .approved: return Palette.seaGreen
         case .pending: return Palette.brass
-        case .denied, .lockedDown: return Palette.rust
+        case .denied: return Palette.rust
         case .warn: return Palette.brass
         case .neutral, .expired: return Color.secondary
         }
@@ -71,7 +70,6 @@ enum StateTone {
         case .approved: return "Approved"
         case .denied: return "Denied"
         case .expired: return "Expired"
-        case .lockedDown: return "Locked down"
         case .neutral: return "Idle"
         case .warn: return "Attention"
         }

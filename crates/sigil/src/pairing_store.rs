@@ -61,7 +61,7 @@ use crate::threshold::PhoneShare;
 /// migration never has to touch the keystore. Each ADDITIONAL device (#36
 /// multi-device) seals its own identity under a per-device label derived from
 /// this stem plus its `deviceId` (see [`identity_label`]).
-const DAEMON_IDENTITY_LABEL: &str = "pairing.daemon-identity.v1";
+pub(crate) const DAEMON_IDENTITY_LABEL: &str = "pairing.daemon-identity.v1";
 
 /// The v1 on-disk `pairing.json` schema: a single [`PersistedPairing`] object.
 /// Still read (and migrated on the fly) so an existing single-device pairing
@@ -102,8 +102,18 @@ pub enum PairingStoreError {
     Keystore(#[from] KeystoreError),
     #[error("unsupported pairing config version {0} (this build understands {PAIRING_VERSION_V1} and {PAIRING_VERSION_V2})")]
     Version(u32),
-    #[error("the daemon identity is missing from the keystore; re-pair with `sigil pair`")]
-    MissingIdentity,
+    /// The pairing config lists a device but its private identity is not in the
+    /// keystore we looked in. Names the backend, because the usual cause is
+    /// looking in the wrong one (a keychain pairing from an older build, or a
+    /// stray `SIGIL_KEYSTORE` override in one shell), and telling someone to
+    /// re-pair when their pairing is intact and sitting in another store is the
+    /// worst possible advice.
+    #[error(
+        "no daemon identity in the {backend} keystore. If this machine paired \
+         under a different store, set SIGIL_KEYSTORE to it and retry; otherwise \
+         the pairing is gone and `sigil pair` re-creates it"
+    )]
+    MissingIdentity { backend: &'static str },
     #[error("the stored daemon identity is corrupt; re-pair with `sigil pair`")]
     CorruptIdentity,
     #[error("the persisted phone Secure-Enclave share F is not a valid P-256 point; re-pair")]
@@ -357,14 +367,17 @@ fn device_to_config(
     ks: &dyn Keystore,
     d: &PersistedDevice,
 ) -> Result<RemotePairingConfig, PairingStoreError> {
-    let blob = ks
-        .load_blob(&identity_label(&d.device_id))?
-        .ok_or(PairingStoreError::MissingIdentity)?;
+    let blob =
+        ks.load_blob(&identity_label(&d.device_id))?
+            .ok_or(PairingStoreError::MissingIdentity {
+                backend: ks.backend(),
+            })?;
     let daemon_identity =
         DeviceIdentity::from_secret_bytes(&blob).ok_or(PairingStoreError::CorruptIdentity)?;
 
-    // Validate and pin the phone's v2 threshold share F on-curve (R2). A v1
-    // pairing has none, which is not an error (it takes the DEK path).
+    // Validate and pin the phone's v2 threshold share F on-curve (R2). A legacy
+    // pairing without F is not an error to load, but it can open no
+    // threshold-sealed secret until re-paired (there is no DEK fallback anymore).
     let phone_share = match &d.phone_share {
         Some(s) => {
             let f = B64
@@ -386,13 +399,48 @@ fn device_to_config(
     })
 }
 
-/// Run the #48 biometric gate before any pairing mutation. On a hardware keystore
-/// this is a live Secure-Enclave user-presence check; a decline returns an error
-/// and the caller writes nothing. Non-biometric dev keystores (only reachable
-/// under `SIGIL_DEV_KEYSTORE`) skip it so headless dev and tests still pair.
+/// Run the #48 presence gate before any pairing mutation: authorizing a new
+/// phone must cost a live human, so a same-UID attacker cannot quietly pair a
+/// device of their own. A decline returns an error and the caller writes nothing.
+///
+/// Where the check comes from depends on the active store, and the two are
+/// deliberately not the same question (see [`crate::keystore::presence_plan`]).
+/// A hardware-backed store proves its own presence. The default on-disk store
+/// cannot, but macOS still can, so the gate is asked of the HOST rather than
+/// quietly disappearing when storage moved to a file. A host with no presence
+/// check at all (Linux today, and the in-memory store tests use) has nothing to
+/// demand and proceeds; the ceremony's other gates, the optical QR and the SAS
+/// confirmation, are unaffected either way.
+/// Refuse a pairing mutation UPFRONT when the keystore is sealed, before any
+/// file is touched.
+///
+/// Under a wrapped keystore the CLI holds no material and cannot write one, so
+/// every mutation here is going to fail. What matters is WHERE it fails. Two of
+/// these paths write `pairing.json` before they touch the keystore, so a failure
+/// discovered late would leave the config and the keystore disagreeing: an unpair
+/// that removed the device row but could not remove its identity, or worse, a
+/// pairing recorded as live whose identity never got stored. So the check happens
+/// first, on a cheap probe read, and the honest "the app must be running" error
+/// comes back with nothing on disk changed.
+///
+/// This is also what keeps the wrapped store's central promise true by
+/// construction: while sealed, NOTHING writes the keystore, from either side.
+fn refuse_if_sealed(ks: &dyn Keystore) -> Result<(), PairingStoreError> {
+    match ks.load_blob(DAEMON_IDENTITY_LABEL) {
+        Err(KeystoreError::Sealed) => Err(PairingStoreError::Keystore(KeystoreError::Sealed)),
+        _ => Ok(()),
+    }
+}
+
 fn gate_presence(ks: &dyn Keystore) -> Result<(), PairingStoreError> {
-    if ks.is_biometric() {
-        ks.verify_presence(PAIRING_PRESENCE_REASON)?;
+    match crate::keystore::presence_plan(ks.backend(), ks.is_biometric()) {
+        crate::keystore::PresencePlan::AskStore => {
+            ks.verify_presence(PAIRING_PRESENCE_REASON)?;
+        }
+        crate::keystore::PresencePlan::AskHost => {
+            crate::keystore::verify_host_presence(PAIRING_PRESENCE_REASON)?;
+        }
+        crate::keystore::PresencePlan::None => {}
     }
     Ok(())
 }
@@ -407,7 +455,8 @@ fn gate_presence(ks: &dyn Keystore) -> Result<(), PairingStoreError> {
 /// is written, deny-closed: a declined or absent biometric refuses the pairing
 /// with NOTHING written (no identity blob, no config file).
 pub fn save(ks: &dyn Keystore, p: &NewPairing) -> Result<(), PairingStoreError> {
-    // 0. Gate on a live hardware biometric before persisting anything.
+    // 0. Refuse upfront against a sealed store, then gate on a live human.
+    refuse_if_sealed(ks)?;
     gate_presence(ks)?;
 
     // 1. Seal the private daemon identity into the keystore blob seam. The bytes
@@ -439,7 +488,9 @@ pub fn add_device(
     p: &NewPairing,
     label: &str,
 ) -> Result<String, PairingStoreError> {
-    // 0. #48 gate on EACH add, before any write.
+    // 0. Refuse upfront against a sealed store; then the #48 gate on EACH add,
+    //    both before any write.
+    refuse_if_sealed(ks)?;
     gate_presence(ks)?;
 
     // 1. A fresh, stable device id (uuidv7: time-ordered, collision-free).
@@ -531,6 +582,10 @@ pub fn list_devices() -> Result<Vec<DeviceSummary>, PairingStoreError> {
 /// file is rewritten (device gone) BEFORE the blob is deleted, so a crash leaves
 /// an orphan blob (inert), never a dangling row pointing at a deleted identity.
 pub fn remove_device(ks: &dyn Keystore, device_id: &str) -> Result<bool, PairingStoreError> {
+    // Upfront: this path writes the config BEFORE deleting the identity blob (a
+    // deliberate ordering, see below), so a sealed store must be refused here or
+    // an unpair would half-apply.
+    refuse_if_sealed(ks)?;
     let path = config_path()?;
     let Some(mut container) = read_container(&path)? else {
         return Ok(false);
@@ -543,7 +598,12 @@ pub fn remove_device(ks: &dyn Keystore, device_id: &str) -> Result<bool, Pairing
         return Ok(false);
     };
     let removed = container.devices.remove(idx);
-    // Write the file first (row gone), then delete the identity blob.
+    // Write the file first (row gone), then delete the identity blob. The order
+    // is deliberate and stays: if the second step fails, what is left is an
+    // orphaned identity blob referenced by no device row, which is inert. The
+    // reverse order would leave the opposite, an armed device row whose identity
+    // is gone, which makes `load` fail loud and the daemon unable to arm. Given a
+    // choice of debris, take the inert kind.
     if container.devices.is_empty() {
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -561,6 +621,7 @@ pub fn remove_device(ks: &dyn Keystore, device_id: &str) -> Result<bool, Pairing
 /// the config file. Returns `true` if a config file was removed. Idempotent.
 /// `sigil unpair` (remove all) maps here.
 pub fn remove(ks: &dyn Keystore) -> Result<bool, PairingStoreError> {
+    refuse_if_sealed(ks)?;
     let path = config_path()?;
     // Snapshot the device ids before deleting the file, so we know which
     // per-device identity blobs to reap.
@@ -591,7 +652,6 @@ pub fn remove(ks: &dyn Keystore) -> Result<bool, PairingStoreError> {
 mod tests {
     use super::*;
     use crate::keystore::MemoryKeystore;
-    use crate::secrets::Dek;
 
     /// A private SIGIL_HOME for one test, plus a guard that restores the env.
     /// Holds the process-wide env lock so parallel tests do not clobber it.
@@ -669,6 +729,9 @@ mod tests {
         }
     }
     impl Keystore for ScriptedBiometric {
+        fn backend(&self) -> &'static str {
+            "memory"
+        }
         fn store_blob(&self, label: &str, data: &[u8]) -> Result<(), KeystoreError> {
             self.inner.store_blob(label, data)
         }
@@ -680,15 +743,6 @@ mod tests {
         }
         fn is_biometric(&self) -> bool {
             true
-        }
-        fn has_dek(&self) -> bool {
-            self.inner.has_dek()
-        }
-        fn ensure_dek(&self) -> Result<(), KeystoreError> {
-            self.inner.ensure_dek()
-        }
-        fn unwrap_dek(&self, reason: &str) -> Result<Dek, KeystoreError> {
-            self.inner.unwrap_dek(reason)
         }
         fn verify_presence(&self, _reason: &str) -> Result<(), KeystoreError> {
             if self.grant_presence {
@@ -743,6 +797,9 @@ mod tests {
         // pairing gate then refuses rather than persisting without a check.
         struct NoOverride(MemoryKeystore);
         impl Keystore for NoOverride {
+            fn backend(&self) -> &'static str {
+                "memory"
+            }
             fn store_blob(&self, l: &str, d: &[u8]) -> Result<(), KeystoreError> {
                 self.0.store_blob(l, d)
             }
@@ -754,15 +811,6 @@ mod tests {
             }
             fn is_biometric(&self) -> bool {
                 true
-            }
-            fn has_dek(&self) -> bool {
-                self.0.has_dek()
-            }
-            fn ensure_dek(&self) -> Result<(), KeystoreError> {
-                self.0.ensure_dek()
-            }
-            fn unwrap_dek(&self, r: &str) -> Result<Dek, KeystoreError> {
-                self.0.unwrap_dek(r)
             }
             // deliberately no verify_presence override
         }
@@ -807,6 +855,70 @@ mod tests {
         assert!(summary().unwrap().is_none());
     }
 
+    /// A keystore that behaves exactly like the wrapped on-disk store from a
+    /// CLI's point of view: every operation reports it is sealed.
+    struct SealedKeystore;
+    impl Keystore for SealedKeystore {
+        fn backend(&self) -> &'static str {
+            "file"
+        }
+        fn store_blob(&self, _l: &str, _d: &[u8]) -> Result<(), KeystoreError> {
+            Err(KeystoreError::Sealed)
+        }
+        fn load_blob(&self, _l: &str) -> Result<Option<Vec<u8>>, KeystoreError> {
+            Err(KeystoreError::Sealed)
+        }
+        fn delete_blob(&self, _l: &str) -> Result<(), KeystoreError> {
+            Err(KeystoreError::Sealed)
+        }
+    }
+
+    #[test]
+    fn every_pairing_mutation_refuses_a_sealed_store_before_touching_a_file() {
+        // The property the wrapped keystore rests on: while sealed, NOTHING
+        // writes it, and nothing half-writes around it either. Each mutation must
+        // refuse before `pairing.json` moves, so an interrupted attempt leaves the
+        // pairing exactly as it was.
+        let _home = HomeGuard::new("sealed-refusal");
+        let ks = MemoryKeystore::new();
+        let (_i, _p, np) = new_pairing();
+        // Start from a real, healthy pairing written by a working store.
+        save(&ks, &np).unwrap();
+        let before = std::fs::read(config_path().unwrap()).unwrap();
+
+        let sealed = SealedKeystore;
+        for (what, result) in [
+            ("save", save(&sealed, &np).map(|_| ())),
+            ("add_device", add_device(&sealed, &np, "iPhone").map(|_| ())),
+            (
+                "remove_device",
+                remove_device(&sealed, PRIMARY_DEVICE_ID).map(|_| ()),
+            ),
+            ("remove", remove(&sealed).map(|_| ())),
+        ] {
+            let err = match result {
+                Err(e) => e,
+                Ok(()) => panic!("{what} must refuse a sealed store"),
+            };
+            assert!(
+                matches!(err, PairingStoreError::Keystore(KeystoreError::Sealed)),
+                "{what} refused for the wrong reason: {err}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("Sigil app"), "{what}: {msg}");
+            assert!(
+                !msg.to_lowercase().contains("re-pair situation") || msg.contains("intact"),
+                "{what} must not read as a lost pairing: {msg}"
+            );
+        }
+
+        assert_eq!(
+            std::fs::read(config_path().unwrap()).unwrap(),
+            before,
+            "not one byte of pairing.json may change on a refused mutation"
+        );
+    }
+
     #[test]
     fn config_present_but_identity_missing_is_a_loud_error() {
         let _home = HomeGuard::new("half");
@@ -819,7 +931,16 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected a MissingIdentity error"),
         };
-        assert!(matches!(err, PairingStoreError::MissingIdentity));
+        assert!(matches!(
+            err,
+            PairingStoreError::MissingIdentity { backend: "memory" }
+        ));
+        // The message must name WHERE it looked and must not advise a re-pair as
+        // the only option: a pairing living in another backend is the likelier
+        // cause, and an unnecessary re-pair ceremony is a real cost.
+        let msg = err.to_string();
+        assert!(msg.contains("memory keystore"), "{msg}");
+        assert!(msg.contains("SIGIL_KEYSTORE"), "{msg}");
     }
 
     #[test]
@@ -900,7 +1021,7 @@ mod tests {
     #[test]
     fn a_v1_pairing_without_a_phone_share_still_loads() {
         // Additive field: a pairing saved with no v2 share reconstructs with
-        // `phone_share: None` and takes the DEK path, unchanged.
+        // `phone_share: None` (a legacy pairing, no threshold F), unchanged.
         let _home = HomeGuard::new("v1-still");
         let ks = MemoryKeystore::new();
         let (_i, _p, np) = new_pairing();

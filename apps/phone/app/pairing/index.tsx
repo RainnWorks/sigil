@@ -9,10 +9,19 @@ import { useTheme } from "@/theme/colors";
 import { radius, space } from "@/theme/tokens";
 
 /**
- * Notification-permission priming. Explains the content-free doorbell before the
- * OS prompt, so the permission ask lands in context.
+ * The pairing landing: states the contract before any mechanics. Two parties
+ * only: the Mac asks, the human on this phone decides. The transport that
+ * carries requests is deliberately absent from this screen; it is plumbing,
+ * never a party. The notification ask rides second, framed as how the Mac
+ * reaches you, so the OS prompt lands in context.
+ *
+ * The pairing is a durable trust relationship: the device identity and its
+ * threshold share survive app updates, so the copy here promises a standing
+ * arrangement, never a per-version connection. If a future migration ever
+ * needs the human again, it is framed as one light re-authorize tap, never as
+ * starting over.
  */
-export default function PairingPriming() {
+export default function PairingLanding() {
   const p = useTheme();
   const router = useRouter();
   const [asked, setAsked] = useState(false);
@@ -30,17 +39,20 @@ export default function PairingPriming() {
   return (
     <ScrollView contentContainerStyle={{ padding: space.xl, gap: space.xl }}>
       <View style={{ gap: space.md }}>
-        <Sf name="bell.badge" color={p.cobalt} size={40} />
+        <Sf name="laptopcomputer.and.iphone" color={p.cobalt} size={40} />
         <Sans size={22} weight="semibold">
-          A quiet doorbell
+          Your Mac asks. You decide.
         </Sans>
         <Sans size={16} tone="muted" style={{ lineHeight: 24 }}>
-          When a secret is requested, your Mac sends a content-free push: &quot;Approval
-          requested,&quot; nothing more. The details are fetched on-device and never touch Apple.
+          Pairing makes this phone the trusted approver for your Mac. When something there wants a
+          secret released or a command run, the request comes here, and nothing proceeds until you
+          approve it with Face ID. Denying is always one tap. You pair once; it holds until you
+          reset it.
         </Sans>
         <Sans size={16} tone="muted" style={{ lineHeight: 24 }}>
-          Allow notifications so requests reach you when you are away from the desk. You can approve
-          from the lock screen, but never with one tap; every approve still passes Face ID.
+          Allow notifications so a request can reach you anywhere. The push itself is content-free:
+          &quot;Approval requested,&quot; nothing more. The details arrive sealed and open only on
+          this phone.
         </Sans>
       </View>
 

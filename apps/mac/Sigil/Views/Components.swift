@@ -4,8 +4,8 @@
 
 import SwiftUI
 
-/// A one-word state pill (Armed / Pending / Approved / Denied / Expired / Locked
-/// down). Color is a tint on a native capsule, never a shield or glow.
+/// A one-word state pill (Armed / Pending / Approved / Denied / Expired). Color
+/// is a tint on a native capsule, never a shield or glow.
 struct StatePill: View {
     let tone: StateTone
     var text: String?

@@ -1,10 +1,10 @@
 # Sigil approver (apps/phone)
 
 The phone is the product's second factor: it holds the device identity keys and
-the DEK wrap, and it never sees a service-account token or a secret value. One
-Expo codebase, iOS-first, rendering native UI (SwiftUI primitives and iOS 26
-glass via `expo-glass-effect`); Android (Compose) follows in v2 behind the same
-seams.
+the Secure Enclave threshold share, and it never sees a credential or a secret
+value. One Expo codebase, iOS-first, rendering native UI (SwiftUI primitives and
+iOS 26 glass via `expo-glass-effect`); Android (Compose) follows in v2 behind
+the same seams.
 
 ## Run
 
@@ -31,13 +31,12 @@ approval sheet and every state are reachable without a daemon.
 ```
 app/                       expo-router routes
   _layout.tsx              root Stack + providers + modal surfaces
-  (tabs)/                  Home · History · Accounts · Settings (native tabs)
+  (tabs)/                  Home · History · Devices · Settings (native tabs)
   approval.tsx             the hero: approval sheet (form sheet w/ detents)
-  lockdown.tsx             hold-to-seal
-  pairing/                 priming → keys → scan → confirm → done
+  pairing/                 landing → keys → scan → confirm → done
 components/
   approval/                gauge, type banner, readout well, provenance,
-                           approve control (tap/slide/hold), deny control
+                           approve control (tap-only), deny control
   ui/                      Sans/Mono text, SF symbol wrapper, primitives
 theme/                     tokens (oklch→hex) and semantic color access
 src/

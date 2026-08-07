@@ -8,18 +8,19 @@
 //!
 //! 1. **Pair.** [`Pairing::scan`] consumes a QR [`PairingPayload`], mints the
 //!    phone identity, pins the daemon, and produces the [`PairingResponse`]. The
-//!    human (or test) confirms the SAS words and feeds the daemon's sealed DEK
-//!    envelope to [`Pairing::receive_dek`], yielding a [`Softphone`] that holds
-//!    the DEK.
+//!    human (or test) confirms the SAS words and calls [`Pairing::finish`],
+//!    yielding a [`Softphone`]. The ceremony delivers no key: at rest every secret
+//!    is threshold-sealed, so the phone holds only its identity (and, for a
+//!    threshold-backed source, its Secure-Enclave share `f`).
 //! 2. **Approve.** Given a sealed [`ApprovalRequest`], the [`Softphone`] verifies
 //!    and opens it, applies a scriptable [`Policy`], and seals an
-//!    [`ApprovalResponse`] back. On approve the response carries the DEK the
-//!    daemon needs to decrypt the one token for this request; on deny it carries
-//!    nothing, so a denial can never release a secret.
+//!    [`ApprovalResponse`] back. A request that opens a threshold-sealed secret
+//!    carries a threshold challenge; the approve then carries the phone's partial
+//!    `Z_F` (from `f`). A plain gate carries no partial; a deny carries nothing.
 //!
-//! The DEK never leaves the softphone except, per approval, sealed inside an
-//! envelope to the daemon's pinned key. This mirrors the product invariant: the
-//! phone holds the key and releases it one request at a time.
+//! The share `f` never leaves the softphone; only the per-request partial `Z_F`
+//! (useless without the daemon's Mac share `m`) is sealed back. This mirrors the
+//! product invariant: no key at rest, opened one request at a time by two parties.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -30,7 +31,7 @@ use base64::Engine;
 
 use sigil_proto::envelope::Envelope;
 use sigil_proto::identity::DeviceIdentity;
-use sigil_proto::pairing::{Dek, PairingResponse};
+use sigil_proto::pairing::PairingResponse;
 use sigil_proto::threshold::{EcdhAlgo, MacShare, P256Point, ThresholdError};
 use sigil_proto::{
     mailbox_id, now_ms, ApprovalRequest, ApprovalResponse, Direction, HandshakeError, InstallLease,
@@ -188,10 +189,11 @@ impl Pairing {
         Ok(())
     }
 
-    /// Open the daemon's sealed DEK envelope and finish pairing.
-    pub fn receive_dek(mut self, env: &Envelope) -> Result<Softphone, SoftphoneError> {
-        let mut guard = ReplayGuard::new();
-        let dek = self.phone.receive_dek(env, &mut guard)?;
+    /// Finish pairing. The ceremony delivers no key: at rest every secret is
+    /// threshold-sealed and opened per-approval with this phone's partial, so the
+    /// paired softphone holds only its identity (and, when configured, the SE
+    /// share `f`). Requires prior SAS confirmation.
+    pub fn finish(self) -> Result<Softphone, SoftphoneError> {
         let daemon = self.phone.daemon();
         let phone_pub = self.phone.phone_identity();
         let pairing_id = mailbox_id(&daemon, &phone_pub);
@@ -199,7 +201,6 @@ impl Pairing {
             identity: self.identity,
             daemon,
             pairing_id,
-            dek,
             policy: self.policy,
             phone_share: None,
             outbound_counter: AtomicU64::new(0),
@@ -208,16 +209,15 @@ impl Pairing {
     }
 }
 
-/// A paired softphone: holds the DEK (v1) and, when configured, the SE share `f`
-/// (v2), and answers sealed approval requests.
+/// A paired softphone: holds its identity and, when configured, the SE share `f`,
+/// and answers sealed approval requests (producing threshold partials `Z_F`).
 pub struct Softphone {
     identity: DeviceIdentity,
     daemon: PeerIdentity,
     pairing_id: [u8; 32],
-    dek: Dek,
     policy: Policy,
-    /// The v2 Secure-Enclave threshold share `f`, when this softphone was paired
-    /// for v2. `None` means v1-only (DEK path); a v2 request then fails closed.
+    /// The Secure-Enclave threshold share `f`, when this softphone was paired with
+    /// one. `None` means it can answer no threshold challenge (it fails closed).
     phone_share: Option<SoftphoneShare>,
     /// phone -> daemon envelope counter (monotonic).
     outbound_counter: AtomicU64,
@@ -306,8 +306,8 @@ impl Softphone {
         now: u64,
     ) -> Result<(Envelope, PolicyDecision), SoftphoneError> {
         let decision = self.policy.decide(req);
-        // On approve, a v2 request (one carrying a threshold challenge) is answered
-        // with the SE partial Z_F; a v1 request with the DEK. Deny carries neither.
+        // On approve, a request carrying a threshold challenge is answered with the
+        // SE partial Z_F; a plain gate with no partial. Deny carries neither.
         let approve_body = |now: u64| -> Result<ApprovalResponse, SoftphoneError> {
             match &req.threshold {
                 Some(challenge) => {
@@ -319,7 +319,7 @@ impl Softphone {
                         now,
                     ))
                 }
-                None => Ok(ApprovalResponse::approve(&req.request_id, &self.dek, now)),
+                None => Ok(ApprovalResponse::approve_gate(&req.request_id, now)),
             }
         };
         let resp = match decision {
@@ -386,8 +386,10 @@ mod tests {
     }
 
     /// Run the pairing ceremony in-process and return a paired softphone plus
-    /// the daemon driver (still holding what it needs to seal requests).
-    fn paired(policy: Policy) -> (DaemonPairing, DeviceIdentity, Softphone, Dek) {
+    /// the daemon driver (still holding what it needs to seal requests). The
+    /// ceremony delivers no key: `op` is a plain gate, so the softphone only
+    /// decides.
+    fn paired(policy: Policy) -> (DaemonPairing, DeviceIdentity, Softphone) {
         let daemon_id = DeviceIdentity::generate();
         let daemon_id_retained = clone_identity(&daemon_id);
         let (mut daemon, payload) = DaemonPairing::mint(daemon_id, endpoints(), NOW);
@@ -401,11 +403,8 @@ mod tests {
         daemon.confirm().unwrap();
         pairing.confirm().unwrap();
 
-        let dek = Dek::generate();
-        let dek_copy = Dek::from_bytes(*dek.as_bytes());
-        let env = daemon.deliver_dek(&dek, 1).unwrap();
-        let phone = pairing.receive_dek(&env).unwrap();
-        (daemon, daemon_id_retained, phone, dek_copy)
+        let phone = pairing.finish().unwrap();
+        (daemon, daemon_id_retained, phone)
     }
 
     fn sample_request(id: &str) -> ApprovalRequest {
@@ -440,8 +439,8 @@ mod tests {
     }
 
     #[test]
-    fn approve_policy_returns_the_dek_over_the_transport() {
-        let (daemon_driver, daemon_id, phone, dek) = paired(Policy::Approve);
+    fn approve_policy_returns_approved_over_the_transport() {
+        let (daemon_driver, daemon_id, phone) = paired(Policy::Approve);
         let _ = daemon_driver;
         let relay = LocalRelay::new();
         let mailbox = phone.mailbox();
@@ -470,12 +469,14 @@ mod tests {
             .open(&phone_peer(&phone), &daemon_id.agreement, &mut guard)
             .unwrap();
         assert_eq!(resp.decision, sigil_proto::Decision::Approved);
-        assert_eq!(resp.dek().unwrap().as_bytes(), dek.as_bytes());
+        // A plain-gate approve carries no threshold partial (op resolves its own
+        // secret); the request had no threshold challenge.
+        assert!(resp.partial_zf().is_none());
     }
 
     #[test]
-    fn deny_policy_carries_no_dek() {
-        let (_d, daemon_id, phone, _dek) = paired(Policy::Deny);
+    fn deny_policy_carries_no_partial() {
+        let (_d, daemon_id, phone) = paired(Policy::Deny);
         let mailbox = phone.mailbox();
         let req = sample_request("req-deny");
         let env =
@@ -488,7 +489,7 @@ mod tests {
             .open(&phone_peer(&phone), &daemon_id.agreement, &mut guard)
             .unwrap();
         assert_eq!(resp.decision, sigil_proto::Decision::Denied);
-        assert!(resp.dek().is_none());
+        assert!(resp.partial_zf().is_none());
     }
 
     #[test]
@@ -506,7 +507,7 @@ mod tests {
                 PolicyDecision::Approve
             }
         });
-        let (_d, _id, phone, _dek) = paired(policy);
+        let (_d, _id, phone) = paired(policy);
 
         let mut prod = sample_request("prod");
         prod.secrets[0].segments[0] = "Production".into();

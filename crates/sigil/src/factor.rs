@@ -11,7 +11,15 @@
 //!   forge. The real shipping gate.
 //! * [`Factor::Biometric`] — a verified hardware keystore
 //!   ([`Keystore::is_biometric`](crate::keystore::Keystore::is_biometric)). The
-//!   Secure Enclave unwrap *is* the biometric.
+//!   Secure Enclave unwrap *is* the biometric. Now that the portable on-disk
+//!   store is the default, this is reachable only under
+//!   `SIGIL_KEYSTORE=keychain`, and an unpaired daemon on the default store
+//!   resolves to [`Factor::NoFactor`] instead. That is the honest answer: there
+//!   is no local biometric APPROVE path (opening a threshold-sealed secret needs
+//!   the phone's partial, which no local factor can produce), so claiming a
+//!   biometric factor would have described a gate that cannot grant. The Touch ID
+//!   check that does survive is the pairing-authorization gate, which asks the
+//!   host directly (see [`crate::keystore::presence_plan`]).
 //! * [`Factor::DevInsecure`] — neither of the above, but the operator explicitly
 //!   passed `--dev-insecure` (or `SIGIL_DEV_INSECURE=1`). Only here do
 //!   `SIGIL_DEV_AUTOAPPROVE` and the bare control-socket approval function, and

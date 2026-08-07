@@ -1,13 +1,16 @@
 //! The macOS launchd LaunchAgent: keep the daemon running across logins and
 //! crashes, and give GUI-spawned tools a `PATH` that finds the shim.
 //!
-//! The daemon must be up whenever Tom is, and must restart itself if it crashes,
+//! The daemon must be up whenever Tom is, and must restart itself if it dies,
 //! without a terminal babysitting it. That is a per-user launchd LaunchAgent
 //! (`~/Library/LaunchAgents/works.rainn.sigil.plist`): `RunAtLoad` starts it at
-//! login, `KeepAlive { Crashed }` respawns it after a crash but leaves it down
-//! after a clean `sigil stop`. The plist's `EnvironmentVariables` also pins a
-//! `PATH` with `~/.sigil/bin` first, so a tool a GUI app launches (which does
-//! not read the shell profile) still resolves the shim ahead of the real `op`.
+//! login, unconditional `KeepAlive` respawns it after ANY exit; `sigil stop`
+//! still stops it because a bootout unloads the job entirely. The plist's
+//! `ProgramArguments` point at the install-stable copy `sigil up` maintains at
+//! `~/.sigil/bin/sigil`, never at a build checkout. The plist's
+//! `EnvironmentVariables` also pins a `PATH` with `~/.sigil/bin` first, so a
+//! tool a GUI app launches (which does not read the shell profile) still
+//! resolves the shim ahead of the real `op`.
 //!
 //! Plist generation and the socket-length check are pure and unit-tested. The
 //! `launchctl` calls are Mac-runtime and are marked NEEDS VERIFICATION; they
@@ -49,13 +52,22 @@ fn plist_path_value(shim_dir: &Path) -> String {
 /// `logs_dir`, with the shim `PATH` rooted at `shim_dir`.
 ///
 /// Pure and deterministic so it can be unit-tested and diffed. `RunAtLoad`
-/// starts the daemon immediately; `KeepAlive.Crashed` respawns after a crash but
-/// not after a clean exit, so `sigil stop` (a bootout) stays stopped.
+/// starts the daemon immediately; `KeepAlive` is unconditional `true` so the
+/// daemon is respawned after ANY exit (crash, error exit, or a stray clean
+/// exit), which is what always-on means. Stopping deliberately still works:
+/// `sigil stop` is a bootout (unload), which KeepAlive does not resurrect.
 pub fn render_plist(sigil_bin: &Path, logs_dir: &Path, shim_dir: &Path) -> String {
     let program = sigil_bin.display();
     let out_log = logs_dir.join("daemon.out.log");
     let err_log = logs_dir.join("daemon.err.log");
     let path_value = plist_path_value(shim_dir);
+    // No keystore variable is pinned here, deliberately. The daemon and the CLI
+    // both default to the on-disk store with no environment at all, so there is
+    // nothing to keep in sync; pinning one was exactly how a launchd daemon and a
+    // plain shell ended up disagreeing about where the pairing lived. An older
+    // plist that still carries the pin is simply rewritten without it on the next
+    // `sigil up` (the bodies differ, so the file is replaced), and the pin remains
+    // harmless in the meantime because it names the same store as the default.
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -76,12 +88,7 @@ pub fn render_plist(sigil_bin: &Path, logs_dir: &Path, shim_dir: &Path) -> Strin
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <dict>
-        <key>Crashed</key>
-        <true/>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+    <true/>
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
@@ -96,12 +103,99 @@ pub fn render_plist(sigil_bin: &Path, logs_dir: &Path, shim_dir: &Path) -> Strin
     )
 }
 
-/// Write the plist to `~/Library/LaunchAgents/works.rainn.sigil.plist`, creating the
-/// logs dir. Returns the plist path. Does not (un)load it; that is [`bootstrap`].
-pub fn install_plist() -> Result<PathBuf> {
-    let sigil_bin = std::env::current_exe()
+/// The install-stable home of the daemon binary: `~/.sigil/bin/sigil`. The
+/// plist's `ProgramArguments` and the shim aliases point HERE, never at
+/// wherever the binary happened to be built (a `target/release` inside a git
+/// checkout is one branch switch away from not existing, which strands
+/// launchd). Anchored to `HOME` like [`paths::shim_bin_dir`] so a `SIGIL_HOME`
+/// test override never moves the path launchd was told about.
+pub fn installed_bin() -> Result<PathBuf> {
+    Ok(paths::shim_bin_dir()
+        .context("HOME is not set")?
+        .join("sigil"))
+}
+
+/// Ensure `~/.sigil/bin/sigil` is a real, byte-identical copy of the running
+/// binary, copying (unlink-then-copy, mode 0755) when it differs, is absent,
+/// or is a symlink (a symlink into a build checkout is exactly the fragility
+/// this replaces). Returns `(installed_path, refreshed)`. Explicit contract:
+/// the binary you run this from becomes the installed runtime, so the dev
+/// loop is `cargo build --release && target/release/sigil up`. Running from
+/// the installed copy itself is a no-op.
+///
+/// Also refreshes a sibling `sigil-config` copy, best-effort, when one sits
+/// next to the running binary: the management CLI should survive the checkout
+/// moving just like the runtime, but its absence never fails the daemon
+/// ensure.
+pub fn ensure_installed_binary() -> Result<(PathBuf, bool)> {
+    let current = std::env::current_exe()
         .and_then(|p| p.canonicalize())
-        .context("resolving the sigil binary path")?;
+        .context("resolving the running binary path")?;
+    let installed = installed_bin()?;
+    let refreshed = install_copy(&current, &installed)?;
+    // Best-effort sibling: `sigil-config` built next to the running binary.
+    if let Some(config_src) = current.parent().map(|d| d.join("sigil-config")) {
+        if config_src.is_file() && config_src != installed.with_file_name("sigil-config") {
+            let _ = install_copy(&config_src, &installed.with_file_name("sigil-config"));
+        }
+    }
+    Ok((installed, refreshed))
+}
+
+/// Copy `src` to `dst` (unlink-then-copy, 0755) unless `dst` is already a
+/// real file with identical bytes. Returns whether a copy happened. A `dst`
+/// that IS `src` (running from the installed copy) is left alone; a symlink
+/// at `dst` is always replaced with a real file, even if it points at
+/// identical bytes, because the symlink's target path is the fragility.
+fn install_copy(src: &Path, dst: &Path) -> Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    let dst_is_symlink = std::fs::symlink_metadata(dst)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if !dst_is_symlink {
+        // Running from the installed copy itself: nothing to do.
+        if dst.canonicalize().ok().as_deref() == Some(src) {
+            return Ok(false);
+        }
+        let up_to_date = match (std::fs::read(src), std::fs::read(dst)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if up_to_date {
+            return Ok(false);
+        }
+    }
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    // Unlink first: overwriting a running executable's inode in place is how
+    // macOS kills future execs of it; a fresh inode leaves any running daemon
+    // on the old bytes until the kickstart.
+    let _ = std::fs::remove_file(dst);
+    std::fs::copy(src, dst).with_context(|| format!("installing {}", dst.display()))?;
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod {}", dst.display()))?;
+    Ok(true)
+}
+
+/// Extract a `SIGIL_DEV_KEYSTORE` pin from an existing plist body. Kept only to
+/// RECOGNIZE a plist written by an older build (which pinned the store into the
+/// launchd environment); nothing writes the pin anymore. Pure string surgery over
+/// a file we rendered ourselves.
+fn plist_dev_keystore_pin(body: &str) -> Option<String> {
+    let key_at = body.find("<key>SIGIL_DEV_KEYSTORE</key>")?;
+    let rest = &body[key_at..];
+    let open = rest.find("<string>")? + "<string>".len();
+    let close = rest[open..].find("</string>")?;
+    let value = &rest[open..open + close];
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Write the plist to `~/Library/LaunchAgents/works.rainn.sigil.plist` for a
+/// daemon at `sigil_bin`, creating the logs dir. Compares before writing so a
+/// no-op re-run does not touch the file. Returns `(plist_path, changed)`.
+/// Does not (un)load it; that is [`bootstrap`].
+pub fn install_plist_for(sigil_bin: &Path) -> Result<(PathBuf, bool)> {
     let logs = paths::logs_dir().context("HOME is not set")?;
     let shim_dir = paths::shim_bin_dir().context("HOME is not set")?;
     std::fs::create_dir_all(&logs).with_context(|| format!("creating {}", logs.display()))?;
@@ -110,10 +204,33 @@ pub fn install_plist() -> Result<PathBuf> {
     if let Some(dir) = plist_path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let body = render_plist(&sigil_bin, &logs, &shim_dir);
+    let existing = std::fs::read_to_string(&plist_path).ok();
+    let body = render_plist(sigil_bin, &logs, &shim_dir);
+    if existing.as_deref() == Some(body.as_str()) {
+        return Ok((plist_path, false));
+    }
     std::fs::write(&plist_path, body)
         .with_context(|| format!("writing {}", plist_path.display()))?;
+    Ok((plist_path, true))
+}
+
+/// Write the plist for the install-stable binary (copying the running binary
+/// into `~/.sigil/bin/sigil` first). Returns the plist path. The legacy
+/// entrypoint `sigil start` and `sigil setup` share with `sigil up`.
+pub fn install_plist() -> Result<PathBuf> {
+    let (installed, _) = ensure_installed_binary()?;
+    let (plist_path, _) = install_plist_for(&installed)?;
     Ok(plist_path)
+}
+
+/// The stale `SIGIL_DEV_KEYSTORE` pin an installed plist still carries, if any.
+/// Only a leftover from an older build now: `sigil up` rewrites the plist without
+/// it. Surfaced so the report can say the daemon was re-rendered rather than
+/// leaving a mystery environment entry in a file the human may read.
+pub fn installed_dev_keystore_pin() -> Option<String> {
+    let plist = paths::launch_agent_plist()?;
+    let body = std::fs::read_to_string(plist).ok()?;
+    plist_dev_keystore_pin(&body)
 }
 
 /// `gui/<uid>` domain target for launchctl.
@@ -146,6 +263,20 @@ pub fn bootout() -> Result<()> {
 pub fn kickstart() -> Result<()> {
     let target = format!("{}/{LABEL}", gui_domain());
     run_launchctl(&["kickstart", "-k", &target])
+}
+
+/// Whether the agent is loaded in the user's GUI domain (`launchctl print`
+/// succeeds for the label). Loaded says nothing about healthy: a loaded
+/// service can hold a wedged process, which is why `sigil up` also does a
+/// real control round trip.
+pub fn is_loaded() -> bool {
+    std::process::Command::new("launchctl")
+        .args(["print", &format!("{}/{LABEL}", gui_domain())])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Shell out to `launchctl` with `args`, mapping a nonzero exit to an error that
@@ -235,12 +366,69 @@ mod tests {
         assert!(plist.contains("<string>/Users/tom/.cargo/bin/sigil</string>"));
         assert!(plist.contains("<string>daemon</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
-        assert!(plist.contains("<key>KeepAlive</key>"));
-        assert!(plist.contains("<key>Crashed</key>"));
+        // Always-on: unconditional KeepAlive, not the old crash-only dict that
+        // left the daemon down after a non-crash exit.
+        assert!(plist.contains("<key>KeepAlive</key>\n    <true/>"));
+        assert!(!plist.contains("<key>Crashed</key>"));
         // The shim dir must be the FIRST PATH entry so it wins over a real op.
         assert!(plist.contains("<string>/Users/tom/.sigil/bin:/opt/homebrew/bin"));
         assert!(plist.contains("daemon.out.log"));
         assert!(plist.contains("daemon.err.log"));
+        // No keystore variable is pinned at all now: daemon and CLI share one
+        // default, so there is nothing to keep in sync through launchd.
+        assert!(!plist.contains("SIGIL_DEV_KEYSTORE"));
+        assert!(!plist.contains("SIGIL_KEYSTORE"));
+    }
+
+    #[test]
+    fn a_render_never_pins_a_keystore_even_in_a_dev_shell() {
+        // The installer's own environment used to leak into the plist. It must
+        // not anymore: a developer with the variable set in their shell should
+        // still install a plist that behaves like everyone else's.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("SIGIL_DEV_KEYSTORE");
+        std::env::set_var("SIGIL_DEV_KEYSTORE", "memory");
+        let plist = render_plist(
+            Path::new("/Users/tom/.sigil/bin/sigil"),
+            Path::new("/Users/tom/.sigil/logs"),
+            Path::new("/Users/tom/.sigil/bin"),
+        );
+        match prev {
+            Some(v) => std::env::set_var("SIGIL_DEV_KEYSTORE", v),
+            None => std::env::remove_var("SIGIL_DEV_KEYSTORE"),
+        }
+        assert!(!plist.contains("SIGIL_DEV_KEYSTORE"));
+        assert!(!plist.contains("<key>SIGIL_KEYSTORE</key>"));
+    }
+
+    #[test]
+    fn an_old_plist_that_still_pins_the_store_is_recognized_and_replaced() {
+        // Tolerance for what is already installed: an older plist carrying the
+        // pin still parses (so `up` can say it was rewritten), and the body we
+        // now render differs from it, which is what replaces the file.
+        let fresh = render_plist(
+            Path::new("/Users/tom/.sigil/bin/sigil"),
+            Path::new("/Users/tom/.sigil/logs"),
+            Path::new("/Users/tom/.sigil/bin"),
+        );
+        let old = fresh.replace(
+            "<key>PATH</key>",
+            "<key>SIGIL_DEV_KEYSTORE</key>\n        <string>file</string>\n        <key>PATH</key>",
+        );
+        assert_eq!(plist_dev_keystore_pin(&old).as_deref(), Some("file"));
+        assert_ne!(
+            old, fresh,
+            "an old plist must not compare equal, so it is rewritten"
+        );
+        assert_eq!(plist_dev_keystore_pin(&fresh), None);
+        // Not fooled by unrelated content or truncation.
+        assert_eq!(plist_dev_keystore_pin(""), None);
+        assert_eq!(
+            plist_dev_keystore_pin("<key>SIGIL_DEV_KEYSTORE</key>"),
+            None
+        );
     }
 
     #[test]
@@ -261,6 +449,42 @@ mod tests {
     #[test]
     fn socket_length_check_passes_for_a_short_path() {
         assert!(path_fits(Path::new("/tmp/sigil/d.sock")).is_ok());
+    }
+
+    #[test]
+    fn install_copy_replaces_symlinks_and_stale_bytes_but_not_identical_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "sigil-installcopy-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src-bin");
+        std::fs::write(&src, b"new bytes").unwrap();
+        let dst = dir.join("installed");
+
+        // Absent -> copied.
+        assert!(install_copy(&src, &dst).unwrap());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new bytes");
+        // A real file with identical bytes -> untouched.
+        assert!(!install_copy(&src, &dst).unwrap());
+        // Stale bytes -> refreshed.
+        std::fs::write(&dst, b"old bytes").unwrap();
+        assert!(install_copy(&src, &dst).unwrap());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new bytes");
+        // A symlink is ALWAYS replaced with a real file, even when it points
+        // at identical bytes: the symlink's target path is the fragility.
+        std::fs::remove_file(&dst).unwrap();
+        std::os::unix::fs::symlink(&src, &dst).unwrap();
+        assert!(install_copy(&src, &dst).unwrap());
+        assert!(
+            !std::fs::symlink_metadata(&dst)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the installed runtime is a real file"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -1,7 +1,7 @@
 /**
  * Theme access. `useTheme` re-resolves on light/dark flips; `Semantic` maps the
- * fixed state vocabulary (Pending/Approved/Denied/Expired/Locked down) onto the
- * three brand state colors so screens never reach for a raw hex.
+ * fixed state vocabulary (Pending/Approved/Denied/Expired) onto the three brand
+ * state colors so screens never reach for a raw hex.
  */
 import { useColorScheme } from "react-native";
 
@@ -18,13 +18,13 @@ export function useScheme(): Scheme {
 
 /** The product's fixed decision vocabulary. */
 export type DecisionState =
+  | "idle"
   | "armed"
   | "pending"
   | "approved"
   | "denied"
   | "expired"
-  | "superseded"
-  | "lockedDown";
+  | "superseded";
 
 export function stateColor(p: Palette, state: DecisionState): string {
   switch (state) {
@@ -35,8 +35,8 @@ export function stateColor(p: Palette, state: DecisionState): string {
     case "approved":
       return p.ok;
     case "denied":
-    case "lockedDown":
       return p.deny;
+    case "idle":
     case "expired":
     case "superseded":
       return p.faint;
@@ -46,6 +46,8 @@ export function stateColor(p: Palette, state: DecisionState): string {
 /** Human label for a state. Fixed strings, brief's voice. */
 export function stateLabel(state: DecisionState): string {
   switch (state) {
+    case "idle":
+      return "Idle";
     case "armed":
       return "Armed";
     case "pending":
@@ -58,7 +60,5 @@ export function stateLabel(state: DecisionState): string {
       return "Expired";
     case "superseded":
       return "Superseded";
-    case "lockedDown":
-      return "Locked down";
   }
 }

@@ -1,11 +1,12 @@
 //! The approval request/response payloads: the plaintext that rides *inside* a
 //! sealed [`Envelope`](crate::Envelope).
 //!
-//! **Provider-agnostic by design.** The daemon's core is generic: "run this
-//! command with the approved credential injected so the command resolves its own
-//! secrets." The *source* of secrets is a pluggable provider seam (1Password's
-//! `op` is provider #1; bitwarden, aws-vault, doppler, an env-file are later
-//! fills). This contract therefore bakes in **no** provider semantics:
+//! **Provider-agnostic by design.** The daemon's core is generic: "gate this
+//! command, then run it, optionally injecting Sigil's own stored secrets." Sigil
+//! does not broker other tools' credentials (`op` is a plain gated command that
+//! does its own auth); the only injection is a Sigil-owned env secret, sealed at
+//! rest under threshold. This contract therefore bakes in **no** provider
+//! semantics:
 //!
 //! * [`ApprovalRequest::command`] is the raw argv the shim intercepted.
 //! * [`ApprovalRequest::secrets`] are provider-agnostic [`SecretRef`]s: each
@@ -15,11 +16,12 @@
 //!   mechanism switch (how to fulfill). The daemon's provider decides the latter.
 //!
 //! An [`ApprovalRequest`] never contains a credential or a resolved secret
-//! value; an [`ApprovalResponse`] carries the decision and, on approve, the DEK
-//! the daemon needs to decrypt the one stored credential for this request. Both
-//! are serialized to JSON and sealed; the seal (crypto_box to the peer's pinned
-//! agreement key, plus the sender's Ed25519 signature) is the confidentiality
-//! and authenticity layer, so these types are plain data.
+//! value; an [`ApprovalResponse`] carries the decision and, for a request that
+//! opens a threshold-sealed secret, the phone's per-request partial `Z_F` (which
+//! is useless without the daemon's Mac share `m`). A plain gate carries no
+//! partial. Both are serialized to JSON and sealed; the seal (crypto_box to the
+//! peer's pinned agreement key, plus the sender's Ed25519 signature) is the
+//! confidentiality and authenticity layer, so these types are plain data.
 //!
 //! ## Reconciliation with `apps/phone/src/protocol/requests.ts`
 //!
@@ -28,7 +30,7 @@
 //! all flagged for the phone team:
 //!
 //! 1. **`RequestKind`** is a provider-neutral display hint
-//!    (`secret_read | ssh_signature | resume | lockdown_clear`), replacing the
+//!    (`secret_read | ssh_signature | resume`), replacing the
 //!    op-flavoured `read_secret | ssh_signature`. The approver switches rendering
 //!    on it; it must not switch mechanism.
 //! 2. **`SecretRef`** is provider-agnostic: `{ provider, reference, segments,
@@ -36,18 +38,17 @@
 //!    }`. The approver renders `segments`/`label` and stays blind to what
 //!    `reference` means. `ApprovalRequest.secrets` is a *list* (a command may
 //!    request several), and `command` (the argv) is now carried explicitly.
-//! 3. **`wrappedDek`** is not a separate ephemeral re-wrap: the whole
-//!    `ApprovalResponse` is already sealed in an [`Envelope`] to the daemon's
-//!    pinned key (fresh ephemeral per response for forward secrecy against
-//!    sender-key compromise, plus the phone's Ed25519 signature), reusing the
-//!    audited hostile-relay path. `wrappedDek` carries the standard-base64 of the
-//!    raw 32-byte DEK, confidential by virtue of the enclosing seal.
+//! 3. **`partial`** (the threshold `Z_F`) is not a separate ephemeral re-wrap:
+//!    the whole `ApprovalResponse` is already sealed in an [`Envelope`] to the
+//!    daemon's pinned key (fresh ephemeral per response for forward secrecy
+//!    against sender-key compromise, plus the phone's Ed25519 signature), reusing
+//!    the audited hostile-relay path. `partial.zf` carries the standard-base64 of
+//!    the raw 32-byte share, confidential by virtue of the enclosing seal and
+//!    useless on its own (the daemon must combine it with its Mac share `m`).
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-
-use crate::pairing::Dek;
 
 /// Per-rule **lease policy**: whether the approver may grant an auto-approve
 /// window for this request, and its cap. This replaces the retired risk tier
@@ -122,10 +123,8 @@ pub enum RequestKind {
     SecretRead,
     /// An SSH signature over a challenge (see [`SshChallenge`]).
     SshSignature,
-    /// Resume a session after a lockdown or a lease lapse.
+    /// Resume a session after a lease lapse.
     Resume,
-    /// Clear an active lockdown.
-    LockdownClear,
 }
 
 /// A provider-agnostic reference to one requested secret.
@@ -148,12 +147,43 @@ pub struct SecretRef {
     pub label: String,
 }
 
-/// An SSH signature challenge: the two things worth verifying before signing.
+/// How much the `host` field of an [`SshChallenge`] can be trusted. A STRUCTURED
+/// discriminator so the approver keys "destination unverified" on structure, not
+/// on parsing a sentinel string out of `host`.
+///
+/// The agent protocol carries no authenticated hostname (see the daemon's
+/// `derive_host`), so even a [`Named`](Self::Named) binding is advisory context,
+/// not a security boundary — a same-UID client can name any destination. This
+/// only tells the phone which of the three honest states produced `host`.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HostBinding {
+    /// The `session-bind` host key matched a name in `~/.ssh/known_hosts`; `host`
+    /// is that name.
+    Named,
+    /// A `session-bind` host key was captured but matched no known-hosts entry;
+    /// `host` is the host key's `SHA256:…` fingerprint.
+    Fingerprint,
+    /// No `session-bind` was sent, so the destination is unverified; `host` is a
+    /// plain marker only. The **default** so an older peer that omits the field
+    /// (or any absent discriminator) is treated as unverified — fail-safe.
+    #[default]
+    Unbound,
+}
+
+/// An SSH signature challenge: the things worth verifying before signing.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct SshChallenge {
     pub key_label: String,
+    /// Best-effort destination string. Its trust level is [`Self::binding`];
+    /// render "destination unverified" off that, never by parsing this string.
     pub host: String,
+    /// Structured host-binding state. Additive and optional (serde `default` =
+    /// [`HostBinding::Unbound`]) so an older phone that predates it ignores it and
+    /// still sees `host`, per the durable-pairing principle.
+    #[serde(default)]
+    pub binding: HostBinding,
     /// Challenge fingerprint, e.g. "SHA256:…".
     pub fingerprint: String,
 }
@@ -213,7 +243,7 @@ pub struct ApprovalRequest {
     /// The argv the shim intercepted, e.g. `["op", "read", "op://…"]`.
     pub command: Vec<String>,
     /// Provider-agnostic references to the secrets this command will resolve.
-    /// Empty for kinds that read no secret (Resume, LockdownClear).
+    /// Empty for kinds that read no secret (e.g. Resume).
     #[serde(default)]
     pub secrets: Vec<SecretRef>,
     /// Present for `ssh_signature`.
@@ -275,11 +305,11 @@ pub struct BlockDirective {
     pub duration_ms: u64,
 }
 
-/// The phone's ECDH partial for a v2 account (`docs/design/threshold-v2.md` §7):
-/// `Z_F = x(f·E)`, the value the Secure Enclave emits under Face ID. For v2
-/// accounts it replaces `wrapped_dek` — the phone no longer holds a self-sufficient
-/// DEK, only its share. Confidential ONLY by virtue of the enclosing sealed
-/// [`Envelope`], exactly as v1's `wrapped_dek` was.
+/// The phone's ECDH partial for a threshold-sealed secret
+/// (`docs/design/threshold-v2.md` §7): `Z_F = x(f·E)`, the value the Secure
+/// Enclave emits under Face ID. The phone holds only its share, never a
+/// self-sufficient key. Confidential ONLY by virtue of the enclosing sealed
+/// [`Envelope`].
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ThresholdPartial {
@@ -295,15 +325,11 @@ pub struct ThresholdPartial {
 pub struct ApprovalResponse {
     pub request_id: String,
     pub decision: Decision,
-    /// On a v1 approve: standard-base64 of the raw 32-byte DEK. Absent on deny and
-    /// on v2 approves. Confidential by virtue of the enclosing sealed [`Envelope`];
-    /// see the module divergence note.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub wrapped_dek: Option<String>,
-    /// On a v2 approve: the phone's threshold partial `Z_F`, replacing
-    /// `wrapped_dek`. Absent on deny and on v1 approves. Exactly one of
-    /// `wrapped_dek` / `partial` is populated per approve, selected by the
-    /// account's record version (R3), never by a wire field.
+    /// On an approve of a request that opens a threshold-sealed secret: the phone's
+    /// threshold partial `Z_F`. Absent on deny and on approves that release no
+    /// sealed secret (a plain gate). Confidential by virtue of the enclosing sealed
+    /// [`Envelope`]; the daemon combines it with its Mac share `m` to open the one
+    /// secret, then zeroizes both.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub partial: Option<ThresholdPartial>,
     /// On "approve for this session": the requested lease, else absent.
@@ -316,27 +342,15 @@ pub struct ApprovalResponse {
 }
 
 impl ApprovalResponse {
-    /// Build a v1 approve response carrying the DEK (standard-base64).
-    pub fn approve(request_id: &str, dek: &Dek, decided_at: u64) -> Self {
-        Self {
-            request_id: request_id.to_string(),
-            decision: Decision::Approved,
-            wrapped_dek: Some(B64.encode(dek.as_bytes())),
-            partial: None,
-            lease: None,
-            block: None,
-            decided_at,
-        }
-    }
-
-    /// Build a v2 approve response carrying the phone's threshold partial `Z_F`
-    /// (32 bytes) instead of a DEK. `account_id` echoes the challenge for
-    /// correlation. Carries no DEK, so a v2 approve can never release a v1 token.
+    /// Build an approve response carrying the phone's threshold partial `Z_F`
+    /// (32 bytes). `account_id` echoes the challenge for correlation. This is the
+    /// only approve shape: a plain gate uses [`approve_gate`](Self::approve_gate)
+    /// (no secret to release), and everything sealed at rest is opened by
+    /// combining this partial with the Mac share.
     pub fn approve_v2(request_id: &str, account_id: &str, zf: &[u8; 32], decided_at: u64) -> Self {
         Self {
             request_id: request_id.to_string(),
             decision: Decision::Approved,
-            wrapped_dek: None,
             partial: Some(ThresholdPartial {
                 account_id: account_id.to_string(),
                 zf: B64.encode(zf),
@@ -347,13 +361,25 @@ impl ApprovalResponse {
         }
     }
 
-    /// Build a deny response. Carries neither a DEK nor a partial, so a denial can
-    /// never release a token on either the v1 or the v2 path.
+    /// Build an approve response for a plain gate: a command Sigil gates but whose
+    /// run releases no threshold-sealed secret, so no partial is carried.
+    pub fn approve_gate(request_id: &str, decided_at: u64) -> Self {
+        Self {
+            request_id: request_id.to_string(),
+            decision: Decision::Approved,
+            partial: None,
+            lease: None,
+            block: None,
+            decided_at,
+        }
+    }
+
+    /// Build a deny response. Carries no partial, so a denial can never release a
+    /// threshold-sealed secret.
     pub fn deny(request_id: &str, decided_at: u64) -> Self {
         Self {
             request_id: request_id.to_string(),
             decision: Decision::Denied,
-            wrapped_dek: None,
             partial: None,
             lease: None,
             block: None,
@@ -367,24 +393,11 @@ impl ApprovalResponse {
         self
     }
 
-    /// Decode the carried DEK, if any. Returns `None` on a denial or if the
-    /// base64 does not decode to exactly 32 bytes (fail closed: a malformed DEK
-    /// yields no key rather than a partial one).
-    pub fn dek(&self) -> Option<Dek> {
-        let b64 = self.wrapped_dek.as_ref()?;
-        // The decoded bytes are raw DEK material: hold them in a Zeroizing
-        // buffer so the plaintext key does not linger in a freed heap
-        // allocation after it is copied into the zeroize-on-drop `Dek`.
-        let bytes = zeroize::Zeroizing::new(B64.decode(b64).ok()?);
-        let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
-        Some(Dek::from_bytes(arr))
-    }
-
-    /// Decode the carried v2 partial `Z_F` and its account id, if any. Returns
-    /// `None` on a denial, a v1 (DEK) response, or if the base64 does not decode to
-    /// exactly 32 bytes (fail closed: a malformed partial yields no share rather
-    /// than a truncated one, mirroring [`Self::dek`]). The 32 bytes are held in a
-    /// `Zeroizing` buffer so the raw share is wiped after use.
+    /// Decode the carried partial `Z_F` and its account id, if any. Returns
+    /// `None` on a denial, a plain-gate approve, or if the base64 does not decode
+    /// to exactly 32 bytes (fail closed: a malformed partial yields no share rather
+    /// than a truncated one). The 32 bytes are held in a `Zeroizing` buffer so the
+    /// raw share is wiped after use.
     pub fn partial_zf(&self) -> Option<(String, zeroize::Zeroizing<[u8; 32]>)> {
         let partial = self.partial.as_ref()?;
         let bytes = zeroize::Zeroizing::new(B64.decode(&partial.zf).ok()?);
@@ -489,7 +502,7 @@ pub enum ResolutionStatus {
     Settled,
     /// The request timed out on the daemon before any device answered.
     Expired,
-    /// The daemon withdrew it (lockdown, restart, or the requester went away).
+    /// The daemon withdrew it (restart, or the requester went away).
     Withdrawn,
 }
 
@@ -669,6 +682,28 @@ mod tests {
     }
 
     #[test]
+    fn ssh_challenge_host_binding_is_additive_and_defaults_unbound() {
+        // A new challenge carries the structured discriminator on the wire.
+        let ch = SshChallenge {
+            key_label: "GitHub".into(),
+            host: "github.com".into(),
+            binding: HostBinding::Named,
+            fingerprint: "SHA256:abc".into(),
+        };
+        let json = serde_json::to_string(&ch).unwrap();
+        assert!(json.contains("\"binding\":\"named\""));
+        assert_eq!(serde_json::from_str::<SshChallenge>(&json).unwrap(), ch);
+
+        // An OLDER phone's message predates `binding`: it must still deserialize,
+        // defaulting to the fail-safe Unbound (durable-pairing principle).
+        let legacy =
+            r#"{"keyLabel":"GitHub","host":"(host not bound)","fingerprint":"SHA256:abc"}"#;
+        let back: SshChallenge = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.binding, HostBinding::Unbound);
+        assert_eq!(HostBinding::default(), HostBinding::Unbound);
+    }
+
+    #[test]
     fn lease_policy_defaults_to_run_once_and_clamps() {
         // The default is the safe one: run-once, never leasable.
         assert_eq!(LeasePolicy::default(), LeasePolicy::RunOnce);
@@ -700,37 +735,24 @@ mod tests {
     }
 
     #[test]
-    fn approve_carries_the_dek_and_deny_never_does() {
-        let dek = Dek::from_bytes([7u8; 32]);
-        let ok = ApprovalResponse::approve("req-1", &dek, 42);
+    fn plain_gate_approve_carries_no_partial_and_deny_never_does() {
+        let ok = ApprovalResponse::approve_gate("req-1", 42);
         assert_eq!(ok.decision, Decision::Approved);
-        assert_eq!(ok.dek().unwrap().as_bytes(), dek.as_bytes());
+        assert!(ok.partial_zf().is_none());
 
         let no = ApprovalResponse::deny("req-1", 42);
         assert_eq!(no.decision, Decision::Denied);
-        assert!(no.dek().is_none());
+        assert!(no.partial_zf().is_none());
     }
 
     #[test]
     fn response_round_trips_through_json() {
-        let dek = Dek::from_bytes([3u8; 32]);
         let resp =
-            ApprovalResponse::approve("r", &dek, 9).with_lease(InstallLease { ttl_ms: 900_000 });
+            ApprovalResponse::approve_gate("r", 9).with_lease(InstallLease { ttl_ms: 900_000 });
         let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"wrappedDek\""));
         assert!(json.contains("\"ttlMs\":900000"));
         let back: ApprovalResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back, resp);
-        assert_eq!(back.dek().unwrap().as_bytes(), dek.as_bytes());
-    }
-
-    #[test]
-    fn malformed_dek_base64_fails_closed_to_none() {
-        let mut resp = ApprovalResponse::deny("r", 1);
-        resp.wrapped_dek = Some("not-base64!!".into());
-        assert!(resp.dek().is_none());
-        resp.wrapped_dek = Some(B64.encode([0u8; 16]));
-        assert!(resp.dek().is_none());
     }
 
     #[test]
@@ -777,23 +799,18 @@ mod tests {
         let zf = [0x5Au8; 32];
         let ok = ApprovalResponse::approve_v2("req-1", "acct-1", &zf, 42);
         assert_eq!(ok.decision, Decision::Approved);
-        // A v2 approve carries the partial, never a DEK.
-        assert!(ok.dek().is_none());
-        assert!(ok.wrapped_dek.is_none());
         let (acct, got) = ok.partial_zf().unwrap();
         assert_eq!(acct, "acct-1");
         assert_eq!(*got, zf);
 
-        // Deny carries neither.
+        // Deny carries no partial.
         let no = ApprovalResponse::deny("req-1", 42);
         assert!(no.partial_zf().is_none());
-        assert!(no.dek().is_none());
 
         // Wire round-trip and camelCase.
         let json = serde_json::to_string(&ok).unwrap();
         assert!(json.contains("\"partial\""));
         assert!(json.contains("\"zf\""));
-        assert!(!json.contains("wrappedDek"));
         let back: ApprovalResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ok);
     }
@@ -820,8 +837,7 @@ mod tests {
             ToDaemonMessage::Push(pr)
         );
 
-        let dek = Dek::from_bytes([9u8; 32]);
-        let resp = ApprovalResponse::approve("req-9", &dek, 7);
+        let resp = ApprovalResponse::approve_gate("req-9", 7);
         let resp_val = serde_json::to_value(&resp).unwrap();
         // An ApprovalResponse carries no `type`, so it classifies as a Response.
         assert!(resp_val.get("type").is_none());
@@ -863,8 +879,7 @@ mod tests {
 
         // An ApprovalResponse (no `type`) still classifies as a Response, so the
         // receipt tag can never shadow a real decision.
-        let dek = Dek::from_bytes([4u8; 32]);
-        let resp = ApprovalResponse::approve("req-42", &dek, 1);
+        let resp = ApprovalResponse::approve_gate("req-42", 1);
         let resp_val = serde_json::to_value(&resp).unwrap();
         assert!(matches!(
             ToDaemonMessage::from_value(resp_val).unwrap(),

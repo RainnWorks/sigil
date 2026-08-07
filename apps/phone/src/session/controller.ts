@@ -6,11 +6,11 @@
  * Two tiers, kept apart exactly as the keystore stores them:
  *   - Arming is a read-path action: it loads the passcode-tier identity, starts
  *     polling, and opens/displays inbound requests. No biometric.
- *   - Approving is a release-path action: {@link liveApprove} reads the DEK behind
- *     Face ID (the `requireAuthentication` keystore item) and only then seals the
- *     response carrying `wrappedDek`. The biometric IS the key release; there is
- *     no path that seals an approve without it. Deny seals nothing sensitive and
- *     needs no biometric.
+ *   - Approving is a release-path action: {@link liveApprove} runs the Secure
+ *     Enclave key-agreement behind Face ID (for a threshold-sealed secret) or the
+ *     Face ID gate alone (for a plain gate), and only then seals the response. The
+ *     biometric IS the authorization; there is no path that seals an approve
+ *     without it. Deny seals nothing sensitive and needs no biometric.
  *
  * When no pairing is stored (dev / demo) nothing is armed and the UI falls back
  * to its local-only store path with the mock transport.
@@ -28,10 +28,11 @@ import {
 } from "@/src/protocol";
 
 import { computePartial, isSecureEnclaveAvailable } from "@/modules/sigil-se";
+import { faceGate } from "@/src/lib/biometric";
 import { store } from "@/src/state/store";
 import { PhoneRelay } from "@/src/transport/phone-relay";
 import { SigilSession } from "./session";
-import { clearPairing, loadDek, loadPairing, type StoredPairing } from "./keystore";
+import { clearPairing, loadPairing, type StoredPairing } from "./keystore";
 
 interface Live {
   session: SigilSession;
@@ -68,6 +69,9 @@ export async function armLiveSession(): Promise<boolean> {
   const transport = new PhoneRelay({
     base: pairing.relayBase,
     mailbox: pairing.mailbox,
+    // Feed drain results into the store so the link dot reflects the last real
+    // exchange with the relay (transport status only, never a party).
+    onStatus: (connected) => store.noteTransport(connected),
   });
   const session = new SigilSession({
     sodium,
@@ -80,12 +84,16 @@ export async function armLiveSession(): Promise<boolean> {
   live = { session, transport };
   // Reflect the real pairing into the store so the UI shows paired (not demo) and
   // stops routing into the pairing flow. This is the single point both boot-time
-  // hydration and a just-completed ceremony pass through.
+  // hydration and a just-completed ceremony pass through. Deliberately no machine
+  // name here: the pairing pins keys, not hostnames, and the relay's address must
+  // never stand in for the Mac (see `pairedMacName` for where the name comes from).
   store.reflectPairing({
     ownFingerprint: ownFingerprint(sodium, pairing),
-    machine: relayHost(pairing.relayBase),
-    seenAt: pairing.pairedAt,
+    pairedAt: pairing.pairedAt,
   });
+  // Drain once right away so the link dot reflects reality within a moment of
+  // arming instead of waiting out the first backstop tick.
+  void transport.wake();
   return true;
 }
 
@@ -95,12 +103,7 @@ function ownFingerprint(sodium: Sodium, pairing: StoredPairing): string {
   return fingerprintWords(sodium, pub, pub).join(" ");
 }
 
-/** Host label for the connection line, derived from the relay base URL. */
-function relayHost(relayBase: string): string {
-  return relayBase.replace(/^https?:\/\//, "").replace(/\/.*$/, "") || "relay";
-}
-
-/** Tear the live session down (lockdown or app teardown). Keeps the stored pairing. */
+/** Tear the live session down (app teardown). Keeps the stored pairing. */
 export function disarmLiveSession(): void {
   live?.session.stop();
   live = null;
@@ -108,8 +111,8 @@ export function disarmLiveSession(): void {
 
 /**
  * Reset the pairing entirely: tear down the live session, erase the stored
- * identity + DEK from the keystore, and return the store to the unpaired empty
- * state so the app routes back into the pairing flow. Used by "Reset pairing".
+ * identity from the keystore, and return the store to the unpaired empty state so
+ * the app routes back into the pairing flow. Used by "Reset pairing".
  */
 export async function unpair(): Promise<void> {
   disarmLiveSession();
@@ -163,50 +166,54 @@ export interface ApproveOptions {
 }
 
 /**
- * Approve `request` over the live transport. Reads the DEK behind Face ID and,
- * only if the gate passes, seals an `ApprovalResponse` carrying `wrappedDek`
- * (standard-base64 of the raw 32-byte DEK, confidential inside the envelope seal)
- * and dispatches it toward the daemon. Returns "sent" once the decision has left
- * this device, "refused" if the biometric did not pass (nothing is sent),
- * "no-session" when unarmed, "error" if the dispatch itself threw.
+ * Approve `request` over the live transport. Only if the biometric gate passes
+ * does it seal an `ApprovalResponse` and dispatch it toward the daemon. Returns
+ * "sent" once the decision has left this device, "refused" if the biometric did
+ * not pass (nothing is sent), "no-session" when unarmed, "error" if the dispatch
+ * itself threw.
+ *
+ * Two shapes, chosen by the request, never by a wire flag:
+ *   - A request that opens a threshold-sealed secret carries a challenge, and the
+ *     approve produces the phone's partial `Z_F` (see {@link liveApproveThreshold}).
+ *   - A plain gate carries no challenge: nothing is sealed to open, so the approve
+ *     carries no partial. The Face ID gate here IS the authorization (invariant
+ *     #4); it releases no key material, only the decision.
  *
  * "sent" means exactly that the response left the phone. This function does not
- * learn, and must not infer, whether the Mac then unlocked or delivered anything:
- * the phone is a zero-knowledge approver, so the outcome on the far side is not
- * its concern and is never reported back through this result.
+ * learn, and must not infer, whether the Mac then unlocked or ran anything: the
+ * phone is a zero-knowledge approver, so the outcome on the far side is not its
+ * concern and is never reported back through this result.
  */
 export async function liveApprove(
   request: ApprovalRequest,
   opts: ApproveOptions = {},
 ): Promise<ApproveOutcome> {
   if (!live) return "no-session";
-  // v2 accounts carry a threshold challenge: the release factor is the Secure
-  // Enclave key-agreement (Z_F), not a stored DEK. Selected by the presence of
-  // the challenge, never by a wire flag; a v2 approve never emits a DEK.
+  // A threshold challenge selects the secret-release path: the Secure Enclave
+  // key-agreement (Z_F). Selected by the presence of the challenge, never by a
+  // wire flag.
   if (request.threshold) return liveApproveThreshold(request, opts);
 
-  const dek = await loadDek("Approve secret release");
-  if (!dek) return "refused";
+  // A plain gate: no secret to open, so no partial. Approving still REQUIRES the
+  // biometric (invariant #4); it gates the decision itself, not any key release.
+  const gate = await faceGate("Approve request");
+  if (!gate.ok) return "refused";
   try {
     await live.session.respond(request, "approved", {
-      wrappedDek: toBase64(dek),
       ...(opts.lease ? { lease: opts.lease } : {}),
     });
     return "sent";
   } catch (e) {
-    // The approve was sealed but the dispatch threw (transport/seal fault). No
-    // secret leaks here: the DEK is a separate, zeroized-below buffer, and the
-    // error is a wire error, not key material.
+    // The approve was sealed but the dispatch threw (transport/seal fault). The
+    // error is a wire error, and this path carries no key material at all.
     console.warn(`[session] approve dispatch failed: ${errText(e)}`);
     return "error";
-  } finally {
-    dek.fill(0);
   }
 }
 
 /**
- * The v2 approve: derive the phone's partial `Z_F = x(f·E)` in the Secure Enclave
- * and seal it as a `ThresholdPartial` (never a DEK). The enclave key-agreement is
+ * The threshold approve: derive the phone's partial `Z_F = x(f·E)` in the Secure
+ * Enclave and seal it as a `ThresholdPartial`. The enclave key-agreement is
  * itself the Face ID gate, so there is no separate biometric and no unguarded
  * path. Fails closed to "refused" on a denied/failed biometric or an off-curve
  * `E`, and "error" if this device has no Secure Enclave (a v2 account cannot be
@@ -255,8 +262,8 @@ async function liveApproveThreshold(
 export type DenyOutcome = "sent" | "no-session" | "error";
 
 /**
- * Deny `request` over the live transport. Carries no DEK, so a denial can never
- * release a secret, and needs no biometric (deny is always frictionless).
+ * Deny `request` over the live transport. Carries no partial, so a denial can
+ * never release a secret, and needs no biometric (deny is always frictionless).
  */
 export async function liveDeny(request: ApprovalRequest): Promise<DenyOutcome> {
   if (!live) return "no-session";

@@ -7,18 +7,19 @@ import { Card, Hairline, SectionHeader } from "@/components/ui/primitives";
 import { stateColor, useTheme } from "@/theme/colors";
 import { space } from "@/theme/tokens";
 import { relativeTime } from "@/src/lib/format";
-import { useAppState } from "@/src/state/store";
+import { pairedMacName, useAppState } from "@/src/state/store";
 
 /**
  * The Macs this phone approves for. Provider-agnostic by construction: the phone
  * is a blind approver, so it knows nothing about what any Mac stores or which
- * tool asks. It shows only the pairing itself: which machine, whether the link is
- * live, and this phone's own fingerprint. Multi-device pairing grows here.
+ * tool asks. It shows only the pairing itself: which Mac, when it was pinned,
+ * and this phone's own fingerprint. The transport is a quiet dot; the relay is
+ * plumbing and is never named here. Multi-device pairing grows here.
  */
 export default function DevicesScreen() {
   const p = useTheme();
   const s = useAppState();
-  const online = s.paired && s.connection.rung !== "none";
+  const linked = s.paired && s.connection.rung !== "none";
 
   return (
     <ScrollView
@@ -31,27 +32,28 @@ export default function DevicesScreen() {
           {s.paired ? (
             <View style={{ padding: space.lg, gap: 6 }}>
               <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
-                <Sans size={16} weight="semibold">
-                  {s.connection.machine || "paired Mac"}
-                </Sans>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 8, flexShrink: 1 }}>
+                  <Sf name="laptopcomputer" color={p.muted} size={18} />
+                  <Sans size={16} weight="semibold" numberOfLines={1} style={{ flexShrink: 1 }}>
+                    {pairedMacName(s) ?? "Your Mac"}
+                  </Sans>
+                </View>
                 <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
                   <View
                     style={{
                       width: 7,
                       height: 7,
                       borderRadius: 99,
-                      backgroundColor: online ? stateColor(p, "armed") : p.faint,
+                      backgroundColor: linked ? stateColor(p, "armed") : p.faint,
                     }}
                   />
-                  <Mono size={12} style={{ color: online ? stateColor(p, "armed") : p.faint }}>
-                    {online ? "connected" : "no link"}
+                  <Mono size={12} style={{ color: linked ? stateColor(p, "armed") : p.faint }}>
+                    {linked ? "link" : "no link"}
                   </Mono>
                 </View>
               </View>
               <Mono size={12} tone="muted">
-                {online
-                  ? `${s.connection.rung} · seen ${relativeTime(s.connection.lastSeenAt)}`
-                  : "waiting for the daemon"}
+                paired {relativeTime(s.pairedAt)}
               </Mono>
             </View>
           ) : (
@@ -73,7 +75,9 @@ export default function DevicesScreen() {
           </Link>
         </Card>
         <Sans size={13} tone="faint" style={{ marginTop: space.md, marginHorizontal: space.xs }}>
-          Pairing is set up from the Mac. Each Mac shows a QR code you scan here.
+          Pairing is set up from the Mac. Each Mac shows a QR code you scan here. Requests travel
+          sealed between the two paired devices; whatever carries them can neither read nor forge
+          them.
         </Sans>
       </View>
 

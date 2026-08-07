@@ -1,31 +1,33 @@
 //! The secret-provider seam and its registry.
 //!
-//! The daemon's core is generic: "run this command with the approved environment
-//! injected so the command resolves its own secrets." The SOURCE of secrets is
-//! pluggable. 1Password (`op` plus a service-account token) is provider #1; a
-//! plain **env-file** is provider #2, the reference impl that proves the seam is
-//! real and not op-shaped. bitwarden, aws-vault, and doppler are future fills of
-//! this same trait. The approval protocol ([`sigil_proto::request`]) and the
-//! approver (phone / softphone) are provider-blind: they carry opaque references
-//! and a display hint, never provider mechanics.
+//! Sigil GATES commands and may inject its OWN stored secrets. It does NOT hold
+//! or inject other tools' credentials. `op` is a plain gated command: you run
+//! `SECRET=$(op read op://...)` inside a gated command and `op` does its own
+//! auth; Sigil never holds op's token. The provider seam is what decides the
+//! optional **own-secret** injection shape, and it stays generic so the approval
+//! protocol ([`sigil_proto::request`]) and approver (phone / softphone) remain
+//! provider-blind: they carry opaque references and a display hint, never
+//! provider mechanics.
 //!
-//! ## Two injection shapes, one invariant, honestly distinguished
+//! ## The providers
 //!
-//! The brief invariant (#2) is "secret VALUES never enter daemon memory." Its
-//! cleanest realization is the `op` shape: inject a **credential** (the SA token,
-//! itself a credential and not a resolved secret) into the child's environment
-//! and let the `op` child resolve and stream the actual secrets straight to the
-//! caller's fds. The daemon then never touches a resolved secret value at all.
+//! * [`OpProvider`] — a plain gate for `op` (and any command that resolves its
+//!   own secrets). It injects nothing; it gates the command and runs the real
+//!   binary, streaming output straight to the caller's fds. The `op://` readout
+//!   it derives is display metadata only.
+//! * [`EnvFileProvider`] — injects KEY=VALUE pairs read from a plaintext file.
+//! * [`EnvProvider`] — injects KEY=VALUE pairs whose VALUES are **threshold**
+//!   sealed at rest and opened per-approval with the phone's partial.
 //!
-//! A direct-injection provider ([`EnvFileProvider`]) cannot fully honor that,
-//! because it *is* the source: it reads KEY=VALUE pairs and must place the actual
-//! values into the child's environment. Those values therefore transit the daemon
-//! process — but **only** as the spawn env map, for the moment of the spawn: they
-//! are held in a [`Zeroizing`] buffer, never logged, and wiped on drop; the child
-//! carries its own copy in its env. This is the honest, documented difference
-//! from the `op` credential-injection path, and it is why leasing is disabled for
-//! such providers (a lease would hold resolved values in RAM across its TTL). See
-//! [`SecretProvider::needs_account`] and the daemon's fulfillment path.
+//! ## Own-secret injection and the memory invariant
+//!
+//! The brief invariant (#2) is "secret VALUES never enter daemon memory." A
+//! direct-injection provider ([`EnvFileProvider`], [`EnvProvider`]) *is* the
+//! source: it must place the actual values into the child's environment. Those
+//! values transit the daemon process — but **only** as the spawn env map, for the
+//! moment of the spawn: held in a [`Zeroizing`] buffer, never logged, wiped on
+//! drop; the child carries its own copy. This is why leasing is disabled for
+//! these providers (a lease would hold resolved values in RAM across its TTL).
 
 use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
@@ -37,19 +39,12 @@ use zeroize::Zeroizing;
 use sigil_proto::{RequestKind, SecretRef};
 
 use crate::paths;
-use crate::secrets::{self, Token};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     /// The provider's backing tool could not be found.
     #[error("provider tool not found")]
     NoTool,
-    /// Probing what the credential can serve failed.
-    #[error("probe failed: {0}")]
-    Probe(String),
-    /// This provider does not support probing (it holds no stored credential).
-    #[error("provider does not support account probing")]
-    Unsupported,
 }
 
 /// One command to run with a provider's environment injected. The provider wires
@@ -60,10 +55,6 @@ pub struct ProviderRun<'a> {
     pub command: &'a [String],
     /// The caller's working directory, or empty to inherit the daemon's.
     pub cwd: &'a str,
-    /// The decrypted account credential to inject, for providers that need one
-    /// (`op`, the SA token). `None` for providers that source their own secrets
-    /// ([`EnvFileProvider`]); see [`SecretProvider::needs_account`].
-    pub credential: Option<&'a Token>,
     /// The provider-specific source string from the command config (the env-file
     /// path for [`EnvFileProvider`]). Empty when unused.
     pub source: &'a str,
@@ -81,17 +72,27 @@ pub struct ProviderRun<'a> {
     /// this and the alias's own fuse bounds the chain (see [`crate::proxy`]).
     pub proxy_depth: u32,
     /// For the inline [`EnvProvider`]: the decrypted KEY=VALUE pairs the daemon
-    /// opened from the source's sealed blob *after* approval, to inject into the
-    /// child. `None` for every other provider (`op` injects a credential;
+    /// opened from the source's threshold-sealed record *after* approval, to inject
+    /// into the child. `None` for every other provider (`op` injects nothing;
     /// `env-file` reads its own file). Like every direct-injection value these
     /// live only in this borrowed, zeroize-on-drop buffer for the spawn instant
     /// (see the module memory note and `EnvProvider`).
     pub env: Option<&'a EnvVars>,
+    /// The source's NON-SECRET `(name, value)` env vars
+    /// ([`Source::plain`](crate::config::Source::plain)), injected into the child
+    /// verbatim by EVERY provider, including the plain gates that inject no
+    /// credential at all. Cleartext by construction: they are behavior switches
+    /// for the gated tool, not secrets, so they are plain `String`s and are never
+    /// zeroized (there is nothing to wipe that `config.json` does not already
+    /// hold in the clear). Written to the child BEFORE any resolved secret, so a
+    /// sealed value of the same name wins; the daemon has already dropped the
+    /// shadowed entries and logged them, so a collision cannot reach here silently.
+    pub plain: &'a [(String, String)],
 }
 
 /// The provider-specific slice of a source's config passed to
 /// [`SecretProvider::describe`]. Each provider reads only the field its shape
-/// uses: `op` reads neither (it works off argv plus the injected credential),
+/// uses: `op` reads neither (it works off argv alone, injecting nothing),
 /// `env-file` reads `path`, the inline `env` provider reads `keys`. It carries
 /// KEY **names** only, never values — values are sealed at rest and decrypted
 /// only post-approval into [`ProviderRun::env`], never touched by `describe`.
@@ -119,32 +120,21 @@ pub trait SecretProvider: Send + Sync {
     /// never read secret values into memory (only KEY names, which are public).
     fn describe(&self, command: &[String], source: &SourceView) -> Vec<SecretRef>;
 
-    /// Whether the daemon must decrypt a stored account token for this provider
-    /// (true for `op`) or the provider sources its own secrets (false for
-    /// `env-file` and the inline `env` provider). When false the daemon skips the
-    /// account routing and leasing entirely; a provider may still need the DEK to
-    /// open its own sealed values (see [`needs_sealed_env`](Self::needs_sealed_env)).
-    fn needs_account(&self) -> bool;
-
-    /// Whether the daemon must open this provider's DEK-sealed inline values (the
-    /// inline `env` provider). When true the daemon fetches the source's sealed
-    /// blob from the account store, unwraps the DEK on approval, decrypts it, and
-    /// hands the KEY=VALUE pairs to [`run`](Self::run) via [`ProviderRun::env`].
-    /// Distinct from [`needs_account`](Self::needs_account) (a routed 1Password
-    /// token, which leases) and from a plaintext env-file (no DEK at all). Never
-    /// leases: like env-file, resolved values must not persist across a TTL.
+    /// Whether the daemon must open this provider's threshold-sealed inline values
+    /// (the inline `env` provider). When true the daemon fetches the source's
+    /// sealed [`ThresholdRecord`](crate::threshold::ThresholdRecord), combines the
+    /// phone's approval partial `Z_F` with the Mac share `m` to open it, and hands
+    /// the KEY=VALUE pairs to [`run`](Self::run) via [`ProviderRun::env`]. Never
+    /// leases: like env-file, resolved values must not persist across a TTL. A
+    /// plaintext env-file returns false (no seal at all).
     fn needs_sealed_env(&self) -> bool {
         false
     }
 
-    /// Run the command with the environment injected, wiring resolved output to
-    /// the caller's fds. Returns the child exit code. Fails closed to a non-zero
-    /// code. Secret VALUES never return here.
+    /// Run the command with the environment injected (if any), wiring resolved
+    /// output to the caller's fds. Returns the child exit code. Fails closed to a
+    /// non-zero code. Secret VALUES never return here.
     fn run(&self, run: ProviderRun) -> i32;
-
-    /// Enumerate what a credential can serve (for `sigil account add` setup).
-    /// Providers with no stored credential return [`ProviderError::Unsupported`].
-    fn probe(&self, credential: &[u8]) -> Result<Vec<String>, ProviderError>;
 }
 
 /// The id-keyed set of providers the daemon can dispatch to. A command's config
@@ -157,8 +147,8 @@ pub struct ProviderRegistry {
 impl ProviderRegistry {
     /// The shipping registry: `op` (provider #1), the `env-file` reference
     /// provider (#2) that proves the abstraction with a distinct injection shape,
-    /// and the inline `env` provider (#3) that seals KEY=VALUE pairs at rest under
-    /// the DEK and injects them after approval.
+    /// and the inline `env` provider (#3) that threshold-seals KEY=VALUE pairs at
+    /// rest and injects them after approval.
     pub fn with_defaults() -> Self {
         Self {
             providers: vec![
@@ -245,41 +235,30 @@ impl SecretProvider for OpProvider {
         command.iter().filter_map(|arg| op_reference(arg)).collect()
     }
 
-    fn needs_account(&self) -> bool {
-        true
-    }
-
     fn run(&self, run: ProviderRun) -> i32 {
+        // `op` is a plain gated command: gate, then run the real binary with the
+        // caller's fds spliced straight to it. Sigil injects NOTHING; `op` does its
+        // own auth (the caller supplies OP_SERVICE_ACCOUNT_TOKEN or an interactive
+        // session). The daemon never holds op's credential.
         let Some(real) = self.resolve() else {
             eprintln!("sigil daemon: no real `op` found on PATH");
             return 127;
         };
-        // The op provider always drives the `op` binary (argv[0] is expected to
-        // be `op`), injecting the SA token so the child resolves its own secrets.
-        let Some(credential) = run.credential else {
-            eprintln!("sigil daemon: the 1password provider requires an account credential");
-            return 1;
-        };
-
         let mut cmd = Command::new(&real);
         cmd.args(run.command.iter().skip(1));
         if !run.cwd.is_empty() {
             cmd.current_dir(run.cwd);
         }
-        // The service-account token is the only way `op` authenticates here. It
-        // is ASCII; a non-UTF-8 token is a corrupt store and fails closed.
-        match std::str::from_utf8(credential) {
-            Ok(s) => {
-                cmd.env("OP_SERVICE_ACCOUNT_TOKEN", s);
-            }
-            Err(_) => {
-                eprintln!("sigil daemon: token is not valid UTF-8");
-                return 1;
-            }
+        // A plain gate injects no credential, but it still injects the source's
+        // non-secret vars: they exist precisely to steer a tool like `op` away
+        // from an ambient auth fallback the daemon cannot use.
+        for (k, v) in run.plain.iter() {
+            cmd.env(k, v);
         }
         // The proxy recursion fuse: the child (and anything it re-invokes through
         // a Sigil alias) carries the incremented depth so the alias's own guard
-        // can bound a runaway loop. Harmless to a non-proxied tool.
+        // can bound a runaway loop. Harmless to a non-proxied tool. Set last, so
+        // no configured var can shadow it.
         cmd.env(crate::proxy::DEPTH_ENV, run.proxy_depth.to_string());
         // Splice the caller's fds to the child. An ABSENT fd defaults to
         // Stdio::null(), never inherit: the daemon's own stdio (a same-UID
@@ -300,11 +279,6 @@ impl SecretProvider for OpProvider {
             }
         }
     }
-
-    fn probe(&self, credential: &[u8]) -> Result<Vec<String>, ProviderError> {
-        let op = self.resolve().ok_or(ProviderError::NoTool)?;
-        secrets::probe_vaults(&op, credential).map_err(|e| ProviderError::Probe(e.to_string()))
-    }
 }
 
 /// Provider #2: an env-file / static provider that injects KEY=VALUE pairs
@@ -314,8 +288,8 @@ impl SecretProvider for OpProvider {
 /// `source` file's values are read *after approval*, placed into the spawned
 /// child's env, and wiped from daemon memory when the spawn env map drops. It
 /// proves the generic "inject env vars after approval, then run" path — distinct
-/// from op's "inject a credential and let the tool resolve" path — and needs no
-/// stored account credential, so it never touches the DEK.
+/// from op's plain-gate path (which injects nothing) — and reads its values from
+/// a plaintext file, so it seals nothing at rest.
 #[derive(Debug, Default, Clone)]
 pub struct EnvFileProvider;
 
@@ -351,10 +325,6 @@ impl SecretProvider for EnvFileProvider {
             segments: vec![path.to_string()],
             label,
         }]
-    }
-
-    fn needs_account(&self) -> bool {
-        false
     }
 
     fn run(&self, run: ProviderRun) -> i32 {
@@ -395,25 +365,23 @@ impl SecretProvider for EnvFileProvider {
         spawn_with_env(run, &vars)
         // `vars` (Zeroizing) is wiped when it drops here at end of scope.
     }
-
-    fn probe(&self, _credential: &[u8]) -> Result<Vec<String>, ProviderError> {
-        Err(ProviderError::Unsupported)
-    }
 }
 
 /// Provider #3: an inline **env** provider that injects KEY=VALUE pairs whose
-/// VALUES are sealed at rest under the DEK (the same AES-256-GCM the account
-/// tokens use) rather than sourced from a plaintext file.
+/// VALUES are **threshold**-sealed at rest (opened per-approval with the phone's
+/// partial) rather than sourced from a plaintext file.
 ///
 /// It is the same direct-injection *shape* as [`EnvFileProvider`] — the resolved
 /// values transit daemon RAM only as the child's spawn env, for the spawn instant,
 /// and it never leases — with one difference: the values do not live in the clear
-/// anywhere. The config holds only the KEY *names* (public, for the readout); the
-/// VALUES are ciphertext in the account store, keyed by the source name, and are
-/// decrypted by the daemon *after approval* into [`ProviderRun::env`]. So the
-/// daemon-at-rest holds no plaintext value (invariant #1) even for this
-/// direct-injection provider, and [`describe`](SecretProvider::describe) shows the
-/// approver the KEY names ("will set FOO, BAR"), never a value (zero-knowledge).
+/// anywhere, and there is no key at rest that could open them. The config holds
+/// only the KEY *names* (public, for the readout); the VALUES are a sealed
+/// [`ThresholdRecord`](crate::threshold::ThresholdRecord) keyed by the source
+/// name, opened by the daemon *after approval* (combining the phone's `Z_F` with
+/// the Mac share `m`) into [`ProviderRun::env`]. So the daemon-at-rest holds
+/// nothing that can release the value (invariant #1), and
+/// [`describe`](SecretProvider::describe) shows the approver the KEY names ("will
+/// set FOO, BAR"), never a value (zero-knowledge).
 #[derive(Debug, Default, Clone)]
 pub struct EnvProvider;
 
@@ -445,10 +413,6 @@ impl SecretProvider for EnvProvider {
             .collect()
     }
 
-    fn needs_account(&self) -> bool {
-        false
-    }
-
     fn needs_sealed_env(&self) -> bool {
         true
     }
@@ -468,10 +432,6 @@ impl SecretProvider for EnvProvider {
             return 1;
         };
         spawn_with_env(run, vars)
-    }
-
-    fn probe(&self, _credential: &[u8]) -> Result<Vec<String>, ProviderError> {
-        Err(ProviderError::Unsupported)
     }
 }
 
@@ -509,12 +469,21 @@ fn spawn_with_env(run: ProviderRun, vars: &[(String, Zeroizing<String>)]) -> i32
     if !run.cwd.is_empty() {
         cmd.current_dir(run.cwd);
     }
+    // Non-secret vars first, resolved secrets second: last write wins in
+    // `Command`'s env map, so a sealed value always beats a plain one of the same
+    // name. The daemon drops shadowed plain entries before we get here (and says
+    // so), which makes this ordering the belt to that braces rather than the only
+    // guard.
+    for (k, v) in run.plain.iter() {
+        cmd.env(k, v);
+    }
     for (k, v) in vars.iter() {
         cmd.env(k, v.as_str());
     }
     // The proxy recursion fuse: the child (and anything it re-invokes through
     // a Sigil alias) carries the incremented depth so the alias's own guard
-    // can bound a runaway loop. Harmless to a non-proxied tool.
+    // can bound a runaway loop. Harmless to a non-proxied tool. Set last, so no
+    // configured var can shadow it.
     cmd.env(crate::proxy::DEPTH_ENV, run.proxy_depth.to_string());
     // Splice the caller's fds to the child. An ABSENT fd defaults to
     // Stdio::null(), never inherit: the daemon's own stdio (a same-UID
@@ -742,45 +711,80 @@ mod tests {
     }
 
     #[test]
-    fn op_provider_needs_an_account_and_env_file_does_not() {
-        assert!(OpProvider::new().needs_account());
-        assert!(!EnvFileProvider.needs_account());
-        // A provider with no stored credential does not support probing.
-        assert!(matches!(
-            EnvFileProvider.probe(b"x"),
-            Err(ProviderError::Unsupported)
-        ));
+    fn env_provider_needs_a_sealed_env_and_op_does_not() {
+        // `op` is a plain gate: it needs no sealed env. The inline env provider
+        // does. Neither injects an account credential (that concept is gone).
+        assert!(!OpProvider::new().needs_sealed_env());
+        assert!(!EnvFileProvider.needs_sealed_env());
+        assert!(EnvProvider.needs_sealed_env());
     }
 
     #[test]
-    fn run_streams_op_child_output_to_the_caller_fd() {
-        // A fake `op` that echoes its token env so we can prove credential injection.
+    fn op_runs_the_real_binary_gated_and_injects_nothing() {
+        // `op` is a plain gate: Sigil runs the real binary and streams its output,
+        // injecting nothing of its own. A SIGIL_ marker env var proves the daemon
+        // added nothing to the child's environment (the child prints only what it
+        // finds; Sigil sets no such var), while the fixed "ran:" prefix proves the
+        // gated child actually ran and its stdout reached the caller's fd.
         let dir = std::env::temp_dir().join(format!("sigil-prov-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let op = dir.join("op");
         std::fs::write(
             &op,
-            "#!/bin/sh\nprintf 'tok=%s' \"$OP_SERVICE_ACCOUNT_TOKEN\"\n",
+            "#!/bin/sh\nprintf 'ran:%s' \"$SIGIL_INJECTED_MARKER\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let (read_end, write_end) = pipe();
         let provider = OpProvider::with_binary(op);
-        let credential: Token = Zeroizing::new(b"secret-token".to_vec());
         let code = provider.run(ProviderRun {
             command: &["op".into(), "read".into()],
             cwd: "",
-            credential: Some(&credential),
             source: "",
             env: None,
+            plain: &[],
             proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
             stderr: None,
         });
         assert_eq!(code, 0);
-        assert_eq!(read_all(read_end), "tok=secret-token");
+        // The gated op ran (prefix present) and Sigil injected no marker var.
+        assert_eq!(read_all(read_end), "ran:");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn op_still_injects_the_sources_plain_vars() {
+        // A plain gate injects no CREDENTIAL, which is not the same as injecting
+        // nothing: the source's non-secret vars are how the gated tool is told to
+        // stop reaching for an ambient auth channel the daemon cannot open.
+        let dir = std::env::temp_dir().join(format!("sigil-provplain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let op = dir.join("op");
+        std::fs::write(
+            &op,
+            "#!/bin/sh\nprintf 'biometric=%s' \"$OP_BIOMETRIC_UNLOCK_ENABLED\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (read_end, write_end) = pipe();
+        let vars = plain(&[("OP_BIOMETRIC_UNLOCK_ENABLED", "false")]);
+        let code = OpProvider::with_binary(op).run(ProviderRun {
+            command: &["op".into(), "read".into()],
+            cwd: "",
+            source: "",
+            env: None,
+            plain: &vars,
+            proxy_depth: 1,
+            stdin: None,
+            stdout: Some(write_end),
+            stderr: None,
+        });
+        assert_eq!(code, 0);
+        assert_eq!(read_all(read_end), "biometric=false");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -825,9 +829,9 @@ mod tests {
         let code = EnvFileProvider.run(ProviderRun {
             command: &["faketool".into()],
             cwd: "",
-            credential: None,
             source: env_path.to_str().unwrap(),
             env: None,
+            plain: &[],
             proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
@@ -876,9 +880,9 @@ mod tests {
         let code = EnvFileProvider.run(ProviderRun {
             command: &["faketool".into()],
             cwd: "",
-            credential: None,
             source: env_path.to_str().unwrap(),
             env: None,
+            plain: &[],
             proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
@@ -939,13 +943,8 @@ mod tests {
     #[test]
     fn env_provider_flags_and_describe_shows_keys_not_values() {
         assert_eq!(EnvProvider.id(), "env");
-        // Direct-injection: no account, no leasing; but it does open a sealed blob.
-        assert!(!EnvProvider.needs_account());
+        // Direct-injection: no leasing; but it does open a threshold-sealed blob.
         assert!(EnvProvider.needs_sealed_env());
-        assert!(matches!(
-            EnvProvider.probe(b"x"),
-            Err(ProviderError::Unsupported)
-        ));
         // describe() surfaces the KEY names only (from config), never a value.
         let keys = vec!["FOO".to_string(), "BAR".to_string()];
         let refs = EnvProvider.describe(
@@ -998,13 +997,13 @@ mod tests {
         let code = EnvProvider.run(ProviderRun {
             command: &["faketool".into()],
             cwd: "",
-            credential: None,
             source: "",
             proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
             stderr: None,
             env: Some(&vars),
+            plain: &[],
         });
 
         match prev {
@@ -1016,19 +1015,125 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Run `script` as `faketool` on a scoped PATH with the given plain vars and
+    /// sealed pairs, returning what it printed. Shared by the plain-injection
+    /// tests so each one is about the environment, not the scaffolding.
+    fn run_faketool(
+        tag: &str,
+        script: &str,
+        plain: &[(String, String)],
+        sealed: Option<&EnvVars>,
+    ) -> String {
+        let dir = std::env::temp_dir().join(format!("sigil-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bindir = dir.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = bindir.join("faketool");
+        std::fs::write(&tool, script).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("PATH");
+        let mut search = vec![bindir.clone()];
+        if let Some(p) = &prev {
+            search.extend(std::env::split_paths(p));
+        }
+        std::env::set_var("PATH", std::env::join_paths(search).unwrap());
+
+        let (read_end, write_end) = pipe();
+        let run = ProviderRun {
+            command: &["faketool".into()],
+            cwd: "",
+            source: "",
+            proxy_depth: 1,
+            stdin: None,
+            stdout: Some(write_end),
+            stderr: None,
+            env: sealed,
+            plain,
+        };
+        let code = match sealed {
+            Some(_) => EnvProvider.run(run),
+            None => run_passthrough(run),
+        };
+
+        match prev {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        assert_eq!(code, 0);
+        let out = read_all(read_end);
+        std::fs::remove_dir_all(&dir).ok();
+        out
+    }
+
+    fn plain(kv: &[(&str, &str)]) -> Vec<(String, String)> {
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_sealed_value_wins_over_a_plain_var_of_the_same_name() {
+        // The ordering that makes cleartext config unable to override a protected
+        // value. The daemon drops the shadowed entry before it reaches a provider
+        // and says so; this is the belt to that braces, so it passes the collision
+        // through deliberately.
+        let vars: EnvVars = Zeroizing::new(pairs(&[("API_KEY", "sealed-42")]));
+        let out = run_faketool(
+            "plaincollide",
+            "#!/bin/sh\nprintf 'key=%s switch=%s' \"$API_KEY\" \"$TOOL_FALLBACK\"\n",
+            &plain(&[("API_KEY", "plain-should-lose"), ("TOOL_FALLBACK", "false")]),
+            Some(&vars),
+        );
+        assert_eq!(out, "key=sealed-42 switch=false");
+    }
+
+    #[test]
+    fn a_plain_var_cannot_shadow_the_proxy_depth_fuse() {
+        // The recursion fuse is written last, after everything configured, so no
+        // config edit can unbound a runaway alias loop.
+        let out = run_faketool(
+            "plaindepth",
+            "#!/bin/sh\nprintf 'depth=%s' \"$SIGIL_PROXY_DEPTH\"\n",
+            &plain(&[(crate::proxy::DEPTH_ENV, "0")]),
+            None,
+        );
+        assert_eq!(out, "depth=1");
+    }
+
+    #[test]
+    fn a_gate_with_only_plain_vars_still_injects_them() {
+        // The degrade-to-plain-gate path: nothing sealed, but the source's
+        // non-secret vars are exactly what the tool needs to stop reaching for its
+        // own ambient auth. This must be a working configuration, not dead config.
+        let out = run_faketool(
+            "plainonly",
+            "#!/bin/sh\nprintf 'biometric=%s dir=%s' \"$OP_BIOMETRIC_UNLOCK_ENABLED\" \"$OP_CONFIG_DIR\"\n",
+            &plain(&[
+                ("OP_BIOMETRIC_UNLOCK_ENABLED", "false"),
+                ("OP_CONFIG_DIR", "/tmp/scratch-op"),
+            ]),
+            None,
+        );
+        assert_eq!(out, "biometric=false dir=/tmp/scratch-op");
+    }
+
     #[test]
     fn env_provider_fails_closed_with_no_pairs() {
         // A missing sealed map is a fail-closed bug, not something to inject blank.
         let code = EnvProvider.run(ProviderRun {
             command: &["faketool".into()],
             cwd: "",
-            credential: None,
             source: "",
             proxy_depth: 1,
             stdin: None,
             stdout: None,
             stderr: None,
             env: None,
+            plain: &[],
         });
         assert_eq!(code, 1, "no sealed values must fail closed");
     }
