@@ -112,9 +112,10 @@ struct Lease: Identifiable, Equatable, Sendable {
     /// that rule matches for the caller chain that opened it, so every renderer
     /// has to show that breadth alongside the name.
     var scope: String
-    /// The daemon's coverage label for that rule ("op read", "op with --account
-    /// rowmhq.1password.eu"): the same words the approver consented to, so this
-    /// screen states the breadth exactly instead of gesturing at it. Nil when the
+    /// The daemon's coverage label for that rule: `op read`, or
+    /// `op with --account "rowmhq.1password.eu"` (Match::coverage quotes a flag's
+    /// value). The same words the approver consented to, so this screen states
+    /// the breadth exactly instead of gesturing at it. Nil when the
     /// daemon sent none, and the row then falls back to the generic breadth
     /// rather than guessing what the rule matches. Display only: nothing branches
     /// on it, and it never defines the window (the daemon's binding does).

@@ -328,7 +328,7 @@ enum Fixtures {
         // `covers` is the daemon's label for what that rule matches. The second
         // row carries none, which is what an older daemon sends.
         Lease(grantHex: "9f3c1a77be20", caller: "claude", account: "Rowm work",
-              scope: "op", covers: "op with --account rowmhq.1password.eu",
+              scope: "op", covers: "op with --account \"rowmhq.1password.eu\"",
               grantedAt: Date().addingTimeInterval(-300),
               expiresAt: Date().addingTimeInterval(600)),
         Lease(grantHex: "2b8ee410c9d1", caller: "rowm launcher", account: "Rowm work",

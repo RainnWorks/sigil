@@ -18,7 +18,14 @@ struct LeasesView: View {
                     // that rule matches. Those words describe a rule, not a command
                     // line, so the breadth is stated once for the whole list rather
                     // than repeated on every row (as `sigil lease list` does).
-                    Text("Each lease covers any command its rule matches, run from anywhere on this Mac, until it expires.")
+                    //
+                    // "everything", not "any command": a rule that injects sealed
+                    // values also holds those values in RAM for the window, and the
+                    // narrower word would understate the grant. "covers everything
+                    // its rule matches ... from anywhere on this Mac" is the CLI's
+                    // LEASE_BREADTH verbatim; only the TTL tail is ours, since this
+                    // list is the one place with a live countdown beside it.
+                    Text("Each lease covers everything its rule matches, run from anywhere on this Mac, until it expires.")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                     // One shared clock drives every countdown.
                     TimelineView(.periodic(from: .now, by: 1)) { context in
