@@ -87,8 +87,14 @@ private struct LeaseRow: View {
                 // caller. Next to the name sits the daemon's coverage label for
                 // that rule, the same words the approver consented to; without
                 // one (an older daemon) the generic breadth stands in.
+                //
+                // Both halves are free text out of the user's config, so both go
+                // through `Lease.sanitized`: the rule name is sanitized nowhere
+                // else, and the label's daemon-side guarantee is worth re-earning
+                // here rather than trusting across a socket.
                 HStack(spacing: 5) {
-                    MonoText(lease.scope, size: 11, color: .secondary)
+                    MonoText(Lease.sanitized(lease.scope), size: 11, color: .secondary)
+                        .lineLimit(1)
                     Text("·").font(.system(size: 11)).foregroundStyle(.tertiary)
                     Text(lease.covers ?? "any matching command")
                         .font(.system(size: 11)).foregroundStyle(.tertiary)

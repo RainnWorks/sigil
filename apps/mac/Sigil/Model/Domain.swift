@@ -108,9 +108,13 @@ struct Lease: Identifiable, Equatable, Sendable {
     let grantHex: String
     var caller: String
     var account: String
-    /// The matched RULE's name, not a command line. The lease covers any command
+    /// The matched RULE's name, not a command line. The lease covers everything
     /// that rule matches for the caller chain that opened it, so every renderer
     /// has to show that breadth alongside the name.
+    ///
+    /// Held verbatim, because it names a rule and callers may need to match on
+    /// it. It is user-authored config that no surface sanitizes, so anything
+    /// rendering it runs it through `sanitized(_:)` at the render site.
     var scope: String
     /// The daemon's coverage label for that rule: `op read`, or
     /// `op with --account "rowmhq.1password.eu"` (Match::coverage quotes a flag's
@@ -125,24 +129,43 @@ struct Lease: Identifiable, Equatable, Sendable {
 
     func remaining(now: Date) -> TimeInterval { max(0, expiresAt.timeIntervalSince(now)) }
 
-    /// Layout hygiene for a coverage label off the wire, not interpretation. The
-    /// daemon already collapses whitespace, strips control characters and bounds
-    /// the length; this repeats the bound so a violated guarantee costs a clipped
-    /// label instead of a broken row. Mirrors the phone's `coverageLabel`. Blank
-    /// in, nil out: the caller then shows no label rather than an empty clause.
-    static func coverage(_ raw: String?) -> String? {
-        guard let raw else { return nil }
-        let despaced = String(String.UnicodeScalarView(raw.unicodeScalars.map {
-            CharacterSet.controlCharacters.contains($0) ? " " : $0
-        }))
-        let flat = despaced
+    /// Layout hygiene for one line of daemon-supplied text, not interpretation.
+    /// Nothing here parses or branches on the text; it only makes an arbitrary
+    /// string safe to lay out on one row.
+    ///
+    /// Both free-text fields on the lease row are rendered from the user's own
+    /// config: the daemon sanitizes and bounds the coverage label, and the rule
+    /// NAME passes through no sanitiser on any surface. So this runs over both,
+    /// and a guarantee that fails upstream costs a clipped line instead of a
+    /// broken row. Mirrors the phone's `coverageLabel`.
+    ///
+    /// Control and format characters (Cc and Cf, so the bidi overrides among
+    /// them) become spaces, then runs of whitespace collapse to one. Non-spacing
+    /// marks (Mn) are dropped rather than spaced: they stack on the preceding
+    /// character instead of taking width, so enough of them obscure the line
+    /// while barely moving the length bound, and spacing them out would only
+    /// spread the damage. Then the line is clipped at the daemon's own bound.
+    static func sanitized(_ raw: String) -> String {
+        var scalars = String.UnicodeScalarView()
+        for scalar in raw.unicodeScalars {
+            if scalar.properties.generalCategory == .nonspacingMark { continue }
+            scalars.append(CharacterSet.controlCharacters.contains(scalar) ? " " : scalar)
+        }
+        let flat = String(scalars)
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if flat.isEmpty { return nil }
         // Clipped by grapheme cluster so an elision can never split one. The
         // daemon's own bound is the one that normally applies.
         guard flat.count > coversMaxChars else { return flat }
         return String(flat.prefix(coversMaxChars - 1)) + "\u{2026}"
+    }
+
+    /// A coverage label as the row should show it. Blank in, nil out: the caller
+    /// then states the generic breadth rather than an empty clause.
+    static func coverage(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let label = sanitized(raw)
+        return label.isEmpty ? nil : label
     }
 
     /// The daemon's bound on a coverage label (sigil_proto::COVERS_MAX_CHARS).
