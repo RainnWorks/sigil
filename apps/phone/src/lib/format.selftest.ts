@@ -22,6 +22,17 @@ function eq<T>(a: T, b: T, label: string): void {
   }
 }
 
+/**
+ * A test label safe to print. JSON.stringify escapes control characters but not
+ * U+202E, so echoing a bidi vector verbatim would reorder the runner's own
+ * output: the same trick the vector plays on the approval sheet.
+ */
+function visible(s: string): string {
+  return JSON.stringify(s).replace(/[\p{Cf}\p{Mn}]/gu, (c) =>
+    `\\u${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`,
+  );
+}
+
 function main(): void {
   console.log("coverageLabel (the leasable caption's breadth clause)");
   // The nine shapes the daemon actually renders, passed through untouched: the
@@ -62,6 +73,53 @@ function main(): void {
     "over-long is clipped by code point",
   );
   eq(coverageLabel("x".repeat(COVERS_MAX_CHARS)), "x".repeat(COVERS_MAX_CHARS), "exactly at bound");
+
+  // Security review R4-F4. The label shares one line with the sentence that
+  // states how wide the window is, so a character that reorders or hides glyphs
+  // inside the label attacks the human's only defence. Both vectors are the
+  // reviewer's, and both defeated the old sanitizer: neither is a control
+  // character, and both fit well inside COVERS_MAX_CHARS, so neither the
+  // control-character strip nor the length bound touched them.
+  const RLO = "\u202E"; // RIGHT-TO-LEFT OVERRIDE: reverses everything after it
+  const ZWSP = "\u200B"; // ZERO WIDTH SPACE: splits a word invisibly
+  const ACUTE = "\u0301"; // COMBINING ACUTE ACCENT: piles up over the glyph
+  eq(
+    coverageLabel(`op with --account "${RLO}terces-on${ZWSP}"`),
+    'op with --account "terces-on"',
+    "bidi override and zero width space removed, reading order restored",
+  );
+  // Removed, not merely clipped: 40 marks is 47 code points, comfortably under
+  // the bound, so a length check alone would have rendered every one of them.
+  eq(coverageLabel(`op read${ACUTE.repeat(40)}`), "op read", "combining pile removed, not clipped");
+  // Deleted rather than spaced. These are not separators, so spacing them would
+  // split one word into two instead of putting it back together.
+  eq(coverageLabel(`o${ZWSP}p read`), "op read", "zero width space does not split a word");
+  eq(coverageLabel("op\u00ADread"), "opread", "soft hyphen removed");
+  // The whole bidi family, not just the one vector: overrides, embeddings, the
+  // pop, and the invisible marks.
+  eq(
+    coverageLabel(`op\u202A\u202B\u202C\u202D${RLO}\u200E\u200F read`),
+    "op read",
+    "every bidi control removed",
+  );
+  // The property that actually matters is about the RENDERED line, not the label
+  // alone: no format character or combining mark may survive anywhere in the
+  // sentence the human reads. Asserted as a property so it cannot drift into a
+  // second copy of the sheet's wording (approval-sheet.tsx owns that string).
+  const caption = (label: string): string =>
+    `Covers ${label}: every command and secret that rule matches, from anywhere on this Mac.`;
+  for (const vector of [
+    `op with --account "${RLO}terces-on${ZWSP}"`,
+    `op read${ACUTE.repeat(40)}`,
+    `${RLO}op read`,
+  ]) {
+    const rendered = caption(coverageLabel(vector) ?? "");
+    eq(
+      /[\p{Cf}\p{Mn}]/u.test(rendered),
+      false,
+      `rendered caption cannot be reordered or buried: ${visible(vector)}`,
+    );
+  }
 
   console.log("commandWord (the deny control's actor)");
   // A plain word: the common shim case, passed through untouched.

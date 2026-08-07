@@ -86,16 +86,34 @@ export function durationWindow(totalSecs: number): string {
  *
  * This is hygiene, not interpretation. The label is display only: it is never
  * parsed, nothing branches on its contents, and the words in it are the daemon's
- * (rendered from the user's own rule), not the phone's. The daemon already
- * collapses whitespace, strips control characters and bounds the length; this
- * repeats the bound so a violated guarantee costs a clipped caption instead of a
- * broken sheet.
+ * (rendered from the user's own rule), not the phone's. The daemon sanitizes to
+ * these same categories at its own choke point; this repeats the work so a
+ * violated guarantee costs a clipped caption instead of a misread one.
+ *
+ * Why it strips more than control characters (security review R4-F4): the label
+ * and the sentence stating how wide the window is share one line, so anything
+ * that reorders or hides glyphs inside the label reorders the human's only
+ * defence. A rule value carrying U+202E RIGHT-TO-LEFT OVERRIDE flips the text
+ * after it, and a pile of combining marks buries it; 40 of those fit inside the
+ * length bound, so the bound alone stops neither. That a config author could
+ * write a wide rule anyway is not the point: the designed path has an agent
+ * adding rules on the human's behalf, and reading this caption correctly is what
+ * the human is left with.
  */
 export function coverageLabel(covers: string | undefined): string | null {
   if (!covers) return null;
-  // Control characters (including newlines and the separators) become spaces,
-  // then runs of whitespace collapse: a caption is one line either way.
   const flat = covers
+    // Format characters (Cf: the bidi overrides and embeddings, zero-width
+    // space/joiner, soft hyphen) and non-spacing combining marks (Mn) are
+    // DELETED, not spaced, because they are not separators: spacing them would
+    // split "o<ZWSP>p" into two words rather than restoring "op". Accepted cost:
+    // a decomposed "e" + U+0301 loses its accent, while a precomposed "é"
+    // (U+00E9, not Mn) is untouched. On a consent surface an unambiguous
+    // rendering is worth more than a faithful one.
+    .replace(/[\p{Cf}\p{Mn}]/gu, "")
+    // Control characters (including newlines and the line/paragraph separators)
+    // ARE separators, so they become spaces; then runs of whitespace collapse
+    // and a caption is one line either way.
     .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
