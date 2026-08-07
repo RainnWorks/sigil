@@ -144,11 +144,11 @@ Residuals for the security-reviewer to weigh:
 | Every failure path denies (deny, timeout, dead phone, decrypt failure) | `daemon.rs::fulfill` (`fail_closed` on each branch), `remote.rs::round_trip` (`?`/`None` → Deny) | `daemon.rs::denied_request_fails_closed_and_delivers_no_secret`, `remote_softphone_denial_fails_closed_with_no_secret`, `approve.rs::local_timeout_fails_closed` |
 | Leases are RAM-only, triple-scoped (grant key + account + scope, where scope is the matched RULE's name), plus a source-material fingerprint when they cache values | `lease.rs::LeaseStore`, `Lease`, `LeaseBinding` | `lease.rs::lease_grant_lookup_and_scope_isolation`, `a_reseal_of_the_source_misses_the_cached_lease` |
 | A lease covers the whole matched rule for that caller chain (any argv, any cwd), and stops at the rule boundary | `daemon.rs::fulfill` (`lease_scope = action.rule`, `grant_key(&caller, ScopeKind::Command, "", &lease_scope)`) | `daemon.rs::a_lease_covers_any_command_the_same_rule_matches`, `a_lease_survives_a_change_of_directory`, `a_lease_on_one_rule_does_not_cover_another_rule`, `lease.rs::{one_rule_covers_any_command_it_matches,cwd_no_longer_splits_a_lease,different_rules_do_not_share_a_grant_key}` |
-| A lease never crosses caller chains: a different tool tree (or a tampered ancestor) is a different grant | `lease.rs::grant_key` (chain code identity) | `lease.rs::different_caller_chains_do_not_share_a_rule_lease`. **UNPROVEN against a deliberate imitator, by construction, not by a missing test (round 4, R4-F1):** the grant key binds only each ancestor's path, measure tag and digest plus the chain length, and nothing instance-specific whenever every ancestor measures, so an attacker who can exec the same binaries from the same paths in the same nesting derives the same key without touching the victim's processes at all. `ps` discloses the tree to imitate. The claim holds for *honest* trees, which is what it is for. **Implementer's addendum (fix round, 2026-08-07):** the stronger statement is now written at every place the claim is made rather than only here: `lease.rs` module docs, `lease.rs::grant_key`'s doc comment, the test comment on `different_caller_chains_do_not_share_a_rule_lease`, and both chain paragraphs of the design brief (which also no longer says malware must be *running under* those ancestors to ride a window). No behaviour changed and no user-facing string claimed the stronger property. |
+| A lease never crosses caller chains: a different tool tree (or a tampered ancestor) is a different grant | `lease.rs::grant_key` (chain code identity) | `lease.rs::different_caller_chains_do_not_share_a_rule_lease`. **UNPROVEN against a deliberate imitator, by construction, not by a missing test (round 4, R4-F1):** the grant key binds only each ancestor's path, measure tag and digest plus the chain length, and nothing instance-specific whenever every ancestor measures, so an attacker who can exec the same binaries from the same paths in the same nesting derives the same key without touching the victim's processes at all. `ps` discloses the tree to imitate. The claim holds for *honest* trees, which is what it is for. **Implementer's addendum (fix round, 2026-08-07):** the stronger statement is now written at every place the claim is made rather than only here: `lease.rs` module docs, `lease.rs::grant_key`'s doc comment, the test comment on `different_caller_chains_do_not_share_a_rule_lease`, and both chain paragraphs of the design brief (which also no longer says malware must be *running under* those ancestors to ride a window). No behaviour changed and no user-facing string claimed the stronger property. **Reviewer verdict (round 5, independent, 2026-08-08): R4-F1 CLOSED.** Checked every place the claim is made. `lease.rs`'s module docs and `grant_key`'s doc comment both now state reconstructibility at full strength and name the unmeasured branch as the only measure an outsider cannot restage; the brief's two chain paragraphs say the same and no longer require malware to be "running under" the ancestors. Nothing left in the crate, the brief or `PROTOCOL.md` implies a different tool tree cannot ride a window. |
 | The **lease coverage label** shown on the consent surface is rendered by the daemon from the matched rule's own match conditions, never read from disk and never supplied by a peer | `config.rs::Match::coverage` (built from `command`/`subcommand`/`flag_present`/`flag_equals`/`argv_contains`/`arg_regex` only, never from argv), `config.rs::Config::resolve` (the sole writer: `with_covers(rule.match_.coverage())` on every match) | `config.rs::{coverage_renders_each_match_shape,resolve_stamps_the_coverage_label_only_on_a_leasable_rule,a_hand_edited_covers_on_disk_is_ignored_by_resolve}`, `daemon.rs::{a_granted_lease_reports_the_same_coverage_the_approver_consented_to,a_run_once_rule_emits_no_coverage_label_anywhere}`. A hand-edited `covers` on disk does deserialize but is unconditionally replaced at resolve time, and `Config::save` never persists one. There is no inbound path at all: `ApprovalResponse`/`InstallLease` carry no such field. |
 | The coverage label describes a window and can never define one: it is outside `LeaseBinding`, outside `grant_key`, and outside the lookup | `lease.rs::{Lease::covers,LeaseStore::grant,LeaseStore::token_for}` (the match compares `grant` + `binding` only; `covers` is written, never compared) | `lease.rs::coverage_is_carried_for_display_and_never_joins_the_lookup` (two labels, one window; a lookup that names no label still hits; a refresh re-stamps without forking) |
 | The coverage label is as protected in transit as the rest of the request: relay-invisible, signature-covered, single-use, and absent from the push doorbell | `request.rs::LeasePolicy::Leasable::covers` (a field of the sealed `ApprovalRequest`, no new transport), `sigil-relay/src/push.rs::DOORBELL_BODY` (a fixed constant) | `sigil-proto/tests/hostile_relay.rs::the_lease_coverage_label_rides_inside_the_seal` (not on the wire, undecryptable by a stranger, `BadSignature` on ciphertext tamper, `DuplicateRequest` on replay) |
-| The coverage label cannot deform the consent surface it rides on | `request.rs::sanitize_covers` (the single choke point: control characters and whitespace collapse, bounded to `COVERS_MAX_CHARS` = 72 counted in characters, single-character ellipsis), plus three independent renderer sanitisers: `apps/phone/src/lib/format.ts::coverageLabel`, `apps/mac/.../Domain.swift::Lease.coverage`, `cli.rs::lease_row` | `request.rs::covers_is_sanitized_bounded_and_never_set_on_run_once`, `config.rs::coverage_is_bounded_and_summarizes_a_busy_rule`, `apps/phone/src/lib/format.selftest.ts`. **UNPROVEN, and PARTIALLY FALSE as stated (round 4, R4-F4, demonstrated):** the choke point strips Unicode `Cc` and `White_Space` only. Bidi controls (`U+202A`-`U+202E`, `U+2066`-`U+2069`), zero-width and other `Cf` characters, and unbounded combining marks pass through it onto the phone's caption, where the label shares a paragraph with the fixed clause that states the breadth. The phone's regex does not close it either; the Swift mirror closes the `Cf` half only (`CharacterSet.controlCharacters` = Cc+Cf, verified) and the CLI re-sanitises nothing. See also R4-F5: the summary fallback can itself exceed the bound and be elided mid-clause. **Implementer's addendum (fix round, 2026-08-07, not a verdict):** the choke point is now `request.rs::sanitize_label`, an allowlist (printable ASCII, collapsed whitespace, `U+2026`; every other character becomes one `?` per run), called by `sanitize_covers` and re-run at the CLI render boundary by `cli.rs::cell` over `covers`, `scope` and `account`. `summarize` now bounds itself so the count clause survives (R4-F5). New tests: `request.rs::{covers_cannot_carry_a_character_that_reorders_or_hides_the_caption,sanitize_label_holds_its_bound_at_any_width}`, `cli.rs::a_lease_row_cannot_repaint_the_terminal_or_reorder_itself`, and the busy-rule case added to `config.rs::coverage_is_bounded_and_summarizes_a_busy_rule`. The phone and Mac mirrors are separate changes. Full record in the fix-round section at the end of this file; the UNPROVEN verdict above stands until an independent pass re-rates it. |
+| The coverage label cannot deform the consent surface it rides on | `request.rs::sanitize_covers` (the single choke point: control characters and whitespace collapse, bounded to `COVERS_MAX_CHARS` = 72 counted in characters, single-character ellipsis), plus three independent renderer sanitisers: `apps/phone/src/lib/format.ts::coverageLabel`, `apps/mac/.../Domain.swift::Lease.coverage`, `cli.rs::lease_row` | `request.rs::covers_is_sanitized_bounded_and_never_set_on_run_once`, `config.rs::coverage_is_bounded_and_summarizes_a_busy_rule`, `apps/phone/src/lib/format.selftest.ts`. **UNPROVEN, and PARTIALLY FALSE as stated (round 4, R4-F4, demonstrated):** the choke point strips Unicode `Cc` and `White_Space` only. Bidi controls (`U+202A`-`U+202E`, `U+2066`-`U+2069`), zero-width and other `Cf` characters, and unbounded combining marks pass through it onto the phone's caption, where the label shares a paragraph with the fixed clause that states the breadth. The phone's regex does not close it either; the Swift mirror closes the `Cf` half only (`CharacterSet.controlCharacters` = Cc+Cf, verified) and the CLI re-sanitises nothing. See also R4-F5: the summary fallback can itself exceed the bound and be elided mid-clause. **Implementer's addendum (fix round, 2026-08-07, not a verdict):** the choke point is now `request.rs::sanitize_label`, an allowlist (printable ASCII, collapsed whitespace, `U+2026`; every other character becomes one `?` per run), called by `sanitize_covers` and re-run at the CLI render boundary by `cli.rs::cell` over `covers`, `scope` and `account`. `summarize` now bounds itself so the count clause survives (R4-F5). New tests: `request.rs::{covers_cannot_carry_a_character_that_reorders_or_hides_the_caption,sanitize_label_holds_its_bound_at_any_width}`, `cli.rs::a_lease_row_cannot_repaint_the_terminal_or_reorder_itself`, and the busy-rule case added to `config.rs::coverage_is_bounded_and_summarizes_a_busy_rule`. The phone and Mac mirrors are separate changes. Full record in the fix-round section at the end of this file; the UNPROVEN verdict above stands until an independent pass re-rates it. **Reviewer verdict (round 5, independent, 2026-08-08): R4-F4 CLOSED. This row is now PROVEN, and the allowlist is a stronger fix than the `Cc`/`Cf`/`Mn` blocklist this reviewer proposed.** Re-run against the original vectors and against four families a blocklist would have passed: `U+202E`/`U+200B` and 40 combining marks are gone; `U+3164 HANGUL FILLER` (Lo), `U+2800 BRAILLE PATTERN BLANK` (So), the `U+E0041` tag block, `U+2066` isolates and full-width homoglyphs (`\u{ff52}\u{ff45}\u{ff41}\u{ff44}`, which any letter-permitting filter renders as `read`) all reduce to `?`. The bound holds at exactly 72 for every pathological family, including the alternating rejected/space input that defeats run-collapsing. `Config::resolve` is still the only writer. One residual the collapse introduces is recorded as **R5-F1**: the marker is not injective, so two rules whose values differ only outside ASCII render the identical caption. |
 | A lease is **not** bound to a process, session, terminal, or user instance. The grant key excludes pids by design, so any *other* concurrently-running tree with the same ancestor executables (a second editor/agent session, another terminal, another project) shares the grant key and rides the window. Compounding it, every gated command arrives through a `~/.sigil/bin` symlink to the one `sigil` binary and macOS resolves symlinks, so the chain leaf is identical across commands: the chain discriminates tool trees, never commands | `lease.rs::grant_key` (pids excluded) | `lease.rs::grant_key_ignores_recycled_pids` (proves the property; the security consequence is reviewer finding **F2**). The load-bearing comment F2 called wrong is corrected at `daemon.rs::fulfill`, and the brief's "process tree key" phrasing with it |
 | A rule's *name* is the lease's scope, and rule names are user-mutable config, so a config reload REVOKES (and zeroizes) every lease whose rule did not survive it unchanged: rule removed, rule differing in any field by whole-struct comparison, or the source it injects from differing in any field. A rule rewritten mid-window cannot inherit the window | `daemon.rs::reload_config` -> `Core::invalidate_leases_for_config_change` -> `lease.rs::LeaseStore::revoke_scope`; each revocation is logged | `daemon.rs::a_rule_rewritten_mid_window_does_not_inherit_the_lease` (the reviewer's F3 scenario: a rule renamed to match `curl` mid-window), `config_reload_invalidates_exactly_the_leases_whose_rule_moved` (removed / match changed / policy changed / source changed / no-op), `lease.rs::revoke_scope_kills_every_lease_on_one_rule` |
 | What a lease holds depends on the rule. A plain gate (`op`, `env-file`, a degraded inline `env`) stores an empty presence marker and injects nothing on a leased run. A **sealed inline `env`** rule stores the values that approval unsealed, and leased runs inject them from RAM with no phone round trip: this is the one place a credential outlives a single request | `daemon.rs::fulfill` (the unseal runs BEFORE the grant, so a failed open leaves no lease; `sealed_plain` is what is stored, else `Zeroizing::new(Vec::new())`), `lease.rs::Lease::token` | `daemon.rs::a_sealed_env_lease_injects_from_ram_with_no_second_approval`, `leased_unsealed_inline_env_source_runs_as_a_plain_gate` (a plain gate still injects nothing) |
@@ -4330,3 +4330,324 @@ replace each run of anything else with a single `?`, bounded to 72 characters
 with `U+2026` as the last character when cut. Mirroring the daemon is what makes a
 label that arrives from an older daemon, or from a lease that outlived the config
 that named it, safe on the surface that renders it.
+
+## Independent review verdict, round 5: closure check on the R4 fixes (`a28dda1`, `39c4036`, `db2a77d`, tip `db2a77d`, 2026-08-08)
+
+Scope: the R4 fix round only. Reviewer wrote none of the fixes and wrote the R4
+findings they answer. Findings are numbered **R5-Fn**. Gate re-measured on the
+merged tree: **571 workspace tests pass, 0 failures**; `cargo clippy --all-targets
+-- -D warnings` clean; `cargo fmt --check` clean.
+
+**Everything below is pinned to `db2a77d`, and the tree moved during the review.**
+`c57404b` (Mac allowlist) landed mid-pass and closes R5-F4; further uncommitted
+work on `sanitize_label`, `Match::coverage` and the phone filter was in the tree
+at the time of writing and supersedes R5-F1. Neither is rated here. Measured
+outputs quoted below - including the `?` rejection marker - are what `db2a77d`
+produces; the in-flight work changes that glyph, which does not affect any ruling,
+because every ruling is about the filter's behaviour rather than its marker.
+A round-6 pass is needed once that work lands.
+
+**VERDICT: five of six CLOSED. R4-F2 is REOPENED, not because the fix is unsafe -
+it is a no-op - but because the premise it was built on is measurably false, and
+the code and this document now both assert that premise in detail.** That is the
+one item to act on, and it is a doc-accuracy action, not a code one. Everything
+else lands, and the R4-F4 fix is better than the fix this reviewer asked for.
+
+### Rulings
+
+**R4-F4 (was MEDIUM) - CLOSED, and the implementer was right to refuse the
+proposed fix.** This reviewer asked for a `Cc`/`Cf`/`Mn` blocklist. The
+implementer built an allowlist instead - printable ASCII, collapsed whitespace,
+`U+2026`, everything else one `?` per run - on the grounds that the blocklist
+still passes characters that render as nothing and fails open on future Unicode.
+Re-measured against the original vectors and against the families that argument
+turns on:
+
+```
+RLO   -> "op with --account \"?terces-on?\""      // U+202E, U+200B gone
+marks -> "op read?"                                // 40x U+0301 gone
+hangul filler  -> "op ? read"        // U+3164 is Lo: a Cc/Cf/Mn blocklist passes it
+braille blank  -> "op ? read"        // U+2800 is So: same
+tag block      -> "op ? read"        // U+E0041
+isolate        -> "op ?read?"        // U+2066/U+2069
+full-width     -> "op ?"             // U+FF52 U+FF45 U+FF41 U+FF44
+```
+
+The last line is the one that settles the design argument and it is worth stating
+plainly, because it was not in the finding: an allowlist closes **homoglyph
+spoofing of the label's own vocabulary**, and no category filter can. Full-width
+`\u{ff52}\u{ff45}\u{ff41}\u{ff44}` is four ordinary letters to any filter that
+permits letters, and it renders as `read` on a consent surface. Under the
+allowlist it is a `?`. A blocklist would have shipped that hole.
+
+The bound holds at exactly 72 characters for every pathological family tested,
+including the alternating rejected/space input specifically constructed to defeat
+run-collapsing (`"\u{e9} ".repeat(200)` -> 36 markers plus the ellipsis, 72
+characters). Run-collapsing cannot hide length or overflow the bound: it only
+ever shortens, and the bound is re-applied after it. The choke point is still
+single (`sanitize_covers` is a thin call onto `sanitize_label`) and
+`Config::resolve` is still the only writer of a label.
+
+**R4-F5 (was LOW) - CLOSED.** `summarize` now computes the tail first and elides
+the head into whatever budget the tail leaves, so the count clause survives whole.
+The exact shape from the finding:
+
+```
+coverage (72 chars) = "ccccccccccccccccccccccccccc… ssssssssssssssssss… with 4 match conditions"
+stamped  (72 chars) = "ccccccccccccccccccccccccccc… ssssssssssssssssss… with 4 match conditions"
+```
+
+The right half is what a reader needs and it is what survives. The busy-rule test
+gained the shape that escaped it.
+
+**R4-F6 (was LOW) - CLOSED for the lease row; the remainder is recorded as
+R5-F2.** `cli.rs::lease_row` draws `covers`, the rule name and the account through
+`cell()`, the same `sanitize_label`. Worth crediting a detail that was easy to
+miss: `LeaseCols::measure` was moved onto the **filtered** cell, so the columns
+measure the text that actually gets drawn. Measuring the raw field would have left
+every row with a `?` mis-aligned, which is how a hygiene fix becomes a display bug.
+
+**R4-F1 (claim correction) - CLOSED.** Verified at every site: `lease.rs` module
+docs, `grant_key`'s doc comment, the test comment, `PROTOCOL.md`, and both chain
+paragraphs of the brief - which also drops "running under those ancestors". No
+text left in the crate, the brief or the protocol doc implies a measured chain is
+a fence against a deliberate imitator.
+
+**R4-F3 (was LOW) - CLOSED.** Dedup on executable path plus reason, with the entry
+refreshed to the newest instance, is the right key: it collapses the degenerate
+per-command leaf case to one line while keeping the `sigil doctor` row pointed at
+a process that is actually running. `doomed_index` preferring a note whose process
+is over, and falling back to oldest only when all are live, is a better eviction
+rule than the finding asked for. `ImageNotVouched::explain()` now names the whole
+of what `-5` covers, including the unsigned case that was the falsely-described
+one.
+
+**R4-F2 - REOPENED. The race it posited does not exist, in either ordering, and
+the fix's stated premise is measurably false.** Measured on this machine (Darwin
+25.3) with a live ad-hoc signed process and a decoy of a different cdhash, driving
+the exact call sequence `sigil_guest_measure` uses:
+
+* **Old order** (`SecCodeCheckValidityWithErrors`, then swap the file to the
+  decoy, then `SecCodeCopySigningInformation`): the read returned the **honest**
+  cdhash `39fbcd64…`, byte-identical to a no-swap control, not the decoy's
+  `ff395a34…`. A second validity check also passed. The old order did **not** lose
+  to one well-timed swap.
+* **New order, attacked in its mirror image** (decoy pre-placed, so the read sees
+  it; honest file restored between the read and the check): the read returned the
+  decoy's cdhash and the validity check answered **`-67034`**, a refusal.
+
+The explanation is the one the original R4-F2 flagged as an unverified assumption
+and which is now verified: a `SecCodeRef` **memoizes its static code on first
+file-touching use**, and every later read and validity check on that same object
+works from that one snapshot. Whichever call touches the file first fixes the
+bytes; the other call then operates on the same bytes. So the two operations can
+never disagree, there was nothing to narrow, and the reorder is a security no-op.
+
+Disposition: **do not revert.** The reordering is harmless (memory management is
+correct on every path, and every swap and rename-over test still passes), and
+having both file-touching calls adjacent is arguably clearer. What must change is
+what is said about it. The code comment in `peercode.m` and the fix-round entry
+above both assert, confidently and at length, that the old order "loses to ONE
+well-timed swap" and that the new one "turns that same swap into a refusal".
+Neither is true. This is a worse defect than the finding it answers: R4-F2 said
+"this rests on an undocumented platform detail", which was accurate; the
+replacement says "this order is safe and the other was not", which measurement
+contradicts. Recorded as **R5-F3**.
+
+Two things in that entry are correct and should survive the rewrite: that
+`csops(pid, CS_OPS_CDHASH)` is the containing answer and is SPI, and that none of
+this is exploitable today because an attacker who can write an ancestor's binary
+can exec it honestly instead (R4-F1). To those, add the detection story neither
+round has stated: an attacker spinning a decoy in and out of an ancestor's path is
+**loud**, because every measurement that lands on the decoy answers `-5`, drops
+the ancestor to `Unmeasured`, breaks the victim's leases, writes a daemon log line
+and raises a `sigil doctor` row. The R4-F3 machinery is the real defence here.
+
+### Round-5 findings
+
+**R5-F1 (LOW; near-zero for this user, real at public release). The rejection
+marker is not injective, so two different rules can render one caption.** A run of
+rejected characters collapses to a single `?` that carries nothing about what it
+replaced, so distinct match values that differ only outside ASCII produce
+identical consent text. Demonstrated:
+
+```
+op with --vault "エンジニア"   ->  op with --vault "?"
+op with --vault "マーケティング" ->  op with --vault "?"
+identical captions: true
+```
+
+A consent surface exists to let a human tell one window from another, and this
+one can now collapse two windows to the same string. That is a sharper cost than
+"a non-ASCII vault renders as `Ing?nierie`", which is the way the trade has been
+described so far, and it is the part worth fixing. Practically inert for Tom's own
+ASCII config; it matters if Sigil ships publicly, which is the stated target.
+Smaller, same area: `sanitize_label`'s doc says "everything else becomes one
+`LABEL_REJECTED` per run", but a `Cc` character takes the whitespace branch and
+becomes a *space*, not a marker (`"a\u{1b}[31mb\u{7}"` -> `"a [31mb"`, as its own
+test asserts). Harmless - a control cannot draw - but the doc claims a uniformity
+the code does not have.
+
+> **Superseded in flight, and by a better fix than this finding proposed.** This
+> reviewer's suggestion was to make the marker injective (a count or a digest of
+> the rejected run). Work landed after the tip this section reviews takes the
+> opposite and correct route: `Match::coverage` now DETECTS that a token would not
+> survive the filter and degrades to the honest count form, so the caption never
+> quotes a value it cannot identify, reusing the existing "too many conditions"
+> path instead of inventing marker syntax. The same work moves the marker off `?`
+> because `?` is `is_ascii_graphic` and therefore forgeable **as content** - a rule
+> written `argv_contains ["?"]` rendered identically to a rejected run - which is a
+> sharper defect than the one filed here and which this reviewer did not spot.
+> Both are unrated: they are uncommitted at the time of writing, and rating a
+> moving tree is how a confident false statement gets written down (see R5-F3).
+> They need a round-6 pass once landed.
+
+**R5-F2 (LOW-MEDIUM). `sigil-config` list output is still unfiltered, and it is
+the more important of the two audit surfaces.** Recorded by the implementer rather
+than fixed, with the reasoning that filtering it is a design question rather than
+a patch. Agreed on the deferral and on the reasoning, and this reviewer rates it
+above the lease row that was fixed: `sigil-config rule list` is where a human
+audits what an agent-operated config path wrote on their behalf, so an escape
+sequence there can hide a rule from the audit that is supposed to catch it. The
+design question they raise - what "verbatim" means once a byte cannot be drawn -
+has an answer that follows from the surfaces' different jobs. A **consent** string
+must be unambiguous, so it filters. An **audit** string must show that the byte is
+there, so it should *escape* rather than filter: render `\x1b`, `\u{202e}`,
+`\u{0301}` visibly. Filtering an audit surface would hide exactly what the audit
+is for. That distinction should be written down before either surface is touched
+again.
+
+**R5-F3 (LOW as risk, MEDIUM as doc-accuracy). The `peercode.m` comment and the
+R4-F2 fix-round entry assert a security property that measurement contradicts.**
+See the R4-F2 ruling above for the evidence. Both should be rewritten to say what
+is true: one `SecCodeRef`, one snapshot pinned at first use, so the two
+file-touching operations cannot disagree and both orderings were and are safe; the
+residual is that the snapshot semantics are undocumented Apple behaviour a future
+OS could change, which is precisely why `csops(pid, CS_OPS_CDHASH)` - which
+touches no file at all - is the version that does not depend on it. A confident
+false statement about a security property in the file that implements it is how
+the next reviewer gets misled.
+
+**R5-F4 (INFO) - CLOSED by `c57404b`, which landed while this section was being
+written.** As of `db2a77d` the CLI applied the *allowlist* to the rule name while
+the Mac applied a *blocklist* to the same rule name, so one rule read
+`Ing<mark>nierie` in `sigil lease list` and `Ingénierie` in the Mac's lease row.
+`c57404b` ports the daemon's allowlist to the Mac, which resolves the
+disagreement. Noting for the record that it resolves it the opposite way to this
+reviewer's suggestion, which was to classify the FIELD rather than the surface -
+`covers` as a consent string (allowlist everywhere) and the rule *name* as an
+identifier that never rides the approval sheet (verbatim everywhere). Either
+resolution removes the defect and consistency is the property that mattered, so
+this is not a re-open; but if a rule name ever needs to be copied, matched on, or
+compared against `sigil-config` output, the field-based classification is the one
+that will be wanted, and R5-F2's consent-versus-audit distinction is the same
+argument in a different place.
+
+### On the trade the allowlist introduces (asked, and answered as an opinion)
+
+Keep it. For a **consent** string the direction of failure is the whole argument,
+and this reviewer's own proposed blocklist was the weaker instrument: measured
+above, `U+3164`, `U+2800` and full-width homoglyphs all sail through a `Cc`/`Cf`/
+`Mn` filter, and the homoglyph case is not a rendering nuisance but a spoof of the
+label's own vocabulary. Normalisation plus a narrower category filter is the wrong
+trade here for three reasons: it needs a Unicode table the fix deliberately
+avoided; it still has to decide about scripts the reader cannot read, which a
+consent surface cannot resolve; and confusables live entirely inside "legitimate
+letters", so it does not close the case that matters most.
+
+But the cost should be restated before it is accepted, because it has been
+described as an aesthetic one and it is not. The defect is R5-F1, ambiguity: not
+that an accented vault name looks wrong, but that two different rules can produce
+the same consent text. Fix the injectivity and keep the allowlist; that gets an
+unambiguous ASCII caption *and* distinguishable windows, which is the pair of
+properties a consent string actually needs. If a future release wants honest
+non-Latin labels, the place to spend that effort is a per-rule human-authored
+label the user writes and the daemon renders verbatim-if-ASCII, not a smarter
+filter on config tokens.
+
+## Implementer's record, R5 fix round: the marker, the degenerate label, and the config-list echo (2026-08-08, not a verdict)
+
+Behaviour and residuals only. R5-F1 and the `sigil-config list` echo noted at
+R4-F6's remainder are what this round answers; whether they are closed is for an
+independent round-6 pass.
+
+**1. The rejection marker is now `U+FFFD REPLACEMENT CHARACTER`
+(`request.rs::LABEL_REJECTED`), not `?`.** The defect was that `?` is
+`is_ascii_graphic`, so it was inside the very alphabet the marker had to stand
+outside of: `argv_contains ["?"]` rendered `op containing "?"` and a Japanese
+vault pin rendered `op with --vault "?"` - same glyph, same position, and no way
+for the reader to separate "a character was removed here" from "the rule contains
+a question mark". `U+FFFD` cannot survive the filter as content, so its presence
+in a label is unambiguous. Exactly one input puts it in a label without having
+been rejected - a config value that literally contains `U+FFFD`, which already
+asserts what the marker asserts. Category `So`, so it passes the phone's
+`\p{Cf}\p{Mn}` pass and the Mac's `nonspacingMark`/`controlCharacters` pass
+unchanged; present in SF Pro and SF Mono.
+
+**The permitted set is now: `is_ascii_graphic()` (`U+0021`..=`U+007E`), runs of
+whitespace collapsed to one `U+0020`, `U+2026` and `U+FFFD`** - printable ASCII
+plus exactly the two marks the daemon itself emits, neither forgeable from
+outside. Permitting `U+FFFD` is load-bearing, not cosmetic: `cli.rs::cell`
+re-runs `sanitize_label` over an already-sanitised label, so without it every
+marker would be re-marked on the CLI path. The function is now exactly idempotent
+(`sanitize_label(sanitize_label(x)) == sanitize_label(x)`), where before it was
+idempotent only by the accident of `?` being ASCII. Pinned by
+`request.rs::sanitize_label_is_idempotent` (four inputs x three bounds) and
+`cli.rs::a_lease_row_cannot_repaint_the_terminal_or_reorder_itself` (a lease row
+drawn from a label the choke point already filtered carries exactly the markers
+the choke point put there). Unforgeability is pinned by
+`request.rs::the_rejected_marker_cannot_be_spelled_by_a_label`.
+
+**2. The degenerate label (R5-F1's sharp edge) now declines to identify rather
+than misidentifying.** `config.rs::Match::coverage` checks every user-authored
+display token through `renders_anything` (the token, filtered, must retain at
+least one ASCII-graphic character) and falls back to the count form the
+"too many conditions" case already uses when any token fails. So a rule whose
+only distinguishing condition is a non-ASCII value renders
+`op read with 1 match condition`, not `op read with --vault "<mark>"`.
+Test: `config.rs::coverage_degrades_a_condition_it_cannot_render_to_the_count`.
+
+**Residual, stated plainly: this does NOT restore injectivity**, which is what the
+round-5 reviewer asked for. Two rules pinning two different Japanese vaults still
+render the identical string; the change is that the string no longer reads as
+though it named the condition. Partly-renderable values are unaffected
+(`Ingénierie` still renders as `Ing<mark>nierie`, marker in place). The count form
+also drops the flag NAME along with the value, so the reader loses "there is a
+vault pin" as well as the vault - coarser than the marker form, and chosen over it
+because a consent surface should not look precise while identifying nothing.
+
+**3. `sigil-config list` is no longer the unfiltered verbatim echo.** Both list
+views (`cli.rs::config_rule_list`, `config_source_list`) draw every free-text cell
+through `ListFilter::cell` - rule names, the target source, `describe_match`
+output, dead-flag names, source names, providers, `source_extra`, and plain env
+keys and values. It is filtered but deliberately NOT length-bounded: a cut here
+would hide a match condition on the view whose job is to show all of them. When
+the filter changes anything, the view prints one faint line naming the path that
+still shows it whole (`config.json` on disk, `sigil-config list --json`), so a
+non-ASCII config reads as filtered rather than as corrupt. Test:
+`cli.rs::a_config_list_cell_cannot_repaint_the_terminal_and_says_when_it_filtered`.
+
+The justification comment at `request.rs::sanitize_label` that leaned on this view
+("`sigil-config list` shows the rule verbatim, and it is the only place that
+claims to") is gone. It was wrong twice over: the human the caption exists for is
+holding a phone and cannot run a Mac CLI, so the marker has to carry the whole
+message unaided; and that view was itself recorded as unfiltered, making it the
+one path where a bidi override still reached a terminal. The replacement text
+states that every human-rendered surface filters and names the two verbatim paths.
+
+Residual: `--json` output is not itself filtered, by intent - it is the machine
+and record path. Anyone piping it to a terminal is piping unfiltered config to a
+terminal, which is true of `cat config.json` too.
+
+Residual, scoped out deliberately: the one-line confirmations (`rule <name>
+added`, `source <name> removed`, `nothing configured named <cmd>`) still echo
+their argument unfiltered. They differ from the list views in the way that
+matters here - they repeat a string the human typed in that same invocation,
+which their own shell already echoed, rather than rendering config written
+earlier or by a hand-edit. Worth closing if these lines ever start reporting a
+name the invocation did not supply.
+
+Gate on this change: **cargo test 575 passing / 0 failed** (571 at `db2a77d`, plus
+the four tests above), `cargo clippy
+--all-targets -- -D warnings` clean, `cargo fmt --check` clean. The phone and Mac
+mirrors of the marker are separate changes owned by those agents.

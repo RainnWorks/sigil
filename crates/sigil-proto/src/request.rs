@@ -113,11 +113,29 @@ pub const COVERS_MAX_CHARS: usize = 72;
 /// Permitting it is what lets an already-bounded label pass the filter unchanged.
 pub const LABEL_ELLIPSIS: char = '\u{2026}';
 
-/// What one run of rejected characters becomes. A visible ASCII marker, never a
-/// silent drop: a label that had something in it must not read as though it never
-/// did, and the human comparing the caption against their own rule should see
-/// that the daemon would not render part of it.
-pub const LABEL_REJECTED: char = '?';
+/// What one run of rejected characters becomes. A visible marker, never a silent
+/// drop: a label that had something in it must not read as though it never did,
+/// and the human comparing the caption against their own rule should see that the
+/// daemon would not render part of it.
+///
+/// **`U+FFFD REPLACEMENT CHARACTER`, because the marker has to be unforgeable.**
+/// A marker drawn from the permitted alphabet cannot carry that message: an ASCII
+/// `?` is `is_ascii_graphic`, so it passes the filter as ordinary content, and a
+/// rule written as `argv_contains ["?"]` renders `op containing "?"` while a rule
+/// pinning a Japanese vault renders `op with --vault "?"` — same glyph, same
+/// position, and no way for the reader to tell "a character was removed here"
+/// from "the rule really does contain a question mark". `U+FFFD` is outside
+/// `is_ascii_graphic`, so it can never survive the filter as content; it is the
+/// standard, self-describing mark for exactly this ("something was here that I
+/// cannot show you"); and it is present in SF Pro and SF Mono, the faces every
+/// surface that renders a label uses.
+///
+/// Stated exactly: the only input that can put this character in a label without
+/// having been rejected is the character itself (it is permitted, so the filter
+/// stays idempotent), and a config value that literally contains `U+FFFD` already
+/// asserts what the marker asserts. Every other input either survives as ASCII or
+/// becomes this mark, so a reader never has to decide which of the two happened.
+pub const LABEL_REJECTED: char = '\u{fffd}';
 
 /// Sanitize a display label for a consent surface, bounded to `max_chars`
 /// characters (elided with a single-character ellipsis, not three dots, so the
@@ -125,8 +143,17 @@ pub const LABEL_REJECTED: char = '?';
 ///
 /// **An allowlist, deliberately, not a list of known-bad characters.** A label
 /// may contain printable ASCII (`U+0021`..=`U+007E`), runs of whitespace
-/// collapsed to one space, and [`LABEL_ELLIPSIS`]. Everything else becomes one
+/// collapsed to one space, and exactly the two non-ASCII marks the daemon itself
+/// emits: [`LABEL_ELLIPSIS`] and [`LABEL_REJECTED`]. Everything else becomes one
 /// [`LABEL_REJECTED`] per run.
+///
+/// Permitting the daemon's own two marks is what makes this function **exactly
+/// idempotent**: `sanitize_label(sanitize_label(x))` is `sanitize_label(x)`. That
+/// is load-bearing rather than tidy, because an already-sanitized label really is
+/// re-filtered at a second boundary (`sigil lease list` re-runs it over a label
+/// the daemon already produced). Without the marker in the permitted set, every
+/// marker would be re-marked on that path; neither mark can be forged into a
+/// label from outside, so permitting them lets nothing new through.
 ///
 /// The blocklist this replaces filtered `char::is_control` (general category
 /// `Cc`) and `char::is_whitespace`, which let two families through onto the
@@ -149,10 +176,19 @@ pub const LABEL_REJECTED: char = '?';
 /// fail in.
 ///
 /// The cost, stated plainly: a legitimately non-ASCII rule token (a 1Password
-/// vault named `Ingénierie`) renders as `Ing?nierie` here. That is accepted. This
+/// vault named `Ingénierie`) renders as `Ing\u{fffd}nierie` here, and a token
+/// with no ASCII in it at all renders as one bare marker. That is accepted: this
 /// string is a statement of BREADTH on a consent surface, not a faithful echo of
-/// config; `sigil-config list` shows the rule verbatim, and it is the only place
-/// that claims to.
+/// config, and the marker states where the gap is instead of leaving a hole.
+///
+/// It is accepted **without** pointing at another surface as the faithful one.
+/// The human this filter exists for is holding a phone and cannot run a Mac CLI
+/// to see what the caption elided, so the marker has to carry the whole message
+/// unaided — which is exactly why it must be unforgeable. Every human-rendered
+/// surface filters, `sigil-config list` included (it is a terminal, the one place
+/// where an unfiltered escape does real damage). `config.json` on disk and
+/// `sigil-config list --json` are the verbatim record, and `list` says so on the
+/// spot whenever the filter had to change a line it drew.
 pub fn sanitize_label(raw: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -165,7 +201,9 @@ pub fn sanitize_label(raw: &str, max_chars: usize) -> String {
             pending_space = !out.is_empty();
             continue;
         }
-        let permitted = ch.is_ascii_graphic() || ch == LABEL_ELLIPSIS;
+        // The daemon's own two marks are permitted so a second pass over an
+        // already-filtered label is a no-op (see the idempotence note above).
+        let permitted = ch.is_ascii_graphic() || ch == LABEL_ELLIPSIS || ch == LABEL_REJECTED;
         // A run of rejected characters collapses to one marker, the same way a
         // run of whitespace collapses to one space: forty combining marks are one
         // piece of information ("something here would not render"), and repeating
@@ -957,13 +995,16 @@ mod tests {
         // report, and the RLO is unterminated: it reordered everything after it.
         let rlo = LeasePolicy::leasable(900)
             .with_covers("op with --account \"\u{202e}terces-on\u{200b}\"");
-        assert_eq!(rlo.covers(), "op with --account \"?terces-on?\"");
+        assert_eq!(
+            rlo.covers(),
+            "op with --account \"\u{fffd}terces-on\u{fffd}\""
+        );
 
         // Vector 2: forty combining acute accents, which survived the old filter
         // whole and sat under the bound.
         let marks =
             LeasePolicy::leasable(900).with_covers(format!("op read{}", "\u{301}".repeat(40)));
-        assert_eq!(marks.covers(), "op read?");
+        assert_eq!(marks.covers(), "op read\u{fffd}");
 
         // Nothing that can move text direction, join or split a word invisibly,
         // or stack on a neighbour survives, on either vector or in the sentence
@@ -972,7 +1013,10 @@ mod tests {
             let rendered = caption(p);
             for ch in rendered.chars() {
                 assert!(
-                    ch.is_ascii_graphic() || ch == ' ' || ch == LABEL_ELLIPSIS,
+                    ch.is_ascii_graphic()
+                        || ch == ' '
+                        || ch == LABEL_ELLIPSIS
+                        || ch == LABEL_REJECTED,
                     "{ch:?} reached the consent caption: {rendered}"
                 );
             }
@@ -984,12 +1028,12 @@ mod tests {
         let invisible = LeasePolicy::leasable(900).with_covers(
             "op\u{3164}read\u{2800}\u{e0041}\u{e0042}", // HANGUL FILLER, BRAILLE BLANK, tags
         );
-        assert_eq!(invisible.covers(), "op?read?");
+        assert_eq!(invisible.covers(), "op\u{fffd}read\u{fffd}");
 
         // A run collapses to one marker, so a rejected pile cannot spend the
         // whole bound either.
         let pile = LeasePolicy::leasable(900).with_covers("\u{202e}".repeat(500));
-        assert_eq!(pile.covers(), "?");
+        assert_eq!(pile.covers(), "\u{fffd}");
 
         // Ordinary labels are untouched, including the quoting and the elision
         // mark `Match::coverage` emits.
@@ -1021,6 +1065,74 @@ mod tests {
         assert_eq!(sanitize_label("abcde fghij", 7), "abcde\u{2026}");
         // Control bytes never reach a terminal through it.
         assert_eq!(sanitize_label("a\u{1b}[31mb\u{7}", 40), "a [31mb");
+    }
+
+    /// The marker must mean one thing and only one thing: "the daemon would not
+    /// render what was here". A marker drawn from the permitted alphabet cannot,
+    /// because content could spell it. This pins the property that makes the
+    /// message unambiguous — a marker in the output was PUT there by the filter.
+    #[test]
+    fn the_rejected_marker_cannot_be_spelled_by_a_label() {
+        // It is outside the permitted set by construction, so nothing that goes
+        // in as content can come out looking like the filter's own mark.
+        assert!(!LABEL_REJECTED.is_ascii_graphic());
+
+        // The old marker (`?`) is ordinary content and stays ordinary content: a
+        // rule that really matches on a question mark is distinguishable, in the
+        // same position, from a rule whose value would not render.
+        let literal = sanitize_label("op containing \"?\"", COVERS_MAX_CHARS);
+        let elided = sanitize_label("op with --vault \"\u{65e5}\u{672c}\"", COVERS_MAX_CHARS);
+        assert_eq!(literal, "op containing \"?\"");
+        assert_eq!(elided, "op with --vault \"\u{fffd}\"");
+        assert!(!literal.contains(LABEL_REJECTED));
+        assert!(elided.contains(LABEL_REJECTED));
+
+        // The mark appears in the output exactly when the input held something the
+        // filter would not render, so its presence is never ambiguous. The one
+        // input that puts the mark there without being rejected is the mark
+        // itself, which already means what the filter means by it.
+        for (raw, marked) in [
+            ("?", false),
+            ("op read", false),
+            ("op with --account \"a-b.c\"", false),
+            ("\u{fe0f}", true),
+            ("\u{202e}", true),
+            ("a\u{300}b", true),
+            ("\u{fffd}", true),
+        ] {
+            assert_eq!(
+                sanitize_label(raw, COVERS_MAX_CHARS).contains(LABEL_REJECTED),
+                marked,
+                "marker presence is wrong for {raw:?}"
+            );
+        }
+    }
+
+    /// Exactly idempotent, because `sigil lease list` re-filters a label the
+    /// daemon already filtered (R4-F6). Today that holds by construction: the two
+    /// marks the filter emits are the two non-ASCII characters it permits. It used
+    /// to hold only by the accident of the marker being ASCII.
+    #[test]
+    fn sanitize_label_is_idempotent() {
+        for raw in [
+            "",
+            "op read",
+            "op with --account \"\u{202e}terces-on\u{200b}\"",
+            "op with --vault \"Ing\u{e9}nierie\"",
+            &"\u{301}".repeat(40),
+            &format!("op {}", "z".repeat(200)),
+            "\u{fffd}\u{2026}",
+            "op containing \"?\"",
+        ] {
+            for bound in [7, 40, COVERS_MAX_CHARS] {
+                let once = sanitize_label(raw, bound);
+                assert_eq!(
+                    sanitize_label(&once, bound),
+                    once,
+                    "not idempotent at {bound} for {raw:?}"
+                );
+            }
+        }
     }
 
     #[test]

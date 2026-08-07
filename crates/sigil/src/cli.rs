@@ -2768,6 +2768,52 @@ fn config_source_add(args: &[String], json: bool) -> i32 {
     )
 }
 
+/// The terminal filter for the `sigil-config list` views, which remembers whether
+/// it ever had to change a line so the view can point at the verbatim path once,
+/// and only when that applies.
+///
+/// These lines are the one config surface drawn into a TERMINAL, where an
+/// unfiltered escape sequence repaints the screen and an unterminated
+/// `U+202E RIGHT-TO-LEFT OVERRIDE` reorders a rule into reading as a rule the
+/// human does not have. Everything on them is user-authored config (rule names,
+/// match values, source names, plain env values), so filtering here is the same
+/// call [`lease_row`] makes at its own render boundary.
+///
+/// It cost something to make it: this view used to be the faithful echo, and the
+/// coverage label's own documentation leaned on that. It is not any more, so the
+/// verbatim record is `config.json` on disk and `sigil-config list --json`, and
+/// [`note`](Self::note) says so on the spot rather than leaving the human to
+/// wonder whether their config or their terminal is wrong.
+#[derive(Default)]
+struct ListFilter {
+    touched: bool,
+}
+
+impl ListFilter {
+    /// One free-text cell: filtered, and deliberately NOT bounded. A length cut
+    /// here would hide a match condition on the view whose whole job is to show
+    /// every one of them; the bound belongs to the consent label, not to this.
+    fn cell(&mut self, raw: &str) -> String {
+        let out = sigil_proto::sanitize_label(raw, usize::MAX);
+        self.touched |= out != raw;
+        out
+    }
+
+    /// Printed after the list, only when the filter changed something, naming the
+    /// path that still shows it whole.
+    fn note(&self, s: Style, what: &str) {
+        if self.touched {
+            println!(
+                "  {}",
+                s.faint(&format!(
+                    "\u{fffd} marks characters in {what} this view cannot render; \
+                     sigil-config list --json shows them verbatim"
+                ))
+            );
+        }
+    }
+}
+
 fn config_source_list(json: bool) -> i32 {
     let cfg = match sources_for_display() {
         Some(c) => c,
@@ -2787,19 +2833,23 @@ fn config_source_list(json: bool) -> i32 {
     }
     println!("{}", s.cobalt("sources"));
     println!();
+    let mut f = ListFilter::default();
     for src in &cfg.sources {
+        let name = f.cell(&src.name);
+        let provider = f.cell(&src.provider);
+        let extra = source_extra(&mut f, src);
         println!(
             "  {}  {}{}",
-            pad(&src.name, 16),
-            s.dim(&src.provider),
-            s.dim(&source_extra(src))
+            pad(&name, 16),
+            s.dim(&provider),
+            s.dim(&extra)
         );
         // Plain vars show their VALUES, on their own lines, labelled `plain`. The
         // distinction from a sealed key (name only, above) has to survive a
         // glance: it is the difference between what Sigil is protecting and what
         // it is merely setting.
         for (k, v) in &src.plain {
-            let line = format!("plain {k}={v}");
+            let line = format!("plain {}={}", f.cell(k), f.cell(v));
             if src.keys.contains(k) {
                 // Listed, but inert: the sealed value of the same name is what the
                 // child will get. Saying so here is the difference between config
@@ -2814,6 +2864,7 @@ fn config_source_list(json: bool) -> i32 {
             }
         }
     }
+    f.note(s, "source names and values");
     0
 }
 
@@ -2843,17 +2894,28 @@ fn sources_for_display() -> Option<crate::config::Config> {
 /// [`sources_for_display`] has already reconciled, so a name reaching the
 /// `sealed` label has a record behind it. For others, the account label or the
 /// env-file path.
-fn source_extra(src: &crate::config::Source) -> String {
+/// The user-authored halves are filtered individually rather than the composed
+/// string being filtered by the caller: this descriptor's own punctuation
+/// includes `U+00B7`, which the label allowlist would mark as unrenderable and
+/// which no user typed.
+fn source_extra(f: &mut ListFilter, src: &crate::config::Source) -> String {
     if src.provider != crate::provider::EnvProvider::ID {
         return src
             .account
             .as_deref()
             .or(src.path.as_deref())
-            .map(|x| format!(" \u{b7} {x}"))
+            .map(|x| format!(" \u{b7} {}", f.cell(x)))
             .unwrap_or_default();
     }
     match (src.keys.is_empty(), src.plain.is_empty()) {
-        (false, _) => format!(" \u{b7} sealed {}", src.keys.join(", ")),
+        (false, _) => format!(
+            " \u{b7} sealed {}",
+            src.keys
+                .iter()
+                .map(|k| f.cell(k))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         // Not dead config: a gate that injects only non-secret vars, which are
         // listed underneath.
         (true, false) => " \u{b7} no sealed values".to_string(),
@@ -3629,6 +3691,7 @@ fn config_rule_list(json: bool) -> i32 {
     }
     println!("{}", s.cobalt("rules"));
     println!();
+    let mut f = ListFilter::default();
     for r in &cfg.rules {
         // An allow rule is a passthrough (no source, no lease); a gate rule shows
         // its target source and lease policy.
@@ -3636,20 +3699,23 @@ fn config_rule_list(json: bool) -> i32 {
             ("-> allow (passthrough)".to_string(), "allow".to_string())
         } else {
             (
-                format!("-> {}", r.action.source),
+                format!("-> {}", f.cell(&r.action.source)),
                 crate::config::lease_str(&r.action.lease),
             )
         };
+        let name = f.cell(&r.name);
+        let conditions = f.cell(&describe_match(&r.match_));
         println!(
             "  {}  {}  {}",
-            pad(&r.name, 16),
+            pad(&name, 16),
             pad(&target, 22),
-            s.dim(&format!("{} \u{b7} {}", policy, describe_match(&r.match_)))
+            s.dim(&format!("{policy} \u{b7} {conditions}"))
         );
         // A rule authored before flag normalization can hold a flag with no
         // leading dash, which never matches. It reads as a working rule on the
         // line above, so say plainly that it is not one.
         for dead in r.match_.dead_flags() {
+            let dead = f.cell(dead);
             println!(
                 "  {}",
                 s.brass(&format!(
@@ -3659,6 +3725,7 @@ fn config_rule_list(json: bool) -> i32 {
             );
         }
     }
+    f.note(s, "rule names and match values");
     0
 }
 
@@ -4290,7 +4357,7 @@ mod tests {
         // values (Sigil is only setting them).
         let sealed = env_source(&["OP_SERVICE_ACCOUNT_TOKEN"], &[]);
         assert_eq!(
-            source_extra(&sealed),
+            source_extra(&mut ListFilter::default(), &sealed),
             " \u{b7} sealed OP_SERVICE_ACCOUNT_TOKEN"
         );
     }
@@ -4337,6 +4404,7 @@ mod tests {
         let shown = sources_for_display().expect("the display config loads");
         let extra = |name: &str| {
             source_extra(
+                &mut ListFilter::default(),
                 shown
                     .sources
                     .iter()
@@ -4373,8 +4441,16 @@ mod tests {
         // Requirement of the degrade path: gate plus plain env injection is a
         // legitimate configuration, so `list` must not render it as dead config.
         let plain_only = env_source(&[], &[("OP_BIOMETRIC_UNLOCK_ENABLED", "false")]);
-        assert_eq!(source_extra(&plain_only), " \u{b7} no sealed values");
-        assert_eq!(source_extra(&env_source(&[], &[])), " \u{b7} (nothing set)");
+        let mut f = ListFilter::default();
+        assert_eq!(
+            source_extra(&mut f, &plain_only),
+            " \u{b7} no sealed values"
+        );
+        assert_eq!(
+            source_extra(&mut f, &env_source(&[], &[])),
+            " \u{b7} (nothing set)"
+        );
+        assert!(!f.touched, "an ordinary source must not raise the note");
     }
 
     #[test]
@@ -4590,16 +4666,36 @@ mod tests {
 
         for ch in row.chars() {
             assert!(
-                ch.is_ascii_graphic() || ch == ' ' || ch == '\u{b7}' || ch == '\u{2026}',
+                ch.is_ascii_graphic()
+                    || ch == ' '
+                    || ch == '\u{b7}'
+                    || ch == '\u{2026}'
+                    || ch == sigil_proto::LABEL_REJECTED,
                 "{ch:?} reached the terminal: {row:?}"
             );
         }
-        assert!(row.contains("op [2Kread?"), "{row}");
+        assert!(row.contains("op [2Kread\u{fffd}"), "{row}");
         assert!(
-            row.ends_with("\u{b7} op with --account \"?terces-on?\""),
+            row.ends_with("\u{b7} op with --account \"\u{fffd}terces-on\u{fffd}\""),
             "{row}"
         );
         assert!(row.contains("120s left"), "{row}");
+
+        // The row is drawn from an ALREADY-filtered label on the daemon's own
+        // path, so the second pass this row makes has to be a no-op: a marker the
+        // choke point emitted must not be re-marked here (the marker is inside the
+        // permitted set, which is what makes the filter idempotent).
+        let stamped = sigil_proto::LeasePolicy::leasable(60)
+            .with_covers("op with --account \"\u{202e}terces-on\u{200b}\"");
+        let twice = lease_json("op-read", stamped.covers());
+        let cols = LeaseCols::measure(std::slice::from_ref(&twice), 1_000);
+        let drawn = lease_row(s, &twice, 1_000, cols);
+        assert!(drawn.ends_with(stamped.covers()), "{drawn}");
+        assert_eq!(
+            drawn.matches(sigil_proto::LABEL_REJECTED).count(),
+            2,
+            "a second pass added markers: {drawn}"
+        );
 
         // A pathological value is bounded rather than flooding the line, and a
         // neighbouring row with nothing wrong with it renders exactly as it would
@@ -4617,6 +4713,30 @@ mod tests {
         );
         assert!(rows[1].ends_with("\u{b7} op read"), "{}", rows[1]);
         assert!(rows[1].contains("  Rowm  op-read"), "{}", rows[1]);
+    }
+
+    /// `sigil-config list` is a terminal too, and it draws the widest
+    /// user-authored text of any surface: rule names and match values that reach
+    /// it having passed no other filter. It used to be documented as the verbatim
+    /// echo, which made it the one path where an escape or a direction override
+    /// still reached a screen.
+    #[test]
+    fn a_config_list_cell_cannot_repaint_the_terminal_and_says_when_it_filtered() {
+        let mut f = ListFilter::default();
+        assert_eq!(f.cell("op-read"), "op-read");
+        assert!(!f.touched, "an ASCII line must not raise the note");
+
+        // No length bound: this view's job is to show every condition, so a long
+        // match description is drawn whole rather than cut like a consent label.
+        let long = format!("cmd={}", "x".repeat(400));
+        assert_eq!(f.cell(&long), long);
+        assert!(!f.touched);
+
+        assert_eq!(
+            f.cell("op\u{1b}[2Kread\u{202e}"),
+            format!("op [2Kread{}", sigil_proto::LABEL_REJECTED)
+        );
+        assert!(f.touched, "a filtered line must raise the note");
     }
 
     /// Render a whole list the way `sigil lease list` does, with the columns

@@ -246,6 +246,15 @@ impl Match {
     ///   would read as if the omitted conditions did not exist. Individual
     ///   user-authored tokens are elided at [`COVERS_TOKEN_MAX`] so one long value
     ///   cannot eat the whole line.
+    /// * It degrades the same way when a condition cannot be RENDERED, not just
+    ///   when there are too many. A value with no printable ASCII in it (a vault
+    ///   named in Japanese) reaches the consent surface as a bare marker, and
+    ///   `op with --vault "<mark>"` would name a condition it cannot identify:
+    ///   every such vault renders identically while the sentence still reads as
+    ///   though it pinned one. `op with 1 match condition` is coarser and true,
+    ///   which is the trade a consent surface takes. The cost is real and worth
+    ///   stating: the count form drops the flag NAME too, so the reader loses
+    ///   "there is a vault pin" along with the vault. See [`renders_anything`].
     /// * Every user-authored VALUE is quoted — `--vault "Shared Eng"`, like an
     ///   `argv_contains` needle — because the surfaces that render this label wrap
     ///   it in a colon-punctuated sentence ("Covers <label>: every command and
@@ -289,6 +298,22 @@ impl Match {
         }
         // Many conditions: an honest count beats a list the bound would truncate.
         if atoms > COVERS_MAX_ATOMS {
+            return summarize(&head, atoms);
+        }
+
+        // A condition whose tokens carry nothing the label filter will render must
+        // not be quoted into the sentence as though it named a value: two
+        // different vaults would produce the identical `op with --vault "<mark>"`,
+        // which looks precise and says nothing. Degrade to the count form the
+        // "too many conditions" case already uses.
+        let unrenderable = self
+            .flag_equals
+            .iter()
+            .flat_map(|fe| [token(&fe.flag), token(&fe.value)])
+            .chain(self.flag_present.iter().map(|f| token(f)))
+            .chain(self.argv_contains.iter().map(|n| token(n)))
+            .any(|t| !renders_anything(&t));
+        if unrenderable {
             return summarize(&head, atoms);
         }
 
@@ -346,6 +371,23 @@ pub const COVERS_TOKEN_MAX: usize = 28;
 /// on the way out; this only stops one long value from consuming the whole label.
 fn token(raw: &str) -> String {
     elide(raw, COVERS_TOKEN_MAX)
+}
+
+/// Whether a display token would survive the label filter carrying anything a
+/// reader could compare against their own rule.
+///
+/// The filter reduces a label to printable ASCII plus its own two marks (see
+/// [`sigil_proto::sanitize_label`]), so a token written entirely in a non-Latin
+/// script, or in whitespace, arrives at the consent surface as a bare marker or
+/// as nothing. Quoting that into `--vault "<mark>"` would name a condition it
+/// cannot identify: every such vault renders identically, and the reader learns
+/// only that a pin exists. This is the predicate `Match::coverage` uses to fall
+/// back to the honest count instead. The token is filtered here rather than
+/// inspected directly so the two definitions of "renderable" cannot drift.
+fn renders_anything(display_token: &str) -> bool {
+    sigil_proto::sanitize_label(display_token, COVERS_TOKEN_MAX)
+        .chars()
+        .any(|c| c.is_ascii_graphic())
 }
 
 /// `raw` cut to at most `max` characters, the last of them the elision mark.
@@ -1248,6 +1290,82 @@ mod tests {
         assert!(stamped_both.covers().ends_with("with 4 match conditions"));
         // The breadth is still stated first: the head is elided, never dropped.
         assert!(stamped_both.covers().starts_with("cccc"));
+    }
+
+    /// A condition the consent surface cannot render must not be quoted into the
+    /// sentence as though it named a value: after the label filter, every such
+    /// value looks identical, so the sentence would read as precise while
+    /// identifying nothing.
+    #[test]
+    fn coverage_degrades_a_condition_it_cannot_render_to_the_count() {
+        let vault = |v: &str| Match {
+            command: Some("op".into()),
+            subcommand: Some("read".into()),
+            flag_equals: vec![FlagEq {
+                flag: "--vault".into(),
+                value: v.into(),
+            }],
+            ..Match::default()
+        };
+
+        // Two different vaults, neither with any printable ASCII in it. Quoted,
+        // both would render `op read with --vault "<mark>"`.
+        for v in ["\u{65e5}\u{672c}", "\u{4e2d}\u{56fd}", "   ", "\u{202e}"] {
+            assert_eq!(
+                vault(v).coverage(),
+                "op read with 1 match condition",
+                "unrenderable value {v:?} was quoted as though it named a vault"
+            );
+        }
+
+        // Partly renderable is still rendered: the marker sits where the gap is,
+        // and the rest of the value is there to compare against the rule.
+        let accented = vault("Ing\u{e9}nierie");
+        assert_eq!(accented.coverage(), "op read with --vault \"Ingénierie\"");
+        assert_eq!(
+            LeasePolicy::leasable(60)
+                .with_covers(accented.coverage())
+                .covers(),
+            "op read with --vault \"Ing\u{fffd}nierie\""
+        );
+
+        // The same holds for the other token positions.
+        let needle = Match {
+            command: Some("op".into()),
+            argv_contains: vec!["\u{30a8}\u{30f3}".into()],
+            ..Match::default()
+        };
+        assert_eq!(needle.coverage(), "op with 1 match condition");
+        let flag = Match {
+            command: Some("op".into()),
+            flag_present: vec!["\u{30d5}\u{30e9}\u{30b0}".into()],
+            ..Match::default()
+        };
+        assert_eq!(flag.coverage(), "op with 1 match condition");
+
+        // A count reached this way is still a count: it must not claim a breadth
+        // narrower than the rule's, and it must survive the choke point whole.
+        let mixed = Match {
+            command: Some("op".into()),
+            flag_equals: vec![
+                FlagEq {
+                    flag: "--account".into(),
+                    value: "rowmhq.1password.eu".into(),
+                },
+                FlagEq {
+                    flag: "--vault".into(),
+                    value: "\u{65e5}\u{672c}".into(),
+                },
+            ],
+            ..Match::default()
+        };
+        assert_eq!(mixed.coverage(), "op with 2 match conditions");
+        assert_eq!(
+            LeasePolicy::leasable(60)
+                .with_covers(mixed.coverage())
+                .covers(),
+            "op with 2 match conditions"
+        );
     }
 
     #[test]
