@@ -83,7 +83,7 @@ pub enum LeasePolicy {
         max_secs: u32,
         /// **The coverage label**: a short, DISPLAY-ONLY sentence fragment naming
         /// how wide the window this tap may open is, e.g. `op read` or
-        /// `op with --account rowmhq.1password.eu`.
+        /// `op with --account "rowmhq.1password.eu"`.
         ///
         /// Rendered **by the daemon** from the matched rule's user-authored match
         /// conditions (rule name and match conditions are user config, not

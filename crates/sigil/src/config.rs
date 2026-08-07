@@ -225,8 +225,8 @@ impl Match {
 
     /// **The coverage label** for this match: a short, factual, display-only
     /// description of everything the rule matches, e.g. `op read`,
-    /// `op with --account rowmhq.1password.eu`, or plain `op` when nothing beyond
-    /// the command is constrained.
+    /// `op with --account "rowmhq.1password.eu"`, or plain `op` when nothing
+    /// beyond the command is constrained.
     ///
     /// This is what the daemon renders into
     /// [`LeasePolicy::Leasable::covers`](sigil_proto::LeasePolicy) so the phone's
@@ -246,6 +246,27 @@ impl Match {
     ///   would read as if the omitted conditions did not exist. Individual
     ///   user-authored tokens are elided at [`COVERS_TOKEN_MAX`] so one long value
     ///   cannot eat the whole line.
+    /// * Every user-authored VALUE is quoted — `--vault "Shared Eng"`, like an
+    ///   `argv_contains` needle — because the surfaces that render this label wrap
+    ///   it in a colon-punctuated sentence ("Covers <label>: every command and
+    ///   secret it matches"). Unquoted, an ordinary 1Password vault name with a
+    ///   space dissolves into that prose, and a value carrying a colon
+    ///   (`--host github.example.com:8443`) collides with the sentence's own
+    ///   punctuation. Quoting also removes a real ambiguity in [`join_and`]:
+    ///   `with --account "X" and --vault` now shows at a glance that the first
+    ///   flag is pinned to a value and the second matches any value.
+    ///
+    ///   This is LEGIBILITY, not injection defence. The label is rendered
+    ///   daemon-side from structured config fields, [`token`] bounds each atom,
+    ///   [`LeasePolicy::with_covers`](sigil_proto::LeasePolicy) strips control
+    ///   characters, and [`Config::resolve`] re-derives the label on every match
+    ///   so a hand-edited `covers` on disk is ignored. Nothing remote reaches it.
+    ///   The reason to quote is that Tom's own legitimate config produces bad
+    ///   sentences without it.
+    ///
+    /// Never returns empty: every arm of `head` yields text, so a renderer's
+    /// empty-label branch is a fallback for a daemon older than this field, not a
+    /// state this code can produce.
     pub fn coverage(&self) -> String {
         let head = match (
             self.command.as_deref().map(token),
@@ -273,7 +294,7 @@ impl Match {
         let mut flags: Vec<String> = self
             .flag_equals
             .iter()
-            .map(|fe| format!("{} {}", token(&fe.flag), token(&fe.value)))
+            .map(|fe| format!("{} \"{}\"", token(&fe.flag), token(&fe.value)))
             .collect();
         flags.extend(self.flag_present.iter().map(|f| token(f)));
         if !flags.is_empty() {
@@ -976,7 +997,10 @@ mod tests {
             "op read"
         );
 
-        // flag_equals names the flag and the value it is pinned to.
+        // flag_equals names the flag and QUOTES the value it is pinned to, so the
+        // value survives the colon-punctuated sentence the consent surfaces wrap
+        // this label in, and so it is visibly distinct from a flag_present flag
+        // that matches any value.
         assert_eq!(
             Match {
                 command: Some("op".into()),
@@ -987,7 +1011,35 @@ mod tests {
                 ..Match::default()
             }
             .coverage(),
-            "op with --account rowmhq.1password.eu"
+            "op with --account \"rowmhq.1password.eu\""
+        );
+
+        // The values that made this necessary: a vault name with a space, and a
+        // value carrying the caption's own punctuation.
+        assert_eq!(
+            Match {
+                command: Some("op".into()),
+                subcommand: Some("read".into()),
+                flag_equals: vec![FlagEq {
+                    flag: "--vault".into(),
+                    value: "Shared Eng".into(),
+                }],
+                ..Match::default()
+            }
+            .coverage(),
+            "op read with --vault \"Shared Eng\""
+        );
+        assert_eq!(
+            Match {
+                command: Some("curl".into()),
+                flag_equals: vec![FlagEq {
+                    flag: "--host".into(),
+                    value: "github.example.com:8443".into(),
+                }],
+                ..Match::default()
+            }
+            .coverage(),
+            "curl with --host \"github.example.com:8443\""
         );
 
         // flag_present names the flag alone (any value satisfies it).
@@ -1025,7 +1077,8 @@ mod tests {
             "op read with --vault, containing \"prod\""
         );
 
-        // Two flags of the same kind list with "and".
+        // Two flags of the same kind list with "and", and the quoting is what
+        // tells them apart: --project is pinned to one value, --quiet takes any.
         assert_eq!(
             Match {
                 command: Some("gcloud".into()),
@@ -1037,7 +1090,7 @@ mod tests {
                 ..Match::default()
             }
             .coverage(),
-            "gcloud with --project prod and --quiet"
+            "gcloud with --project \"prod\" and --quiet"
         );
 
         // No command at all: the label must not pretend one was pinned.

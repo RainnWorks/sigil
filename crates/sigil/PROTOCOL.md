@@ -135,7 +135,7 @@ and `sigil lease list`. No renderer derives its own description of the breadth.
   `config.json` is ignored and overwritten), never taken from a client, and never
   built from the argv that happened to trip the rule. A raw argv and a secret
   reference can therefore never appear in it.
-- **Register.** `op read` (subcommand), `op with --account rowmhq.1password.eu`
+- **Register.** `op read` (subcommand), `op with --account "rowmhq.1password.eu"`
   (flag equality), `op with --vault` (flag presence), `op containing "prod"`
   (substring), plain `op` when nothing beyond the command is constrained. The
   label never implies a rule is narrower than it is: a command-only rule renders

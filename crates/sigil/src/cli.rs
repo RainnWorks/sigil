@@ -715,13 +715,13 @@ fn cmd_lease(args: &[String]) -> i32 {
                 return 0;
             }
             let now = sigil_proto::now_ms();
-            // The account column only earns its width when some lease names one
-            // (a plain gate carries none), so it never renders as a blank gutter.
-            let with_account = leases.iter().any(|l| !l.account.is_empty());
+            let cols = LeaseCols::measure(&leases, now);
             println!("{}", s.cobalt("leases"));
             println!();
+            println!("  {}", s.faint(LEASE_BREADTH));
+            println!();
             for l in &leases {
-                println!("{}", lease_row(s, l, now, with_account));
+                println!("{}", lease_row(s, l, now, cols));
             }
             0
         }
@@ -741,37 +741,96 @@ fn cmd_lease(args: &[String]) -> i32 {
     }
 }
 
-/// One `sigil lease list` row: grant-key prefix (what `lease revoke` takes), the
-/// account when there is one, the RULE the lease covers, what that rule covers,
-/// and the countdown.
+/// The breadth of every lease in the list, stated ONCE above the rows.
 ///
-/// A lease is rule-wide: it auto-approves anything that rule matches for the
-/// caller chain that opened it, not only the command that did. The row says so
-/// outright rather than leaving the rule name to be read as a command, and it
-/// says it with the daemon's own **coverage label** (`op read`,
-/// `op with --account rowmhq.1password.eu`) — the same string the approver was
+/// A lease is rule-wide: it auto-approves anything its rule matches for the
+/// caller chain that opened it, not only the command that did. The scope column
+/// names that RULE, and a rule name reads like a command (`op-read`), so without
+/// this line a row invites exactly the misreading "the one command I approved".
+/// It sits at list level rather than on each row so a row can spend its width on
+/// aligned columns instead of repeating a constant.
+const LEASE_BREADTH: &str =
+    "A lease covers everything its rule matches, from anywhere on this Mac.";
+
+/// Above this the rule column stops widening for one outlier: a single very long
+/// rule name should step out of its own column rather than tax every other row
+/// with a gutter it does not use.
+const LEASE_SCOPE_MAX: usize = 36;
+
+/// The fixed-width column widths for one `sigil lease list`, measured from the
+/// rows about to be printed rather than guessed.
+///
+/// Guessed widths are how a table goes ragged: the account column used to be a
+/// flat 14, and a perfectly ordinary account name (`rowmhq.1password.eu`, 19)
+/// overflowed it and shoved every column after it out of line. Measuring means a
+/// column is exactly as wide as its widest value, so nothing overflows and
+/// nothing pays for a gutter it does not use.
+#[derive(Clone, Copy)]
+struct LeaseCols {
+    /// Zero when no lease names an account (a plain gate carries none), which is
+    /// how the column disappears instead of rendering as a blank gutter.
+    account: usize,
+    scope: usize,
+    left: usize,
+}
+
+impl LeaseCols {
+    fn measure(leases: &[json::LeaseJson], now: u64) -> Self {
+        let widest =
+            |f: &dyn Fn(&json::LeaseJson) -> usize| leases.iter().map(f).max().unwrap_or(0);
+        Self {
+            account: widest(&|l| l.account.len()),
+            scope: widest(&|l| l.scope.len()).min(LEASE_SCOPE_MAX),
+            left: widest(&|l| countdown(l, now).len()),
+        }
+    }
+}
+
+/// The countdown cell, as text, so its column can be measured before it is drawn.
+fn countdown(l: &json::LeaseJson, now: u64) -> String {
+    format!("{}s left", l.expires_ms.saturating_sub(now) / 1000)
+}
+
+/// One `sigil lease list` row: grant-key prefix (what `lease revoke` takes), the
+/// account when there is one, the RULE the lease covers, the countdown, and then
+/// what that rule covers.
+///
+/// Every fixed-width column is emitted BEFORE the one free-text column, so a
+/// coverage label of any length or shape can only ragged-edge the end of the
+/// line; it can never push the countdown out of alignment with the row above it.
+///
+/// That trailing column is the daemon's own **coverage label** (`op read`,
+/// `op with --account "rowmhq.1password.eu"`) — the same string the approver was
 /// shown when they opened the window, rendered once in `Match::coverage` and
-/// carried here. When the daemon rendered no label the row falls back to the
-/// generic breadth: still true, never a guess at what the rule matches.
-fn lease_row(s: Style, l: &json::LeaseJson, now: u64, with_account: bool) -> String {
-    let left = l.expires_ms.saturating_sub(now) / 1000;
-    let account = if with_account {
-        format!("{}  ", pad(&l.account, 14))
-    } else {
+/// carried here. The breadth that keeps the rule name from being misread as a
+/// single approved command is stated once for the whole list in
+/// [`LEASE_BREADTH`], not repeated on every row.
+///
+/// `Match::coverage` never returns empty and `Config::resolve` stamps a label on
+/// every lease policy, so the empty-label fallback below is unreachable from this
+/// daemon. It is kept as a defensive branch for a lease minted by a daemon older
+/// than the field: still true, never a guess at what the rule matches.
+fn lease_row(s: Style, l: &json::LeaseJson, now: u64, cols: LeaseCols) -> String {
+    let account = if cols.account == 0 {
         String::new()
+    } else {
+        format!("{}  ", pad(&l.account, cols.account))
     };
     let covers = if l.covers.is_empty() {
-        "any matching command".to_string()
+        "any matching command"
     } else {
-        l.covers.clone()
+        &l.covers
     };
     format!(
         "  {}  {}{}  {}  {}",
         s.dim(&l.grant_hex[..12.min(l.grant_hex.len())]),
         account,
-        pad(&l.scope, 30),
+        pad(&l.scope, cols.scope),
+        // Right-aligned, alone among the columns: a countdown is a number, and
+        // right-aligning it lines up both the digits and the "s left" unit as the
+        // window drains from three digits to one.
+        s.faint(&format!("{:>w$}", countdown(l, now), w = cols.left)),
         s.faint(&format!("\u{b7} {covers}")),
-        s.faint(&format!("{left}s left"))
     )
 }
 
@@ -4431,46 +4490,99 @@ mod tests {
 
     #[test]
     fn a_lease_row_names_its_rule_and_says_how_wide_it_is() {
-        // Display honesty: the middle column is a RULE, and the row must not let
-        // it read as "the one command that was approved". With no label rendered,
-        // the row still states the breadth generically rather than implying none.
+        // Display honesty: the middle column is a RULE, and the list must not let
+        // it read as "the one command that was approved". The breadth is stated
+        // once above the rows, so it is the list, not the row, that carries it.
+        assert!(LEASE_BREADTH.contains("everything its rule matches"));
+        assert!(LEASE_BREADTH.contains("from anywhere on this Mac"));
+
         let s = Style::with_color(false);
         let l = lease_json("op-account-rowmhq-1password-eu", "");
-        let row = lease_row(s, &l, 1_000, false);
+        let one = [l.clone()];
+        let row = lease_row(s, &l, 1_000, LeaseCols::measure(&one, 1_000));
         // Revoke prefix first, then the rule: with no account anywhere, the row
         // spends no width on an empty column.
         assert!(
             row.starts_with("  a1b2c3d4e5f6  op-account-rowmhq-1password-eu"),
             "{row}"
         );
-        assert!(row.contains("\u{b7} any matching command"), "{row}");
-        assert!(row.ends_with("120s left"), "{row}");
+        // With no label rendered, the row still states the breadth generically
+        // rather than implying none.
+        assert!(row.ends_with("\u{b7} any matching command"), "{row}");
+        assert!(row.contains("120s left"), "{row}");
 
         // An account, when there is one, keeps its own aligned column.
         let mut with = l.clone();
         with.account = "Rowm".into();
-        assert!(lease_row(s, &with, 1_000, true).contains("Rowm"));
+        let two = [with.clone()];
+        assert!(lease_row(s, &with, 1_000, LeaseCols::measure(&two, 1_000)).contains("Rowm"));
     }
 
     #[test]
     fn a_lease_row_states_the_coverage_label_when_the_daemon_rendered_one() {
         // The whole point of the label: the row stops gesturing at the breadth
         // ("any matching command") and states it in the same words the approver
-        // consented to.
+        // consented to. It is the LAST column, being the only free-text one.
         let s = Style::with_color(false);
-        let row = lease_row(
-            s,
-            &lease_json("op-eu", "op with --account rowmhq.1password.eu"),
-            1_000,
-            false,
-        );
+        let l = lease_json("op-eu", "op with --account \"rowmhq.1password.eu\"");
+        let one = [l.clone()];
+        let row = lease_row(s, &l, 1_000, LeaseCols::measure(&one, 1_000));
         assert!(row.contains("op-eu"), "{row}");
         assert!(
-            row.contains("\u{b7} op with --account rowmhq.1password.eu"),
+            row.ends_with("\u{b7} op with --account \"rowmhq.1password.eu\""),
             "{row}"
         );
         assert!(!row.contains("any matching command"), "{row}");
-        assert!(row.ends_with("120s left"), "{row}");
+        assert!(row.contains("120s left"), "{row}");
+    }
+
+    /// Render a whole list the way `sigil lease list` does, with the columns
+    /// measured across all of its rows.
+    fn lease_rows(leases: &[json::LeaseJson], now: u64) -> Vec<String> {
+        let s = Style::with_color(false);
+        let cols = LeaseCols::measure(leases, now);
+        leases.iter().map(|l| lease_row(s, l, now, cols)).collect()
+    }
+
+    #[test]
+    fn a_lease_list_aligns_every_column_before_the_free_text_one() {
+        // The alignment invariant, and the reason the coverage label was moved to
+        // the end: rules of wildly different shapes, an account name far wider
+        // than the old fixed 14 (which it used to overflow, shoving every later
+        // column out of line), and countdowns of different digit counts must all
+        // still put "s left" and the label at one offset.
+        let mut long_account = lease_json("op-eu", "op with --account \"rowmhq.1password.eu\"");
+        long_account.account = "rowmhq.1password.eu".into();
+        let mut short_account = lease_json("op-read", "op read");
+        short_account.account = "Rowm".into();
+        let mut nearly_done = lease_json(
+            "op-shared",
+            "op read with --vault \"Shared Eng\", containing \"prod\"",
+        );
+        nearly_done.account = "Rowm".into();
+        nearly_done.expires_ms = 10_000;
+
+        let rows = lease_rows(&[long_account, short_account, nearly_done], 1_000);
+        let at = |needle: &str, row: &str| row.find(needle).unwrap_or_else(|| panic!("{row}"));
+        let left: Vec<usize> = rows.iter().map(|r| at("s left", r)).collect();
+        let label: Vec<usize> = rows.iter().map(|r| at("\u{b7}", r)).collect();
+        assert!(
+            left.windows(2).all(|w| w[0] == w[1]),
+            "countdown column moved:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            label.windows(2).all(|w| w[0] == w[1]),
+            "label column moved:\n{}",
+            rows.join("\n")
+        );
+        // The measured account column is exactly as wide as its widest value, so
+        // the rule that follows it is not pushed right by one long account.
+        assert_eq!(
+            LeaseCols::measure(&[lease_json("r", "c")], 1_000).account,
+            0,
+            "an account column with nothing in it must not be drawn"
+        );
     }
 
     #[test]

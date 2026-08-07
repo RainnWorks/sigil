@@ -138,7 +138,7 @@ pub struct LeaseJson {
     /// showing this must not imply it covers only one command.
     pub scope: String,
     /// The daemon-rendered coverage label for that rule (`op read`,
-    /// `op with --account rowmhq.1password.eu`, …) — the same words the phone was
+    /// `op with --account "rowmhq.1password.eu"`, …) — the same words the phone was
     /// shown when it consented, so a UI can state the breadth exactly instead of
     /// gesturing at it. Empty when the daemon rendered none; a renderer then falls
     /// back to naming the rule and its breadth generically, never to a guess at
@@ -210,7 +210,7 @@ pub struct PendingJson {
     /// The daemon-rendered coverage label for the matched rule when
     /// [`leasable`](Self::leasable): a short, display-only description of how wide
     /// the window this approval may open is (`op read`,
-    /// `op with --account rowmhq.1password.eu`, …), the same string the sealed
+    /// `op with --account "rowmhq.1password.eu"`, …), the same string the sealed
     /// request carries to the phone. `None` (omitted) for run-once or when the
     /// daemon rendered none; a renderer then states no coverage, never a guess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
