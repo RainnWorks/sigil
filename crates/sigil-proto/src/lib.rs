@@ -29,7 +29,7 @@ pub use request::{
     ApprovalRequest, ApprovalResponse, BlockDirective, Decision, DeliveryReceipt, HostBinding,
     InstallLease, LeasePolicy, Provenance, PushRegister, RequestKind, ResolutionBroadcast,
     ResolutionStatus, SecretRef, SshChallenge, ThresholdChallenge, ThresholdPartial,
-    ToDaemonMessage, ToPhoneMessage,
+    ToDaemonMessage, ToPhoneMessage, COVERS_MAX_CHARS,
 };
 pub use threshold::{
     aead_open, aead_seal, all_ephemerals_unique, combine, decode_partial, EcdhAlgo, MacShare,

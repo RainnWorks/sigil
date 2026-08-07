@@ -31,6 +31,10 @@ Each echoes one account object (same shape as a `list` element).
     "mode": "gate" | "allow",
     "lease": { "kind": "runOnce" } | { "kind": "leasable", "maxSecs": int } }, ... ]
 ```
+The stored `lease` carries the cap only. The leasable policy's coverage label
+(`covers`) is **derived by the daemon** from the rule's match at resolve time and
+is never authored or persisted here; see "The lease coverage label" in
+`PROTOCOL.md`.
 
 ### `sigil config add <cmd> --provider <id> [...] --json`
 Echoes the one added command object (same shape as a `list` element). Validated

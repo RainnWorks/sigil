@@ -101,10 +101,13 @@ the runtime facts (live leases, the pending set, the audit log).
 (`ssh-agent socket`) is informational (always `ok`).
 
 `LeaseJson`: `{ "grant_hex": str, "caller": str, "account": str, "scope": str,
-"granted_ms": int, "expires_ms": int }`. `scope` is the matched RULE's name: the
-lease covers any command that rule matches for the caller chain that opened it,
-not just the command line that did. Renderers must show that breadth (the CLI
-prints `<rule> · any matching command`).
+"covers": str, "granted_ms": int, "expires_ms": int }`. `scope` is the matched
+RULE's name: the lease covers any command that rule matches for the caller chain
+that opened it, not just the command line that did. `covers` is the daemon's
+coverage label (below) naming exactly what that rule matches, so renderers can
+state the breadth instead of gesturing at it; the CLI prints
+`<rule> · <covers>`, falling back to `<rule> · any matching command` when the
+daemon rendered no label.
 
 `PendingJson`:
 ```json
@@ -112,9 +115,49 @@ prints `<rule> · any matching command`).
   "secrets": [ { "provider": str, "segments": [str], "label": str } ],
   "ssh": { "key_label": str, "host": str, "fingerprint": str }?,
   "provenance": { "process_chain": [str], "cwd": str, "machine": str, "requested_ms": int },
-  "leasable": bool, "max_lease_secs": int?, "reason": str?,
+  "leasable": bool, "max_lease_secs": int?, "lease_covers": str?, "reason": str?,
   "expires_ms": int, "timeout_ms": int, "coalesced": int }
 ```
+
+### The lease coverage label (`covers`)
+
+A leasable request must tell the human **how wide the window is** before they
+open it. The daemon therefore renders one short string, the **coverage label**,
+and every surface shows that same string: the phone's approval sheet, the Mac,
+and `sigil lease list`. No renderer derives its own description of the breadth.
+
+- **Provenance.** Rendered by the daemon (`Match::coverage` in
+  `crates/sigil/src/config.rs`) from the **matched rule's own match conditions**
+  (`command`, `subcommand`, `argv_contains`, `flag_present`, `flag_equals`,
+  `arg_regex`) at resolve time. Those conditions are **user-authored config**, not
+  provider semantics, so carrying them does not dent the approver's
+  provider-blindness. It is never read from disk (a hand-edited `covers` in
+  `config.json` is ignored and overwritten), never taken from a client, and never
+  built from the argv that happened to trip the rule. A raw argv and a secret
+  reference can therefore never appear in it.
+- **Register.** `op read` (subcommand), `op with --account rowmhq.1password.eu`
+  (flag equality), `op with --vault` (flag presence), `op containing "prod"`
+  (substring), plain `op` when nothing beyond the command is constrained. The
+  label never implies a rule is narrower than it is: a command-only rule renders
+  the bare command.
+- **Bound.** At most `sigil_proto::COVERS_MAX_CHARS` (72) characters, control
+  characters stripped and whitespace collapsed by `LeasePolicy::with_covers`.
+  A rule with more than three conditions, or one whose list would exceed the
+  bound, degrades to an honest count (`op read with 5 match conditions`) rather
+  than a truncated list that would read as if the dropped conditions did not
+  exist. A single over-long user token is elided with `…`.
+- **Run-once carries none.** A run-once request opens no window, so it has
+  nothing to describe: `lease_covers` is omitted (and the proto's `covers` is
+  absent from the sealed policy).
+- **Display only.** Renderers must treat it as text to show, never as something
+  to parse, match on, or act on. The daemon remains the sole lease authority: the
+  label describes the window, it does not define it. When it is absent or empty a
+  renderer shows **no coverage clause** rather than inventing one.
+
+**On the wire to the phone**, the same string rides *inside the sealed envelope*
+as a field of the request's lease policy (proto `LeasePolicy::Leasable`):
+`{"kind":"leasable","maxSecs":900,"covers":"op read"}`, omitted when empty. It
+uses no new transport and is not visible to the relay.
 
 `HistoryJson`: `{ "id": str, "kind": str, "label": str, "account": str,
 "process": str, "cwd": str, "decision": "approved|denied|expired", "note": str?,
@@ -230,10 +273,14 @@ See `JSON.md` for those mutation output shapes.
 - `account.health`/`detail`/`last_used_ms`: no token-expiry model → `healthy`/null.
 - `account.id`: equals the label (the store keys by unique label).
 - `lease.caller`: empty — a lease retains the grant key, not the provenance.
-- `pending.leasable`/`max_lease_secs`: carried through from the matched rule's
-  lease policy (`leasable=false` + omitted cap for a run-once rule). A local
-  approver must not offer "approve for N minutes" when `leasable` is false, and
-  clamps any window to `max_lease_secs`; the daemon re-checks regardless.
+- `pending.leasable`/`max_lease_secs`/`lease_covers`: carried through from the
+  matched rule's lease policy (`leasable=false` + omitted cap and label for a
+  run-once rule). A local approver must not offer "approve for N minutes" when
+  `leasable` is false, and clamps any window to `max_lease_secs`; the daemon
+  re-checks regardless. See "The lease coverage label" above for `lease_covers`.
+- `lease.covers`: empty for a grant whose rule the daemon rendered no label for;
+  a renderer then falls back to naming the rule and its breadth generically,
+  never to a guess at what the rule matches.
 - `pending.reason`/`coalesced`: null/0 — the local control-socket path sets no
   reason line and the registry does not count coalesced waiters.
 - `pair.name`: fixed `"iPhone"` — the ceremony captures no device name.

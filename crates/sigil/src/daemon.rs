@@ -2026,6 +2026,7 @@ fn leases_json(core: &Core) -> Vec<crate::json::LeaseJson> {
             caller: String::new(),
             account: l.account,
             scope: l.scope,
+            covers: l.covers,
             granted_ms: now.saturating_sub(l.age.as_millis() as u64),
             expires_ms: now + l.remaining.as_millis() as u64,
         })
@@ -2075,6 +2076,7 @@ fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
                 },
                 leasable: ctx.lease.is_leasable(),
                 max_lease_secs: ctx.lease.max_secs(),
+                lease_covers: covers_or_none(&ctx.lease),
                 reason: None,
                 expires_ms: s.queued_at_ms + s.timeout_ms,
                 timeout_ms: s.timeout_ms,
@@ -2115,6 +2117,15 @@ fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
     rows
 }
 
+/// The lease coverage label as the DTO carries it: `None` rather than an empty
+/// string when there is none (run-once, or a policy the daemon never labeled), so
+/// a renderer shows no coverage clause instead of an empty one.
+fn covers_or_none(lease: &LeasePolicy) -> Option<String> {
+    Some(lease.covers())
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+}
+
 /// Map one in-flight remote approval to the `pending` DTO. The request is a
 /// plaintext snapshot (names/provenance only, never a secret); `delivered` /
 /// `delivered_at_ms` reflect the phone's receipt (task #41), display only.
@@ -2146,6 +2157,7 @@ fn remote_pending_json(p: crate::remote::RemotePending) -> crate::json::PendingJ
         },
         leasable: req.lease_policy.is_leasable(),
         max_lease_secs: req.lease_policy.max_secs(),
+        lease_covers: covers_or_none(&req.lease_policy),
         reason: req.reason,
         expires_ms: req.expires_at,
         timeout_ms: req.timeout_ms,
@@ -2596,7 +2608,9 @@ fn fulfill(
         command: argv.to_vec(),
         secret_refs: provider.describe(argv, &view),
         kind: provider.kind(argv),
-        lease: action.lease,
+        // Carries the coverage label `resolve` rendered from the matched rule, so
+        // the phone's consent surface can state the window's breadth exactly.
+        lease: action.lease.clone(),
         ssh: None,
         threshold,
     };
@@ -2702,7 +2716,12 @@ fn fulfill(
         .map(|s| Duration::from_secs(u64::from(s)));
     if let Some(ttl) = lease_ttl {
         let cached = sealed_plain.unwrap_or_else(|| zeroize::Zeroizing::new(Vec::new()));
-        core.leases.grant(gk, &binding, cached, ttl);
+        // The window is stamped with the same coverage label the approver was
+        // shown, so `sigil lease list` and the Mac describe what is open in the
+        // words the human agreed to. Display only; the binding above is what
+        // actually decides which runs this window serves.
+        core.leases
+            .grant(gk, &binding, action.lease.covers(), cached, ttl);
     }
 
     core.record_audit(
@@ -3017,7 +3036,7 @@ mod tests {
                 // per-rule run-once/clamp enforcement has its own focused tests.
                 mode: RuleMode::Gate,
                 source: "op".into(),
-                lease: LeasePolicy::Leasable { max_secs: 900 },
+                lease: LeasePolicy::leasable(900),
                 timeout_sec: None,
             },
         })
@@ -3530,7 +3549,7 @@ mod tests {
                 action: Action {
                     mode: RuleMode::Gate,
                     source: "op".into(),
-                    lease: LeasePolicy::Leasable { max_secs: 900 },
+                    lease: LeasePolicy::leasable(900),
                     timeout_sec: None,
                 },
             })
@@ -3749,7 +3768,7 @@ mod tests {
             "secret-A",
             DevMode::Lease(Duration::from_secs(60)),
             Duration::from_millis(50),
-            op_config_with_lease(LeasePolicy::Leasable { max_secs: 5 }),
+            op_config_with_lease(LeasePolicy::leasable(5)),
         );
         let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
         let (r1, w1) = pipe();
@@ -3764,6 +3783,93 @@ mod tests {
             leases[0].remaining
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_granted_lease_reports_the_same_coverage_the_approver_consented_to() {
+        // The daemon renders the coverage label once, from the matched rule, and
+        // it must reach BOTH the sealed request (what the phone consents to) and
+        // `lease list` (what the CLI and the Mac later show), identically. Anything
+        // less and one surface describes the open window in words the human never
+        // agreed to.
+        use crate::config::{Action, Match, Rule, RuleMode, Source};
+        let dir = tmpdir("covers");
+        let mut cfg = Config::default();
+        cfg.add_source(Source {
+            name: "op".into(),
+            provider: OpProvider::ID.into(),
+            account: None,
+            path: None,
+            keys: Vec::new(),
+            plain: Default::default(),
+        })
+        .unwrap();
+        cfg.add_rule(Rule {
+            name: "op-read".into(),
+            match_: Match {
+                command: Some("op".into()),
+                subcommand: Some("read".into()),
+                ..Match::default()
+            },
+            action: Action {
+                mode: RuleMode::Gate,
+                source: "op".into(),
+                lease: LeasePolicy::leasable(900),
+                timeout_sec: None,
+            },
+        })
+        .unwrap();
+
+        let (core, _) = test_core_with_config(
+            &dir,
+            "tok-abc",
+            "secret-A",
+            DevMode::Lease(Duration::from_secs(60)),
+            Duration::from_millis(50),
+            cfg,
+        );
+        let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
+
+        // What the sealed request would carry to the phone: the resolved policy.
+        let resolved = match core.config.snapshot().resolve(&argv) {
+            Some(crate::config::Resolution::Gate(a)) => a,
+            other => panic!("expected a gate resolution, got {other:?}"),
+        };
+        assert_eq!(resolved.lease.covers(), "op read");
+
+        let (r1, w1) = pipe();
+        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(read_all(r1), "secret-A");
+
+        // What `sigil lease list` renders, over the same control-socket DTO.
+        let rows = leases_json(&core);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].scope, "op-read", "the lease names its rule");
+        assert_eq!(
+            rows[0].covers,
+            resolved.lease.covers(),
+            "the CLI row and the wire must describe one window the same way"
+        );
+        // And it is a rendering of the RULE, never of the argv that tripped it.
+        assert!(!rows[0].covers.contains("op://"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_run_once_rule_emits_no_coverage_label_anywhere() {
+        // A run-once request opens no window, so there is nothing to describe: the
+        // policy carries no label and the pending DTO omits it entirely.
+        let cfg = op_config_with_lease(LeasePolicy::RunOnce);
+        let resolved = match cfg.resolve(&["op".to_string(), "read".to_string()]) {
+            Some(crate::config::Resolution::Gate(a)) => a,
+            other => panic!("expected a gate resolution, got {other:?}"),
+        };
+        assert_eq!(resolved.lease, LeasePolicy::RunOnce);
+        assert_eq!(resolved.lease.covers(), "");
+        assert_eq!(covers_or_none(&resolved.lease), None);
+
+        let json = serde_json::to_string(&sigil_proto::LeasePolicy::RunOnce).unwrap();
+        assert!(!json.contains("covers"));
     }
 
     #[test]
@@ -4630,7 +4736,7 @@ mod tests {
         let (core, calls) = sealed_env_core(
             "faketool",
             &[("TOKEN", "sealed-value-42")],
-            LeasePolicy::Leasable { max_secs: 900 },
+            LeasePolicy::leasable(900),
             Duration::from_secs(60),
         );
 
@@ -4703,7 +4809,7 @@ mod tests {
         let (core, calls) = sealed_env_core(
             "faketool",
             &[("TOKEN", "sealed-value-42")],
-            LeasePolicy::Leasable { max_secs: 900 },
+            LeasePolicy::leasable(900),
             Duration::from_secs(1),
         );
 
@@ -4739,7 +4845,7 @@ mod tests {
         let (core, calls) = sealed_env_core(
             "faketool",
             &[("TOKEN", "sealed-value-42")],
-            LeasePolicy::Leasable { max_secs: 900 },
+            LeasePolicy::leasable(900),
             Duration::from_secs(60),
         );
 
@@ -4838,7 +4944,7 @@ mod tests {
         let (core, calls) = sealed_env_core(
             "faketool",
             &[("TOKEN", "sealed-value-42")],
-            LeasePolicy::Leasable { max_secs: 900 },
+            LeasePolicy::leasable(900),
             Duration::from_secs(60),
         );
         let (_, out1) = run_sealed(&core, &[]);
@@ -4867,7 +4973,7 @@ mod tests {
                 action: Action {
                     mode: RuleMode::Gate,
                     source: "faketool".into(),
-                    lease: LeasePolicy::Leasable { max_secs: 900 },
+                    lease: LeasePolicy::leasable(900),
                     timeout_sec: None,
                 },
             })
@@ -4977,7 +5083,7 @@ mod tests {
                 action: Action {
                     mode: RuleMode::Gate,
                     source: "other".into(),
-                    lease: LeasePolicy::Leasable { max_secs: 900 },
+                    lease: LeasePolicy::leasable(900),
                     timeout_sec: None,
                 },
             })
@@ -4990,6 +5096,7 @@ mod tests {
                 core.leases.grant(
                     [i as u8; 32],
                     &lease::LeaseBinding::cached("src", rule, "E1", 0),
+                    rule,
                     zeroize::Zeroizing::new(b"TOKEN=v".to_vec()),
                     Duration::from_secs(60),
                 );
@@ -5016,7 +5123,7 @@ mod tests {
         // 3. Only the lease policy changed. Still a change; the window dies.
         seed(&core);
         let mut relaxed = base.clone();
-        relaxed.rules[0].action.lease = LeasePolicy::Leasable { max_secs: 30 };
+        relaxed.rules[0].action.lease = LeasePolicy::leasable(30);
         core.invalidate_leases_for_config_change(&base, &relaxed);
         assert_eq!(core.leases.active(), 1);
 
@@ -5085,7 +5192,7 @@ mod tests {
                 action: Action {
                     mode: RuleMode::Gate,
                     source: "faketool".into(),
-                    lease: LeasePolicy::Leasable { max_secs: 900 },
+                    lease: LeasePolicy::leasable(900),
                     timeout_sec: None,
                 },
             })

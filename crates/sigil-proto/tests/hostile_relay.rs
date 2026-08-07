@@ -9,9 +9,10 @@
 //! product's core promise is broken.
 
 use sigil_proto::{
-    ApprovalResponse, DeliveryReceipt, DeviceIdentity, Envelope, InstallLease, OpenError,
-    PeerIdentity, PushRegister, ReplayError, ReplayGuard, ResolutionBroadcast, ResolutionStatus,
-    ToDaemonMessage, ToPhoneMessage, REPLAY_WINDOW_MS,
+    ApprovalRequest, ApprovalResponse, DeliveryReceipt, DeviceIdentity, Envelope, InstallLease,
+    LeasePolicy, OpenError, PeerIdentity, Provenance, PushRegister, ReplayError, ReplayGuard,
+    RequestKind, ResolutionBroadcast, ResolutionStatus, ToDaemonMessage, ToPhoneMessage,
+    REPLAY_WINDOW_MS,
 };
 
 /// A paired sender (phone) and recipient (daemon), plus the honest replay guard
@@ -636,5 +637,87 @@ fn a_lease_grant_cannot_be_replayed_to_reopen_an_expired_window() {
         open_response(&mut fx, &env),
         Err(OpenError::Replay(ReplayError::DuplicateRequest)),
         "re-delivering a lease grant must never re-open the window"
+    );
+}
+
+// --- the lease coverage label rides the same hostile-relay proofs -------------
+
+#[test]
+fn the_lease_coverage_label_rides_inside_the_seal() {
+    // The coverage label tells the human how wide a lease window is. It is
+    // consent-bearing text, so it must be exactly as protected as the rest of the
+    // request: invisible to the relay, covered by the signature, single-use. It
+    // rides as a field of the request's lease policy, inside the same seal, over
+    // no new transport.
+    let sender = DeviceIdentity::generate(); // the daemon, sending a request
+    let recipient = DeviceIdentity::generate(); // the phone
+    let pairing_id = [0x3c; 32];
+    let mut guard = ReplayGuard::new();
+
+    let covers = "op with --account rowmhq.1password.eu";
+    let req = ApprovalRequest {
+        request_id: "01920000-0000-7000-8000-00000000c0de".into(),
+        kind: RequestKind::SecretRead,
+        command: vec!["op".into(), "read".into(), "op://Engineering/.env".into()],
+        secrets: Vec::new(),
+        ssh: None,
+        provenance: Provenance {
+            process_chain: vec!["zsh".into(), "op".into()],
+            cwd: "/Projects/rowm".into(),
+            machine: "mac".into(),
+            requested_at: 1,
+        },
+        lease_policy: LeasePolicy::leasable(900).with_covers(covers),
+        reason: None,
+        threshold: None,
+        expires_at: 2,
+        timeout_ms: 1,
+    };
+    let env = Envelope::seal(
+        &req,
+        pairing_id,
+        1,
+        &sender.signing,
+        &recipient.peer_identity(),
+    )
+    .expect("seal");
+
+    // Not relay-visible: the label appears nowhere on the wire, and the relay
+    // cannot decrypt it even knowing the true sender's public identity.
+    let on_the_wire = serde_json::to_string(&env).expect("serialize");
+    assert!(!on_the_wire.contains(covers));
+    assert!(!on_the_wire.contains("rowmhq"));
+    let stranger = DeviceIdentity::generate();
+    assert_eq!(
+        env.open::<ApprovalRequest>(
+            &sender.peer_identity(),
+            &stranger.agreement,
+            &mut ReplayGuard::new()
+        ),
+        Err(OpenError::Decrypt)
+    );
+
+    // Tampering is rejected: a relay cannot rewrite the breadth the human is shown.
+    let tampered = MaliciousRelay::flip_ciphertext(&env);
+    assert_eq!(
+        tampered.open::<ApprovalRequest>(
+            &sender.peer_identity(),
+            &recipient.agreement,
+            &mut ReplayGuard::new()
+        ),
+        Err(OpenError::BadSignature)
+    );
+
+    // Honest delivery reproduces the label byte-for-byte.
+    let opened: ApprovalRequest = env
+        .open(&sender.peer_identity(), &recipient.agreement, &mut guard)
+        .expect("open");
+    assert_eq!(opened.lease_policy.covers(), covers);
+    assert_eq!(opened, req);
+
+    // And the exact bytes cannot be replayed to re-prompt with the same consent.
+    assert_eq!(
+        env.open::<ApprovalRequest>(&sender.peer_identity(), &recipient.agreement, &mut guard),
+        Err(OpenError::Replay(ReplayError::DuplicateRequest))
     );
 }

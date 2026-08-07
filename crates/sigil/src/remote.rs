@@ -312,7 +312,7 @@ impl RemoteApprover {
                 machine: self.machine.clone(),
                 requested_at: now,
             },
-            lease_policy: ctx.lease,
+            lease_policy: ctx.lease.clone(),
             reason: None,
             // A threshold-sealed secret (inline env, or a stored SSH key) carries
             // its threshold challenge to the phone; a plain gate leaves it absent
@@ -1113,7 +1113,7 @@ mod tests {
                 label: ".env".into(),
             }],
             kind: RequestKind::SecretRead,
-            lease: LeasePolicy::Leasable { max_secs: 900 },
+            lease: LeasePolicy::leasable(900),
             ssh: None,
             threshold: None,
         };
@@ -1122,7 +1122,7 @@ mod tests {
         assert_eq!(req.kind, RequestKind::SecretRead);
         assert_eq!(
             req.lease_policy,
-            LeasePolicy::Leasable { max_secs: 900 },
+            LeasePolicy::leasable(900),
             "lease policy is threaded from the context"
         );
         assert_eq!(req.command, ctx.command);

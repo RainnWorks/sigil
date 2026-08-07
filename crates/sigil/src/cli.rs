@@ -742,11 +742,17 @@ fn cmd_lease(args: &[String]) -> i32 {
 }
 
 /// One `sigil lease list` row: grant-key prefix (what `lease revoke` takes), the
-/// account when there is one, the RULE the lease covers, and the countdown.
+/// account when there is one, the RULE the lease covers, what that rule covers,
+/// and the countdown.
 ///
 /// A lease is rule-wide: it auto-approves anything that rule matches for the
 /// caller chain that opened it, not only the command that did. The row says so
-/// outright rather than leaving the rule name to be read as a command.
+/// outright rather than leaving the rule name to be read as a command, and it
+/// says it with the daemon's own **coverage label** (`op read`,
+/// `op with --account rowmhq.1password.eu`) — the same string the approver was
+/// shown when they opened the window, rendered once in `Match::coverage` and
+/// carried here. When the daemon rendered no label the row falls back to the
+/// generic breadth: still true, never a guess at what the rule matches.
 fn lease_row(s: Style, l: &json::LeaseJson, now: u64, with_account: bool) -> String {
     let left = l.expires_ms.saturating_sub(now) / 1000;
     let account = if with_account {
@@ -754,12 +760,17 @@ fn lease_row(s: Style, l: &json::LeaseJson, now: u64, with_account: bool) -> Str
     } else {
         String::new()
     };
+    let covers = if l.covers.is_empty() {
+        "any matching command".to_string()
+    } else {
+        l.covers.clone()
+    };
     format!(
         "  {}  {}{}  {}  {}",
         s.dim(&l.grant_hex[..12.min(l.grant_hex.len())]),
         account,
         pad(&l.scope, 30),
-        s.faint("\u{b7} any matching command"),
+        s.faint(&format!("\u{b7} {covers}")),
         s.faint(&format!("{left}s left"))
     )
 }
@@ -3352,7 +3363,9 @@ fn lease_flag(args: &[String]) -> Result<sigil_proto::LeasePolicy, i32> {
         },
         None => DEFAULT_LEASE_MAX_SECS,
     };
-    Ok(sigil_proto::LeasePolicy::Leasable { max_secs })
+    // No coverage label here: it is rendered by the daemon from the rule's match
+    // at resolve time, never authored or stored CLI-side.
+    Ok(sigil_proto::LeasePolicy::leasable(max_secs))
 }
 
 /// Normalize a rule-matcher flag name to the form it must have to ever match.
@@ -3538,7 +3551,7 @@ fn config_rule_list(json: bool) -> i32 {
         } else {
             (
                 format!("-> {}", r.action.source),
-                crate::config::lease_str(r.action.lease),
+                crate::config::lease_str(&r.action.lease),
             )
         };
         println!(
@@ -3810,7 +3823,7 @@ fn config_add(args: &[String], json: bool) -> i32 {
         action: crate::config::Action {
             mode: crate::config::RuleMode::Gate,
             source: cmd.clone(),
-            lease,
+            lease: lease.clone(),
             timeout_sec: None,
         },
     };
@@ -3833,7 +3846,7 @@ fn config_add(args: &[String], json: bool) -> i32 {
     println!(
         "  {}     {}",
         s.dim("lease"),
-        s.dim(&crate::config::lease_str(lease))
+        s.dim(&crate::config::lease_str(&lease))
     );
     println!(
         "  {}",
@@ -4402,19 +4415,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_lease_row_names_its_rule_and_says_how_wide_it_is() {
-        // Display honesty: the middle column is a RULE, and the row must not let
-        // it read as "the one command that was approved".
-        let s = Style::with_color(false);
-        let l = json::LeaseJson {
+    /// A `lease list` row as the daemon would hand it over. `scope` is the rule
+    /// name; `covers` is the daemon's coverage label for that rule.
+    fn lease_json(rule: &str, covers: &str) -> json::LeaseJson {
+        json::LeaseJson {
             grant_hex: "a1b2c3d4e5f60718293a4b5c6d7e8f90".into(),
             caller: String::new(),
             account: String::new(),
-            scope: "op-account-rowmhq-1password-eu".into(),
+            scope: rule.into(),
+            covers: covers.into(),
             granted_ms: 1_000,
             expires_ms: 121_000,
-        };
+        }
+    }
+
+    #[test]
+    fn a_lease_row_names_its_rule_and_says_how_wide_it_is() {
+        // Display honesty: the middle column is a RULE, and the row must not let
+        // it read as "the one command that was approved". With no label rendered,
+        // the row still states the breadth generically rather than implying none.
+        let s = Style::with_color(false);
+        let l = lease_json("op-account-rowmhq-1password-eu", "");
         let row = lease_row(s, &l, 1_000, false);
         // Revoke prefix first, then the rule: with no account anywhere, the row
         // spends no width on an empty column.
@@ -4429,6 +4450,27 @@ mod tests {
         let mut with = l.clone();
         with.account = "Rowm".into();
         assert!(lease_row(s, &with, 1_000, true).contains("Rowm"));
+    }
+
+    #[test]
+    fn a_lease_row_states_the_coverage_label_when_the_daemon_rendered_one() {
+        // The whole point of the label: the row stops gesturing at the breadth
+        // ("any matching command") and states it in the same words the approver
+        // consented to.
+        let s = Style::with_color(false);
+        let row = lease_row(
+            s,
+            &lease_json("op-eu", "op with --account rowmhq.1password.eu"),
+            1_000,
+            false,
+        );
+        assert!(row.contains("op-eu"), "{row}");
+        assert!(
+            row.contains("\u{b7} op with --account rowmhq.1password.eu"),
+            "{row}"
+        );
+        assert!(!row.contains("any matching command"), "{row}");
+        assert!(row.ends_with("120s left"), "{row}");
     }
 
     #[test]

@@ -223,6 +223,81 @@ impl Match {
             .collect()
     }
 
+    /// **The coverage label** for this match: a short, factual, display-only
+    /// description of everything the rule matches, e.g. `op read`,
+    /// `op with --account rowmhq.1password.eu`, or plain `op` when nothing beyond
+    /// the command is constrained.
+    ///
+    /// This is what the daemon renders into
+    /// [`LeasePolicy::Leasable::covers`](sigil_proto::LeasePolicy) so the phone's
+    /// consent surface, the Mac, and `sigil lease list` describe one window with
+    /// the same words instead of each guessing. Rendering rules:
+    ///
+    /// * It states the breadth honestly. A command-only rule renders the bare
+    ///   command, never a narrower-sounding phrase, because the rule really does
+    ///   cover every invocation of that command.
+    /// * It is built ONLY from the user's own match conditions. No argv is ever
+    ///   emitted (the invocation that happened to trip the rule is not the rule),
+    ///   and no secret reference can appear (the match vocabulary has no secret
+    ///   axis).
+    /// * It is bounded. Beyond [`COVERS_MAX_ATOMS`] conditions, or past
+    ///   [`sigil_proto::COVERS_MAX_CHARS`] characters, it degrades to an honest
+    ///   count ("op with 5 match conditions") rather than a truncated list that
+    ///   would read as if the omitted conditions did not exist. Individual
+    ///   user-authored tokens are elided at [`COVERS_TOKEN_MAX`] so one long value
+    ///   cannot eat the whole line.
+    pub fn coverage(&self) -> String {
+        let head = match (
+            self.command.as_deref().map(token),
+            self.subcommand.as_deref().map(token),
+        ) {
+            (Some(cmd), Some(sub)) => format!("{cmd} {sub}"),
+            (Some(cmd), None) => cmd,
+            (None, Some(sub)) => format!("any command with the subcommand {sub}"),
+            (None, None) => "any command".to_string(),
+        };
+
+        let atoms = self.flag_equals.len()
+            + self.flag_present.len()
+            + self.argv_contains.len()
+            + usize::from(self.arg_regex.is_some());
+        if atoms == 0 {
+            return head;
+        }
+        // Many conditions: an honest count beats a list the bound would truncate.
+        if atoms > COVERS_MAX_ATOMS {
+            return summarize(&head, atoms);
+        }
+
+        let mut clauses: Vec<String> = Vec::new();
+        let mut flags: Vec<String> = self
+            .flag_equals
+            .iter()
+            .map(|fe| format!("{} {}", token(&fe.flag), token(&fe.value)))
+            .collect();
+        flags.extend(self.flag_present.iter().map(|f| token(f)));
+        if !flags.is_empty() {
+            clauses.push(format!("with {}", join_and(&flags)));
+        }
+        if !self.argv_contains.is_empty() {
+            let needles: Vec<String> = self
+                .argv_contains
+                .iter()
+                .map(|n| format!("\"{}\"", token(n)))
+                .collect();
+            clauses.push(format!("containing {}", join_and(&needles)));
+        }
+        if self.arg_regex.is_some() {
+            clauses.push("matching a pattern".to_string());
+        }
+
+        let detailed = format!("{head} {}", clauses.join(", "));
+        if detailed.chars().count() > sigil_proto::COVERS_MAX_CHARS {
+            return summarize(&head, atoms);
+        }
+        detailed
+    }
+
     /// Whether this match carries no conditions at all.
     pub fn is_empty(&self) -> bool {
         self.command.is_none()
@@ -231,6 +306,48 @@ impl Match {
             && self.flag_present.is_empty()
             && self.flag_equals.is_empty()
             && self.arg_regex.is_none()
+    }
+}
+
+/// Above this many match conditions, [`Match::coverage`] states a count instead
+/// of listing them: three atoms is about what a phone caption line carries
+/// before it stops being read.
+pub const COVERS_MAX_ATOMS: usize = 3;
+
+/// The longest a single user-authored token (a command, flag, value, or needle)
+/// may run inside a coverage label before it is elided.
+pub const COVERS_TOKEN_MAX: usize = 28;
+
+/// One user-authored token, bounded for display. Whitespace and control
+/// characters are normalized by `LeasePolicy::with_covers` on the way out; this
+/// only stops one long value from consuming the whole label.
+fn token(raw: &str) -> String {
+    if raw.chars().count() <= COVERS_TOKEN_MAX {
+        return raw.to_string();
+    }
+    let mut s: String = raw
+        .chars()
+        .take(COVERS_TOKEN_MAX.saturating_sub(1))
+        .collect();
+    s.push('\u{2026}');
+    s
+}
+
+/// `a`, `a and b`, `a, b and c` — the human list separator for a coverage label.
+fn join_and(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// The honest summary form: how wide, plus how many conditions narrow it.
+fn summarize(head: &str, atoms: usize) -> String {
+    if atoms == 1 {
+        format!("{head} with 1 match condition")
+    } else {
+        format!("{head} with {atoms} match conditions")
     }
 }
 
@@ -302,7 +419,10 @@ pub struct Action {
     /// [`LeasePolicy::RunOnce`], so a rule missing this field fails safe to
     /// run-once. Meaningless for an allow rule, where it stays run-once and is
     /// never consulted. Serializes only when leasable, e.g.
-    /// `{"kind":"leasable","maxSecs":900}`.
+    /// `{"kind":"leasable","maxSecs":900}`. The policy's coverage label is NOT
+    /// stored here: it is derived from the rule's [`Match`] at resolve time, so a
+    /// hand-edited `covers` on disk is ignored and cannot be used to write
+    /// arbitrary words onto the phone's consent surface.
     #[serde(default, skip_serializing_if = "LeasePolicy::is_run_once")]
     pub lease: LeasePolicy,
     /// Optional per-rule approval timeout in seconds; falls back to the global
@@ -363,6 +483,11 @@ pub struct ResolvedAction {
     /// The rule's lease policy: whether an approval may open an auto-approve
     /// window and its cap. The daemon consults this as the sole authority when
     /// deciding whether to grant (and how long to grant) a lease.
+    ///
+    /// When leasable, [`resolve`](Config::resolve) has already stamped it with the
+    /// [`coverage`](Match::coverage) label rendered from THIS rule's match, so
+    /// every downstream renderer (phone, Mac, CLI) says the same thing about the
+    /// window's breadth. A run-once policy carries no label.
     pub lease: LeasePolicy,
     /// Optional per-rule approval timeout in seconds.
     pub timeout_sec: Option<u32>,
@@ -579,7 +704,15 @@ impl Config {
                 account: src.account.clone(),
                 env_keys: src.keys.clone(),
                 plain_env: src.plain_pairs(),
-                lease: rule.action.lease,
+                // The coverage label is rendered HERE, by the daemon, from this
+                // rule's own match conditions — never read from disk and never
+                // supplied by a client, so no hand-edit or peer can put words on
+                // the consent surface that the match does not back.
+                lease: rule
+                    .action
+                    .lease
+                    .clone()
+                    .with_covers(rule.match_.coverage()),
                 timeout_sec: rule.action.timeout_sec,
             }));
         }
@@ -668,10 +801,10 @@ impl Config {
 
 /// A short human label for a lease policy, for `rule list` and `list` display.
 /// Run-once renders `run-once`; leasable renders `leasable(<n>s)`.
-pub fn lease_str(lease: LeasePolicy) -> String {
+pub fn lease_str(lease: &LeasePolicy) -> String {
     match lease {
         LeasePolicy::RunOnce => "run-once".to_string(),
-        LeasePolicy::Leasable { max_secs } => format!("leasable({max_secs}s)"),
+        LeasePolicy::Leasable { max_secs, .. } => format!("leasable({max_secs}s)"),
     }
 }
 
@@ -817,6 +950,310 @@ mod tests {
         );
     }
 
+    // --- coverage label -----------------------------------------------------
+
+    #[test]
+    fn coverage_renders_each_match_shape() {
+        // Command only: the honest breadth is the whole command, and the label
+        // says exactly that rather than implying a narrower window.
+        assert_eq!(
+            Match {
+                command: Some("op".into()),
+                ..Match::default()
+            }
+            .coverage(),
+            "op"
+        );
+
+        // Subcommand: the register the design brief asks for.
+        assert_eq!(
+            Match {
+                command: Some("op".into()),
+                subcommand: Some("read".into()),
+                ..Match::default()
+            }
+            .coverage(),
+            "op read"
+        );
+
+        // flag_equals names the flag and the value it is pinned to.
+        assert_eq!(
+            Match {
+                command: Some("op".into()),
+                flag_equals: vec![FlagEq {
+                    flag: "--account".into(),
+                    value: "rowmhq.1password.eu".into(),
+                }],
+                ..Match::default()
+            }
+            .coverage(),
+            "op with --account rowmhq.1password.eu"
+        );
+
+        // flag_present names the flag alone (any value satisfies it).
+        assert_eq!(
+            Match {
+                command: Some("op".into()),
+                flag_present: vec!["--vault".into()],
+                ..Match::default()
+            }
+            .coverage(),
+            "op with --vault"
+        );
+
+        // argv_contains is a substring test, rendered as a quoted needle.
+        assert_eq!(
+            Match {
+                command: Some("op".into()),
+                argv_contains: vec!["Engineering".into()],
+                ..Match::default()
+            }
+            .coverage(),
+            "op containing \"Engineering\""
+        );
+
+        // Mixed conditions read as one sentence, flags first.
+        assert_eq!(
+            Match {
+                command: Some("op".into()),
+                subcommand: Some("read".into()),
+                flag_present: vec!["--vault".into()],
+                argv_contains: vec!["prod".into()],
+                ..Match::default()
+            }
+            .coverage(),
+            "op read with --vault, containing \"prod\""
+        );
+
+        // Two flags of the same kind list with "and".
+        assert_eq!(
+            Match {
+                command: Some("gcloud".into()),
+                flag_equals: vec![FlagEq {
+                    flag: "--project".into(),
+                    value: "prod".into(),
+                }],
+                flag_present: vec!["--quiet".into()],
+                ..Match::default()
+            }
+            .coverage(),
+            "gcloud with --project prod and --quiet"
+        );
+
+        // No command at all: the label must not pretend one was pinned.
+        assert_eq!(
+            Match {
+                subcommand: Some("read".into()),
+                ..Match::default()
+            }
+            .coverage(),
+            "any command with the subcommand read"
+        );
+        assert_eq!(
+            Match {
+                argv_contains: vec!["prod".into()],
+                ..Match::default()
+            }
+            .coverage(),
+            "any command containing \"prod\""
+        );
+
+        // The deferred regex condition is named, never echoed.
+        let re = Match {
+            command: Some("op".into()),
+            arg_regex: Some("^op://Engineering/.*$".into()),
+            ..Match::default()
+        }
+        .coverage();
+        assert_eq!(re, "op matching a pattern");
+        assert!(!re.contains("op://"));
+    }
+
+    #[test]
+    fn coverage_is_bounded_and_summarizes_a_busy_rule() {
+        // Beyond COVERS_MAX_ATOMS conditions, an honest count beats a list that
+        // the bound would have to truncate (a truncated list would read as if the
+        // dropped conditions did not narrow the window).
+        let busy = Match {
+            command: Some("op".into()),
+            subcommand: Some("read".into()),
+            flag_present: vec!["--a".into(), "--b".into()],
+            argv_contains: vec!["x".into(), "y".into(), "z".into()],
+            ..Match::default()
+        };
+        assert_eq!(busy.coverage(), "op read with 5 match conditions");
+        assert!(busy.coverage().chars().count() <= sigil_proto::COVERS_MAX_CHARS);
+
+        // A few conditions that are individually long also summarize rather than
+        // overflow the caption line.
+        let long_values = Match {
+            command: Some("op".into()),
+            flag_equals: vec![
+                FlagEq {
+                    flag: "--account".into(),
+                    value: "a".repeat(40),
+                },
+                FlagEq {
+                    flag: "--vault".into(),
+                    value: "b".repeat(40),
+                },
+            ],
+            ..Match::default()
+        };
+        assert_eq!(long_values.coverage(), "op with 2 match conditions");
+
+        // One long token is elided, not allowed to consume the whole label.
+        let one_long = Match {
+            command: Some("op".into()),
+            flag_equals: vec![FlagEq {
+                flag: "--account".into(),
+                value: "c".repeat(200),
+            }],
+            ..Match::default()
+        };
+        assert!(one_long.coverage().chars().count() <= sigil_proto::COVERS_MAX_CHARS);
+        assert!(one_long.coverage().contains('\u{2026}'));
+
+        // Even a pathological command name cannot overflow the wire bound once
+        // the policy stamps it (the proto is the last line of defense).
+        let huge = Match {
+            command: Some("d".repeat(500)),
+            ..Match::default()
+        };
+        let stamped = LeasePolicy::leasable(60).with_covers(huge.coverage());
+        assert!(stamped.covers().chars().count() <= sigil_proto::COVERS_MAX_CHARS);
+
+        // Singular reads as singular when a single long condition summarizes.
+        let single = Match {
+            command: Some("e".repeat(60)),
+            flag_equals: vec![FlagEq {
+                flag: "f".repeat(40),
+                value: "g".repeat(40),
+            }],
+            ..Match::default()
+        };
+        assert!(
+            single.coverage().ends_with("with 1 match condition"),
+            "got {}",
+            single.coverage()
+        );
+    }
+
+    #[test]
+    fn resolve_stamps_the_coverage_label_only_on_a_leasable_rule() {
+        let mut cfg = Config::default();
+        cfg.add_source(Source {
+            name: "op".into(),
+            provider: "1password".into(),
+            account: None,
+            path: None,
+            keys: Vec::new(),
+            plain: Default::default(),
+        })
+        .unwrap();
+        cfg.add_rule(Rule {
+            name: "op-read".into(),
+            match_: Match {
+                command: Some("op".into()),
+                subcommand: Some("read".into()),
+                ..Match::default()
+            },
+            action: Action {
+                mode: RuleMode::Gate,
+                source: "op".into(),
+                lease: LeasePolicy::leasable(900),
+                timeout_sec: None,
+            },
+        })
+        .unwrap();
+        cfg.add_rule(Rule {
+            name: "op-item".into(),
+            match_: Match {
+                command: Some("op".into()),
+                subcommand: Some("item".into()),
+                ..Match::default()
+            },
+            action: Action {
+                mode: RuleMode::Gate,
+                source: "op".into(),
+                lease: LeasePolicy::RunOnce,
+                timeout_sec: None,
+            },
+        })
+        .unwrap();
+
+        let leasable = gate(cfg.resolve(&argv(&["op", "read", "op://V/i/f"])).unwrap());
+        assert_eq!(leasable.rule, "op-read");
+        assert_eq!(leasable.lease.covers(), "op read");
+
+        // A run-once rule opens no window, so it must describe none.
+        let once = gate(cfg.resolve(&argv(&["op", "item", "get", "x"])).unwrap());
+        assert_eq!(once.lease, LeasePolicy::RunOnce);
+        assert_eq!(once.lease.covers(), "");
+    }
+
+    #[test]
+    fn a_hand_edited_covers_on_disk_is_ignored_by_resolve() {
+        // `covers` is daemon-rendered from the match, never read from config: a
+        // hand-edit cannot put arbitrary words on the phone's consent surface.
+        let json = r#"{
+          "version": 1,
+          "sources": [{"name":"op","provider":"1password"}],
+          "rules": [{
+            "name":"op-read",
+            "match":{"command":"op","subcommand":"read"},
+            "action":{"mode":"gate","source":"op",
+                      "lease":{"kind":"leasable","maxSecs":900,
+                               "covers":"only this one harmless secret"}}
+          }]
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let a = gate(cfg.resolve(&argv(&["op", "read", "op://V/i/f"])).unwrap());
+        assert_eq!(a.lease.covers(), "op read");
+    }
+
+    #[test]
+    fn resolving_never_writes_the_label_back_into_the_config() {
+        // The label is derived per resolution, so the in-memory (and therefore
+        // saved) config keeps none: it can never drift from the match it claims to
+        // describe, and `sigil-config export` stays byte-stable.
+        let mut cfg = Config::default();
+        cfg.add_source(Source {
+            name: "op".into(),
+            provider: "1password".into(),
+            account: None,
+            path: None,
+            keys: Vec::new(),
+            plain: Default::default(),
+        })
+        .unwrap();
+        cfg.add_rule(Rule {
+            name: "op-read".into(),
+            match_: Match {
+                command: Some("op".into()),
+                subcommand: Some("read".into()),
+                ..Match::default()
+            },
+            action: Action {
+                mode: RuleMode::Gate,
+                source: "op".into(),
+                lease: LeasePolicy::leasable(900),
+                timeout_sec: None,
+            },
+        })
+        .unwrap();
+
+        let r = gate(cfg.resolve(&argv(&["op", "read", "op://V/i/f"])).unwrap());
+        assert_eq!(r.lease.covers(), "op read");
+        assert_eq!(cfg.rules[0].action.lease.covers(), "");
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"maxSecs\":900"));
+        assert!(
+            !json.contains("covers"),
+            "the saved config must not carry a coverage label: {json}"
+        );
+    }
+
     #[test]
     fn resolve_first_match_wins_and_flattens_source() {
         let mut cfg = Config::default();
@@ -848,7 +1285,7 @@ mod tests {
             action: Action {
                 mode: RuleMode::Gate,
                 source: "rowm-op".into(),
-                lease: LeasePolicy::Leasable { max_secs: 900 },
+                lease: LeasePolicy::leasable(900),
                 timeout_sec: Some(60),
             },
         })
@@ -872,7 +1309,11 @@ mod tests {
         assert_eq!(r.rule, "op-read");
         assert_eq!(r.provider, "1password");
         assert_eq!(r.account.as_deref(), Some("Rowm"));
-        assert_eq!(r.lease, LeasePolicy::Leasable { max_secs: 900 });
+        // Resolution stamps the coverage label rendered from this rule's match.
+        assert_eq!(
+            r.lease,
+            LeasePolicy::leasable(900).with_covers("op containing \"read\"")
+        );
         assert_eq!(r.timeout_sec, Some(60));
 
         let g = gate(cfg.resolve(&argv(&["gcloud", "auth"])).unwrap());
@@ -1346,7 +1787,7 @@ mod tests {
             action: Action {
                 mode: RuleMode::Gate,
                 source: "gc".into(),
-                lease: LeasePolicy::Leasable { max_secs: 900 },
+                lease: LeasePolicy::leasable(900),
                 timeout_sec: None,
             },
         })
@@ -1354,10 +1795,13 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("\"kind\":\"leasable\""));
         assert!(json.contains("\"maxSecs\":900"));
+        // The stored policy carries the cap only; the coverage label is derived at
+        // resolve time and never persisted.
+        assert!(!json.contains("covers"));
         let back: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(back.rules, cfg.rules);
         let r = gate(back.resolve(&argv(&["gcloud", "auth"])).unwrap());
-        assert_eq!(r.lease, LeasePolicy::Leasable { max_secs: 900 });
+        assert_eq!(r.lease, LeasePolicy::leasable(900).with_covers("gcloud"));
     }
 
     #[test]
@@ -1465,7 +1909,7 @@ mod tests {
                 action: Action {
                     mode: RuleMode::Allow,
                     source: String::new(),
-                    lease: LeasePolicy::Leasable { max_secs: 60 },
+                    lease: LeasePolicy::leasable(60),
                     timeout_sec: None,
                 },
             })

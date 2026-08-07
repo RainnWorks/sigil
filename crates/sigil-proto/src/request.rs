@@ -68,23 +68,109 @@ use serde::{Deserialize, Serialize};
 ///
 /// One tap approves on the phone regardless of policy; policy governs only
 /// whether that tap may *also* open a lease window, never the friction of the tap.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum LeasePolicy {
     /// Fresh approval every invocation; no lease is ever offered or granted. The
     /// default: a rule leases only when explicitly made leasable.
     #[default]
     RunOnce,
-    /// The approver may grant a session lease up to `max_secs` seconds. The field
-    /// is renamed explicitly (the enum-level `rename_all` renames only the variant
-    /// tags, not struct-variant fields) so the wire spelling is `maxSecs`.
+    /// The approver may grant a session lease up to `max_secs` seconds. The fields
+    /// are renamed explicitly (the enum-level `rename_all` renames only the variant
+    /// tags, not struct-variant fields) so the wire spelling is `maxSecs`/`covers`.
     Leasable {
         #[serde(rename = "maxSecs")]
         max_secs: u32,
+        /// **The coverage label**: a short, DISPLAY-ONLY sentence fragment naming
+        /// how wide the window this tap may open is, e.g. `op read` or
+        /// `op with --account rowmhq.1password.eu`.
+        ///
+        /// Rendered **by the daemon** from the matched rule's user-authored match
+        /// conditions (rule name and match conditions are user config, not
+        /// provider semantics, so this does not dent the approver's
+        /// provider-blindness). It is never an argv, never a secret reference, and
+        /// never a value the approver should parse or act on: it exists so the
+        /// consent surface can state the breadth of the window exactly instead of
+        /// hedging.
+        ///
+        /// Bounded to [`COVERS_MAX_CHARS`] characters and stripped of control
+        /// characters by [`LeasePolicy::with_covers`], the only constructor the
+        /// daemon uses. **Empty means "no label available"** (it is then omitted
+        /// from the wire): a renderer must show no coverage clause rather than
+        /// invent one.
+        #[serde(rename = "covers", default, skip_serializing_if = "String::is_empty")]
+        covers: String,
     },
 }
 
+/// The maximum length, in characters, of a [`LeasePolicy::Leasable`] coverage
+/// label. It rides on a consent surface with a fixed caption line, so both the
+/// renderer (daemon) and every reader (phone, Mac, CLI) hold to one bound.
+pub const COVERS_MAX_CHARS: usize = 72;
+
+/// Sanitize a coverage label for a consent surface: control characters become
+/// spaces, whitespace runs collapse, and the result is bounded to
+/// [`COVERS_MAX_CHARS`] characters (eliding with a single-character ellipsis, not
+/// three dots, so the bound is exact).
+fn sanitize_covers(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(COVERS_MAX_CHARS));
+    let mut pending_space = false;
+    for ch in raw.chars() {
+        if ch.is_control() || ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(ch);
+    }
+    if out.chars().count() > COVERS_MAX_CHARS {
+        out = out
+            .chars()
+            .take(COVERS_MAX_CHARS.saturating_sub(1))
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        out.push('\u{2026}');
+    }
+    out
+}
+
 impl LeasePolicy {
+    /// A leasable policy capped at `max_secs`, with no coverage label yet. The
+    /// label is attached by the daemon at resolve time via
+    /// [`with_covers`](Self::with_covers); config on disk stores none.
+    pub fn leasable(max_secs: u32) -> Self {
+        LeasePolicy::Leasable {
+            max_secs,
+            covers: String::new(),
+        }
+    }
+
+    /// Attach (or replace) the daemon-rendered coverage label, sanitized and
+    /// bounded. A no-op on [`RunOnce`](Self::RunOnce): a run-once request opens no
+    /// window, so it must carry no coverage label at all.
+    pub fn with_covers(self, label: impl AsRef<str>) -> Self {
+        match self {
+            LeasePolicy::RunOnce => LeasePolicy::RunOnce,
+            LeasePolicy::Leasable { max_secs, .. } => LeasePolicy::Leasable {
+                max_secs,
+                covers: sanitize_covers(label.as_ref()),
+            },
+        }
+    }
+
+    /// The coverage label, or `""` when there is none (run-once, or a peer that
+    /// omitted it). Display only.
+    pub fn covers(&self) -> &str {
+        match self {
+            LeasePolicy::Leasable { covers, .. } => covers,
+            LeasePolicy::RunOnce => "",
+        }
+    }
+
     /// Whether this policy permits any lease at all.
     pub fn is_leasable(&self) -> bool {
         matches!(self, LeasePolicy::Leasable { .. })
@@ -99,7 +185,7 @@ impl LeasePolicy {
     /// The per-rule cap in seconds if leasable, else `None` (run-once).
     pub fn max_secs(&self) -> Option<u32> {
         match self {
-            LeasePolicy::Leasable { max_secs } => Some(*max_secs),
+            LeasePolicy::Leasable { max_secs, .. } => Some(*max_secs),
             LeasePolicy::RunOnce => None,
         }
     }
@@ -251,10 +337,12 @@ pub struct ApprovalRequest {
     pub ssh: Option<SshChallenge>,
     pub provenance: Provenance,
     /// The rule's lease policy: whether this tap may also open an auto-approve
-    /// window and its cap. Rides inside the seal so it is part of what the
-    /// approver consents to; the phone offers "approve for N minutes" only when
-    /// this is [`LeasePolicy::Leasable`]. Defaults to [`LeasePolicy::RunOnce`]
-    /// when absent, so an older/omitting peer fails safe to run-once.
+    /// window, its cap, and (on a leasable rule) the daemon-rendered
+    /// [`covers`](LeasePolicy::covers) label describing how wide that window is.
+    /// Rides inside the seal so it is part of what the approver consents to; the
+    /// phone offers "approve for N minutes" only when this is
+    /// [`LeasePolicy::Leasable`]. Defaults to [`LeasePolicy::RunOnce`] when
+    /// absent, so an older/omitting peer fails safe to run-once.
     #[serde(default)]
     pub lease_policy: LeasePolicy,
     /// One optional reason line the approver renders under the command.
@@ -712,7 +800,7 @@ mod tests {
         // Run-once refuses any lease, whatever the request asks for.
         assert_eq!(LeasePolicy::RunOnce.clamp_secs(60), None);
 
-        let leasable = LeasePolicy::Leasable { max_secs: 900 };
+        let leasable = LeasePolicy::leasable(900);
         assert!(leasable.is_leasable());
         assert_eq!(leasable.max_secs(), Some(900));
         // Under the cap passes through; over the cap clamps down.
@@ -728,10 +816,60 @@ mod tests {
         assert_eq!(j1, "{\"kind\":\"runOnce\"}");
         assert_eq!(serde_json::from_str::<LeasePolicy>(&j1).unwrap(), once);
 
-        let leas = LeasePolicy::Leasable { max_secs: 900 };
+        // No coverage label: `covers` is omitted entirely, so the wire shape is
+        // byte-identical to the pre-coverage protocol.
+        let leas = LeasePolicy::leasable(900);
         let j2 = serde_json::to_string(&leas).unwrap();
         assert_eq!(j2, "{\"kind\":\"leasable\",\"maxSecs\":900}");
         assert_eq!(serde_json::from_str::<LeasePolicy>(&j2).unwrap(), leas);
+
+        // With a label it rides alongside the cap, and an omitting peer decodes
+        // to the empty label (fails safe to "no coverage clause", never invented).
+        let covered = LeasePolicy::leasable(900).with_covers("op read");
+        let j3 = serde_json::to_string(&covered).unwrap();
+        assert_eq!(
+            j3,
+            "{\"kind\":\"leasable\",\"maxSecs\":900,\"covers\":\"op read\"}"
+        );
+        assert_eq!(serde_json::from_str::<LeasePolicy>(&j3).unwrap(), covered);
+        assert_eq!(covered.covers(), "op read");
+        assert_eq!(
+            serde_json::from_str::<LeasePolicy>("{\"kind\":\"leasable\",\"maxSecs\":900}")
+                .unwrap()
+                .covers(),
+            ""
+        );
+    }
+
+    #[test]
+    fn covers_is_sanitized_bounded_and_never_set_on_run_once() {
+        // A run-once policy opens no window, so it can carry no coverage label.
+        assert_eq!(
+            LeasePolicy::RunOnce.with_covers("op read"),
+            LeasePolicy::RunOnce
+        );
+        assert_eq!(LeasePolicy::RunOnce.covers(), "");
+
+        // Control characters and whitespace runs cannot deform the consent
+        // surface: they collapse to single spaces and the ends are trimmed.
+        let messy = LeasePolicy::leasable(60).with_covers("  op\n\tread   with\r\n--vault  ");
+        assert_eq!(messy.covers(), "op read with --vault");
+
+        // The bound is exact, counted in characters, and marked with an ellipsis.
+        let long = LeasePolicy::leasable(60).with_covers("x".repeat(500));
+        assert_eq!(long.covers().chars().count(), COVERS_MAX_CHARS);
+        assert!(long.covers().ends_with('\u{2026}'));
+
+        // Multi-byte characters are truncated on a char boundary, not a byte one.
+        let wide = LeasePolicy::leasable(60).with_covers("\u{e9}".repeat(500));
+        assert_eq!(wide.covers().chars().count(), COVERS_MAX_CHARS);
+
+        // A label exactly at the bound is left alone.
+        let exact = "y".repeat(COVERS_MAX_CHARS);
+        assert_eq!(
+            LeasePolicy::leasable(60).with_covers(&exact).covers(),
+            exact
+        );
     }
 
     #[test]

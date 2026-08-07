@@ -18,7 +18,8 @@
 //! sync with this file. Enum-like fields are plain `String` so the exact wire
 //! spelling is explicit here; [`request_kind_str`] maps the proto enum to the
 //! strings the Swift `RawValue` initializers expect. The lease policy is carried
-//! flat as `leasable` + `max_lease_secs` for the Swift approve sheet.
+//! flat as `leasable` + `max_lease_secs` + `lease_covers` for the Swift approve
+//! sheet.
 
 use serde::{Deserialize, Serialize};
 
@@ -136,6 +137,13 @@ pub struct LeaseJson {
     /// Not the command line that opened it (that is in the audit log). Any UI
     /// showing this must not imply it covers only one command.
     pub scope: String,
+    /// The daemon-rendered coverage label for that rule (`op read`,
+    /// `op with --account rowmhq.1password.eu`, …) — the same words the phone was
+    /// shown when it consented, so a UI can state the breadth exactly instead of
+    /// gesturing at it. Empty when the daemon rendered none; a renderer then falls
+    /// back to naming the rule and its breadth generically, never to a guess at
+    /// what the rule matches. Display only.
+    pub covers: String,
     pub granted_ms: u64,
     pub expires_ms: u64,
 }
@@ -199,6 +207,14 @@ pub struct PendingJson {
     /// (omitted) for run-once. A local approver clamps any offered window to this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_lease_secs: Option<u32>,
+    /// The daemon-rendered coverage label for the matched rule when
+    /// [`leasable`](Self::leasable): a short, display-only description of how wide
+    /// the window this approval may open is (`op read`,
+    /// `op with --account rowmhq.1password.eu`, …), the same string the sealed
+    /// request carries to the phone. `None` (omitted) for run-once or when the
+    /// daemon rendered none; a renderer then states no coverage, never a guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_covers: Option<String>,
     pub reason: Option<String>,
     pub expires_ms: u64,
     pub timeout_ms: u64,

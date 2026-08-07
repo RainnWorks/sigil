@@ -377,6 +377,11 @@ impl LeaseBinding {
 struct Lease {
     grant: [u8; 32],
     binding: LeaseBinding,
+    /// The daemon-rendered coverage label for the rule this window covers, e.g.
+    /// `op read`. Display only, and deliberately NOT part of [`LeaseBinding`]:
+    /// the binding is the lookup key, and a description of a window must never be
+    /// able to widen, narrow, or split it. Empty when none was rendered.
+    covers: String,
     token: Token,
     granted: Instant,
     expires: Instant,
@@ -390,6 +395,11 @@ pub struct LeaseInfo {
     /// The rule name the lease covers. Display must make the breadth plain: the
     /// lease covers any command that rule matches, not the one that opened it.
     pub scope: String,
+    /// What that rule matches, in the daemon's own words (`op read`,
+    /// `op with --account rowmhq.1password.eu`, …): the same string the approver
+    /// consented to, so the CLI states the breadth instead of gesturing at it.
+    /// Empty when the daemon rendered none.
+    pub covers: String,
     pub remaining: Duration,
     pub age: Duration,
 }
@@ -409,7 +419,19 @@ impl LeaseStore {
     /// Grant (or refresh) a lease for `grant` + `binding` with `ttl`. Refreshing
     /// replaces the cached token, so the newest approval's values are the ones
     /// served (the old ones are dropped, and so zeroized).
-    pub fn grant(&self, grant: [u8; 32], binding: &LeaseBinding, token: Token, ttl: Duration) {
+    ///
+    /// `covers` is the display-only coverage label for the rule the binding names
+    /// (see [`Lease::covers`]). It never participates in the match, so it cannot
+    /// change which runs a window serves; a refresh re-stamps it so the readout
+    /// follows the latest approval rather than the first one.
+    pub fn grant(
+        &self,
+        grant: [u8; 32],
+        binding: &LeaseBinding,
+        covers: &str,
+        token: Token,
+        ttl: Duration,
+    ) {
         let now = Instant::now();
         let mut leases = self.inner.lock().expect("lease store poisoned");
         leases.retain(|l| l.expires > now);
@@ -418,12 +440,14 @@ impl LeaseStore {
             .find(|l| l.grant == grant && &l.binding == binding)
         {
             l.token = token;
+            l.covers = covers.to_string();
             l.expires = now + ttl;
             return;
         }
         leases.push(Lease {
             grant,
             binding: binding.clone(),
+            covers: covers.to_string(),
             token,
             granted: now,
             expires: now + ttl,
@@ -455,6 +479,7 @@ impl LeaseStore {
                 grant_hex: hex32(&l.grant),
                 account: l.binding.account.clone(),
                 scope: l.binding.scope.clone(),
+                covers: l.covers.clone(),
                 remaining: l.expires.saturating_duration_since(now),
                 age: now.saturating_duration_since(l.granted),
             })
@@ -1090,6 +1115,10 @@ mod tests {
     /// cover a generation actually moving).
     const GEN: u64 = 0;
 
+    /// The display-only coverage label a grant is stamped with. It is not part of
+    /// the binding, so every lookup below must succeed without naming it.
+    const COVERS: &str = "op read";
+
     /// A presence binding (what a plain gate stores).
     fn gate(account: &str, scope: &str) -> LeaseBinding {
         LeaseBinding::presence(account, scope, GEN)
@@ -1101,7 +1130,7 @@ mod tests {
         let store = LeaseStore::new();
         let gk = rule_key(&walk_ancestry(&tree(), 300), "op");
         let b = gate("Rowm", "op");
-        store.grant(gk, &b, token("tok"), Duration::from_secs(60));
+        store.grant(gk, &b, COVERS, token("tok"), Duration::from_secs(60));
 
         assert_eq!(store.active(), 1);
         let t = store.token_for(&gk, &b).unwrap();
@@ -1125,6 +1154,7 @@ mod tests {
         store.grant(
             gk,
             &sealed_then,
+            COVERS,
             token("TOKEN=old"),
             Duration::from_secs(60),
         );
@@ -1139,11 +1169,38 @@ mod tests {
     }
 
     #[test]
+    fn coverage_is_carried_for_display_and_never_joins_the_lookup() {
+        // The label describes the window; the binding decides it. Two leases whose
+        // labels differ but whose bindings match are ONE lease, and a lookup that
+        // knows nothing about labels still hits: a description can never widen,
+        // narrow, or split a grant.
+        let store = LeaseStore::new();
+        let gk = rule_key(&walk_ancestry(&tree(), 300), "op");
+        let b = gate("Rowm", "op");
+        store.grant(gk, &b, COVERS, token("tok"), Duration::from_secs(60));
+        assert_eq!(store.list()[0].covers, COVERS);
+        assert_eq!(store.list()[0].scope, "op", "scope stays the rule name");
+        assert!(store.token_for(&gk, &b).is_some());
+
+        // A refresh under a re-rendered label (the rule was edited) re-stamps the
+        // readout without forking the window.
+        store.grant(
+            gk,
+            &b,
+            "op with --account rowm",
+            token("tok2"),
+            Duration::from_secs(60),
+        );
+        assert_eq!(store.active(), 1);
+        assert_eq!(store.list()[0].covers, "op with --account rowm");
+    }
+
+    #[test]
     fn lease_expires_and_is_purged() {
         let store = LeaseStore::new();
         let gk = [7u8; 32];
         let b = gate("Rowm", "s");
-        store.grant(gk, &b, token("tok"), Duration::from_millis(15));
+        store.grant(gk, &b, COVERS, token("tok"), Duration::from_millis(15));
         assert!(store.token_for(&gk, &b).is_some());
         std::thread::sleep(Duration::from_millis(30));
         assert!(store.token_for(&gk, &b).is_none());
@@ -1158,7 +1215,13 @@ mod tests {
         let store = LeaseStore::new();
         let gk = [9u8; 32];
         let b = LeaseBinding::cached("prod-env", "deploy", "E1", GEN);
-        store.grant(gk, &b, token("TOKEN=live"), Duration::from_millis(15));
+        store.grant(
+            gk,
+            &b,
+            COVERS,
+            token("TOKEN=live"),
+            Duration::from_millis(15),
+        );
         assert_eq!(&store.token_for(&gk, &b).unwrap()[..], b"TOKEN=live");
         std::thread::sleep(Duration::from_millis(30));
         assert!(store.token_for(&gk, &b).is_none(), "the window lapsed");
@@ -1171,12 +1234,14 @@ mod tests {
         store.grant(
             [1u8; 32],
             &gate("A", "s"),
+            COVERS,
             token("a"),
             Duration::from_secs(60),
         );
         store.grant(
             [2u8; 32],
             &gate("B", "s"),
+            COVERS,
             token("b"),
             Duration::from_secs(60),
         );
@@ -1190,7 +1255,7 @@ mod tests {
         let store = LeaseStore::new();
         let gk = [0xabu8; 32];
         let b = gate("A", "s");
-        store.grant(gk, &b, token("a"), Duration::from_secs(60));
+        store.grant(gk, &b, COVERS, token("a"), Duration::from_secs(60));
         let prefix = &hex32(&gk)[..8];
         assert_eq!(store.revoke(prefix), 1);
         assert_eq!(store.active(), 0);
@@ -1209,18 +1274,21 @@ mod tests {
         store.grant(
             [1u8; 32],
             &doomed,
+            COVERS,
             token("TOKEN=a"),
             Duration::from_secs(60),
         );
         store.grant(
             [2u8; 32],
             &doomed,
+            COVERS,
             token("TOKEN=b"),
             Duration::from_secs(60),
         );
         store.grant(
             [3u8; 32],
             &gate("", "op"),
+            COVERS,
             token(""),
             Duration::from_secs(60),
         );
@@ -1236,8 +1304,8 @@ mod tests {
         let store = LeaseStore::new();
         let gk = [3u8; 32];
         let b = gate("A", "s");
-        store.grant(gk, &b, token("a"), Duration::from_secs(1));
-        store.grant(gk, &b, token("b"), Duration::from_secs(60));
+        store.grant(gk, &b, COVERS, token("a"), Duration::from_secs(1));
+        store.grant(gk, &b, COVERS, token("b"), Duration::from_secs(60));
         assert_eq!(store.active(), 1);
         assert_eq!(&store.token_for(&gk, &b).unwrap()[..], b"b");
     }
