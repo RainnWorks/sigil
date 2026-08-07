@@ -267,9 +267,9 @@ export function ApprovalSheet({
                       rule" is load-bearing: it gives the pronoun an antecedent
                       the label itself cannot be, and it stops the label reading
                       as the thing that does the matching. Several of the real
-                      shapes are phrases rather than single words ("op with
-                      --account rowmhq.1password.eu", "any command with the
-                      subcommand read"), so the label carries a weight bump to
+                      shapes are phrases rather than single words (`op with
+                      --account "rowmhq.1password.eu"`, `any command with the
+                      subcommand read`), so the label carries a weight bump to
                       mark where the rule's description ends; it does NOT carry a
                       tone bump, because on a consent surface the brightest text
                       must not be the half that makes the grant sound contained.

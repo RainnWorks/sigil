@@ -29,7 +29,7 @@ function main(): void {
   for (const shape of [
     "op",
     "op read",
-    "op with --account rowmhq.1password.eu",
+    'op with --account "rowmhq.1password.eu"',
     "op with --vault",
     'op containing "prod"',
     'op read with --vault, containing "prod"',

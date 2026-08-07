@@ -63,8 +63,8 @@ export interface LeasePolicy {
   maxSecs: number;
   /**
    * The daemon's own one-line description of how wide the window is, e.g.
-   * `"op read"`, `"op with --account rowmhq.1password.eu"`, or
-   * `"any command with the subcommand read"`. Rendered by the daemon from the
+   * `op read`, `op with --account "rowmhq.1password.eu"`, or
+   * `any command with the subcommand read`. Rendered by the daemon from the
    * user's rule match conditions, so the phone can state the breadth exactly
    * instead of guessing it from argv.
    *

@@ -79,9 +79,9 @@ export function durationWindow(totalSecs: number): string {
 }
 
 /**
- * The daemon's lease coverage label, made safe to lay out: `"op read"`,
- * `"op with --account rowmhq.1password.eu"`, `"any command with the subcommand
- * read"`. Returns null when there is nothing to show, and the caller then shows
+ * The daemon's lease coverage label, made safe to lay out: `op read`,
+ * `op with --account "rowmhq.1password.eu"`, `any command with the subcommand
+ * read`. Returns null when there is nothing to show, and the caller then shows
  * NO coverage clause rather than inventing one.
  *
  * This is hygiene, not interpretation. The label is display only: it is never
