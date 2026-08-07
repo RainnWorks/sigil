@@ -93,11 +93,11 @@ pub enum LeasePolicy {
         /// consent surface can state the breadth of the window exactly instead of
         /// hedging.
         ///
-        /// Bounded to [`COVERS_MAX_CHARS`] characters and stripped of control
-        /// characters by [`LeasePolicy::with_covers`], the only constructor the
-        /// daemon uses. **Empty means "no label available"** (it is then omitted
-        /// from the wire): a renderer must show no coverage clause rather than
-        /// invent one.
+        /// Bounded to [`COVERS_MAX_CHARS`] characters and reduced to the
+        /// printable-ASCII allowlist by [`LeasePolicy::with_covers`] (see
+        /// [`sanitize_label`]), the only constructor the daemon uses. **Empty
+        /// means "no label available"** (it is then omitted from the wire): a
+        /// renderer must show no coverage clause rather than invent one.
         #[serde(rename = "covers", default, skip_serializing_if = "String::is_empty")]
         covers: String,
     },
@@ -108,34 +108,96 @@ pub enum LeasePolicy {
 /// renderer (daemon) and every reader (phone, Mac, CLI) hold to one bound.
 pub const COVERS_MAX_CHARS: usize = 72;
 
-/// Sanitize a coverage label for a consent surface: control characters become
-/// spaces, whitespace runs collapse, and the result is bounded to
-/// [`COVERS_MAX_CHARS`] characters (eliding with a single-character ellipsis, not
-/// three dots, so the bound is exact).
-fn sanitize_covers(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len().min(COVERS_MAX_CHARS));
+/// The single character a label may carry from outside printable ASCII: the
+/// elision mark the bound below and `Match::coverage`'s token elider both emit.
+/// Permitting it is what lets an already-bounded label pass the filter unchanged.
+pub const LABEL_ELLIPSIS: char = '\u{2026}';
+
+/// What one run of rejected characters becomes. A visible ASCII marker, never a
+/// silent drop: a label that had something in it must not read as though it never
+/// did, and the human comparing the caption against their own rule should see
+/// that the daemon would not render part of it.
+pub const LABEL_REJECTED: char = '?';
+
+/// Sanitize a display label for a consent surface, bounded to `max_chars`
+/// characters (elided with a single-character ellipsis, not three dots, so the
+/// bound is exact).
+///
+/// **An allowlist, deliberately, not a list of known-bad characters.** A label
+/// may contain printable ASCII (`U+0021`..=`U+007E`), runs of whitespace
+/// collapsed to one space, and [`LABEL_ELLIPSIS`]. Everything else becomes one
+/// [`LABEL_REJECTED`] per run.
+///
+/// The blocklist this replaces filtered `char::is_control` (general category
+/// `Cc`) and `char::is_whitespace`, which let two families through onto the
+/// phone's consent caption, where the label shares a sentence with the fixed
+/// clause stating how wide the window is:
+///
+/// * **Category `Cf`.** An unterminated `U+202E RIGHT-TO-LEFT OVERRIDE` inside a
+///   rule's flag value reorders the caption, including the half that states the
+///   breadth. Zero-width characters (`U+200B`, `U+2060`, the `U+E0020` tag block)
+///   hide text or split a word invisibly.
+/// * **Combining marks (`Mn`/`Me`).** A pile of them on one base character
+///   obscures the line it lands on while counting as one character each against
+///   any length bound.
+///
+/// An allowlist closes both, and closes what a `Cc`/`Cf`/`Mn` blocklist would
+/// still miss: characters that are neither control nor mark yet render as
+/// nothing (`U+3164 HANGUL FILLER` is a letter, `U+2800 BRAILLE PATTERN BLANK`
+/// is a symbol), plus whatever a future Unicode revision adds. Unknown input is
+/// rejected rather than passed, which is the direction a consent surface has to
+/// fail in.
+///
+/// The cost, stated plainly: a legitimately non-ASCII rule token (a 1Password
+/// vault named `Ingénierie`) renders as `Ing?nierie` here. That is accepted. This
+/// string is a statement of BREADTH on a consent surface, not a faithful echo of
+/// config; `sigil-config list` shows the rule verbatim, and it is the only place
+/// that claims to.
+pub fn sanitize_label(raw: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out = String::with_capacity(raw.len().min(max_chars));
     let mut pending_space = false;
+    let mut prev_rejected = false;
     for ch in raw.chars() {
         if ch.is_control() || ch.is_whitespace() {
             pending_space = !out.is_empty();
+            continue;
+        }
+        let permitted = ch.is_ascii_graphic() || ch == LABEL_ELLIPSIS;
+        // A run of rejected characters collapses to one marker, the same way a
+        // run of whitespace collapses to one space: forty combining marks are one
+        // piece of information ("something here would not render"), and repeating
+        // the marker forty times would itself deform the line.
+        if !permitted && prev_rejected && !pending_space {
             continue;
         }
         if pending_space {
             out.push(' ');
             pending_space = false;
         }
-        out.push(ch);
+        out.push(if permitted { ch } else { LABEL_REJECTED });
+        prev_rejected = !permitted;
     }
-    if out.chars().count() > COVERS_MAX_CHARS {
+    if out.chars().count() > max_chars {
         out = out
             .chars()
-            .take(COVERS_MAX_CHARS.saturating_sub(1))
+            .take(max_chars.saturating_sub(1))
             .collect::<String>()
             .trim_end()
             .to_string();
-        out.push('\u{2026}');
+        out.push(LABEL_ELLIPSIS);
     }
     out
+}
+
+/// [`sanitize_label`] at the coverage label's own bound. The single choke point
+/// every coverage label passes through: [`LeasePolicy::with_covers`] is the only
+/// constructor that sets one, and the daemon's `Config::resolve` is the only
+/// caller of that.
+fn sanitize_covers(raw: &str) -> String {
+    sanitize_label(raw, COVERS_MAX_CHARS)
 }
 
 impl LeasePolicy {
@@ -861,7 +923,9 @@ mod tests {
         assert!(long.covers().ends_with('\u{2026}'));
 
         // Multi-byte characters are truncated on a char boundary, not a byte one.
-        let wide = LeasePolicy::leasable(60).with_covers("\u{e9}".repeat(500));
+        // The ellipsis is the one non-ASCII character the allowlist admits, so it
+        // is what proves the truncation is counted and cut in characters.
+        let wide = LeasePolicy::leasable(60).with_covers("\u{2026}".repeat(500));
         assert_eq!(wide.covers().chars().count(), COVERS_MAX_CHARS);
 
         // A label exactly at the bound is left alone.
@@ -870,6 +934,93 @@ mod tests {
             LeasePolicy::leasable(60).with_covers(&exact).covers(),
             exact
         );
+    }
+
+    /// R4-F4, the reviewer's own vectors. The choke point used to filter general
+    /// category `Cc` plus whitespace, so bidi controls, zero-width characters and
+    /// combining marks reached the phone's consent caption, where the label and
+    /// the fixed clause stating how wide the window is share one sentence.
+    #[test]
+    fn covers_cannot_carry_a_character_that_reorders_or_hides_the_caption() {
+        // The caption the label rides in. If the label cannot introduce a
+        // direction override, a zero-width character or a combining mark, the
+        // rendered sentence cannot be reordered or obscured either.
+        let caption = |p: &LeasePolicy| {
+            format!(
+                "Covers {}: every command and secret that rule matches, from anywhere on this Mac.",
+                p.covers()
+            )
+        };
+
+        // Vector 1: RIGHT-TO-LEFT OVERRIDE and ZERO WIDTH SPACE inside a rule's
+        // flag value. Both are category Cf, which `char::is_control` does not
+        // report, and the RLO is unterminated: it reordered everything after it.
+        let rlo = LeasePolicy::leasable(900)
+            .with_covers("op with --account \"\u{202e}terces-on\u{200b}\"");
+        assert_eq!(rlo.covers(), "op with --account \"?terces-on?\"");
+
+        // Vector 2: forty combining acute accents, which survived the old filter
+        // whole and sat under the bound.
+        let marks =
+            LeasePolicy::leasable(900).with_covers(format!("op read{}", "\u{301}".repeat(40)));
+        assert_eq!(marks.covers(), "op read?");
+
+        // Nothing that can move text direction, join or split a word invisibly,
+        // or stack on a neighbour survives, on either vector or in the sentence
+        // they render into.
+        for p in [&rlo, &marks] {
+            let rendered = caption(p);
+            for ch in rendered.chars() {
+                assert!(
+                    ch.is_ascii_graphic() || ch == ' ' || ch == LABEL_ELLIPSIS,
+                    "{ch:?} reached the consent caption: {rendered}"
+                );
+            }
+        }
+
+        // The rest of the families an allowlist closes and a Cc/Cf/Mn blocklist
+        // would not: characters that are neither control nor mark and still
+        // render as nothing, and the tag block used to smuggle whole sentences.
+        let invisible = LeasePolicy::leasable(900).with_covers(
+            "op\u{3164}read\u{2800}\u{e0041}\u{e0042}", // HANGUL FILLER, BRAILLE BLANK, tags
+        );
+        assert_eq!(invisible.covers(), "op?read?");
+
+        // A run collapses to one marker, so a rejected pile cannot spend the
+        // whole bound either.
+        let pile = LeasePolicy::leasable(900).with_covers("\u{202e}".repeat(500));
+        assert_eq!(pile.covers(), "?");
+
+        // Ordinary labels are untouched, including the quoting and the elision
+        // mark `Match::coverage` emits.
+        for plain in [
+            "op read",
+            "op with --account \"rowmhq.1password.eu\"",
+            "op with --vault \"Shared Eng\" and --account \"a\u{2026}\"",
+            "op containing \"prod\", matching a pattern",
+        ] {
+            assert_eq!(
+                LeasePolicy::leasable(900).with_covers(plain).covers(),
+                plain
+            );
+        }
+    }
+
+    /// The exported filter is what the CLI re-runs at its own render boundary
+    /// (R4-F6), so it has to hold at any bound, not just the coverage one.
+    #[test]
+    fn sanitize_label_holds_its_bound_at_any_width() {
+        assert_eq!(sanitize_label("", 40), "");
+        assert_eq!(sanitize_label("anything", 0), "");
+        assert_eq!(sanitize_label("  op   read  ", 40), "op read");
+        // Bounded exactly, in characters, with the elision mark inside the bound.
+        let cut = sanitize_label(&"z".repeat(99), 10);
+        assert_eq!(cut.chars().count(), 10);
+        assert!(cut.ends_with(LABEL_ELLIPSIS));
+        // A trailing space is trimmed before the mark, never elided into "x …".
+        assert_eq!(sanitize_label("abcde fghij", 7), "abcde\u{2026}");
+        // Control bytes never reach a terminal through it.
+        assert_eq!(sanitize_label("a\u{1b}[31mb\u{7}", 40), "a [31mb");
     }
 
     #[test]

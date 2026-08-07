@@ -91,8 +91,8 @@ int sigil_audit_satisfies_requirement(const void *token, size_t token_len,
 //
 // Keyed on the live pid, never on a path. SecCodeCopyGuestWithAttributes with
 // kSecGuestAttributePid resolves the pid to the code object the kernel is
-// actually running, and SecCodeCheckValidityWithErrors then asks the platform
-// whether that image is still intact. That check is the load-bearing part:
+// actually running, and SecCodeCheckValidityWithErrors asks the platform whether
+// that image is still intact. That check is the load-bearing part:
 // kSecCodeInfoUnique is returned WITHOUT any validity check, so on its own a
 // cdhash is only whatever the CodeDirectory claims. Measured on this platform:
 // replace the file at a running process's path (in place or by rename) and the
@@ -158,23 +158,44 @@ int sigil_guest_measure(int pid, unsigned char *out, size_t out_len, char *path_
         return -2;
     }
 
-    // The whole point of the dynamic path: does the platform still vouch for the
-    // image this pid is running? A post-exec swap of the file answers -67034 here
-    // and answers the substituted binary's cdhash below, so this must gate.
-    st = SecCodeCheckValidityWithErrors(code, kSecCSDefaultFlags, NULL, NULL);
-    if (st != errSecSuccess) {
-        CFRelease(code);
-        return -5;
-    }
-
+    // Two operations here touch the file on disk: reading the signing information
+    // and asking whether the platform still vouches for the image. Read FIRST,
+    // validate SECOND, and use nothing from the read until the check has passed.
+    //
+    // The ordering is the only defence available at this layer, and it is worth
+    // stating why this way round. Validate-then-read, which this did until
+    // R4-F2, loses to ONE well-timed swap: the check passes against the honest
+    // file, the attacker replaces it, and the read hands back the substituted
+    // binary's cdhash, which the caller goes on to trust. Read-then-validate
+    // turns that same swap into a refusal, because whatever the read produced
+    // must still be the image the kernel executed when the check runs a moment
+    // later. That is a narrowing, not a proof: an attacker who could swap the
+    // file and swap it back, straddling both calls, is racing a window this code
+    // cannot close from userspace. The containing answer is the kernel's own
+    // csops(pid, CS_OPS_CDHASH), which touches no file; it is SPI, so it is not
+    // taken here, and the remaining window is recorded as a residual rather than
+    // claimed closed. Not exploitable as things stand either way: an attacker who
+    // can write an ancestor's binary can simply exec it honestly and skip the
+    // race (see the reconstructible-chain residual in lease.rs).
     CFDictionaryRef info = NULL;
     st = SecCodeCopySigningInformation((SecStaticCodeRef)code, kSecCSDefaultFlags, &info);
-    CFRelease(code);
     if (st != errSecSuccess || info == NULL) {
         if (info != NULL) {
             CFRelease(info);
         }
+        CFRelease(code);
         return -3;
+    }
+
+    // Does the platform still vouch for the image this pid is running? A
+    // post-exec swap of the file answers -67034 here while the read above answers
+    // the substituted binary's cdhash, so this must gate: everything below is
+    // reached only once this has succeeded.
+    st = SecCodeCheckValidityWithErrors(code, kSecCSDefaultFlags, NULL, NULL);
+    CFRelease(code);
+    if (st != errSecSuccess) {
+        CFRelease(info);
+        return -5;
     }
 
     // The path comes off the SAME guest object as the measurement, so the two can

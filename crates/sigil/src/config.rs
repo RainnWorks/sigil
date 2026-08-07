@@ -258,8 +258,10 @@ impl Match {
     ///
     ///   This is LEGIBILITY, not injection defence. The label is rendered
     ///   daemon-side from structured config fields, [`token`] bounds each atom,
-    ///   [`LeasePolicy::with_covers`](sigil_proto::LeasePolicy) strips control
-    ///   characters, and [`Config::resolve`] re-derives the label on every match
+    ///   [`LeasePolicy::with_covers`](sigil_proto::LeasePolicy) reduces the whole
+    ///   label to an allowlist of printable ASCII (so nothing in it can reorder,
+    ///   hide or stack on the caption it rides in), and [`Config::resolve`]
+    ///   re-derives the label on every match
     ///   so a hand-edited `covers` on disk is ignored. Nothing remote reaches it.
     ///   The reason to quote is that Tom's own legitimate config produces bad
     ///   sentences without it.
@@ -339,17 +341,26 @@ pub const COVERS_MAX_ATOMS: usize = 3;
 /// may run inside a coverage label before it is elided.
 pub const COVERS_TOKEN_MAX: usize = 28;
 
-/// One user-authored token, bounded for display. Whitespace and control
-/// characters are normalized by `LeasePolicy::with_covers` on the way out; this
-/// only stops one long value from consuming the whole label.
+/// One user-authored token, bounded for display. Whitespace and characters a
+/// consent surface will not render are normalized by `LeasePolicy::with_covers`
+/// on the way out; this only stops one long value from consuming the whole label.
 fn token(raw: &str) -> String {
-    if raw.chars().count() <= COVERS_TOKEN_MAX {
+    elide(raw, COVERS_TOKEN_MAX)
+}
+
+/// `raw` cut to at most `max` characters, the last of them the elision mark.
+/// Counted in characters, like every other bound on this label, so a multi-byte
+/// token is cut where a reader would cut it.
+fn elide(raw: &str, max: usize) -> String {
+    if raw.chars().count() <= max {
         return raw.to_string();
     }
     let mut s: String = raw
         .chars()
-        .take(COVERS_TOKEN_MAX.saturating_sub(1))
-        .collect();
+        .take(max.saturating_sub(1))
+        .collect::<String>()
+        .trim_end()
+        .to_string();
     s.push('\u{2026}');
     s
 }
@@ -364,12 +375,28 @@ fn join_and(parts: &[String]) -> String {
 }
 
 /// The honest summary form: how wide, plus how many conditions narrow it.
+///
+/// The count clause is the whole reason this form exists, so it is what survives
+/// the bound: the HEAD is elided to whatever
+/// [`sigil_proto::COVERS_MAX_CHARS`] leaves after the clause, never the other way
+/// round. Rendering the fallback and letting `with_covers` cut the tail off
+/// produced `op … sss… with 4 match…`, which states neither the breadth nor the
+/// count (R4-F5): a long `command` plus a long `subcommand` plus more than
+/// [`COVERS_MAX_ATOMS`] conditions reaches 81 characters unaided.
 fn summarize(head: &str, atoms: usize) -> String {
-    if atoms == 1 {
-        format!("{head} with 1 match condition")
+    let tail = if atoms == 1 {
+        " with 1 match condition".to_string()
     } else {
-        format!("{head} with {atoms} match conditions")
+        format!(" with {atoms} match conditions")
+    };
+    let budget = sigil_proto::COVERS_MAX_CHARS.saturating_sub(tail.chars().count());
+    // A count so long it leaves the head no room at all is not reachable from a
+    // config (atoms counts match conditions), but the clause still wins: a label
+    // that says only how many conditions there are is degraded, not dishonest.
+    if budget == 0 {
+        return tail.trim_start().to_string();
     }
+    format!("{}{tail}", elide(head, budget))
 }
 
 /// Whether `--flag` appears in `argv`, as a bare `--flag` or a `--flag=value`.
@@ -1190,6 +1217,37 @@ mod tests {
             "got {}",
             single.coverage()
         );
+
+        // R4-F5, the shape the three above never reached: a long command AND a
+        // long subcommand AND more than COVERS_MAX_ATOMS conditions. The head is
+        // then two elided tokens plus a space (57 characters) and the count
+        // clause adds 24, so the summary used to hand `with_covers` 81 characters
+        // and get the count clause itself cut ("... with 4 match…"). The count is
+        // the whole point of this form, so the head yields to it instead.
+        let both_long = Match {
+            command: Some("c".repeat(60)),
+            subcommand: Some("s".repeat(60)),
+            flag_present: vec!["--a".into(), "--b".into()],
+            argv_contains: vec!["x".into(), "y".into()],
+            ..Match::default()
+        };
+        let summary = both_long.coverage();
+        assert!(
+            summary.ends_with("with 4 match conditions"),
+            "the count clause must survive the bound intact: {summary}"
+        );
+        assert!(
+            summary.chars().count() <= sigil_proto::COVERS_MAX_CHARS,
+            "{} chars: {summary}",
+            summary.chars().count()
+        );
+        // And it is still true after the choke point, which is what the phone,
+        // the Mac and `sigil lease list` actually render.
+        let stamped_both = LeasePolicy::leasable(60).with_covers(&summary);
+        assert_eq!(stamped_both.covers(), summary);
+        assert!(stamped_both.covers().ends_with("with 4 match conditions"));
+        // The breadth is still stated first: the head is elided, never dropped.
+        assert!(stamped_both.covers().starts_with("cccc"));
     }
 
     #[test]

@@ -112,7 +112,8 @@ pub enum GuestFailure {
     NoLiveImage,
     /// The pid resolves, but the platform will not vouch for the image: the file
     /// at its path changed after it started (`-67034 errSecCSStaticCodeChanged`),
-    /// or the signature is not one it will validate.
+    /// or it is unsigned (`errSecCSUnsigned`), or the signature is not one it
+    /// will validate.
     ImageNotVouched,
     /// The image validated but reports no cdhash, or the code-identity machinery
     /// failed or is absent (every non-macOS build).
@@ -121,10 +122,20 @@ pub enum GuestFailure {
 
 impl GuestFailure {
     /// One clause, for a log line or a `sigil doctor` row. Never a status code.
+    ///
+    /// [`ImageNotVouched`](Self::ImageNotVouched) names the whole of what `-5`
+    /// covers rather than only its commonest cause (R4-F3), and ends in a
+    /// catch-all rather than a closed list, because `-5` is a catch-all. Reading
+    /// it as "the executable changed" alone told a human something false on any
+    /// build whose binaries are not validly signed, where an unsigned image
+    /// answers `errSecCSUnsigned` and EVERY process lands here: they would go
+    /// looking for a swap that never happened while the cause was the build.
     pub fn explain(self) -> &'static str {
         match self {
             GuestFailure::NoLiveImage => "its executable is gone or it has exited",
-            GuestFailure::ImageNotVouched => "its executable changed after it started",
+            GuestFailure::ImageNotVouched => {
+                "its executable is unsigned, was changed after it started, or was otherwise refused"
+            }
             GuestFailure::NoIdentity => "the platform reports no code identity for it",
         }
     }

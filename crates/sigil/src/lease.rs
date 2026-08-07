@@ -66,8 +66,22 @@
 //! * The dominant residual is untouched by any of this: an attacker who can run
 //!   a process as this user does not need to imitate an ancestor, because they
 //!   can spawn UNDER the honest ones and run the genuine gated command, and the
-//!   chain then matches by construction. The measure's value is telling honest
-//!   tool trees apart.
+//!   chain then matches by construction.
+//!
+//! State the last one at its full strength, because a weaker version of it has
+//! been written here before. **A chain of measured ancestors is
+//! RECONSTRUCTIBLE, not just joinable.** [`grant_key`] binds each ancestor's
+//! executable path, measure tag and digest, plus the chain length and the rule
+//! name, and NOTHING instance-specific whenever every ancestor measures. So an
+//! attacker who can run code as this user need not touch the victim's processes
+//! at all: they can exec the same binaries from the same paths in the same
+//! nesting and derive the identical key, and `ps` discloses the tree to imitate.
+//! Closing that would need a per-session secret the ancestors cannot both hold
+//! and be measured by, so it is not closed. The measure's value is telling
+//! HONEST tool trees apart, which is what it is for; it is not a fence against a
+//! deliberate imitator, and no text here or on a consent surface may imply it is.
+//! (The one measure an attacker cannot reconstruct is the unmeasured branch
+//! below, which keys to a live process instance.)
 //!
 //! # When the platform will not describe an ancestor
 //!
@@ -102,8 +116,8 @@
 //!   the daemon could not put a single process behind gets no window at all
 //!   ([`Caller::may_lease`]), because every such caller would share one key.
 //! * **It is never silent.** The daemon logs each unmeasurable ancestor once per
-//!   process instance, naming it and why, and `sigil doctor` carries a row for
-//!   as long as any are outstanding ([`unmeasured_notes`]).
+//!   executable and reason, naming it and why, and `sigil doctor` carries a row
+//!   for as long as any are outstanding ([`unmeasured_notes`]).
 //!
 //! Honest limit on the chain: every gated command reaches the daemon through a
 //! `~/.sigil/bin` symlink to the ONE `sigil` binary, and macOS `proc_pidpath`
@@ -434,6 +448,14 @@ impl ScopeKind {
 /// the same byte string. Each ancestor contributes its path, the tag naming HOW
 /// its identity was measured ([`IdentityMeasure`]), and the digest, so two
 /// measures can never derive one key even if their 32 bytes coincided.
+///
+/// Read "a different tool chain derives a different key" as the honest-tree
+/// statement it is, never as unforgeability. Every input above is a property of
+/// code on disk plus the shape of the tree, all of it readable with `ps`, so a
+/// chain in which every ancestor MEASURES can be reconstructed from scratch by
+/// anyone able to exec those same binaries from those same paths. The unmeasured
+/// branch is the only one that binds something an outsider cannot restage (a
+/// live process instance). See the module docs.
 pub fn grant_key(caller: &Caller, kind: ScopeKind, project_root: &str, scope: &str) -> [u8; 32] {
     let mut h = Blake2b256::new();
     h.update(GRANT_DOMAIN);
@@ -819,18 +841,33 @@ fn still_running(_note: &UnmeasuredNote) -> bool {
     false
 }
 
-/// Record an unmeasurable ancestor and log it ONCE per process instance.
+/// Record an unmeasurable ancestor and log it ONCE per executable and reason.
 ///
 /// Once, not once per command: a gated command walks the same chain every time,
-/// and an ancestor that will not measure now will not measure for the rest of
-/// its life, so per-command logging would bury the daemon log in a repetition
-/// that says nothing new. The dedup key is the process instance (pid plus start
-/// time) and its path, so a genuinely new occurrence still speaks up.
+/// and an ancestor that will not measure now will not measure for the rest of its
+/// life, so per-command logging would bury the daemon log in a repetition that
+/// says nothing new.
+///
+/// The dedup key is the PATH plus the reason, not the process instance, which is
+/// R4-F3. An instance key is right for a long-lived ancestor and degenerate for
+/// the leaf: the shim is a fresh process per gated command, so a build whose shim
+/// will not measure (an unsigned x86_64 one, where every process answers `-5`)
+/// used to emit a line and consume a registry slot per command, and the 64-slot
+/// cap then evicted the long-lived note `sigil doctor` exists to surface. Keyed
+/// by path, that whole class collapses to one entry and one line, and the entry
+/// is REFRESHED to the newest instance so the row keeps naming a process that is
+/// actually running. Nothing is lost: the actionable content of the line is the
+/// path and the reason, and the pid is only there to find it with.
 fn note_unmeasured(note: UnmeasuredNote) {
     let mut notes = unmeasured_registry()
         .lock()
         .expect("unmeasured registry poisoned");
-    if notes.contains(&note) {
+    if let Some(seen) = notes
+        .iter_mut()
+        .find(|n| n.exe == note.exe && n.reason == note.reason)
+    {
+        // Same problem, newer process: keep the row current and stay quiet.
+        *seen = note;
         return;
     }
     let ts = std::time::SystemTime::now()
@@ -845,9 +882,21 @@ fn note_unmeasured(note: UnmeasuredNote) {
         note.reason.explain(),
     );
     if notes.len() >= UNMEASURED_NOTES_MAX {
-        notes.remove(0);
+        let doomed = doomed_index(&notes, still_running);
+        notes.remove(doomed);
     }
     notes.push(note);
+}
+
+/// Which note the registry drops when it is full: the first whose process is
+/// over, and only if every note is still live, the oldest.
+///
+/// Eviction order matters because the registry's whole job is answering "what is
+/// the human in RIGHT NOW" (`sigil doctor` reads only the live notes). A note
+/// about a process that has exited is history and costs nothing to drop; dropping
+/// a live one loses the row that was going to explain why approvals came back.
+fn doomed_index(notes: &[UnmeasuredNote], live: impl Fn(&UnmeasuredNote) -> bool) -> usize {
+    notes.iter().position(|n| !live(n)).unwrap_or_default()
 }
 
 /// The kernel's BSD info for `pid`: parent, start time, and the rest.
@@ -1114,6 +1163,11 @@ mod tests {
     fn different_caller_chains_do_not_share_a_rule_lease() {
         // Same rule, different tool tree: the lease must not carry across. This
         // is the whole security boundary now that argv and cwd are out of the key.
+        //
+        // What it proves is separation between HONEST trees, and only that. It is
+        // not a claim that a tree cannot be imitated: every input to the key is
+        // reconstructible by anyone who can exec the same binaries from the same
+        // paths in the same nesting (see the module docs, R4-F1).
         let mine = walk_ancestry(&tree(), 300);
         let mut other = tree();
         other.node(300, 200, "/opt/homebrew/bin/op", 3);
@@ -1524,6 +1578,76 @@ mod tests {
             "a recycled pid must not keep its predecessor's note alive"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R4-F3. The leaf of every chain is a fresh shim process per gated command,
+    /// so a build whose shim will not measure hits this once per command. Keyed
+    /// by process instance that was one log line and one registry slot each, and
+    /// the cap then evicted the long-lived note the report exists to carry.
+    #[test]
+    fn a_repeating_unmeasurable_executable_collapses_to_one_note() {
+        // A path no other test uses: the registry is process-wide.
+        let exe = PathBuf::from("/nonexistent/sigil-r4f3/shim");
+        for pid in 9_000..9_064 {
+            note_unmeasured(UnmeasuredNote {
+                pid,
+                started: ProcessStart {
+                    sec: 1_770_000_000 + u64::try_from(pid).unwrap_or(0),
+                    usec: 1,
+                },
+                exe: exe.clone(),
+                reason: crate::peercode::GuestFailure::ImageNotVouched,
+            });
+        }
+        let mine: Vec<UnmeasuredNote> = unmeasured_notes()
+            .into_iter()
+            .filter(|n| n.exe == exe)
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "64 runs of one unmeasurable executable must be one note, not 64"
+        );
+        // And the surviving note names the process that is running NOW, so the
+        // doctor row is about a live problem rather than a dead first sighting.
+        assert_eq!(mine[0].pid, 9_063);
+
+        // A second reason for the same path is a different problem and does speak
+        // up: the dedup is per path AND reason, not per path.
+        note_unmeasured(UnmeasuredNote {
+            pid: 9_100,
+            started: ProcessStart {
+                sec: 1_770_000_001,
+                usec: 2,
+            },
+            exe: exe.clone(),
+            reason: crate::peercode::GuestFailure::NoLiveImage,
+        });
+        assert_eq!(
+            unmeasured_notes().iter().filter(|n| n.exe == exe).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_full_registry_evicts_a_finished_process_before_a_live_one() {
+        let note = |pid| UnmeasuredNote {
+            pid,
+            started: ProcessStart {
+                sec: 1_770_000_000,
+                usec: 0,
+            },
+            exe: PathBuf::from(format!("/opt/tools/t{pid}")),
+            reason: crate::peercode::GuestFailure::NoIdentity,
+        };
+        let notes: Vec<UnmeasuredNote> = (1..=4).map(note).collect();
+
+        // The oldest is still running and the third has exited: the third goes,
+        // so the report keeps the state the human is actually in.
+        assert_eq!(doomed_index(&notes, |n| n.pid != 3), 2);
+        // Every note live: the cap still has to give, and it gives up the oldest.
+        assert_eq!(doomed_index(&notes, |_| true), 0);
+        assert_eq!(doomed_index(&[], |_| true), 0);
     }
 
     #[cfg(target_os = "macos")]

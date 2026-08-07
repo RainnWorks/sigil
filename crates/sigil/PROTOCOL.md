@@ -140,8 +140,13 @@ and `sigil lease list`. No renderer derives its own description of the breadth.
   (substring), plain `op` when nothing beyond the command is constrained. The
   label never implies a rule is narrower than it is: a command-only rule renders
   the bare command.
-- **Bound.** At most `sigil_proto::COVERS_MAX_CHARS` (72) characters, control
-  characters stripped and whitespace collapsed by `LeasePolicy::with_covers`.
+- **Bound.** At most `sigil_proto::COVERS_MAX_CHARS` (72) characters, reduced by
+  `LeasePolicy::with_covers` to an allowlist: printable ASCII, whitespace runs
+  collapsed to one space, and `…`. Every other character (bidi controls,
+  zero-width and other format characters, combining marks, and anything else that
+  renders as nothing) becomes one `?` per run, so a label cannot reorder, hide
+  inside, or stack on the caption it is rendered into. Renderers mirror this
+  filter rather than trusting it.
   A rule with more than three conditions, or one whose list would exceed the
   bound, degrades to an honest count (`op read with 5 match conditions`) rather
   than a truncated list that would read as if the dropped conditions did not

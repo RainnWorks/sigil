@@ -780,13 +780,26 @@ impl LeaseCols {
             |f: &dyn Fn(&json::LeaseJson) -> usize| leases.iter().map(f).max().unwrap_or(0);
         // Characters, not bytes, and for the same reason `pad` counts characters:
         // the two must agree or the padding a column asks for is not the padding
-        // it gets.
+        // it gets. Measured on the FILTERED cell, never the raw field, for the
+        // same reason: `lease_row` draws the filtered one, and a column measured
+        // against text that is not what gets drawn is a column out of alignment.
         Self {
-            account: widest(&|l| l.account.chars().count()),
-            scope: widest(&|l| l.scope.chars().count()).min(LEASE_SCOPE_MAX),
+            account: widest(&|l| cell(&l.account).chars().count()),
+            scope: widest(&|l| cell(&l.scope).chars().count()).min(LEASE_SCOPE_MAX),
             left: widest(&|l| countdown(l, now).chars().count()),
         }
     }
+}
+
+/// One free-text cell of a lease row, filtered and bounded for a terminal.
+///
+/// The bound is the coverage label's own, which is generous for a rule name and
+/// an account: it is not a display preference, it is the ceiling that stops a
+/// single absurd value from flooding the line. Column WIDTH is decided
+/// separately, by [`LeaseCols`], which is why an over-long rule name still steps
+/// out of its column rather than being cut to fit it.
+fn cell(raw: &str) -> String {
+    sigil_proto::sanitize_label(raw, sigil_proto::COVERS_MAX_CHARS)
 }
 
 /// The countdown cell, as text, so its column can be measured before it is drawn.
@@ -810,25 +823,36 @@ fn countdown(l: &json::LeaseJson, now: u64) -> String {
 /// [`LEASE_BREADTH`], not repeated on every row.
 ///
 /// `Match::coverage` never returns empty and `Config::resolve` stamps a label on
-/// every lease policy, so the empty-label fallback below is unreachable from this
-/// daemon. It is kept as a defensive branch for a lease minted by a daemon older
-/// than the field: still true, never a guess at what the rule matches.
+/// every lease policy, so the EMPTY-label branch below is unreachable from this
+/// daemon. It is kept for a lease minted by a daemon older than the field: still
+/// true, never a guess at what the rule matches.
+///
+/// The free text is re-filtered here, at the render boundary, through the same
+/// [`sigil_proto::sanitize_label`] the coverage choke point uses (R4-F6). That is
+/// not distrust of this daemon's own label; it is that this row is the one
+/// surface where a control byte does real damage (an escape sequence on a
+/// terminal), and it is the surface with the widest inputs: the RULE NAME arrives
+/// here unfiltered by any other stage, and a lease can outlive the config that
+/// named it. Filtering costs a `?` in a non-ASCII rule name and buys a row that
+/// cannot repaint the screen. `Config::resolve` remains the only WRITER of a
+/// coverage label; this only decides how one is drawn.
 fn lease_row(s: Style, l: &json::LeaseJson, now: u64, cols: LeaseCols) -> String {
     let account = if cols.account == 0 {
         String::new()
     } else {
-        format!("{}  ", pad(&l.account, cols.account))
+        format!("{}  ", pad(&cell(&l.account), cols.account))
     };
-    let covers = if l.covers.is_empty() {
+    let drawn = cell(&l.covers);
+    let covers = if drawn.is_empty() {
         "any matching command"
     } else {
-        &l.covers
+        &drawn
     };
     format!(
         "  {}  {}{}  {}  {}",
         s.dim(&l.grant_hex[..12.min(l.grant_hex.len())]),
         account,
-        pad(&l.scope, cols.scope),
+        pad(&cell(&l.scope), cols.scope),
         // Right-aligned, alone among the columns: a countdown is a number, and
         // right-aligning it lines up both the digits and the "s left" unit as the
         // window drains from three digits to one.
@@ -4545,6 +4569,54 @@ mod tests {
         );
         assert!(!row.contains("any matching command"), "{row}");
         assert!(row.contains("120s left"), "{row}");
+    }
+
+    /// R4-F6: this row is the one lease surface that writes free text straight to
+    /// a terminal, and the rule name reaches it having passed no other filter.
+    #[test]
+    fn a_lease_row_cannot_repaint_the_terminal_or_reorder_itself() {
+        let s = Style::with_color(false);
+        // A rule name carrying an escape sequence and a direction override, and a
+        // coverage label from a daemon that did not filter one (the label is
+        // filtered at its choke point, but a lease outlives the daemon that
+        // minted it and this row must not depend on that).
+        let mut l = lease_json(
+            "op\u{1b}[2Kread\u{202e}",
+            "op with --account \"\u{202e}terces-on\u{200b}\"",
+        );
+        l.account = "Rowm\u{7}".into();
+        let one = [l.clone()];
+        let row = lease_row(s, &l, 1_000, LeaseCols::measure(&one, 1_000));
+
+        for ch in row.chars() {
+            assert!(
+                ch.is_ascii_graphic() || ch == ' ' || ch == '\u{b7}' || ch == '\u{2026}',
+                "{ch:?} reached the terminal: {row:?}"
+            );
+        }
+        assert!(row.contains("op [2Kread?"), "{row}");
+        assert!(
+            row.ends_with("\u{b7} op with --account \"?terces-on?\""),
+            "{row}"
+        );
+        assert!(row.contains("120s left"), "{row}");
+
+        // A pathological value is bounded rather than flooding the line, and a
+        // neighbouring row with nothing wrong with it renders exactly as it would
+        // have alone: the outlier steps out of its own column (LEASE_SCOPE_MAX)
+        // instead of taxing the list.
+        let mut huge = lease_json(&"n".repeat(4_000), &"c".repeat(4_000));
+        huge.account = "Rowm".into();
+        let mut plain = lease_json("op-read", "op read");
+        plain.account = "Rowm".into();
+        let rows = lease_rows(&[huge, plain.clone()], 1_000);
+        assert!(
+            rows[0].chars().count() <= 2 * sigil_proto::COVERS_MAX_CHARS + 64,
+            "an unbounded cell flooded the line: {}",
+            rows[0]
+        );
+        assert!(rows[1].ends_with("\u{b7} op read"), "{}", rows[1]);
+        assert!(rows[1].contains("  Rowm  op-read"), "{}", rows[1]);
     }
 
     /// Render a whole list the way `sigil lease list` does, with the columns
