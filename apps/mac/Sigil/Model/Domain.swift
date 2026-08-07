@@ -112,10 +112,40 @@ struct Lease: Identifiable, Equatable, Sendable {
     /// that rule matches for the caller chain that opened it, so every renderer
     /// has to show that breadth alongside the name.
     var scope: String
+    /// The daemon's coverage label for that rule ("op read", "op with --account
+    /// rowmhq.1password.eu"): the same words the approver consented to, so this
+    /// screen states the breadth exactly instead of gesturing at it. Nil when the
+    /// daemon sent none, and the row then falls back to the generic breadth
+    /// rather than guessing what the rule matches. Display only: nothing branches
+    /// on it, and it never defines the window (the daemon's binding does).
+    var covers: String? = nil
     var grantedAt: Date
     var expiresAt: Date
 
     func remaining(now: Date) -> TimeInterval { max(0, expiresAt.timeIntervalSince(now)) }
+
+    /// Layout hygiene for a coverage label off the wire, not interpretation. The
+    /// daemon already collapses whitespace, strips control characters and bounds
+    /// the length; this repeats the bound so a violated guarantee costs a clipped
+    /// label instead of a broken row. Mirrors the phone's `coverageLabel`. Blank
+    /// in, nil out: the caller then shows no label rather than an empty clause.
+    static func coverage(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let despaced = String(String.UnicodeScalarView(raw.unicodeScalars.map {
+            CharacterSet.controlCharacters.contains($0) ? " " : $0
+        }))
+        let flat = despaced
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if flat.isEmpty { return nil }
+        // Clipped by grapheme cluster so an elision can never split one. The
+        // daemon's own bound is the one that normally applies.
+        guard flat.count > coversMaxChars else { return flat }
+        return String(flat.prefix(coversMaxChars - 1)) + "\u{2026}"
+    }
+
+    /// The daemon's bound on a coverage label (sigil_proto::COVERS_MAX_CHARS).
+    static let coversMaxChars = 72
 }
 
 // MARK: - History (audit)

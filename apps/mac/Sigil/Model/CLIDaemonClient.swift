@@ -548,9 +548,13 @@ struct CheckDTO: Decodable { let label: String; let ok: Bool; let hint: String }
 
 struct LeaseDTO: Decodable {
     let grant_hex: String; let caller: String; let account: String; let scope: String
+    /// Optional on the wire: a daemon older than the coverage label omits the key
+    /// entirely, and the row then states the breadth generically.
+    let covers: String?
     let granted_ms: Int; let expires_ms: Int
     func model() -> Lease {
         Lease(grantHex: grant_hex, caller: caller, account: account, scope: scope,
+              covers: Lease.coverage(covers),
               grantedAt: Date(timeIntervalSince1970: Double(granted_ms) / 1000),
               expiresAt: Date(timeIntervalSince1970: Double(expires_ms) / 1000))
     }

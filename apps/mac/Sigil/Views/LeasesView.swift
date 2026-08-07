@@ -14,6 +14,12 @@ struct LeasesView: View {
                 if model.leases.isEmpty {
                     empty
                 } else {
+                    // Each row names its rule and, in the daemon's own words, what
+                    // that rule matches. Those words describe a rule, not a command
+                    // line, so the breadth is stated once for the whole list rather
+                    // than repeated on every row (as `sigil lease list` does).
+                    Text("Each lease covers any command its rule matches, run from anywhere on this Mac, until it expires.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
                     // One shared clock drives every countdown.
                     TimelineView(.periodic(from: .now, by: 1)) { context in
                         VStack(spacing: 10) {
@@ -71,11 +77,15 @@ private struct LeaseRow: View {
                 }
                 // `scope` is the matched rule's name, not a command line: the
                 // lease auto-approves anything that rule matches for this
-                // caller. Say the breadth out loud next to the name.
+                // caller. Next to the name sits the daemon's coverage label for
+                // that rule, the same words the approver consented to; without
+                // one (an older daemon) the generic breadth stands in.
                 HStack(spacing: 5) {
                     MonoText(lease.scope, size: 11, color: .secondary)
                     Text("·").font(.system(size: 11)).foregroundStyle(.tertiary)
-                    Text("any matching command").font(.system(size: 11)).foregroundStyle(.tertiary)
+                    Text(lease.covers ?? "any matching command")
+                        .font(.system(size: 11)).foregroundStyle(.tertiary)
+                        .lineLimit(1)
                 }
                 MonoText("grant \(lease.grantHex)  ·  \(clockRemaining(remaining)) left",
                          size: 10, color: Color(.tertiaryLabelColor))
