@@ -4282,24 +4282,42 @@ brief's two chain paragraphs. The brief also no longer says malware must be
 itself. No user-facing string claimed the stronger property, so none needed to
 change.
 
-**R4-F2, the two file-touching operations (narrowed, not closed).**
-`sigil_guest_measure` now reads the signing information FIRST and runs
-`SecCodeCheckValidityWithErrors` SECOND, using nothing from the read until the
-check passes. The old order lost to ONE well-timed swap: validity passes against
-the honest file, the attacker replaces it, and the cdhash read hands back the
-substituted binary's identity, which the daemon then trusts. Read-then-validate
-turns that same single swap into a refusal, because whatever the read produced
-must still be the image the kernel executed a moment later when the check runs.
-What remains: an attacker who can swap the file and swap it back, straddling both
-calls, is racing a window this code cannot close from userspace. The containing
-answer is the kernel's `csops(pid, CS_OPS_CDHASH)`, which touches no file and
-needs no validity call; it is SPI, so it is not taken, and this is recorded as a
-residual rather than claimed closed. Unchanged either way: this is not exploitable
-today, because an attacker who can write an ancestor's binary can exec it honestly
-and skip the race (R4-F1). All existing swap and rename-over tests still pass on
-the new ordering, including
+**R4-F2, the two file-touching operations (reordered; the security claim first
+written here was false and is corrected below).** `sigil_guest_measure` reads the
+signing information FIRST and runs `SecCodeCheckValidityWithErrors` SECOND, using
+nothing from the read until the check passes.
+
+~~The old order lost to ONE well-timed swap ... read-then-validate turns that same
+single swap into a refusal.~~ **Struck. Round 5 measured both orderings and both
+answer honestly** (evidence in the R4-F2 ruling of the round-5 section; recorded
+as R5-F3, and this entry is the second of the two places it names). One
+`SecCodeRef` pins ONE snapshot of its static code at the first file-touching use,
+and every later read and validity check on that object works from that snapshot,
+so whichever call touches the file first fixes the bytes and the other sees the
+same bytes. The two operations cannot disagree; there was no window between them
+to narrow, and the reorder is a security no-op. It is kept because it is harmless
+and puts both file-touching calls adjacent, not because it is safer.
+
+What is actually residual is the snapshot, not the ordering: memoization is
+undocumented Apple behaviour rather than a contract, and an OS that re-read the
+file per call would open exactly the window the struck text claimed was already
+closed - which no arrangement of these two calls would close. The containing
+answer depends on none of it, since the kernel's `csops(pid, CS_OPS_CDHASH)`
+touches no file at all and needs no validity call; it is SPI, so it is not taken,
+and the dependence is recorded as a residual rather than claimed closed.
+
+Unchanged, and both still true: this is not exploitable today, because an attacker
+who can write an ancestor's binary can exec it honestly and skip the question
+(R4-F1); and it is loud, because a measurement that lands on a decoy answers `-5`,
+drops that ancestor to `Unmeasured`, breaks the victim's leases, writes a daemon
+log line and raises a `sigil doctor` row (the R4-F3 machinery is the real defence
+here). All existing swap and rename-over tests pass on this ordering, including
 `swapping_the_file_under_a_running_process_does_not_change_what_it_measures_as`
 and `a_stamp_preserving_rewrite_is_never_served_the_old_identity`.
+
+The corresponding comment in `peercode.m` is rewritten to the same statement,
+including the measurement that contradicts the struck claim, so the file that
+implements the property does not assert a stronger one than it has.
 
 **R4-F3, note availability and observability (fixed).** `note_unmeasured` now
 dedups on the executable PATH plus the reason rather than on the process instance,

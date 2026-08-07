@@ -162,21 +162,44 @@ int sigil_guest_measure(int pid, unsigned char *out, size_t out_len, char *path_
     // and asking whether the platform still vouches for the image. Read FIRST,
     // validate SECOND, and use nothing from the read until the check has passed.
     //
-    // The ordering is the only defence available at this layer, and it is worth
-    // stating why this way round. Validate-then-read, which this did until
-    // R4-F2, loses to ONE well-timed swap: the check passes against the honest
-    // file, the attacker replaces it, and the read hands back the substituted
-    // binary's cdhash, which the caller goes on to trust. Read-then-validate
-    // turns that same swap into a refusal, because whatever the read produced
-    // must still be the image the kernel executed when the check runs a moment
-    // later. That is a narrowing, not a proof: an attacker who could swap the
-    // file and swap it back, straddling both calls, is racing a window this code
-    // cannot close from userspace. The containing answer is the kernel's own
-    // csops(pid, CS_OPS_CDHASH), which touches no file; it is SPI, so it is not
-    // taken here, and the remaining window is recorded as a residual rather than
-    // claimed closed. Not exploitable as things stand either way: an attacker who
-    // can write an ancestor's binary can simply exec it honestly and skip the
-    // race (see the reconstructible-chain residual in lease.rs).
+    // What that order buys, at measured strength. This comment used to claim the
+    // ordering was the defence -- that validate-then-read "loses to ONE well-timed
+    // swap" and read-then-validate "turns that same swap into a refusal". That is
+    // FALSE, and measurement is what says so (R4-F2 as filed, corrected by R5-F3).
+    // Both orderings answer honestly, for the same reason: one SecCodeRef pins ONE
+    // snapshot of its static code on the first file-touching use, and every later
+    // read and validity check on that same object works from that snapshot.
+    // Whichever call touches the file first fixes the bytes; the other sees the
+    // same bytes. The two operations cannot disagree, so there is no window
+    // between them to lose.
+    //
+    // Measured by the round-5 security review, not by the author of this comment;
+    // the raw sequence and both results are in docs/security-claims.md, and the
+    // claim they replace was written here without measurement, which is the whole
+    // lesson. Darwin 25.3, live ad-hoc signed process, decoy of a different
+    // cdhash, driving this exact call sequence: validate, swap in the decoy, then
+    // read returned the HONEST cdhash, byte-identical to a no-swap control. The
+    // mirror-image attack on the order used here (decoy pre-placed so the read
+    // sees it, honest file restored before the check) returned the decoy's cdhash
+    // and -67034 from the check, which is the refusal the gate below turns into
+    // -5. Read-first is kept because it is harmless and puts both file-touching
+    // calls adjacent, NOT because it is safer than the other way round.
+    //
+    // The residual is what R4-F2 originally said it was, and it is about the
+    // snapshot rather than the ordering: memoization here is undocumented Apple
+    // behaviour, not a contract. An OS that re-read the file per call would create
+    // exactly the window this comment used to claim was already closed, and no
+    // arrangement of these two calls would close it. The containing answer depends
+    // on none of it -- the kernel's own csops(pid, CS_OPS_CDHASH) touches no file
+    // at all -- but it is SPI, so it is not taken here and the dependence is
+    // recorded as a residual rather than claimed closed.
+    //
+    // Not exploitable as things stand either way: an attacker who can write an
+    // ancestor's binary can simply exec it honestly and skip the question (see the
+    // reconstructible-chain residual in lease.rs). It is also loud. Every
+    // measurement that lands on a decoy answers -5, which drops that ancestor to
+    // Unmeasured, breaks the victim's leases, writes a daemon log line and raises
+    // a `sigil doctor` row.
     CFDictionaryRef info = NULL;
     st = SecCodeCopySigningInformation((SecStaticCodeRef)code, kSecCSDefaultFlags, &info);
     if (st != errSecSuccess || info == NULL) {
@@ -187,10 +210,12 @@ int sigil_guest_measure(int pid, unsigned char *out, size_t out_len, char *path_
         return -3;
     }
 
-    // Does the platform still vouch for the image this pid is running? A
-    // post-exec swap of the file answers -67034 here while the read above answers
-    // the substituted binary's cdhash, so this must gate: everything below is
-    // reached only once this has succeeded.
+    // Does the platform still vouch for the image this pid is running? This
+    // gates: everything below is reached only once it has succeeded. Sharing one
+    // snapshot with the read above (see above) is what makes gating sufficient
+    // rather than merely prudent -- a run whose read landed on a substituted
+    // binary is exactly the run that fails here, so a cdhash can never be returned
+    // from an image the platform refused.
     st = SecCodeCheckValidityWithErrors(code, kSecCSDefaultFlags, NULL, NULL);
     CFRelease(code);
     if (st != errSecSuccess) {
