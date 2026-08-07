@@ -778,10 +778,13 @@ impl LeaseCols {
     fn measure(leases: &[json::LeaseJson], now: u64) -> Self {
         let widest =
             |f: &dyn Fn(&json::LeaseJson) -> usize| leases.iter().map(f).max().unwrap_or(0);
+        // Characters, not bytes, and for the same reason `pad` counts characters:
+        // the two must agree or the padding a column asks for is not the padding
+        // it gets.
         Self {
-            account: widest(&|l| l.account.len()),
-            scope: widest(&|l| l.scope.len()).min(LEASE_SCOPE_MAX),
-            left: widest(&|l| countdown(l, now).len()),
+            account: widest(&|l| l.account.chars().count()),
+            scope: widest(&|l| l.scope.chars().count()).min(LEASE_SCOPE_MAX),
+            left: widest(&|l| countdown(l, now).chars().count()),
         }
     }
 }
@@ -4216,13 +4219,21 @@ fn cmd_wipe(args: &[String], json: bool) -> i32 {
     0
 }
 
-/// Left-pad-to-width a plain (unstyled) label so columns line up. Styling is
+/// Pad a plain (unstyled) label out to `width` so columns line up. Styling is
 /// applied to the glyph separately, so widths here are real display widths.
+///
+/// Counted in CHARACTERS, not bytes: an account or rule name with any non-ASCII
+/// in it would otherwise be measured as wider than it draws and misalign the
+/// very table this exists to align. Characters are not true display width either
+/// (a CJK glyph draws two columns, a combining mark none), but closing that gap
+/// needs a unicode-width dependency, and these are command, flag, and account
+/// names. Whatever counts here must also count in [`LeaseCols::measure`].
 fn pad(s: &str, width: usize) -> String {
-    if s.len() >= width {
+    let len = s.chars().count();
+    if len >= width {
         s.to_string()
     } else {
-        format!("{s}{}", " ".repeat(width - s.len()))
+        format!("{s}{}", " ".repeat(width - len))
     }
 }
 
@@ -4561,9 +4572,18 @@ mod tests {
         );
         nearly_done.account = "Rowm".into();
         nearly_done.expires_ms = 10_000;
+        // A non-ASCII name is measured in characters, not the bytes it encodes
+        // to, or it claims more width than it draws and drags the row left.
+        let mut accented = lease_json("op-café", "op read");
+        accented.account = "Rowmé".into();
 
-        let rows = lease_rows(&[long_account, short_account, nearly_done], 1_000);
-        let at = |needle: &str, row: &str| row.find(needle).unwrap_or_else(|| panic!("{row}"));
+        let rows = lease_rows(&[long_account, short_account, nearly_done, accented], 1_000);
+        // Offsets in CHARACTERS: a byte offset would differ across these rows for
+        // reasons that have nothing to do with where the column is drawn.
+        let at = |needle: &str, row: &str| {
+            let byte = row.find(needle).unwrap_or_else(|| panic!("{row}"));
+            row[..byte].chars().count()
+        };
         let left: Vec<usize> = rows.iter().map(|r| at("s left", r)).collect();
         let label: Vec<usize> = rows.iter().map(|r| at("\u{b7}", r)).collect();
         assert!(
@@ -4582,6 +4602,27 @@ mod tests {
             LeaseCols::measure(&[lease_json("r", "c")], 1_000).account,
             0,
             "an account column with nothing in it must not be drawn"
+        );
+
+        // INTENDED, not a bug to be "fixed" by truncating: a rule name past
+        // LEASE_SCOPE_MAX steps out of its own column and pushes that row's
+        // countdown right, rather than every other row paying a gutter for one
+        // outlier. `pad` does not truncate, because a rule name is what
+        // `lease revoke` and the config are keyed on and half of one is worse
+        // than a long one.
+        let outlier = "op-".to_string() + &"x".repeat(LEASE_SCOPE_MAX);
+        let stepped = lease_rows(
+            &[
+                lease_json(&outlier, "op read"),
+                lease_json("op-read", "op read"),
+            ],
+            1_000,
+        );
+        assert!(stepped[0].contains(&outlier), "the rule name is never cut");
+        assert!(
+            at("s left", &stepped[0]) > at("s left", &stepped[1]),
+            "an over-long rule must step out of its column, not be truncated:\n{}",
+            stepped.join("\n")
         );
     }
 
