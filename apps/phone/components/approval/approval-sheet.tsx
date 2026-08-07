@@ -263,12 +263,18 @@ export function ApprovalSheet({
                     committing={inFlight === "window"}
                     onApprove={() => void handleApprove({ ttlMs: lease.maxSecs * 1000 })}
                   />
-                  {/* The breadth of the window, in the daemon's words. The label
-                      is set brighter than the sentence around it so the eye can
-                      see where the rule's description ends: several of its real
-                      shapes are phrases, not single words ("op with --account
-                      rowmhq.1password.eu", "any command with the subcommand
-                      read"), and a phrase dropped mid-sentence reads as prose.
+                  {/* The breadth of the window, in the daemon's words. "that
+                      rule" is load-bearing: it gives the pronoun an antecedent
+                      the label itself cannot be, and it stops the label reading
+                      as the thing that does the matching. Several of the real
+                      shapes are phrases rather than single words ("op with
+                      --account rowmhq.1password.eu", "any command with the
+                      subcommand read"), so the label carries a weight bump to
+                      mark where the rule's description ends; it does NOT carry a
+                      tone bump, because on a consent surface the brightest text
+                      must not be the half that makes the grant sound contained.
+                      "every command and secret" and "from anywhere on this Mac"
+                      are the dangerous halves and they read at caption tone.
                       When the daemon sent no label (one that predates the
                       field), the sentence still states both remaining axes and
                       simply cannot name the rule. It never guesses one. */}
@@ -276,10 +282,14 @@ export function ApprovalSheet({
                     {covers ? (
                       <>
                         Covers{" "}
-                        <Sans size={13} weight="medium" tone="label">
+                        {/* tone is restated, not omitted: Sans defaults to
+                            tone="label" and always writes a color, so leaving
+                            it off would brighten the label rather than inherit
+                            the caption's muted. */}
+                        <Sans size={13} weight="medium" tone="muted">
                           {covers}
                         </Sans>
-                        : every command and secret it matches, from anywhere on this Mac.
+                        : every command and secret that rule matches, from anywhere on this Mac.
                       </>
                     ) : (
                       "Covers every command and secret this rule matches, from anywhere on this Mac."

@@ -208,11 +208,15 @@
   .tapcap.primary { background: oklch(0.42 0.1 231); color: oklch(0.97 0.004 235); }
   .tapcap.secondary { margin-top: 12px; border: 1px solid oklch(0.5 0.12 231 / 0.6); color: oklch(0.72 0.09 235); }
   .leasecap { margin-top: 8px; font-size: 0.72rem; line-height: 1.35; color: var(--muted); }
-  /* the daemon's coverage label, set a step brighter so the eye sees where the
-     rule's description ends and the sentence resumes */
-  .leasecap b { color: var(--ink); font-weight: 500; }
+  /* the daemon's coverage label: weight only, so the eye sees where the rule's
+     description ends and the sentence resumes, without making the half that
+     bounds the grant the brightest text on a consent surface */
+  .leasecap b { font-weight: 500; }
   .denybtn { margin-top: 12px; text-align: center; padding: 13px; border-radius: 999px; border: 1px solid oklch(0.5 0.12 25 / 0.65); color: oklch(0.74 0.13 25); font-size: 0.95rem; }
   .mock-cap { font-size: 0.8rem; color: var(--muted); margin-top: 14px; max-width: 40ch; }
+  /* a caption quoted inside the prose must demonstrate the treatment the prose
+     is describing: the same weight step, the same absence of a color step */
+  .mock-cap b { font-weight: 500; }
 
   /* risk ladder */
   .ladder { margin: 18px 0; }
@@ -465,11 +469,11 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
       </div>
       <div class="risk">Leasable rule &middot; keep approved for up to 15 minutes, or approve once.</div>
       <div class="tapcap primary">Keep approved for 15 minutes</div>
-      <div class="leasecap">Covers <b>op read with --vault</b>: every command and secret it matches, from anywhere on this Mac.</div>
+      <div class="leasecap">Covers <b>op read with --vault</b>: every command and secret that rule matches, from anywhere on this Mac.</div>
       <div class="tapcap secondary">Approve once</div>
       <div class="denybtn">Deny</div>
     </div></div>
-    <p class="mock-cap">The approval sheet: the asking Mac in the header (the party, never the transport), brass gauge counting to expiry, the readout well leading with the reference label, provenance in mono, one tap to approve. A leasable rule leads with "Keep approved for N minutes" and captions it "Covers <b>op read with --vault</b>: every command and secret it matches, from anywhere on this Mac." so the full breadth of the window is stated where it is granted: the window is rule-wide, so it serves other secrets besides the one in the well, and it binds the caller chain's code identity rather than a process, session, or terminal. The bold clause is the daemon's own one-line rendering of the matched rule ("op", "op with --account rowmhq.1password.eu", "any command with the subcommand read"), sent inside the sealed request and shown verbatim, so the sheet states the true breadth instead of the phone guessing it from the command that happened to trip the rule. "Approve once" sits below as the narrower second choice, and a run-once rule shows only the single tap. The well renders provider-supplied display segments; the phone never parses what the reference means.</p>
+    <p class="mock-cap">The approval sheet: the asking Mac in the header (the party, never the transport), brass gauge counting to expiry, the readout well leading with the reference label, provenance in mono, one tap to approve. A leasable rule leads with "Keep approved for N minutes" and captions it "Covers <b>op read with --vault</b>: every command and secret that rule matches, from anywhere on this Mac." so the full breadth of the window is stated where it is granted: the window is rule-wide, so it serves other secrets besides the one in the well, and it binds the caller chain's code identity rather than a process, session, or terminal. The sentence names the rule rather than pointing at it, because the label is a description of a rule and not a command line, and a bare "it" would leave the label as the only antecedent and so read as if a command were what matched things. The heavier clause is the daemon's own one-line rendering of the matched rule ("op", "op with --account rowmhq.1password.eu", "any command with the subcommand read"), sent inside the sealed request and shown verbatim, so the sheet states the true breadth instead of the phone guessing it from the command that happened to trip the rule. It carries a weight step and no color step: it marks where the rule's description ends, but the words that state how wide the grant is ("every command and secret", "from anywhere on this Mac") must never read as quieter than the words that make it sound contained. "Approve once" sits below as the narrower second choice, and a run-once rule shows only the single tap. The well renders provider-supplied display segments; the phone never parses what the reference means.</p>
   </div>
   <div>
     <h3 style="margin-top:0">One tap; the rule sets what that tap may do</h3>
