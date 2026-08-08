@@ -302,25 +302,25 @@
   <div class="wrap">
     <div class="sec-head">
       <h2>One machine, different skins</h2>
-      <p>Nothing in the core is Apple-specific. The crypto, pairing ceremony, leases, relay, provider seam, and audit model run unchanged everywhere; each platform only supplies its own answer to five seams: keystore, biometric, push, service manager, and socket.</p>
+      <p>Nothing in the core is Apple-specific. The pairing ceremony, leases, relay, provider seam, and audit model run unchanged everywhere; each platform only supplies its own answer to five seams: keystore, biometric, push, service manager, and socket. One thing does not port yet, and it is the interesting one: the threshold share that opens a sealed value is a Secure Enclave key with no Android equivalent written, so Android is a gate-only approver.</p>
     </div>
     <div class="platforms">
       <div class="plat">
         <div class="role">approver</div>
         <div class="nm">iPhone</div>
-        <div class="ds">Expo app, SwiftUI primitives, Secure Enclave keys, Face ID.</div>
+        <div class="ds">Expo app, SwiftUI primitives, Face ID. The only Secure Enclave key in the product is here: the share that opens a sealed value.</div>
         <div class="st st-dev">in development</div>
       </div>
       <div class="plat">
         <div class="role">approver</div>
         <div class="nm">Android</div>
-        <div class="ds">Same Expo codebase, Jetpack Compose, StrongBox, BiometricPrompt.</div>
+        <div class="ds">Same Expo codebase, Jetpack Compose, BiometricPrompt. <strong>Not at parity:</strong> there is no Android enclave module, so an Android phone can approve gated commands but cannot open a threshold-sealed value.</div>
         <div class="st st-dev">planned · v2</div>
       </div>
       <div class="plat">
         <div class="role">daemon host</div>
         <div class="nm">macOS</div>
-        <div class="ds">launchd agent, Keychain, SwiftUI configurator and menubar with Touch ID.</div>
+        <div class="ds">launchd agent, SwiftUI configurator and menubar with Touch ID. Keys live in a 0600 file by default, with the login Keychain opt-in.</div>
         <div class="st st-dev">in development</div>
       </div>
       <div class="plat">
