@@ -65,11 +65,10 @@ export default function KeysScreen() {
           This phone is the key
         </Sans>
         <Sans size={16} tone="muted" style={{ lineHeight: 24 }}>
-          Sigil just generated this phone&apos;s own keys, and none of them leave it. The share
-          that unlocks a sealed secret is held in this device&apos;s secure hardware and cannot be
-          exported, even by Sigil; the keys that identify this phone to your Mac are kept in the
-          system keychain. Your Mac keeps only ciphertext, so for a sealed secret your approval
-          supplies the missing half of the cryptography, not a permission flag.
+          Sigil just generated this phone&apos;s own keys, here on this device. Your Mac never
+          gets the private half of any of them, so it cannot grant itself anything: every gated
+          command runs on a decision you made. The piece that opens a sealed secret is held in
+          this phone&apos;s secure hardware, where nothing can export it, not even Sigil.
         </Sans>
       </View>
 
