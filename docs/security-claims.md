@@ -9,6 +9,31 @@ the gap named.
 Paths are relative to the repo root. Test names are the `#[test]` fn names;
 run any with `cargo test <name>`.
 
+> **KNOWN DEFECT IN THIS DOCUMENT, 2026-08-08. Roughly 30 rows name proving
+> tests that no longer exist in the tree, and roughly 20 rows are
+> inspection-only without the UNPROVEN mark this document's own convention
+> requires.** Most are v1 DEK-era rows (§2, §3, §6, §10, §14, §19) whose symbols
+> were retired with that model. A row citing a test that does not exist is worse
+> than a row citing none, because the citation is what stops a reader checking.
+> Until they are re-mapped, **treat any row whose test you cannot run as
+> UNPROVEN**, whatever the cell says. §6 and §19 were audited and corrected on
+> this date; the rest were identified but not repaired.
+>
+> The mechanical fix is now built: `crates/sigil-doccheck` extracts every
+> backticked citation from the "Proving test" column of every table in this file
+> and fails `cargo test` if it does not exist in the tree. It found 44 dead
+> citations, which are recorded in `KNOWN_STALE` (crates/sigil-doccheck/src/lib.rs)
+> so the backlog is visible and shrinking rather than blocking; a new dead
+> citation cannot be added. Run `cargo run -p sigil-doccheck` for the current
+> list, with the line number, the claim text, and the likely rename for each.
+> A comment cannot be tested; a claim naming a test can.
+>
+> What the checker expects of a row, so it can keep checking: cite the test in
+> backticks, as `file.rs::test_name`, a bare `test_name` continuing a list, or
+> the `file.rs::{a,b}` shorthand. Cite a non-Rust check by its file path
+> (`apps/phone/src/lib/format.selftest.ts`), since a `bun run` case is a string
+> rather than an identifier and cannot be resolved by name.
+
 **Authorship convention (review integrity).** The claim/code/test rows and the
 residuals are maintained by whoever touches the surface. But a *verdict*, any
 "reviewed and found sound" / "CONFIRMED SOUND" statement about whether a
@@ -111,12 +136,28 @@ Residuals for the security-reviewer to weigh:
 
 ## 6. Biometric gating is structural (invariant #5)
 
+> **Section audited 2026-08-08 by the security-reviewer.** Two things were wrong
+> with it and are corrected below. (1) It mapped only the Mac keystore factor:
+> **the phone-side gate, which is the sole authorization for every plain-gate
+> approve and therefore for every `op` rule on this machine, had no row anywhere
+> in this document.** That gap is what let R8-F1 (a passcode fallback enabled
+> under a comment denying it) live unnoticed. (2) Three cited symbols no longer
+> exist (`has_dek`, `unwrap_dek`, `se_paths_refuse_until_verified`); they are v1
+> DEK vocabulary retired with that model. Rows depending on them are struck and
+> marked, not silently deleted.
+
 | Claim | Enforcing code | Proving test |
 |-------|----------------|--------------|
-| A dev/in-memory keystore can never count as the biometric approving factor | `keystore.rs::Keystore::is_biometric` (default `false`), `approve.rs::LocalApprover::decide_local` (guard `is_biometric() && has_dek()`) | `keystore.rs::memory_keystore_is_not_a_biometric_factor`, `approve.rs::dev_autoapprove_grants_without_biometrics` (grant only via explicit dev switch) |
-| Only the macOS Secure Enclave keystore reports biometric, and its unwrap refuses until verified on hardware | `keystore_macos.rs::MacKeystore::is_biometric` (`true`), `unwrap_dek` (`NeedsVerification`) | `keystore_macos.rs::se_paths_refuse_until_verified` |
+| **No gate in the phone app accepts a device passcode.** `disableDeviceFallback: true` is the property; `false` (the library default) is what ENABLES iOS's "Use Passcode" button, and this shipped as `false` under a comment claiming the opposite (R8-F1) | `biometric-policy.ts::BIOMETRIC_ONLY` (fixed, parameterless, no weak variant to reach for), spread LAST in `biometric.ts::faceGate` so no caller argument can override it | `biometric.selftest.ts` (asserts the value, and that the policy grew no other knobs so reintroducing a parameter fails) |
+| All three phone gates share that one policy: plain-gate approve, lease list, and the pairing ceremony that mints the device identity | `controller.ts::liveApprove`, `controller.ts::refreshLeases`, `app/pairing/keys.tsx` | **UNPROVEN**: the selftest guards the policy VALUE, not the call-site wiring; `biometric.ts` imports native code and will not load headlessly (see rounds 6-8 verdict, residual 3) |
+| A plain-gate approve is authorized by biometry ALONE: nothing cryptographic is unlocked, so the gate is the whole authorization rather than a prompt in front of a key | `controller.ts::liveApprove` -> `faceGate` | **UNPROVEN**: no automated test covers the call-site wiring |
+| A threshold approve does not rely on the app-level gate at all; the Secure Enclave key-agreement is its own gate, enforced by the key's access control | `SigilSeModule.swift::computePartial` (fresh `LAContext` per call, no reuse), key created with `[.privateKeyUsage, .biometryCurrentSet]` | **UNPROVEN, hardware-only**: that flag combination admits biometry only per Apple's documentation, but has never been exercised on a device here. Until it is, **nothing may claim the threshold path is passcode-proof.** The NEEDS-VERIFICATION note in `biometric.ts` records this and must not be deleted |
+| The phone's identity keys cannot leave the device via backup or restore | `keystore.ts::IDENTITY_OPTIONS` (`WHEN_UNLOCKED_THIS_DEVICE_ONLY`), written under a fresh key name by `migrateIdentityToProtectedKey` so the class applies via `SecItemAdd` rather than the update path, which carries only `kSecValueData` | **UNPROVEN, hardware-only**: keychain accessibility cannot be exercised headlessly and the failure mode is silent. The proving test is: pair, take an encrypted backup, restore to a second device, confirm the restored app is unpaired. Note this class is what enforces "this phone", NOT `faceGate`, which binds to a device rather than a human: a restored clone enrols its own biometric and the gate opens for it as designed. A clone holding the seeds opens every plain gate (which is every `op` rule here) but cannot threshold-approve, since `f` is enclave-resident and does not travel |
+| Deny requires no biometric, ever, and revoking a lease requires none either | `controller.ts` deny path (never calls `faceGate`), `controller.ts::revokeLease` | rounds 6-8 verdict, R6-F8 (a deny must never be made heavier than an approve) |
+| A dev/in-memory keystore can never count as the biometric approving factor | `keystore.rs::Keystore::is_biometric` (default `false`) | `keystore.rs::memory_keystore_is_not_a_biometric_factor`, `approve.rs::dev_autoapprove_grants_without_biometrics` (grant only via explicit dev switch) |
 | Deny / timeout always fails closed (never a grant) | `approve.rs::LocalApprover::decide_local` (timeout → `Deny`), `remote.rs::RemoteApprover::decide` (`unwrap_or Deny`) | `approve.rs::local_timeout_fails_closed`, `daemon.rs::denied_request_fails_closed_and_delivers_no_secret` |
-| The Secure Enclave DEK unwrap fires Touch ID on real hardware | `keystore_macos.rs::unwrap_dek` | **UNPROVEN, PARTIAL**: FFI is documented but returns `NeedsVerification`; must be exercised on a Mac (see NEEDS-VERIFICATION block). Until then, the shipping local approver falls through to the control socket (see Residuals). |
+| ~~Only the macOS Secure Enclave keystore reports biometric, and its unwrap refuses until verified on hardware~~ | ~~`keystore_macos.rs::unwrap_dek`~~ | **STALE, 2026-08-08**: `unwrap_dek`/`has_dek` and the test `se_paths_refuse_until_verified` no longer exist; there is no DEK. The Mac presence gate is now `presence.m` (`LAContext`, biometrics-only policy). Needs re-mapping by whoever owns that surface |
+| ~~The Secure Enclave DEK unwrap fires Touch ID on real hardware~~ | ~~`keystore_macos.rs::unwrap_dek`~~ | **STALE, 2026-08-08**: same retirement. The live hardware question is now the phone SE row above and the Mac keystore-wrap key |
 
 ## 7. Caller identity is daemon-verified (invariant #6)
 
@@ -568,12 +609,18 @@ open recommendations.
 
 The inline `env` provider (provider id `env`) lets the user set secret VALUES
 directly (`KEY=VALUE`) instead of pointing at a plaintext env-file. It is the
-same direct-injection *shape* as §12's `env-file`, resolved values transit
-daemon RAM only as the child's spawn env, for the spawn instant, and it never
-leases, but unlike `env-file` the values are **sealed at rest under the DEK**,
+same direct-injection *shape* as §12's `env-file`, but unlike `env-file` the
+values are **sealed at rest under the DEK**,
 so the daemon-at-rest holds no plaintext value (invariant #1) even here. This
 section records behavior and residuals; the verdict is the independent
 reviewer's.
+
+> **WITHDRAWN IN PART, 2026-08-08.** This section previously stated that this
+> provider "never leases" and that resolved values never persist in daemon RAM
+> across a TTL, and the verdict below certified it. **That is false of the
+> shipped code**, and has been since the RAM-cache lease path landed. See the
+> withdrawal notice at the end of this section. The crypto/at-rest findings are
+> unaffected; the never-leases property is not.
 
 | Claim | Enforcing code | Proving test |
 |-------|----------------|--------------|
@@ -582,7 +629,7 @@ reviewer's.
 | `describe()` is **zero-knowledge**: it surfaces the KEY NAMES only (from config), never a value, and never reads the sealed blob (which it could not open pre-approval anyway) | `provider.rs::EnvProvider::describe` (maps `source.keys` to `SecretRef`s), `daemon.rs::fulfill` (builds `SourceView{keys}` before the decision) | `provider.rs::env_provider_flags_and_describe_shows_keys_not_values` |
 | The blob is **decrypted only after the grant**: the ciphertext is fetched before the approval wait (safe to hold), the DEK arrives with the phone approval (or is unwrapped from the keystore on a local approval, the same as `op`), is used for the one decrypt, and is dropped at once | `daemon.rs::fulfill` (`sealed_ct` fetched pre-decision; the `else if let Some(ct)=&sealed_ct` arm unwraps `outcome.dek`/keystore, `decrypt_token`, `drop(dek)`) | `daemon.rs::inline_env_command_runs_gated_and_injects_sealed_values` |
 | The decrypted pairs live in a `Zeroizing` map wiped at end of `run()`; the decode borrows out of the `Zeroizing` plaintext with `str::from_utf8` (no owned/un-zeroized value `String`) and fails closed on truncation or non-UTF-8 without panicking | `provider.rs::{decode_env_pairs,EnvProvider::run,spawn_with_env}`, `daemon.rs::fulfill` (`drop(sealed_env)`) | `provider.rs::{env_encode_decode_round_trips_including_awkward_values,env_decode_rejects_truncated_and_bad_utf8_without_panicking,env_provider_injects_decrypted_pairs_into_the_child}` |
-| **Never leases** (`needs_account()==false`, `needs_sealed_env()==true`): like `env-file`, resolved values must not persist in daemon RAM across a TTL, so it is gated on every run | `provider.rs::EnvProvider::{needs_account,needs_sealed_env}`, `daemon.rs::fulfill` (the sealed-env arm never calls `leases.grant`; the lease short-circuit is `if needs_account`) | `daemon.rs::inline_env_command_runs_gated_and_injects_sealed_values` (`leases.active()==0`) |
+| ~~**Never leases**: resolved values must not persist in daemon RAM across a TTL, so it is gated on every run~~ **WITHDRAWN 2026-08-08, THIS CLAIM IS FALSE.** A leasable inline-`env` rule caches the just-unsealed VALUES in the lease for the whole TTL and serves later matching runs from RAM with no phone contact. See the withdrawal notice below and §8's residuals. | Actual behaviour: `daemon.rs::fulfill` caches `sealed_plain` into `core.leases.grant(...)`; leasing is governed by the rule's `LeasePolicy` alone and is not keyed off the provider anywhere | `daemon.rs::a_sealed_env_lease_injects_from_ram_with_no_second_approval` proves the opposite of the withdrawn claim |
 | An **unset** source (no sealed blob) fails closed, never runs the child with a blank environment | `daemon.rs::fulfill` (`sealed_ct == None` → `fail_closed`) | `daemon.rs::inline_env_with_no_sealed_values_fails_closed` |
 | **Readout integrity (invariant #3):** the decoded blob's KEY set is reconciled against `action.env_keys` (the set the phone readout/audit was built from) *before* injection; any divergence fails closed. This closes the two ways names could drift from values without breaking crypto, a crash between the store save and config save in `seal_env_pairs`, and an import that kept a source NAME but changed its keys while a stale blob survived, so the approver can never consent to "will set FOO" and have the child receive a hidden BAR | `daemon.rs::fulfill` (the sealed-env arm's `BTreeSet` compare of decoded keys vs `action.env_keys` → `fail_closed`) | `daemon.rs::inline_env_blob_keys_must_match_the_approved_set_or_fail_closed` (blob has an extra key vs config → refused, nothing injected) |
 | Bulk `--stdin` parse errors report the **line NUMBER, never the line content**, so a mistakenly-piped secret line is not echoed to the terminal/logs | `cli.rs::read_env_pairs_stdin` (`"line {n}: no '=' found"`) | reviewed by inspection |
@@ -683,6 +730,55 @@ Net: the sealing, zeroization, fail-closed decoding, no-lease, and
 zero-knowledge-of-values properties all hold as claimed. The one substantive
 finding (P2-1) is a readout/injection reconciliation gap that should get an
 inject-time key-set check; the other two are hygiene. No P0/P1.
+
+### WITHDRAWAL NOTICE, 2026-08-08: the "never leases" certification
+
+Written by the security-reviewer that found it, which authored neither the
+inline `env` provider nor the lease path. Recorded as an entry rather than a
+silent edit, because a verdict that was wrong is itself a finding.
+
+**What was certified.** The verdict above certified this section as CONFIRMED
+SOUND while the section asserted, in three places (the intro, the "Never leases"
+claim row, and the module docs it cited), that a direct-injection provider never
+leases and that resolved values never persist in daemon RAM across a TTL.
+
+**Why it was wrong.** It was true when written and was falsified by a later
+change, the RAM-cache lease path, which nothing re-checked against this
+document. A leasable inline-`env` rule now caches the values that approval
+unsealed and injects them from RAM on later matching runs, for the whole TTL,
+with no phone round trip. `daemon.rs::fulfill` caches `sealed_plain` into
+`leases.grant`, and `a_sealed_env_lease_injects_from_ram_with_no_second_approval`
+proves it. Nothing keys leasing off the provider anywhere in the tree; the rule's
+`LeasePolicy` is the sole authority.
+
+**What is actually true**, and was already stated correctly at §8 of this
+document while §19 contradicted it: a sealed inline `env` lease is **the one
+place a credential outlives a single request**. It is RAM-only, triple-scoped,
+TTL-bound, and killed by expiry, revocation, daemon restart, or a config change
+touching the covering rule. That is a deliberate, documented trade, not an
+oversight in the code. The oversight was here.
+
+**Scope of the withdrawal.** The crypto and at-rest findings in the verdict above
+stand and were re-checked: values are ciphertext at rest, never in `config.json`,
+never on argv, decrypted only after the grant, reconciled against the approved
+key set before injection. **Only the never-leases property is withdrawn.** The
+verdict's remaining certification is narrowed accordingly and should be read as
+covering the seal/open core, not the memory-lifetime claim.
+
+**Two named tests in this section do not exist in the tree**
+(`inline_env_command_runs_gated_and_injects_sealed_values`,
+`inline_env_with_no_sealed_values_fails_closed`), so the rows citing them are
+**UNPROVEN** until re-pointed at the current tests. This section is also written
+throughout in v1 DEK vocabulary, which no longer exists; that is stale rather
+than false and is tracked separately.
+
+**Why this one mattered more than an ordinary stale comment.** It is the shape a
+future reviewer cites *instead of* reading the code. A claim table is read as
+settled, and a CONFIRMED SOUND verdict over it is read as settled twice. The
+generalisable lesson, which applies to every verdict in this document: a verdict
+is true of a commit, not of a codebase, and nothing re-validates it when the code
+moves underneath. Pin verdicts to commits, and re-check any claim a later change
+touches.
 
 ---
 
@@ -4669,3 +4765,329 @@ Gate on this change: **cargo test 575 passing / 0 failed** (571 at `db2a77d`, pl
 the four tests above), `cargo clippy
 --all-targets -- -D warnings` clean, `cargo fmt --check` clean. The phone and Mac
 mirrors of the marker are separate changes owned by those agents.
+
+## Independent review verdict, rounds 6-8: phone lease control, design contract to shipped surface (`5804080`..`072aa8d`, 2026-08-08)
+
+Scope: the phone's ability to list and revoke live lease windows, from the
+proposed wire contract (reviewed before implementation) through the shipped
+daemon and phone halves. Daemon: `5804080`, `a54adbf`, `58c5124`, `169408b`,
+`2ae4305`, `97d5f26`. Phone: `7e47597`, `5849633`, `34dd89c`, `703b1d0`,
+`1fb0039`, `041cca8`, `e8fd0fd`, `072aa8d`. Findings are numbered **R6-Fn**,
+**R7-Fn**, **R8-Fn**.
+
+Reviewer wrote none of the code under review. Reviewer wrote the findings it
+answers, the hostile-relay cases cited, and no implementation in this program.
+
+Gate re-measured on the tip: **603 workspace tests pass, 0 failures**; `cargo
+clippy --all-targets -- -D warnings` clean; `cargo fmt --check` clean.
+
+**The tree moved continuously during all three rounds.** R6 was written against a
+proposed contract that did not exist yet; R7 against `7e47597`, two commits of
+which were superseded before the ruling was read; R8 against `5849633`. Every
+ruling below is re-verified against `072aa8d` rather than against the commit the
+finding was written for.
+
+**VERDICT: SOUND. All eight R6 findings closed, all six R7 findings closed or
+withdrawn, both R8 findings closed.** Two of the reviewer's own findings were
+withdrawn on the implementer's argument and are recorded below with the reasoning,
+because a withdrawn finding tells the next reader as much as an upheld one. The
+containment story the brief cites for a rule-wide window is now real rather than
+badged: the phone can see live windows and end one, and every path that cannot
+confirm says so instead of implying success.
+
+### What this feature had to survive, and does
+
+A lease is a rule-wide auto-approve window. The brief cites phone-side visibility
+and revocation as its containment, and before this change the phone's control was
+a `planned` badge (the honest state after R4-F7 found that a revoke silently doing
+nothing is worse than no revoke at all). Making the control real means putting a
+security-bearing question and answer on a channel a hostile relay owns. The
+design pressure is therefore not confidentiality, which the seal already handles,
+but **whether a human can be made to believe a window closed when it did not**.
+
+### R6 rulings (design-level, before implementation)
+
+**R6-F1 and R6-F2 (both HIGH, blocking) - CLOSED, and the fix is better than the
+one asked for.** The proposed contract named a window by its grant key. A grant
+key is a hash of the caller's ancestor code identity plus the rule
+(`lease.rs::grant_key`) with nothing instance-specific, so it RECURS: naming only
+the key aims a revoke at every window that key will ever have, and a captured
+revoke becomes a stored weapon against a future window. Replay is bounded but not
+prevented (see the counter note below), so this was reachable.
+
+The reviewer asked for an opaque per-window id in addition to the key. The
+implementer removed the grant key from the wire entirely
+(`request.rs::LeaseRow::lease_id`, 16 bytes of CSPRNG, minted per window,
+preserved across a refresh, never reused), which is strictly better and closes a
+third objection the reviewer raised separately: a grant key on the phone is a
+stable correlator over the caller's code identity that outlives the window.
+Nothing of grant-key shape now reaches the app, and a phone-side selftest asserts
+it. `revoke_instance` -> `revoke_id` matches one id exactly, so a stale or
+mis-aimed revoke is a clean no-op.
+
+Two footguns died with it: `LeaseStore::revoke` is prefix-matched, so an empty
+string would have revoked everything, and one grant key can cover several windows
+under different bindings, so a per-key revoke would have killed siblings the human
+never saw. Neither is reachable from the phone now.
+
+**R6-F3 (HIGH, blocking) - CLOSED. This is the finding the feature turns on.**
+The proposed replies carried no correlation. The attack: a relay captures a
+genuine `LeaseRevokeReply{revoked:true}`, waits for the app to be killed (routine,
+and it resets the RAM-only replay guard), and when the human next taps revoke it
+suppresses the outgoing request and delivers the captured reply. Fresh guard,
+unseen id, valid signature, inside the freshness window, because the message
+genuinely is genuine. The human is told the window closed. It is open. That is
+strictly worse than the badge it replaced, because a badge never lies.
+
+The fix is `session/outstanding.ts`: a reply applies only if it names a request
+THIS process issued, of that exact kind, not yet answered, and claiming it
+consumes the entry. The map dies with the process, which is what makes the
+captured reply match nothing.
+
+**Worth recording precisely, because the implementer's first account of it was
+wrong and the correction matters:** this protection is NOT the envelope layer. The
+envelope guard is a freshness window plus a single-use id set held in RAM on both
+ends, empty again after a restart on either side, and the counter gates nothing
+(`replay.rs:81`, `let _ = counter;`). The application-layer correlation stands on
+its own and is load-bearing security, not belt-and-braces. The code and its
+comments now say so in those terms.
+
+**R6-F4 (MEDIUM) - CLOSED.** The contract's claim that both display fields were
+already sanitised was false for `scope`: the rule name is raw user config
+(`config.rs` validates only duplicates and emptiness), it was on no phone surface
+before this, and the CLI survived it only by filtering at its own render boundary.
+`LeaseRow::new` now filters all three display fields through the same allowlist as
+the approval caption, and the phone re-filters. A hostile-relay case pins that an
+unsanitised rule name cannot put a bidi override, zero-width character or
+combining mark into a row.
+
+**R6-F5 (MEDIUM) - CLOSED, then DOWNGRADED by the reviewer, then implemented
+anyway and correctly.** See the R8-F1 ruling: the list is gated, and it gets the
+same biometry-only policy as release.
+
+**R6-F6 (MEDIUM) - CLOSED.** Lease-control replies deposit with no push hint
+(`remote.rs::seal_to_phone`). Copying the resolution-broadcast pattern would have
+rung the APNs doorbell on every list refresh, handing the relay (which owns push)
+and Apple a signal correlated with lease-control use.
+
+**R6-F7 (MEDIUM) - CLOSED, with its limit pinned rather than papered over.** See
+R7-F6.
+
+**R6-F8 (LOW-MED) - CLOSED.** A list is rate-limited
+(`remote.rs::lease_list_allowed`, compare-and-set so a burst cannot pass twice); a
+revoke deliberately is NOT. That asymmetry is correct and matches invariant #4's
+logic: a deny must never be made heavier than an approve.
+
+### R7 rulings (shipped phone half)
+
+**R7-F1 (MEDIUM) - CLOSED.** Snapshot age was stamped at reply ARRIVAL, a number
+the adversary picks: a relay stalling a reply 19 seconds, just inside the reply
+timeout, handed the phone a 19-second-old answer reading as current. Age is now
+measured from when the query was SENT (`leases.ts::snapshotFresh`, from
+`askedAt`), bound to the specific outstanding entry rather than a loose
+last-asked time. Send time cannot be pushed later by anyone but this phone, so it
+is the correct upper bound on the answer's age.
+
+**The asymmetry is deliberate and must survive future tidying**, which is why the
+implementer wrote it out at length in two files and pinned the counterfactual in a
+selftest: `remainingMs` stays stamped at ARRIVAL, because that over-reports how
+long a window is open, which prompts a revoke; answer age is measured from SEND,
+because that over-reports staleness, which withholds the "no active leases" claim.
+Both err toward "assume more is open than you can see". A later reader
+"simplifying" them to one convention breaks one of the two.
+
+**R7-F2 (MEDIUM) - WITHDRAWN BY THE REVIEWER. The implementer's refusal was
+correct and the reasoning is worth keeping.** The finding asked to split a
+40-second freshness budget into a loose render tolerance and a tight assert
+tolerance for the definite "No active leases." claim. It was written against a
+POLLING surface, where rows refresh continuously and a loose render tolerance only
+costs flicker. The amendment replaced polling with a one-shot pull, and in a pull
+model the split is not merely unnecessary but wrong: a row list still rendering as
+live at 35 seconds would hide a window OPENED since the snapshot, which
+under-reports what is open. Render tolerance cannot honestly exceed assert
+tolerance here; they collapse into one number. The shipping budget is 10 seconds
+measured from send, tighter than both halves of what the finding proposed.
+
+The implementer's rejection of an even tighter 5 seconds is also upheld: measured
+from send, the budget spans the whole round trip, and 5 seconds over a relay
+long-poll could make the authoritative state unreachable. A human who can never
+obtain a definite answer cannot distinguish "nothing is open" from "this is
+broken", and a containment surface that can never make its claim is not a cautious
+surface, it is one that stops being read. **A control that fails to inform is a
+failure mode that looks like caution.**
+
+**R7-F3 (MEDIUM) - CLOSED.** Ciphertext length leaked the live-window count. See
+R7-F6 for what padding buys and what it does not.
+
+**R7-F4 (LOW) - CLOSED, and it changed shape.** The Mac fallback offered under a
+failed revoke printed a grant-key prefix, and the Mac's revoke is prefix-matched,
+so it could close more windows than the row it sat under. With grant keys off the
+phone entirely (R6-F2) the fallback now names `sigil lease list` on the Mac and
+carries the caveat that a prefix match may close other windows opened by the same
+caller under that rule. Killing more is the safe direction; the copy now says so.
+
+**R7-F5 (INFO) - the phone's inference is SOUND, and more firmly than its author
+believed.** A later snapshot omitting a window with a pending revoke is treated as
+confirmation the window closed. The author flagged this as an inference they were
+unsure of. It is airtight, and it rests on exactly one property: **a lease id goes
+live to dead and never back.** A genuine snapshot omitting an id therefore proves
+that id was dead when the snapshot was computed, and dead is permanent, whatever a
+relay does to ordering. The reviewer attempted to construct a false confirmation
+from a snapshot computed before the window existed and could not: seeing the
+window at all requires a later answer, which supersedes the single outstanding
+query.
+
+The risk was that nothing pinned the property the inference borrows. It is now
+pinned daemon-side (`2ae4305`) and named on both sides (`041cca8`, `97d5f26`), so
+a future change reusing a lease id across re-grants fails a test instead of
+silently making the phone lie. A later commit (`e8fd0fd`) correctly removed an
+ordering guard that implied the inference depended on send/receive ordering; it
+does not, and implying a dependency the reasoning does not have is its own hazard.
+
+**R7-F6 (MEDIUM as a claim, LOW as a leak) - CLOSED.** The padding test asserted a
+universal under the name `..._leaks_nothing` while proving only that no plaintext
+substring appeared on the wire. Padding to `LEASE_PAD_BUCKET` (1024) hides the
+live-window count only while a reply fits ONE bucket. Measured: the crossing is at
+8 rows with short labels, 6 typical, and **3 with maximum-length labels**, which
+is reachable rather than theoretical. The test is now
+`lease_control_is_one_ciphertext_length_within_a_bucket`, it documents the crossing
+points, and it does not pretend to close the leak. The claim and the test now say
+the same thing.
+
+### R8 rulings
+
+**R8-F1 (HIGH) - CLOSED. Independently verified by this reviewer, who wrote none
+of the fix.** Found while verifying an unrelated ruling, in the file the lease
+gate calls rather than in the lease feature itself.
+`apps/phone/src/lib/biometric.ts` set `disableDeviceFallback: false` directly
+beneath a comment reading "Never silently fall through to a device passcode for an
+approval", and under a module docstring reading "Approving REQUIRES a fresh
+biometric". `false` is not "no fallback": it is the library default and the value
+that ENABLES iOS's "Use Passcode" button after failed biometry.
+
+Impact was on the primary path, not an edge case. A threshold approve is gated by
+the Secure Enclave key-agreement and never reaches this flag, but a PLAIN GATE
+approve has `faceGate` as its only authorization, and every `op` rule on this
+machine is a plain gate. Anyone holding the phone and knowing its passcode could
+approve a gated command having never passed biometry. That is invariant #4 broken
+where it matters most.
+
+Verified at `072aa8d`:
+
+* The policy is a fixed, parameterless value in its own module
+  (`biometric-policy.ts::BIOMETRIC_ONLY`, `disableDeviceFallback: true`). The
+  implementer refused a per-caller option on the grounds that it would keep the
+  weak variant alive one forgotten argument away from the approve path. **Upheld:
+  for a property this load-bearing, divergence should be impossible rather than
+  discouraged.**
+* `faceGate` spreads the policy LAST (`biometric.ts:52-55`), so no caller argument
+  can override it. The prompt string remains per-caller, which is right: a human
+  trained to clear an identical prompt for a harmless read is being conditioned to
+  clear the one that releases a secret.
+* All three `faceGate` call sites take it: plain-gate approve
+  (`controller.ts:413`), lease list (`controller.ts:283`), and the pairing
+  ceremony (`app/pairing/keys.tsx:52`), which mints the device identity and pins
+  the daemon and which neither the finding nor the brief had named. Catching that
+  one was the implementer's, not the reviewer's.
+* **Correction to the implementer's own account:** there are three `faceGate`
+  callers, not four. The threshold approve is a fourth GATE but not a `faceGate`
+  caller; it is gated by the SE key's access control
+  (`SigilSeModule.swift::computePartial`), which this fix does not touch and does
+  not need to.
+
+**The lease list gets the strong policy too, and this does not reverse the earlier
+downgrade.** The reviewer downgraded "gate the list" from required to recommended
+on the grounds that an attacker who can pass biometry can simply approve, which
+dominates anything listing discloses. That argument was about whether to have a
+gate. The implementer's argument is about how strong the gate should be once it
+exists: the only thing gating the list still buys is denying an enumeration of
+live auto-approve windows to someone holding an unlocked phone who cannot pass
+biometry, and someone who unlocked it plausibly knows the passcode, so a fallback
+there hands back precisely the capability the gate exists to deny. Both hold. The
+narrow residual value is exactly what the strong policy preserves.
+
+**Fail direction and lockout - upheld.** With no passcode fallback, repeated
+biometric failure locks biometry out at OS level with no in-app recovery, and
+approvals stop until the device is unlocked by other means. That is the correct
+direction. A lockout surfacing as an ordinary `"failed"` is also correct: every way
+of not passing biometry has to mean the same thing to the gate, and distinguishing
+them would invite a "use your passcode instead" affordance, which is the hole that
+was just closed.
+
+**R8-F2 (LOW) - CLOSED.** A docstring in `leases.ts` still described the staleness
+decision as using elapsed time since arrival, which is what the code did before
+`34dd89c`. It pointed the next reader at precisely the regression the adjacent
+comment existed to prevent. Fixed at `1fb0039`.
+
+### What the reviewer got wrong
+
+Recorded because this document is a map a skeptical adopter reads, and a reviewer
+that only records other people's errors is not a reliable narrator.
+
+**The replay freshness window is 150 seconds, not 90.** `sigil-proto/src/lib.rs`
+and `apps/phone/src/protocol/replay.ts` both read `150_000`. The reviewer stated
+"90s window" throughout R6, R7 and R8 as verified fact, having inherited it from
+the brief without checking the constant. No ruling changes, but every
+replay-timing argument in those rounds was 60 seconds more permissive than
+described, and the docs carry the same error in several places. This is the exact
+defect class the reviewer had just finished naming.
+
+### Residuals (honest limits of this feature)
+
+1. **Traffic analysis is reduced, not eliminated.** The relay learns which
+   1024-byte band the live-window count falls in (crossing at 3 rows with
+   maximum-length labels), and it learns THAT lease control was used and when.
+   Padding cannot touch timing. The 15-second poll that would have made this a
+   periodic beacon is gone; the signal is now one exchange per deliberate human
+   tap, which is a cleaner signal of "the human is on this screen" but not a
+   repeating one.
+2. **The threshold path's passcode-proofness is UNPROVEN.** The SE key is created
+   with `[.privateKeyUsage, .biometryCurrentSet]`
+   (`modules/sigil-se/ios/SigilSeModule.swift:96`), which by Apple's documentation
+   admits biometry only. That has never been exercised on hardware here. Until it
+   is, no string, comment or document may claim the threshold path is
+   passcode-proof. The NEEDS-VERIFICATION note in `biometric.ts` is correctly
+   framed as what the source says rather than what was observed, and it tells the
+   next reader not to delete it because the code above it looks correct. **Keep
+   it.** Related, and a mild instance of the R8-F1 pattern: the comment at
+   `SigilSeModule.swift:138-140` places "Passcode fallback is disabled so key
+   release is strictly biometric" directly above
+   `context.localizedFallbackTitle = ""`, which hides a button. The enforcement is
+   real but lives in the access control 40 lines earlier; the comment credits a
+   cosmetic line with it.
+3. **The biometric selftest guards the value, not the wiring.** It asserts
+   `BIOMETRIC_ONLY.disableDeviceFallback === true` and that the policy grew no
+   knobs, which is a genuine guard verified by reintroducing the bug. It cannot
+   assert that `faceGate` still spreads the policy, or that no future call site
+   calls `authenticateAsync` directly, because `biometric.ts` imports native code
+   and will not load headlessly. A cheap closure exists if wanted: export a pure
+   function that builds the options object and assert on its output.
+4. **A revoke whose reply arrives after the 20-second timeout is dropped**, so a
+   genuine `revoked: true` can leave a standing warning over a window that did
+   close. Over-warning is the right direction, and the TTL retirement now ends the
+   warning when the window's own remaining time elapses (with any approval, or any
+   request another device resolved, in the interim keeping it standing, because
+   either could have been a renewal this phone was not told about).
+5. **The relay can still deny the answer entirely.** Every path that cannot
+   confirm says so; none of them can be made to say the opposite. That is the
+   whole claim, and it is the right one.
+
+### Claims added by this work
+
+| Claim | Enforcing code | Proving test |
+|---|---|---|
+| A revoke names one window, so a captured revoke cannot kill a future window sharing a caller and rule | `lease.rs::LeaseStore::revoke_id`, `request.rs::LeaseRevoke::target` | `revoke_by_id_is_exact_and_refuses_anything_prefix_shaped`, `a_captured_lease_revoke_cannot_be_replayed_or_backdated` |
+| A lease id is never reused, so absence from a snapshot proves the window is dead | `lease.rs` (mint on new window, preserve on refresh) | `a_lease_id_names_one_window_and_survives_a_refresh`, `a_live_window_keeps_its_id_and_a_dead_one_never_lends_it_out` (`2ae4305`) |
+| One grant key can hold several windows, and ids still separate them | `lease.rs::LeaseStore` | `one_grant_key_can_hold_several_windows_and_ids_still_separate_them` |
+| The lease-control handle can only list and revoke by id | `remote.rs` lease-control seam | `the_lease_control_handle_can_only_list_and_revoke_by_id` |
+| A reply applies only to a request this process issued, once | `apps/phone/src/session/outstanding.ts::claim` | `apps/phone/src/domain/leases.selftest.ts` (replays the captured-reply scenario) |
+| The grant key never reaches the phone | `request.rs::LeaseRow` (no grant field) | `leases.selftest.ts` asserts no grant-key-width string on any lease surface |
+| Lease-control display fields are allowlist-filtered daemon-side | `request.rs::LeaseRow::new` -> `sanitize_label` | `a_lease_query_cannot_be_forged_and_a_list_reply_reveals_no_plaintext` |
+| Lease-control envelopes are one ciphertext length within a bucket | `request.rs::LeaseControlMessage::padded` | `lease_control_is_one_ciphertext_length_within_a_bucket` |
+| Snapshot age is measured from the query, not the answer | `leases.ts::snapshotFresh` (`askedAt`) | `leases.selftest.ts`, incl. the arrival-stamp counterfactual |
+| No gate in the phone app accepts a device passcode | `biometric-policy.ts::BIOMETRIC_ONLY`, spread last in `biometric.ts::faceGate` | `biometric.selftest.ts` (value + no-knobs); **UNPROVEN** that the wiring still consumes it (see residual 3) |
+| A plain-gate approve is authorized by biometry alone, with no key release | `controller.ts::liveApprove` -> `faceGate` | **UNPROVEN**: no automated test covers the call-site wiring |
+
+The last two rows close a structural gap this review found: before it, the sole
+authorization for every plain-gate approve on this machine had **no row anywhere
+in this document**.
