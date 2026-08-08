@@ -87,19 +87,99 @@ export interface HistoryEntry {
   via: string;
 }
 
-export interface Lease {
-  id: string;
-  /** e.g. "rowm launcher". */
-  caller: string;
+/**
+ * One active daemon lease, as this phone last heard it and stamped it against
+ * its own clock. Built from a wire {@link LeaseRow} by `toActiveLeases`
+ * (src/domain/leases.ts); every display string has already been through the
+ * daemon's label allowlist a second time there.
+ *
+ * A MIRROR, never a source of truth: the daemon is the only lease authority, and
+ * every field here describes what it said at {@link LeaseView.answeredAt}. The
+ * phone holds no lease state of its own, which is why removing a row locally can
+ * never stand in for revoking one.
+ */
+export interface ActiveLease {
+  /** Opaque grant key from the daemon. Stable across windows, so it is NOT the
+   *  row's identity; it is one half of what a revoke names. Never phone-derived. */
+  grantHex: string;
+  /** This window's opaque instance id: the row's identity, and the half of a
+   *  revoke that binds it to the window the human is actually looking at. */
+  instance: string;
   /**
-   * The matched RULE's name, mirroring the daemon's `LeaseJson.scope`, e.g.
+   * The matched RULE's name, mirroring the daemon's `LeaseInfo.scope`, e.g.
    * "op-eu". NOT the command line that opened the lease: one lease covers any
    * command that rule matches, run by the caller chain that opened it, until it
    * expires. Anything rendering this must not imply it covers a single command.
+   * Null when the daemon sent nothing usable.
    */
-  scope: string;
-  grantedAt: number;
+  scope: string | null;
+  /** The daemon's own description of the rule's breadth; null when it sent none,
+   *  which never means the window is narrow. */
+  covers: string | null;
+  /** The account the window is scoped to; null for a plain gate that holds no values. */
+  account: string | null;
+  /** Absolute local expiry, unix ms: arrival time plus the daemon's `remainingMs`. */
   expiresAt: number;
+  /** Absolute local grant time, unix ms: arrival time minus the daemon's `ageMs`. */
+  grantedAt: number;
+}
+
+/** A revoke this phone has sent and not yet had confirmed. */
+export interface PendingRevoke {
+  /** The correlation id sent with it; this is what attributes the reply. */
+  queryId: string;
+  grantHex: string;
+  /** The window it names. Rows and pending revokes are both keyed on this. */
+  instance: string;
+  /** When the revoke left this device, unix ms. */
+  sentAt: number;
+  /**
+   * True once the reply window has passed with no answer. The row STAYS on
+   * screen and says the window may still be open: a suppressed reply must never
+   * leave the human believing a window closed.
+   */
+  unconfirmed: boolean;
+}
+
+/**
+ * How the last completed revoke ended. Held until the next revoke starts, so the
+ * one line of feedback does not blink out from under someone mid-read; it names
+ * no rule, so it cannot be misread as describing a row that arrived after it.
+ */
+export interface RevokeNote {
+  instance: string;
+  /**
+   * `closed`: the daemon ended a live window. `alreadyGone`: it had no such
+   * lease (unknown, expired, or already revoked), which is equally a success.
+   */
+  outcome: "closed" | "alreadyGone";
+  at: number;
+}
+
+/**
+ * What this phone knows about the daemon's leases, and how recently it knew it.
+ *
+ * The freshness fields are load-bearing, not decoration. The phone may state
+ * that nothing is open ONLY from a fresh successful answer; a phone that cannot
+ * reach the daemon saying "no active leases" is a false statement of fact about
+ * a containment surface. `answeredAt === 0` means never answered, and that is a
+ * different sentence from "asked and got none".
+ */
+export interface LeaseView {
+  /** The rows from the last successful answer. Empty is meaningful only when
+   *  {@link answeredAt} is non-zero. */
+  rows: ActiveLease[];
+  /** When the last successful answer arrived, unix ms. 0 = never answered. */
+  answeredAt: number;
+  /** A list query is in flight right now. */
+  asking: boolean;
+  /** The last query did not come back. Cleared by the next successful answer. */
+  unreachable: boolean;
+  /** Revokes sent and not yet confirmed, keyed off {@link ActiveLease.instance}. */
+  revokes: PendingRevoke[];
+  /** The outcome of the last completed revoke, for one line of plain feedback.
+   *  Both outcomes are successes; see {@link RevokeNote}. */
+  note: RevokeNote | null;
 }
 
 export interface Settings {
@@ -135,7 +215,8 @@ export interface AppState {
   pairedAt: number;
   pending: PendingRequest[];
   history: HistoryEntry[];
-  leases: Lease[];
+  /** What the daemon last said is open, and how recently it said it. */
+  leases: LeaseView;
   settings: Settings;
   /** The six pairing words, held only during the ceremony. */
   pairingWords: string[] | null;

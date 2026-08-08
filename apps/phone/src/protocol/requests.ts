@@ -313,26 +313,251 @@ export interface ResolutionBroadcastMessage {
 }
 
 /**
- * An opened daemon -> phone payload: either a fresh {@link ApprovalRequest} to
- * display (untagged, legacy) or a tagged {@link ResolutionBroadcastMessage} to
- * dismiss one. Mirrors proto `ToPhoneMessage`. {@link classifyToPhone} is the
- * single place the phone decides which one an opened envelope is.
+ * The exact width of a grant key rendered as lowercase hex, mirroring proto
+ * `GRANT_HEX_CHARS`. Exact, not a range: a row the phone could not act on is
+ * never sent, so anything else is a malformed message rather than a lease.
+ */
+export const GRANT_HEX_CHARS = 64;
+
+/** The exact width of a lease instance id in hex, mirroring `LEASE_INSTANCE_CHARS`. */
+export const LEASE_INSTANCE_CHARS = 32;
+
+/** The longest correlation id the daemon will echo, mirroring `QUERY_ID_MAX_CHARS`. */
+export const QUERY_ID_MAX_CHARS = 64;
+
+/**
+ * Phone -> daemon: list the daemon's live lease windows (PHONE LEASE CONTROL).
+ *
+ * Sealed over the live session like {@link PushRegisterMessage}, outside the
+ * request/response flow. It releases nothing and gates nothing, so it is a
+ * READ-PATH action: passcode tier, no biometric, because the biometric belongs to
+ * release and not to looking.
+ *
+ * `queryId` is what the daemon echoes in its {@link LeaseListReplyMessage}. The
+ * phone MUST drop a reply whose id it did not send, so a late answer to a
+ * previous screen-open cannot repaint a newer list.
+ */
+export interface LeaseListMessage {
+  type: "leaseList";
+  queryId: string;
+}
+
+/**
+ * Phone -> daemon: end ONE live lease window.
+ *
+ * Both identifiers come verbatim from a {@link LeaseRow} the daemon itself sent;
+ * the zero-knowledge phone cannot compute either and never invents one. Naming
+ * `instance` as well as `grantHex` is what makes the revoke bind to the window
+ * the human is actually looking at: a grant key is stable across windows, so a
+ * revoke that named only the key could land on a window granted after the human
+ * read the row.
+ *
+ * Revoking only ever NARROWS authority, so like a deny it needs no biometric and
+ * no confirmation.
+ */
+export interface LeaseRevokeMessage {
+  type: "leaseRevoke";
+  queryId: string;
+  /** From a {@link LeaseRow}, verbatim. Never a prefix. */
+  grantHex: string;
+  /** From the same {@link LeaseRow}, verbatim: which window, not which key. */
+  instance: string;
+}
+
+/**
+ * One live lease window as the daemon reports it, mirroring proto `LeaseRow`.
+ * Display only, in every field: nothing here is parsed, matched on, or branched
+ * upon, and the two identifiers are opaque handles to hand back on a revoke.
+ *
+ * The daemon sanitizes `scope`, `covers`, and `account` through its own label
+ * allowlist before sending. The phone re-runs that allowlist anyway (`safeLabel`
+ * in src/lib/format.ts), exactly as the approval sheet's coverage caption does:
+ * this type describes what the daemon promises, not what a screen may assume it
+ * received.
+ *
+ * `remainingMs` and `ageMs` are relative to the moment the DAEMON measured them,
+ * so the phone stamps them against arrival time to get absolute local clocks
+ * (see `toActiveLeases` in src/domain/leases.ts). Transit delay therefore makes
+ * the phone's countdown very slightly generous, which is the safe direction: it
+ * can overstate how long a window is open, never understate it.
+ */
+export interface LeaseRow {
+  /** The grant key, lowercase hex, {@link GRANT_HEX_CHARS} wide. Stable across
+   *  the life of a window and equal for a later window with the same caller
+   *  chain and rule, which is why a revoke must also name {@link instance}. */
+  grantHex: string;
+  /** This window's id, lowercase hex, {@link LEASE_INSTANCE_CHARS} wide. Minted
+   *  when the window opens, preserved across a refresh, never reused. This is
+   *  the row's identity on the phone, and what a revoke binds to. */
+  instance: string;
+  /**
+   * The matched RULE's name. One window covers ANY command that rule matches for
+   * the caller chain that opened it, so no renderer may let this read as a
+   * single command line.
+   */
+  scope: string;
+  /**
+   * The daemon's own one-line description of the rule's breadth, the same string
+   * the approval sheet's caption consented to. **Empty means no label was
+   * rendered**: show no coverage clause rather than inventing one, and never read
+   * empty as "narrow".
+   */
+  covers: string;
+  /** The source label the window injects from. Empty for a plain gate, which
+   *  injects nothing. */
+  account: string;
+  /** Milliseconds left when the daemon measured it. */
+  remainingMs: number;
+  /** Milliseconds since the window opened, when the daemon measured it. */
+  ageMs: number;
+}
+
+/**
+ * Daemon -> phone: the answer to a {@link LeaseListMessage}.
+ *
+ * An empty `leases` array is a POSITIVE statement that nothing is open, and it
+ * is the only thing that entitles the phone to say so. The absence of a reply is
+ * not an empty list, and the settings screen must never render one as the other.
+ */
+export interface LeaseListReplyMessage {
+  type: "leaseListReply";
+  /** Echoes the query's id; a reply the phone did not ask for is dropped. */
+  queryId: string;
+  leases: LeaseRow[];
+}
+
+/**
+ * Daemon -> phone: the answer to a {@link LeaseRevokeMessage}.
+ *
+ * `revoked: true` means a live window with that exact instance was found and
+ * zeroized. `revoked: false` means there was none, and the daemon deliberately
+ * does not distinguish already-lapsed from already-revoked from never-held, so
+ * the answer is not an oracle for which grant keys exist. Every `false` is a
+ * SUCCESS: the window is closed either way, and the UI says so plainly rather
+ * than dressing it as a failure. The only real failure is no reply at all, which
+ * leaves the window's state unknown.
+ *
+ * A revoke is idempotent, so the daemon's own guidance is to re-list afterwards
+ * rather than treat `revoked` as the new state of the world.
+ */
+export interface LeaseRevokeReplyMessage {
+  type: "leaseRevokeReply";
+  /** Echoes the revoke's id; this is what attributes the answer to its row. */
+  queryId: string;
+  /** Echoes the revoke's normalized grant key. */
+  grantHex: string;
+  revoked: boolean;
+}
+
+/** Exactly-width lowercase hex, normalized. Anything else is not an identifier. */
+function hexField(v: unknown, chars: number): string | null {
+  if (typeof v !== "string" || v.length !== chars) return null;
+  return /^[0-9a-fA-F]+$/.test(v) ? v.toLowerCase() : null;
+}
+
+/** A correlation id: non-empty, bounded, and printable enough to compare. */
+function queryIdField(v: unknown): string | null {
+  if (typeof v !== "string" || v.length === 0 || v.length > QUERY_ID_MAX_CHARS) return null;
+  return v;
+}
+
+function isMs(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0;
+}
+
+/**
+ * Validate one wire lease row. Shape only: the display hygiene (the daemon's
+ * label allowlist, re-applied here as defence in depth) happens where the row is
+ * turned into something renderable, in src/domain/leases.ts.
+ */
+function parseLeaseRow(v: unknown): LeaseRow | null {
+  if (typeof v !== "object" || v === null) return null;
+  const r = v as Record<string, unknown>;
+  const grantHex = hexField(r.grantHex, GRANT_HEX_CHARS);
+  const instance = hexField(r.instance, LEASE_INSTANCE_CHARS);
+  if (!grantHex || !instance) return null;
+  if (typeof r.scope !== "string" || typeof r.covers !== "string") return null;
+  if (typeof r.account !== "string") return null;
+  if (!isMs(r.remainingMs) || !isMs(r.ageMs)) return null;
+  return {
+    grantHex,
+    instance,
+    scope: r.scope,
+    covers: r.covers,
+    account: r.account,
+    remainingMs: r.remainingMs,
+    ageMs: r.ageMs,
+  };
+}
+
+/**
+ * Validate a lease-list reply, returning null for anything malformed.
+ *
+ * **One bad row voids the whole answer, deliberately.** Skipping the bad row and
+ * keeping the rest would under-report open windows, and under-reporting is the
+ * one direction this surface must never fail in: the human would read a shorter
+ * list as "that is everything". Voiding the answer lands the screen in "cannot
+ * check right now", which is a true statement about what the phone knows.
+ */
+export function parseLeaseListReply(payload: unknown): LeaseListReplyMessage | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const p = payload as Record<string, unknown>;
+  const queryId = queryIdField(p.queryId);
+  if (!queryId) return null;
+  if (!Array.isArray(p.leases)) return null;
+  const leases: LeaseRow[] = [];
+  for (const raw of p.leases) {
+    const row = parseLeaseRow(raw);
+    if (!row) return null;
+    leases.push(row);
+  }
+  return { type: "leaseListReply", queryId, leases };
+}
+
+/** Validate a revoke reply. Fails closed: a malformed one confirms nothing. */
+export function parseLeaseRevokeReply(payload: unknown): LeaseRevokeReplyMessage | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const p = payload as Record<string, unknown>;
+  const queryId = queryIdField(p.queryId);
+  const grantHex = hexField(p.grantHex, GRANT_HEX_CHARS);
+  if (!queryId || !grantHex) return null;
+  if (typeof p.revoked !== "boolean") return null;
+  return { type: "leaseRevokeReply", queryId, grantHex, revoked: p.revoked };
+}
+
+/**
+ * An opened daemon -> phone payload: a fresh {@link ApprovalRequest} to display
+ * (untagged, legacy), a tagged {@link ResolutionBroadcastMessage} to dismiss one,
+ * or a tagged answer to a lease-control question. Mirrors proto `ToPhoneMessage`.
+ * {@link classifyToPhone} is the single place the phone decides which one an
+ * opened envelope is.
  */
 export type ToPhoneMessage =
   | { kind: "request"; request: ApprovalRequest }
-  | { kind: "resolution"; resolution: ResolutionBroadcastMessage };
+  | { kind: "resolution"; resolution: ResolutionBroadcastMessage }
+  | { kind: "leaseList"; reply: LeaseListReplyMessage }
+  | { kind: "leaseRevoke"; reply: LeaseRevokeReplyMessage };
 
 /**
  * Classify an opened (decrypted, verified) ToPhone payload by its `type` tag,
  * mirroring proto `ToPhoneMessage::from_value`. `"resolution"` selects a
- * dismissal; its absence is an approval request. Fails closed: a `"resolution"`
- * tag with a missing/blank `requestId` returns `null` so the caller drops it
- * rather than dismissing an unknown request. Kept a pure function so it is unit
+ * dismissal, `"leaseListReply"` / `"leaseRevokeReply"` select a lease-control
+ * answer; the absence of a tag is an approval request. Fails closed: a tagged
+ * payload that does not validate returns `null` so the caller drops it rather
+ * than acting on a half-read message. Kept a pure function so it is unit
  * testable without a live session.
  */
 export function classifyToPhone(payload: unknown): ToPhoneMessage | null {
   if (typeof payload !== "object" || payload === null) return null;
   const tag = (payload as { type?: unknown }).type;
+  if (tag === "leaseListReply") {
+    const reply = parseLeaseListReply(payload);
+    return reply ? { kind: "leaseList", reply } : null;
+  }
+  if (tag === "leaseRevokeReply") {
+    const reply = parseLeaseRevokeReply(payload);
+    return reply ? { kind: "leaseRevoke", reply } : null;
+  }
   if (tag === "resolution") {
     const p = payload as Partial<ResolutionBroadcastMessage>;
     if (typeof p.requestId !== "string" || p.requestId.length === 0) return null;

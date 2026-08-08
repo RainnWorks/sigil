@@ -15,6 +15,8 @@ import {
   type DeliveryReceiptMessage,
   type DeviceIdentity,
   type Envelope,
+  type LeaseListReplyMessage,
+  type LeaseRevokeReplyMessage,
   type PeerIdentity,
   type Sodium,
   open,
@@ -32,7 +34,20 @@ export interface SessionConfig {
   daemonPub: PeerIdentity;
   pairingId: Uint8Array;
   transport: Transport;
+  /**
+   * Where a verified answer to a lease-control question goes. Handed in rather
+   * than written straight to the store, because the caller (the session
+   * controller) is what asked the question and owns the reply timers that decide
+   * when silence becomes "cannot confirm". Absent => lease replies are dropped,
+   * which is the correct behavior for a session nobody is asking through.
+   */
+  onLeaseReply?: (reply: LeaseControlReply) => void;
 }
+
+/** A verified lease-control answer, already demuxed and shape-checked. */
+export type LeaseControlReply =
+  | { kind: "leaseList"; reply: LeaseListReplyMessage }
+  | { kind: "leaseRevoke"; reply: LeaseRevokeReplyMessage };
 
 export class SigilSession {
   private readonly inboundGuard = new ReplayGuard();
@@ -89,6 +104,15 @@ export class SigilSession {
     // Demux by the `type` tag, mirroring the daemon's ToDaemon demux.
     const msg = classifyToPhone(payload);
     if (!msg) return; // malformed: drop it (fail closed)
+    if (msg.kind === "leaseList" || msg.kind === "leaseRevoke") {
+      // An answer to a lease-control question. It rides the same sealed, signed,
+      // single-use envelope as everything else on this counter, so a hostile relay
+      // can neither forge one (to claim a window closed, or that none are open) nor
+      // replay an old one. It releases nothing and gates nothing: it is a report,
+      // and suppressing it can only ever leave the phone saying it does not know.
+      this.cfg.onLeaseReply?.(msg);
+      return;
+    }
     if (msg.kind === "resolution") {
       // #36: another paired device resolved this ring-all request (or it expired /
       // was withdrawn). Dismiss our copy. Zero-knowledge: we learn only that it is

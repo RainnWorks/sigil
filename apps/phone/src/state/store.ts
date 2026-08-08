@@ -5,12 +5,20 @@
  */
 import { useSyncExternalStore } from "react";
 
-import { type ApprovalRequest, type Decision, type ResolutionStatus } from "@/src/protocol";
+import {
+  type ApprovalRequest,
+  type Decision,
+  type LeaseRow,
+  type ResolutionStatus,
+} from "@/src/protocol";
 import { secretRefLabel, sshLabel } from "@/src/lib/format";
+import { toActiveLeases } from "@/src/domain/leases";
 import {
   type AppState,
   type HistoryEntry,
+  type LeaseView,
   type PendingRequest,
+  type PendingRevoke,
   type RelayOrigin,
   type RequestState,
 } from "@/src/domain/types";
@@ -138,16 +146,122 @@ class Store {
     this.remove(requestId);
   }
 
+  // ---- lease control -------------------------------------------------------
+  //
+  // Every writer below records only what the DAEMON said, and when. Nothing here
+  // removes a row on the phone's own initiative, because the phone holds no lease
+  // state: the daemon's `LeaseStore` is the only authority, and a local edit that
+  // looked like a revoke would be exactly the consent theatre this replaced
+  // (security review F7). The one local removal is expiry, which is arithmetic on
+  // the daemon's own number, and it is never reported as a revoke.
+
+  /** A list query has left this phone. */
+  leaseQueryStarted(): void {
+    this.patchLeases({ asking: true });
+  }
+
   /**
-   * PHONE-LOCAL ONLY, and deliberately not called by any screen (security review
-   * F7). This drops a row from this phone's array; it sends no envelope, so the
-   * daemon's `LeaseStore` keeps honoring the window for the rest of its TTL. Do
-   * NOT put a "Revoke" control behind this: a control that says a window closed
-   * when it did not is worse than no control. Wire a real revoke message first,
-   * then restore the affordance in the settings screen.
+   * The list query could not be sent, or nothing came back in time. Records
+   * inability, never emptiness: `rows` and `answeredAt` are left exactly as they
+   * were, so the screen goes on describing the last real answer (and says how old
+   * it is) instead of inventing a fresh one.
    */
-  revokeLease(id: string): void {
-    this.patch({ leases: this.state.leases.filter((l) => l.id !== id) });
+  leaseQueryFailed(): void {
+    this.patchLeases({ asking: false, unreachable: true });
+  }
+
+  /**
+   * A fresh, verified answer from the daemon. This is the ONLY writer of `rows`
+   * and `answeredAt`, and therefore the only thing that can entitle the screen to
+   * say the list is complete.
+   *
+   * It also settles pending revokes: a window missing from an answer the daemon
+   * produced AFTER the revoke was sent is confirmed closed by the daemon's own
+   * account of itself, which is stronger evidence than the revoke reply. A window
+   * still present stays pending, warning and all, because it really is still open.
+   */
+  leaseListReceived(rows: LeaseRow[], receivedAt: number): void {
+    const live = toActiveLeases(rows, receivedAt);
+    const present = new Set(live.map((l) => l.instance));
+    const settled = this.state.leases.revokes.filter(
+      (r) => r.sentAt < receivedAt && !present.has(r.instance),
+    );
+    const note =
+      settled.length > 0
+        ? { instance: settled[0]!.instance, outcome: "closed" as const, at: receivedAt }
+        : this.state.leases.note;
+    this.patchLeases({
+      rows: live,
+      answeredAt: receivedAt,
+      asking: false,
+      unreachable: false,
+      revokes: this.state.leases.revokes.filter((r) => !settled.includes(r)),
+      note,
+    });
+  }
+
+  /**
+   * A revoke has left this phone. The row deliberately STAYS: clearing it here
+   * would be an optimistic claim that a window closed, and a hostile or broken
+   * relay suppressing the reply must never be able to buy that claim.
+   */
+  leaseRevokeStarted(revoke: PendingRevoke): void {
+    const others = this.state.leases.revokes.filter((r) => r.instance !== revoke.instance);
+    this.patchLeases({ revokes: [...others, revoke], note: null });
+  }
+
+  /**
+   * The daemon answered a revoke, attributed by the correlation id this phone
+   * sent. Both answers are successes: `revoked` true means it ended a live
+   * window, false means it had no such window (already lapsed, already revoked,
+   * replaced, or never held, and the daemon deliberately does not distinguish
+   * them). Either way that window is closed, so the row goes, and the note says
+   * which it was rather than letting the second case read as a failure.
+   *
+   * A reply whose id this phone did not send is not routed here at all; the
+   * session controller drops it.
+   */
+  leaseRevokeConfirmed(queryId: string, revoked: boolean, at: number): void {
+    const p = this.state.leases.revokes.find((r) => r.queryId === queryId);
+    if (!p) return;
+    this.patchLeases({
+      rows: this.state.leases.rows.filter((l) => l.instance !== p.instance),
+      revokes: this.state.leases.revokes.filter((r) => r.queryId !== queryId),
+      note: { instance: p.instance, outcome: revoked ? "closed" : "alreadyGone", at },
+    });
+  }
+
+  /**
+   * The revoke went out and nothing came back. The row stays, flagged, and the
+   * screen names the Mac-side fallback: the honest reading is that the window may
+   * still be open, and saying anything else here would be the failure mode this
+   * whole feature exists to avoid.
+   */
+  leaseRevokeUnconfirmed(queryId: string): void {
+    this.patchLeases({
+      revokes: this.state.leases.revokes.map((r) =>
+        r.queryId === queryId ? { ...r, unconfirmed: true } : r,
+      ),
+    });
+  }
+
+  /**
+   * Drop rows whose window has run out. Arithmetic on the daemon's own
+   * `remainingMs`, so it claims nothing the daemon did not already say; a row
+   * that lapses is never recorded as a revoke.
+   */
+  expireLeases(nowMs: number): void {
+    const rows = this.state.leases.rows.filter((l) => l.expiresAt > nowMs);
+    if (rows.length === this.state.leases.rows.length) return;
+    const kept = new Set(rows.map((l) => l.instance));
+    this.patchLeases({
+      rows,
+      revokes: this.state.leases.revokes.filter((r) => kept.has(r.instance)),
+    });
+  }
+
+  private patchLeases(p: Partial<LeaseView>): void {
+    this.patch({ leases: { ...this.state.leases, ...p } });
   }
 
   setSetting<K extends keyof AppState["settings"]>(key: K, value: AppState["settings"][K]): void {

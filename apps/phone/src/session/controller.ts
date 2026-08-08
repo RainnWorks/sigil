@@ -19,6 +19,8 @@ import {
   type ApprovalRequest,
   fingerprintWords,
   fromBase64,
+  type LeaseListMessage,
+  type LeaseRevokeMessage,
   loadSodium,
   peerIdentity,
   type PushRegisterMessage,
@@ -29,9 +31,10 @@ import {
 
 import { computePartial, isSecureEnclaveAvailable } from "@/modules/sigil-se";
 import { faceGate } from "@/src/lib/biometric";
+import { LEASE_REPLY_TIMEOUT_MS } from "@/src/domain/leases";
 import { store } from "@/src/state/store";
 import { PhoneRelay } from "@/src/transport/phone-relay";
-import { SigilSession } from "./session";
+import { type LeaseControlReply, SigilSession } from "./session";
 import { clearPairing, loadPairing, type StoredPairing } from "./keystore";
 
 interface Live {
@@ -79,6 +82,7 @@ export async function armLiveSession(): Promise<boolean> {
     daemonPub: pairing.daemonPub,
     pairingId: pairing.mailbox,
     transport,
+    onLeaseReply: handleLeaseReply,
   });
   await session.start();
   live = { session, transport };
@@ -107,6 +111,7 @@ function ownFingerprint(sodium: Sodium, pairing: StoredPairing): string {
 export function disarmLiveSession(): void {
   live?.session.stop();
   live = null;
+  clearLeaseTimers();
 }
 
 /**
@@ -152,6 +157,137 @@ export async function sendPushRegister(token: string): Promise<PushRegisterOutco
  */
 export async function nudgeTransport(): Promise<void> {
   await live?.transport.wake();
+}
+
+// ---- lease control ---------------------------------------------------------
+//
+// The phone half of PHONE LEASE CONTROL: ask the daemon what windows are open,
+// and end one. Both are READ-PATH actions. Listing releases nothing, and revoking
+// only ever narrows authority, so neither passes the biometric: the Face ID gate
+// belongs to release (invariant #4), and putting it in front of the control that
+// CLOSES a window would make containment heavier than consent, which is the same
+// mistake as making deny heavier than approve.
+//
+// The reply timers live here rather than in the store, because this module is
+// what asked the question. Their whole job is to decide the moment silence has to
+// be reported as silence: a relay that drops the answer must leave the human
+// looking at "this window may still be open", never at a closed row.
+
+// The correlation ids this phone is currently waiting on. A reply that names an
+// id we did not send is dropped: the daemon's contract says so, and it is what
+// keeps a late answer to a previous screen-open from repainting a newer list.
+let pendingListQueryId: string | null = null;
+let leaseListTimer: ReturnType<typeof setTimeout> | null = null;
+const leaseRevokeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function clearLeaseTimers(): void {
+  if (leaseListTimer) clearTimeout(leaseListTimer);
+  leaseListTimer = null;
+  pendingListQueryId = null;
+  for (const t of leaseRevokeTimers.values()) clearTimeout(t);
+  leaseRevokeTimers.clear();
+}
+
+function newQueryId(): string {
+  return crypto.randomUUID();
+}
+
+/** Route a verified answer to the store and stand its timer down. */
+function handleLeaseReply(msg: LeaseControlReply): void {
+  if (msg.kind === "leaseList") {
+    // An unsolicited or superseded answer changes nothing on screen.
+    if (msg.reply.queryId !== pendingListQueryId) return;
+    pendingListQueryId = null;
+    if (leaseListTimer) clearTimeout(leaseListTimer);
+    leaseListTimer = null;
+    store.leaseListReceived(msg.reply.leases, Date.now());
+    return;
+  }
+  const { queryId } = msg.reply;
+  const t = leaseRevokeTimers.get(queryId);
+  if (!t) return; // not a revoke this phone is waiting on
+  clearTimeout(t);
+  leaseRevokeTimers.delete(queryId);
+  store.leaseRevokeConfirmed(queryId, msg.reply.revoked, Date.now());
+  // The daemon's own guidance: a revoke is idempotent, so re-list rather than
+  // treat one verdict as the new state of the world.
+  void refreshLeases();
+}
+
+/**
+ * Ask the daemon for its live lease windows. Unarmed or a failed send both land
+ * in "cannot check right now": the phone records that it could not ask, and never
+ * that there is nothing to see. Resolves once the question has left the device;
+ * the answer arrives later through {@link handleLeaseReply}.
+ */
+export async function refreshLeases(): Promise<void> {
+  if (!live) {
+    store.leaseQueryFailed();
+    return;
+  }
+  const queryId = newQueryId();
+  store.leaseQueryStarted();
+  try {
+    await live.session.sendToDaemon<LeaseListMessage>({ type: "leaseList", queryId });
+  } catch (e) {
+    console.warn(`[lease] list request failed: ${errText(e)}`);
+    store.leaseQueryFailed();
+    return;
+  }
+  pendingListQueryId = queryId;
+  // Hurry the answer down the ladder rather than waiting out the poll backstop.
+  void live.transport.wake();
+  if (leaseListTimer) clearTimeout(leaseListTimer);
+  leaseListTimer = setTimeout(() => {
+    leaseListTimer = null;
+    // Only report silence if this is still the question we are waiting on.
+    if (pendingListQueryId !== queryId) return;
+    pendingListQueryId = null;
+    store.leaseQueryFailed();
+  }, LEASE_REPLY_TIMEOUT_MS);
+}
+
+/**
+ * Revoke ONE live window, named by both identifiers the daemon sent for it. The
+ * `instance` is what binds the revoke to the window the human actually read: a
+ * grant key is stable across windows, so naming it alone could land on a window
+ * granted after they looked.
+ *
+ * The row is NOT cleared here. It is marked in flight and stays put until the
+ * daemon confirms, or until the reply window lapses and it is marked unconfirmed.
+ * Optimistically clearing it would let a hostile or broken relay buy the claim
+ * that a window closed simply by dropping one message, and the brief cites this
+ * list as the containment for a rule-wide window.
+ */
+export async function revokeLease(grantHex: string, instance: string): Promise<void> {
+  const queryId = newQueryId();
+  const sentAt = Date.now();
+  store.leaseRevokeStarted({ queryId, grantHex, instance, sentAt, unconfirmed: false });
+  if (!live) {
+    // Nothing left the device, so nothing can be assumed about the window.
+    store.leaseRevokeUnconfirmed(queryId);
+    return;
+  }
+  try {
+    await live.session.sendToDaemon<LeaseRevokeMessage>({
+      type: "leaseRevoke",
+      queryId,
+      grantHex,
+      instance,
+    });
+  } catch (e) {
+    console.warn(`[lease] revoke dispatch failed: ${errText(e)}`);
+    store.leaseRevokeUnconfirmed(queryId);
+    return;
+  }
+  void live.transport.wake();
+  leaseRevokeTimers.set(
+    queryId,
+    setTimeout(() => {
+      leaseRevokeTimers.delete(queryId);
+      store.leaseRevokeUnconfirmed(queryId);
+    }, LEASE_REPLY_TIMEOUT_MS),
+  );
 }
 
 export type ApproveOutcome = "sent" | "refused" | "no-session" | "error";

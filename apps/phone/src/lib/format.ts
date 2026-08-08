@@ -188,9 +188,40 @@ function sanitizeLabel(raw: string, maxChars: number): string {
  * rule verbatim, and it is the only place that claims to.
  */
 export function coverageLabel(covers: string | undefined): string | null {
-  if (!covers) return null;
-  const label = sanitizeLabel(covers, COVERS_MAX_CHARS);
+  return safeLabel(covers, COVERS_MAX_CHARS);
+}
+
+/**
+ * The same allowlist as {@link coverageLabel}, for any other daemon-sent string
+ * a screen sets in a line of its own prose: a lease's rule name and account in
+ * the settings list. Returns null when nothing survives, and the caller then
+ * phrases around the absence rather than printing an empty gap.
+ *
+ * The reasoning is {@link coverageLabel}'s, unchanged. The daemon sanitizes
+ * first and is authoritative; this pass is a no-op on anything it produced and
+ * exists for the case where that guarantee failed, which is exactly the case
+ * where failing open on unfamiliar Unicode would bite.
+ */
+export function safeLabel(raw: string | undefined, maxChars: number): string | null {
+  if (!raw) return null;
+  const label = sanitizeLabel(raw, maxChars);
   return label === "" ? null : label;
+}
+
+/**
+ * A lease's remaining window in words for the settings list: "41m left",
+ * "1h 12m left", "38s left". Coarse on purpose above a minute (a lease window is
+ * a span, not a deadline), and precise in the last minute, where the number is
+ * about to matter. Display only.
+ */
+export function remainingWindow(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  if (total < 60) return `${total}s left`;
+  const mins = Math.floor(total / 60);
+  if (mins < 60) return `${mins}m left`;
+  const hours = Math.floor(mins / 60);
+  const rem = mins % 60;
+  return rem === 0 ? `${hours}h left` : `${hours}h ${rem}m left`;
 }
 
 /**
