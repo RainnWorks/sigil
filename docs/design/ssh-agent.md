@@ -227,10 +227,15 @@ should say so.
   The residual, which matters more for a signature than for a read: **both
   surviving gates are RAM-only on each end**, so a restart empties the seen-id
   set. A captured `SIGN_RESPONSE` replayed inside its 150s window across a restart
-  clears both. What still stands behind them is the fresh per-envelope ephemeral
-  key, plus request-id correlation at the application layer for any message whose
-  safety depends on matching an outstanding request. Fail closed: no approval, no
-  signature.
+  clears both. What still stands behind them is **correlation**: the response
+  names the request it answered, and a response with no registered waiter is
+  dropped as stale (`remote.rs`). Do not credit the per-envelope ephemeral key
+  here. It is forward secrecy against sender-key compromise, not replay
+  resistance: a crypto_box ciphertext opens from the recipient's static key and
+  the ephemeral carried in the envelope, so nothing about it binds a captured
+  response to a request context. Any new message type whose safety depends on
+  matching an outstanding request needs its own correlation, not the envelope's.
+  Fail closed: no approval, no signature.
 - **Show a fingerprint, not raw bytes.** The `data` to sign is opaque and useless to
   a human. The phone screen must show a stable **hash of the data** (e.g. the same
   Blake2 fingerprint style already used), plus the derived destination (§3). Never
