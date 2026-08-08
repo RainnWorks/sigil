@@ -166,7 +166,7 @@ class Store {
 
   /**
    * The list query could not be sent, or nothing came back in time. Records
-   * inability, never emptiness: `rows`, `answeredAt` and `asOf` are left exactly
+   * inability, never emptiness: `rows`, `askedAt` and `asOfMs` are left exactly
    * as they were, so the screen goes on describing the last real snapshot (and
    * says it has aged) instead of inventing a fresh one.
    */
@@ -191,7 +191,7 @@ class Store {
 
   /**
    * A fresh, correlated snapshot from the daemon. This is the ONLY writer of
-   * `rows`, `answeredAt` and `asOf`, and therefore the only thing that can
+   * `rows`, `askedAt` and `asOfMs`, and therefore the only thing that can
    * entitle the screen to say the list is complete.
    *
    * It also settles pending revokes: a window missing from a snapshot the daemon
@@ -199,7 +199,7 @@ class Store {
    * account of itself, which is stronger evidence than the revoke reply. A window
    * still present stays pending, warning and all, because it really is still open.
    */
-  leaseListReceived(rows: LeaseRow[], asOf: number, sentAt: number, receivedAt: number): void {
+  leaseListReceived(rows: LeaseRow[], asOfMs: number, sentAt: number, receivedAt: number): void {
     const live = toActiveLeases(rows, receivedAt);
     const present = new Set(live.map((l) => l.leaseId));
     const settled = this.state.leases.revokes.filter(
@@ -215,7 +215,7 @@ class Store {
       // up: the relay picks the delay, so arrival is a number it controls. See
       // the two-timestamp note in the session controller.
       askedAt: sentAt,
-      asOf,
+      asOfMs,
       asking: false,
       unreachable: false,
       noBiometric: false,
@@ -290,7 +290,7 @@ class Store {
     this.patchLeases({
       rows: [],
       askedAt: 0,
-      asOf: 0,
+      asOfMs: 0,
       asking: false,
       unreachable: false,
       noBiometric: false,

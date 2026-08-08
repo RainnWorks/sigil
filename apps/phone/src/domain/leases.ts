@@ -14,14 +14,14 @@
  *      would be a false statement of fact on the surface the brief cites as the
  *      containment for a rule-wide window.
  *   2. **What comes back is a snapshot, not a view.** It carries the daemon's own
- *      `asOf`, the screen shows it, and it goes visibly stale within seconds
+ *      `asOfMs`, the screen shows it, and it goes visibly stale within seconds
  *      rather than sitting there implying it still describes the Mac.
  *   3. **Failing means failing toward "the window may still be open."** Never
  *      toward a clean-looking list. An unconfirmed revoke keeps warning until
  *      something actually settles it.
  */
 import { relativeTime, remainingWindow, safeLabel } from "@/src/lib/format";
-import { COVERS_MAX_CHARS, type LeaseRow } from "@/src/protocol";
+import { LEASE_LABEL_MAX_CHARS, type LeaseRow } from "@/src/protocol";
 
 import { type ActiveLease, type LeaseView, type PendingRevoke } from "./types";
 
@@ -43,16 +43,16 @@ export const LEASE_SNAPSHOT_FRESH_MS = 10_000;
  */
 export const LEASE_REPLY_TIMEOUT_MS = 20_000;
 
-/** Layout bounds for the two daemon strings this screen sets in its own prose. */
-export const SCOPE_MAX_CHARS = 48;
-export const ACCOUNT_MAX_CHARS = 48;
+// The bound for every daemon string this screen sets in its own prose is the
+// daemon's own LEASE_LABEL_MAX_CHARS, imported rather than re-guessed: the two
+// surfaces must not be able to render the same input at different lengths.
 
 /** The never-asked resting state, and what a cleared snapshot returns to. */
 export function emptyLeaseView(): LeaseView {
   return {
     rows: [],
     askedAt: 0,
-    asOf: 0,
+    asOfMs: 0,
     asking: false,
     unreachable: false,
     noBiometric: false,
@@ -88,9 +88,9 @@ export function toActiveLeases(rows: LeaseRow[], receivedAt: number): ActiveLeas
     if (r.remainingMs <= 0) continue;
     out.push({
       leaseId: r.leaseId,
-      scope: safeLabel(r.scope, SCOPE_MAX_CHARS),
-      covers: safeLabel(r.covers, COVERS_MAX_CHARS),
-      account: safeLabel(r.account, ACCOUNT_MAX_CHARS),
+      scope: safeLabel(r.scope, LEASE_LABEL_MAX_CHARS),
+      covers: safeLabel(r.covers, LEASE_LABEL_MAX_CHARS),
+      account: safeLabel(r.account, LEASE_LABEL_MAX_CHARS),
       expiresAt: receivedAt + r.remainingMs,
       windowMs: r.remainingMs,
     });
@@ -126,7 +126,7 @@ export function snapshotFresh(view: LeaseView, nowMs: number): boolean {
 /**
  * The daemon's own snapshot time as a wall clock, e.g. "14:23:07".
  *
- * Displayed verbatim from `asOf`, but the staleness decision above deliberately
+ * Displayed verbatim from `asOfMs`, but the staleness decision above deliberately
  * uses local elapsed time since arrival instead. The two clocks are only loosely
  * tied (the envelope freshness window is the only thing keeping them near each
  * other), and a daemon clock running fast must not be able to make an old
@@ -259,7 +259,7 @@ export function leaseListStatus(view: LeaseView, nowMs: number): LeaseListStatus
     };
   }
 
-  const at = asOfClock(view.asOf);
+  const at = asOfClock(view.asOfMs);
   const doubt = view.unreachable
     ? `This phone cannot reach your Mac right now. ${AGED}`
     : `That snapshot has aged. ${AGED}`;

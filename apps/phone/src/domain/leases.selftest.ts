@@ -17,7 +17,11 @@
 import {
   classifyToPhone,
   LEASE_ID_CHARS,
+  LEASE_PAD_BUCKET,
+  type LeaseListMessage,
+  type LeaseRevokeMessage,
   type LeaseRow,
+  padLeaseControl,
   parseLeaseListReply,
   parseLeaseRevokeReply,
 } from "../protocol/requests";
@@ -105,7 +109,7 @@ function main(): void {
 
   console.log("leaseListStatus (an empty list is a claim that has to be earned)");
   {
-    const answered = { askedAt: NOW - 1_000, asOf: NOW - 1_000 };
+    const answered = { askedAt: NOW - 1_000, asOfMs: NOW - 1_000 };
     const fresh = leaseListStatus(view(answered), NOW);
     eq(fresh.kind, "empty", "fresh snapshot, no rows");
     eq(fresh.line, "No active leases.", "fresh empty line");
@@ -114,7 +118,7 @@ function main(): void {
 
     // One tick past the freshness window: the sentence weakens and dates itself.
     const agedAt = NOW - LEASE_SNAPSHOT_FRESH_MS - 1;
-    const old = leaseListStatus(view({ askedAt: agedAt, asOf: agedAt }), NOW);
+    const old = leaseListStatus(view({ askedAt: agedAt, asOfMs: agedAt }), NOW);
     eq(old.line, `No active leases as of ${asOfClock(agedAt)}.`, "stale empty line dates itself");
     ok(!old.authoritative, "a stale snapshot is not authoritative");
     ok(old.detail?.includes("Check again") ?? false, "a stale snapshot says what to do");
@@ -132,14 +136,14 @@ function main(): void {
   console.log("snapshot freshness (10s, measured locally, not on the daemon's clock)");
   {
     ok(!snapshotFresh(view(), NOW), "never answered is never fresh");
-    ok(snapshotFresh(view({ askedAt: NOW - 9_000, asOf: NOW }), NOW), "9s old is fresh");
-    ok(!snapshotFresh(view({ askedAt: NOW - 11_000, asOf: NOW }), NOW), "11s old is stale");
+    ok(snapshotFresh(view({ askedAt: NOW - 9_000, asOfMs: NOW }), NOW), "9s old is fresh");
+    ok(!snapshotFresh(view({ askedAt: NOW - 11_000, asOfMs: NOW }), NOW), "11s old is stale");
     // A daemon clock running fast must not be able to refresh an old snapshot.
     ok(
-      !snapshotFresh(view({ askedAt: NOW - 60_000, asOf: NOW + 3_600_000 }), NOW),
-      "a future asOf cannot make an old snapshot look current",
+      !snapshotFresh(view({ askedAt: NOW - 60_000, asOfMs: NOW + 3_600_000 }), NOW),
+      "a future asOfMs cannot make an old snapshot look current",
     );
-    eq(asOfClock(new Date(2026, 0, 2, 14, 3, 7).getTime()), "14:03:07", "asOf renders as a clock");
+    eq(asOfClock(new Date(2026, 0, 2, 14, 3, 7).getTime()), "14:03:07", "asOfMs renders as a clock");
   }
 
   console.log("a stalled reply cannot buy currency (R7-F1)");
@@ -149,7 +153,7 @@ function main(): void {
     // age is measured from when the QUESTION went out, which no one but this
     // phone can push later.
     const sentAt = NOW - 19_000;
-    const stalled = view({ askedAt: sentAt, asOf: NOW - 100 });
+    const stalled = view({ askedAt: sentAt, asOfMs: NOW - 100 });
     ok(!snapshotFresh(stalled, NOW), "a 19s stalled reply is not fresh");
     const s = leaseListStatus(stalled, NOW);
     eq(s.line, `No active leases as of ${asOfClock(NOW - 100)}.`, "and cannot claim emptiness flatly");
@@ -159,29 +163,29 @@ function main(): void {
     // new. That is the bug this pins, so state it as an assertion rather than
     // trusting the constant above to stay put.
     ok(
-      snapshotFresh(view({ askedAt: NOW, asOf: NOW - 100 }), NOW),
+      snapshotFresh(view({ askedAt: NOW, asOfMs: NOW - 100 }), NOW),
       "the same answer stamped at arrival would have looked current",
     );
 
     // A prompt answer is still fresh: the fix must not make the definite claim
     // unreachable over an honest link.
-    ok(snapshotFresh(view({ askedAt: NOW - 1_500, asOf: NOW }), NOW), "a 1.5s round trip stays fresh");
+    ok(snapshotFresh(view({ askedAt: NOW - 1_500, asOfMs: NOW }), NOW), "a 1.5s round trip stays fresh");
   }
 
   console.log("leaseListStatus (rows)");
   {
     const rows = toActiveLeases([row()], NOW);
-    const fresh = leaseListStatus(view({ rows, askedAt: NOW, asOf: NOW }), NOW);
+    const fresh = leaseListStatus(view({ rows, askedAt: NOW, asOfMs: NOW }), NOW);
     eq(fresh.kind, "rows", "fresh rows");
     eq(fresh.line, `Snapshot as of ${asOfClock(NOW)}.`, "fresh rows stamp the snapshot");
     ok(fresh.detail === undefined, "fresh rows need no caveat");
 
     const agedAt = NOW - LEASE_SNAPSHOT_FRESH_MS - 60_000;
-    const stale = leaseListStatus(view({ rows, askedAt: agedAt, asOf: agedAt }), NOW);
+    const stale = leaseListStatus(view({ rows, askedAt: agedAt, asOfMs: agedAt }), NOW);
     ok(stale.detail?.includes("Check again") ?? false, "stale rows carry a caveat");
 
     // Rows that have all run out read as an empty list, not as rows.
-    const lapsed = leaseListStatus(view({ rows, askedAt: NOW, asOf: NOW }), NOW + 600_001);
+    const lapsed = leaseListStatus(view({ rows, askedAt: NOW, asOfMs: NOW }), NOW + 600_001);
     eq(lapsed.kind, "empty", "every row lapsed");
   }
 
@@ -230,20 +234,26 @@ function main(): void {
     const good = parseLeaseListReply({
       type: "leaseListReply",
       inReplyTo: REQ,
-      asOf: NOW,
+      asOfMs: NOW,
       leases: [row()],
     });
     eq(good?.leases.length, 1, "a well formed snapshot parses");
     eq(good?.inReplyTo, REQ, "the correlation id is carried through");
-    eq(good?.asOf, NOW, "the snapshot time is carried through");
+    eq(good?.asOfMs, NOW, "the snapshot time is carried through");
 
     const list = (leases: unknown[], over: Record<string, unknown> = {}) =>
-      parseLeaseListReply({ type: "leaseListReply", inReplyTo: REQ, asOf: NOW, ...over, leases });
+      parseLeaseListReply({ type: "leaseListReply", inReplyTo: REQ, asOfMs: NOW, ...over, leases });
 
     eq(list([])?.leases.length, 0, "an empty snapshot is a valid snapshot");
     eq(list([], { inReplyTo: undefined }), null, "a snapshot with no correlation id is dropped");
     eq(list([], { inReplyTo: "not-a-uuid" }), null, "a malformed correlation id is dropped");
-    eq(list([], { asOf: undefined }), null, "an unstamped snapshot is dropped");
+    eq(list([], { asOfMs: undefined }), null, "an unstamped snapshot is dropped");
+
+    // `pad` is inert filler. It must parse away to nothing: never surfaced,
+    // never sanitized, and never able to change what the screen decides.
+    const padded = list([row()], { pad: ".".repeat(4096) });
+    eq(padded?.leases.length, 1, "a padded snapshot parses exactly as an unpadded one");
+    eq((padded as unknown as Record<string, unknown>).pad, undefined, "and the filler is dropped");
 
     // Under-reporting is the one direction this surface must not fail in: a
     // shorter list reads as "that is everything", so a bad row voids the lot and
@@ -253,7 +263,7 @@ function main(): void {
     eq(list([row({ leaseId: LEASE.slice(1) })]), null, "a short lease id is rejected");
     eq(list([{ ...row(), remainingMs: "10" }]), null, "a non-numeric remaining is rejected");
     eq(list([{ ...row(), scope: 42 }]), null, "a non-string rule name is rejected");
-    eq(parseLeaseListReply({ type: "leaseListReply", inReplyTo: REQ, asOf: NOW }), null, "a missing list is not an empty list");
+    eq(parseLeaseListReply({ type: "leaseListReply", inReplyTo: REQ, asOfMs: NOW }), null, "a missing list is not an empty list");
     eq(parseLeaseListReply(null), null, "null is not a snapshot");
   }
 
@@ -268,7 +278,7 @@ function main(): void {
 
   console.log("classifyToPhone (lease answers demux, and fail closed)");
   {
-    const listed = classifyToPhone({ type: "leaseListReply", inReplyTo: REQ, asOf: NOW, leases: [] });
+    const listed = classifyToPhone({ type: "leaseListReply", inReplyTo: REQ, asOfMs: NOW, leases: [] });
     eq(listed?.kind, "leaseList", "a snapshot is recognized");
     const revoked = classifyToPhone({
       type: "leaseRevokeReply",
@@ -285,6 +295,38 @@ function main(): void {
     // An untagged payload is still an approval request: the existing wire shape
     // must not shift under the new tags.
     eq(classifyToPhone({ requestId: "r1" })?.kind, "request", "untagged is still a request");
+  }
+
+  console.log("padLeaseControl (F7: length must not carry the row count)");
+  {
+    const bytes = (v: unknown) => new TextEncoder().encode(JSON.stringify(v)).length;
+
+    const list = padLeaseControl<LeaseListMessage>({ type: "leaseList", pad: "" });
+    eq(bytes(list) % LEASE_PAD_BUCKET, 0, "a list request lands on a bucket");
+    eq(bytes(list), LEASE_PAD_BUCKET, "and fits in the first one");
+
+    const rev = padLeaseControl<LeaseRevokeMessage>({
+      type: "leaseRevoke",
+      leaseId: LEASE,
+      pad: "",
+    });
+    eq(bytes(rev) % LEASE_PAD_BUCKET, 0, "a revoke lands on a bucket");
+    // The whole point: the two must be indistinguishable by length, or the relay
+    // reads "the human is revoking something" straight off the ciphertext.
+    eq(bytes(rev), bytes(list), "a revoke is the same size as a list");
+
+    // Padding is exact, not approximate: `pad` always serializes, so measuring
+    // with it empty already accounts for the field's own overhead.
+    eq(padLeaseControl({ pad: "" }).pad.length, LEASE_PAD_BUCKET - bytes({ pad: "" }), "exact fill");
+
+    // A payload that overflows still lands on a bucket rather than spilling.
+    const big = padLeaseControl({ pad: "", blob: "x".repeat(2000) });
+    eq(bytes(big) % LEASE_PAD_BUCKET, 0, "an oversized payload rolls to the next bucket");
+    ok(bytes(big) > LEASE_PAD_BUCKET, "and really did overflow the first");
+
+    // Idempotent: padding an already-padded message must not grow it, or a
+    // resend would change size and leak that it was a resend.
+    eq(bytes(padLeaseControl(list)), bytes(list), "padding twice changes nothing");
   }
 
   console.log("OutstandingRequests (F3: the captured-reply replay)");
@@ -387,7 +429,7 @@ function main(): void {
     // string this module can produce is checked for anything of that shape.
     const rows = toActiveLeases([row()], NOW);
     const strings = [
-      ...[view(), view({ asking: true }), view({ unreachable: true }), view({ askedAt: NOW, asOf: NOW }), view({ rows, askedAt: NOW, asOf: NOW })]
+      ...[view(), view({ asking: true }), view({ unreachable: true }), view({ askedAt: NOW, asOfMs: NOW }), view({ rows, askedAt: NOW, asOfMs: NOW })]
         .map((v) => leaseListStatus(v, NOW))
         .flatMap((s) => [s.line, s.detail ?? ""]),
       unconfirmedRevokeLine(revoke({ unconfirmed: true })),
@@ -412,9 +454,9 @@ function main(): void {
       view(),
       view({ asking: true }),
       view({ unreachable: true }),
-      view({ askedAt: NOW, asOf: NOW }),
-      view({ askedAt: NOW - 10 * 60_000, asOf: NOW - 10 * 60_000, unreachable: true }),
-      view({ rows, askedAt: NOW, asOf: NOW }),
+      view({ askedAt: NOW, asOfMs: NOW }),
+      view({ askedAt: NOW - 10 * 60_000, asOfMs: NOW - 10 * 60_000, unreachable: true }),
+      view({ rows, askedAt: NOW, asOfMs: NOW }),
     ]
       .map((v) => leaseListStatus(v, NOW))
       .flatMap((s) => [s.line, s.detail ?? ""])

@@ -22,6 +22,7 @@ import {
   type LeaseListMessage,
   type LeaseRevokeMessage,
   loadSodium,
+  padLeaseControl,
   peerIdentity,
   type PushRegisterMessage,
   shapeEcdh,
@@ -253,7 +254,7 @@ function handleLeaseReply(msg: LeaseControlReply): void {
     //
     // Both err toward "assume more is open than you can see", which is the one
     // direction this surface is allowed to be wrong in.
-    store.leaseListReceived(msg.reply.leases, msg.reply.asOf, asked.sentAt, Date.now());
+    store.leaseListReceived(msg.reply.leases, msg.reply.asOfMs, asked.sentAt, Date.now());
     return;
   }
   if (!claim(msg.reply.inReplyTo, "revoke")) return;
@@ -296,13 +297,19 @@ export async function refreshLeases(): Promise<LeaseQueryOutcome> {
   store.leaseQueryStarted();
   let requestId: string;
   try {
-    requestId = await live.session.sendToDaemon<LeaseListMessage>({ type: "leaseList" });
+    requestId = await live.session.sendToDaemon<LeaseListMessage>(
+      padLeaseControl<LeaseListMessage>({ type: "leaseList", pad: "" }),
+    );
   } catch (e) {
     console.warn(`[lease] list request failed: ${errText(e)}`);
     store.leaseQueryFailed();
     return "cannot-ask";
   }
   outstanding.issue(requestId, "list", sentAt);
+  // Silence is a normal outcome, not an anomaly: the daemon simply does not
+  // answer a query over its rate budget, and it does not answer a malformed one
+  // either. Both land here as "cannot check right now", which is the correct
+  // reading. What silence must never become is "no active leases".
   armLeaseTimer(requestId, () => store.leaseQueryFailed());
   // Hurry the answer down the ladder rather than waiting out the poll backstop.
   void live.transport.wake();
@@ -338,10 +345,9 @@ export async function revokeLease(leaseId: string, scope: string | null): Promis
   }
   let requestId: string;
   try {
-    requestId = await live.session.sendToDaemon<LeaseRevokeMessage>({
-      type: "leaseRevoke",
-      leaseId,
-    });
+    requestId = await live.session.sendToDaemon<LeaseRevokeMessage>(
+      padLeaseControl<LeaseRevokeMessage>({ type: "leaseRevoke", leaseId, pad: "" }),
+    );
   } catch (e) {
     console.warn(`[lease] revoke dispatch failed: ${errText(e)}`);
     store.leaseRevokeStarted({ requestId: unsent, leaseId, scope, sentAt, unconfirmed: true });
@@ -349,6 +355,9 @@ export async function revokeLease(leaseId: string, scope: string | null): Promis
   }
   store.leaseRevokeStarted({ requestId, leaseId, scope, sentAt, unconfirmed: false });
   outstanding.issue(requestId, "revoke", sentAt);
+  // The daemon sends no error for a revoke it will not act on, so silence covers
+  // both a dropped message and a rejected one. Either way the window's state is
+  // unknown, which is what the standing warning says.
   armLeaseTimer(requestId, () => store.leaseRevokeUnconfirmed(requestId));
   void live.transport.wake();
 }

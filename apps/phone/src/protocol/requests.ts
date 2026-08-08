@@ -328,6 +328,61 @@ export interface ResolutionBroadcastMessage {
 export const LEASE_ID_CHARS = 32;
 
 /**
+ * The bound every human-readable field of a {@link LeaseRow} is sanitized to,
+ * mirroring the daemon's `LEASE_LABEL_MAX_CHARS`. The same number as
+ * {@link COVERS_MAX_CHARS}, because it is the same allowlist doing the same job
+ * on the same kind of surface.
+ */
+export const LEASE_LABEL_MAX_CHARS = COVERS_MAX_CHARS;
+
+/**
+ * Every lease-control plaintext is padded to a multiple of this before sealing,
+ * mirroring the daemon's `LEASE_PAD_BUCKET`.
+ *
+ * Ciphertext length would otherwise carry the row count straight to the relay: a
+ * realistic row is around 169 bytes, so an unpadded reply says how many windows
+ * are open, and a revoke is trivially shorter than a list. 1024 rather than 512
+ * because 512 holds only two realistic rows and rolls at three, leaking the count
+ * in exactly the range that matters.
+ *
+ * Padding is a SENDER obligation and is deliberately not verified on receipt. A
+ * peer that does not pad leaks its own lengths and nobody else's, whereas
+ * rejecting an unpadded message would make a version skew between the two halves
+ * fail silently and closed, and a revoke that vanishes is the failure this whole
+ * feature exists to end.
+ */
+export const LEASE_PAD_BUCKET = 1024;
+
+/** The inert filler. ASCII, so one character is one byte and needs no escaping. */
+const LEASE_PAD_FILL = ".";
+
+/** A lease-control payload, which always carries its own padding field. */
+interface Padded {
+  pad: string;
+}
+
+/**
+ * Size `pad` so the serialized JSON is exactly a multiple of
+ * {@link LEASE_PAD_BUCKET} bytes. Mirrors the daemon's
+ * `LeaseControlMessage::padded`.
+ *
+ * Exact rather than approximate because `pad` always serializes, even when empty,
+ * so measuring with it empty already accounts for the field's own overhead and
+ * the filler can never spill into a further bucket. Measured in BYTES, matching
+ * `serde_json::to_vec().len()` on the daemon and the `TextEncoder` in `seal`.
+ *
+ * Key order differs from the daemon's struct order and that is fine: only the
+ * length is load-bearing, and nothing on either side parses the padding.
+ */
+export function padLeaseControl<T extends Padded>(payload: T): T {
+  const encoder = new TextEncoder();
+  const bare = { ...payload, pad: "" };
+  const len = encoder.encode(JSON.stringify(bare)).length;
+  const target = Math.ceil(len / LEASE_PAD_BUCKET) * LEASE_PAD_BUCKET;
+  return { ...bare, pad: LEASE_PAD_FILL.repeat(target - len) };
+}
+
+/**
  * Phone -> daemon: list the daemon's live lease windows (PHONE LEASE CONTROL).
  *
  * Sealed over the live session like {@link PushRegisterMessage}, outside the
@@ -345,6 +400,8 @@ export const LEASE_ID_CHARS = 32;
  */
 export interface LeaseListMessage {
   type: "leaseList";
+  /** Length-hiding filler; see {@link padLeaseControl}. Never read by anyone. */
+  pad: string;
 }
 
 /**
@@ -360,6 +417,8 @@ export interface LeaseListMessage {
 export interface LeaseRevokeMessage {
   type: "leaseRevoke";
   leaseId: string;
+  /** Length-hiding filler; see {@link padLeaseControl}. Never read by anyone. */
+  pad: string;
 }
 
 /**
@@ -405,7 +464,7 @@ export interface LeaseRow {
 /**
  * Daemon -> phone: the answer to a {@link LeaseListMessage}.
  *
- * A SNAPSHOT, and the type says so: `asOf` is when the daemon measured it, and
+ * A SNAPSHOT, and the type says so: `asOfMs` is when the daemon measured it, and
  * the screen renders that timestamp and goes visibly stale rather than sitting
  * there looking like a live view of the Mac.
  *
@@ -418,7 +477,7 @@ export interface LeaseListReplyMessage {
   /** The envelope request id of the {@link LeaseListMessage} this answers. */
   inReplyTo: string;
   /** When the daemon took this snapshot, unix ms on the daemon's clock. */
-  asOf: number;
+  asOfMs: number;
   leases: LeaseRow[];
 }
 
@@ -514,7 +573,7 @@ export function parseLeaseListReply(payload: unknown): LeaseListReplyMessage | n
   if (typeof payload !== "object" || payload === null) return null;
   const p = payload as Record<string, unknown>;
   const inReplyTo = uuidField(p.inReplyTo);
-  if (!inReplyTo || !isMs(p.asOf)) return null;
+  if (!inReplyTo || !isMs(p.asOfMs)) return null;
   if (!Array.isArray(p.leases)) return null;
   const leases: LeaseRow[] = [];
   for (const raw of p.leases) {
@@ -522,7 +581,10 @@ export function parseLeaseListReply(payload: unknown): LeaseListReplyMessage | n
     if (!row) return null;
     leases.push(row);
   }
-  return { type: "leaseListReply", inReplyTo, asOf: p.asOf, leases };
+  // `pad` is deliberately not read, not copied, and not sanitized: it is inert
+  // filler, and letting its size or content reach anything would hand a relay a
+  // lever it does not otherwise have.
+  return { type: "leaseListReply", inReplyTo, asOfMs: p.asOfMs, leases };
 }
 
 /** Validate a revoke reply. Fails closed: a malformed one confirms nothing. */

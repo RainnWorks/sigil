@@ -94,7 +94,7 @@ export interface HistoryEntry {
  * daemon's label allowlist a second time there.
  *
  * A SNAPSHOT ROW, never a source of truth: the daemon is the only lease
- * authority, and every field here describes what it said at {@link LeaseView.asOf}.
+ * authority, and every field here describes what it said at {@link LeaseView.asOfMs}.
  * The phone holds no lease state of its own, which is why removing a row locally
  * can never stand in for revoking one. Rows are rendered and dropped; nothing
  * here is persisted, because a stored list of live auto-approve windows is a map
@@ -195,13 +195,13 @@ export interface LeaseView {
    * 0 = never answered. This is the freshness base, and it is deliberately not
    * the arrival time: a relay chooses how long to stall a reply, so arrival is a
    * number the adversary controls, while send time is an upper bound on the
-   * answer's age that only this phone can set. Nor is it {@link asOf}, which a
+   * answer's age that only this phone can set. Nor is it {@link asOfMs}, which a
    * daemon clock running fast could use to make an old snapshot look current.
    */
   askedAt: number;
   /** When the DAEMON measured it, unix ms on its clock. Displayed, never used to
    *  decide freshness. 0 = never answered. */
-  asOf: number;
+  asOfMs: number;
   /** A list query is in flight right now. */
   asking: boolean;
   /** The last query did not come back. Cleared by the next successful snapshot. */

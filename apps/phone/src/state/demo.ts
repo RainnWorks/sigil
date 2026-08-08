@@ -184,7 +184,7 @@ export const demoLeases: ActiveLease[] = [
 
 /** A demo lease view: a snapshot taken a moment ago, so the samples read fresh. */
 export function demoLeaseView(): LeaseView {
-  return { ...emptyLeaseView(), rows: demoLeases, askedAt: now, asOf: now };
+  return { ...emptyLeaseView(), rows: demoLeases, askedAt: now, asOfMs: now };
 }
 
 export const demoHistory: HistoryEntry[] = [
