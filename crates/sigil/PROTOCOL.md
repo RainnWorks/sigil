@@ -21,8 +21,7 @@ operations so a compromised daemon cannot perform them. Therefore:
   (+ live subscription), history, approve/deny.
 - **CLI-only mutations (the Mac app shells out to `sigil … --json`):** account
   add/rotate/remove, **command config** (`config add|list|remove`), settings
-  get/set, wipe `--force`, mac-approvals `--enable|--phone-only`, shim
-  install/add, and **pairing** (`sigil pair --relay <url> --json`, an NDJSON
+  get/set, wipe `--force`, shim install/add, and **pairing** (`sigil pair --relay <url> --json`, an NDJSON
   ceremony stream). These write the keystore / `~/.sigil` and so are deliberately
   not daemon capabilities. Their `--json` shapes are in `JSON.md`.
 
@@ -485,7 +484,6 @@ mutations that must not be daemon capabilities):
 - `addAccount`/`rotateAccount`/`removeAccount` → `account add|rotate|remove … --json`
 - `settings`/`saveSettings` → `settings get|set --json`
 - `wipe` → `wipe --force --json`
-- `setMacApprovals` → `mac-approvals --enable|--phone-only --json`
 - `installShim` → `shim install --json`
 - `unpair` → `unpair --json`
 - pairing → `pair --relay <url> --json` (read the NDJSON `qr`/`sas`/`paired`/

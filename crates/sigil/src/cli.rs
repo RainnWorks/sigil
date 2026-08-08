@@ -13,7 +13,7 @@ use crate::json::{self, ControlResult};
 use crate::keystore;
 use crate::local::{self, Frame, Reply};
 use crate::paths;
-use crate::settings::{self, Settings};
+use crate::settings::Settings;
 use crate::style::Style;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -78,7 +78,7 @@ pub fn run_gating() -> i32 {
 
 /// Dispatch the `sigil-config` binary: all configuration management. Its verbs
 /// are the config engine (`source`/`rule`/`list`/`export`/`import`) plus
-/// `account`, `settings`, `mac-approvals`, and `wipe`. It never gates a command;
+/// `account`, `settings`, and `wipe`. It never gates a command;
 /// an unknown verb is an error, not a `sigil <cmd>` invocation.
 pub fn run_config() -> i32 {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -94,7 +94,6 @@ pub fn run_config() -> i32 {
         "remove" | "rm" => config_remove(args.get(1).map(String::as_str), json),
         "proxy" => cmd_proxy(&args[1..], json),
         "settings" => cmd_settings(&args[1..], json),
-        "mac-approvals" => cmd_mac_approvals(&args[1..], json),
         "wipe" => cmd_wipe(&args[1..], json),
         "version" | "--version" | "-V" => {
             println!("sigil-config {VERSION}");
@@ -114,7 +113,7 @@ pub fn run_config() -> i32 {
 
 /// Whether `cmd` is a reserved verb in the lean `sigil` binary (handled by
 /// [`run_gating`]) and therefore takes precedence over the `sigil <cmd>`
-/// primitive. The management verbs (config/account/settings/mac-approvals/wipe)
+/// primitive. The management verbs (config/account/settings/wipe)
 /// are deliberately NOT reserved here — they moved to `sigil-config`, which frees
 /// those names to be gated. The escape hatch for a tool named like a residual
 /// reserved verb is `sigil run -- <cmd>`.
@@ -295,13 +294,12 @@ usage: sigil-config <cmd> [args...]   author rules/sources, manage accounts
                     also: proxy remove <cmd> [--purge] | list | status |
                     doctor [<cmd>] | env [--shell zsh|bash|fish|nu]
   settings get|set  read or change preferences (timeouts, relay, retention)
-  mac-approvals --enable|--phone-only  toggle the Mac local-approval factor
   wipe [--force]    remove pairing, accounts, keys, config, and settings
   version           print version
   help              print this message
 
 --json is for the CLI-only mutation commands the Mac app shells out for
-(source/rule/list/export/import, account, settings, wipe, mac-approvals).
+(source/rule/list/export/import, account, settings, wipe).
 A running daemon picks up config, sealed values, and SSH keys on its own."
     );
 }
@@ -4067,82 +4065,6 @@ fn config_remove(cmd: Option<&str>, json: bool) -> i32 {
     print_config_result(&result, json)
 }
 
-/// `sigil mac-approvals --enable | --phone-only`: toggle the Mac local-approval
-/// factor / hardened mode. `--phone-only` persists the hardened intent (every
-/// approval degrades to the phone). `--enable` needs the Mac Secure Enclave DEK
-/// envelope, whose minting is not yet verified on hardware (task #17): it
-/// succeeds on the dev keystores and honestly reports "needs verification" on a
-/// real enclave rather than pretending.
-fn cmd_mac_approvals(args: &[String], json: bool) -> i32 {
-    let s = Style::stdout();
-    let enable = has_flag(args, "--enable");
-    let phone_only = has_flag(args, "--phone-only");
-    if enable == phone_only {
-        eprintln!("usage: sigil mac-approvals --enable | --phone-only");
-        return 2;
-    }
-
-    let mut settings = match Settings::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("sigil: loading settings: {e}");
-            return 1;
-        }
-    };
-
-    if phone_only {
-        // Hardened: the phone is strictly required. We persist the intent; the
-        // Secure Enclave envelope teardown itself defers to task #17.
-        settings.mac_approvals = settings::MAC_APPROVALS_PHONE_ONLY.to_string();
-        if let Err(e) = settings.save() {
-            eprintln!("sigil: saving settings: {e}");
-            return 1;
-        }
-        if json {
-            println!("{}", json::to_line(&json::MacApprovalsJson { ok: true }));
-        } else {
-            println!(
-                "{} mac approvals hardened (phone required)",
-                s.ok("\u{2713}")
-            );
-        }
-        return 0;
-    }
-
-    // --enable: provision the Mac threshold share and confirm the keystore is
-    // usable. The phone is always the approving factor now (there is no local
-    // Touch-ID approve path); this only readies the Mac side. On a dev keystore
-    // this always succeeds; a real keystore failure is surfaced honestly.
-    let ks = keystore::for_host();
-    match crate::threshold::load_or_create_mac_share(ks.as_ref()) {
-        Ok(_) => {
-            settings.mac_approvals = settings::MAC_APPROVALS_ENABLED.to_string();
-            if let Err(e) = settings.save() {
-                eprintln!("sigil: saving settings: {e}");
-                return 1;
-            }
-            if json {
-                println!("{}", json::to_line(&json::MacApprovalsJson { ok: true }));
-            } else {
-                println!(
-                    "{} Mac side readied (the phone remains the approving factor)",
-                    s.ok("\u{2713}")
-                );
-            }
-            0
-        }
-        Err(e) => {
-            eprintln!(
-                "sigil: cannot ready the Mac side: {e}. The phone remains the approving factor."
-            );
-            if json {
-                println!("{}", json::to_line(&json::MacApprovalsJson { ok: false }));
-            }
-            1
-        }
-    }
-}
-
 /// `sigil settings get|set`: read or change preferences. `set` takes either a
 /// `<key> <value>` pair or, with `--json`, a JSON object patch on stdin (the
 /// form the Mac app uses); a patch is *merged*, so unlisted keys are untouched.
@@ -4192,11 +4114,6 @@ fn settings_get(json: bool) -> i32 {
         "  {}  {}",
         pad("reduce_motion", 22),
         s.dim(&settings.reduce_motion.to_string())
-    );
-    println!(
-        "  {}  {}",
-        pad("mac_approvals", 22),
-        s.dim(&settings.mac_approvals)
     );
     0
 }
@@ -4830,15 +4747,7 @@ mod tests {
         // Management verbs moved to sigil-config, so they are NOT reserved in the
         // lean binary — which frees those names to be gated as `sigil <name>`.
         for c in [
-            "op",
-            "gcloud",
-            "bw",
-            "kubectl",
-            "mytool",
-            "config",
-            "settings",
-            "wipe",
-            "mac-approvals",
+            "op", "gcloud", "bw", "kubectl", "mytool", "config", "settings", "wipe",
         ] {
             assert!(!is_reserved_verb(c), "{c} must dispatch as a command");
         }

@@ -9,7 +9,7 @@
 //!   bodies: [`StatusJson`], [`CheckJson`], [`LeaseJson`], [`PendingJson`],
 //!   [`HistoryJson`]; and
 //! * the short-lived **CLI mutation commands** emit the rest on stdout under
-//!   `--json`: [`AccountJson`], [`SettingsJson`], [`MacApprovalsJson`],
+//!   `--json`: [`AccountJson`], [`SettingsJson`],
 //!   [`PairListJson`]/[`PairedJson`], and [`ControlResult`].
 //!
 //! Field names, nesting, and value spellings match the Swift decoder in
@@ -277,17 +277,6 @@ pub struct SettingsJson {
     pub retention_days: u32,
     pub relay_url: String,
     pub reduce_motion: bool,
-    /// `enabled` | `phone_only`. Not part of the Swift `SettingsDTO`; carried so
-    /// `settings set` never clobbers the `mac-approvals` choice. Ignored by the
-    /// GUI's decoder.
-    pub mac_approvals: String,
-}
-
-// --- mac-approvals ---------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MacApprovalsJson {
-    pub ok: bool,
 }
 
 // --- helpers ---------------------------------------------------------------

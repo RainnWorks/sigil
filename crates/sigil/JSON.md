@@ -58,24 +58,19 @@ All return the control shape:
 `wipe` refuses (`ok:false`) without `--force`. `wipe --force` removes the
 pairing, accounts, SSH keys, command config, settings, dev keystore, and history.
 
-### `sigil mac-approvals --enable | --phone-only --json`
-```json
-{ "ok": bool }
-```
-`--phone-only` persists the hardened mode (phone strictly required) → `ok:true`.
-`--enable` needs the Mac Secure Enclave DEK envelope: it succeeds on the dev
-keystores, and on a real enclave exits non-zero with a "needs verification"
-stderr line (minting defers to task #17) rather than faking success.
-
 ### `sigil settings get --json`  /  `sigil settings set --json`
 ```json
 { "approval_timeout_sec": int, "notifications": bool, "retention_days": int,
-  "relay_url": str, "reduce_motion": bool, "mac_approvals": "enabled|phone_only" }
+  "relay_url": str, "reduce_motion": bool }
 ```
 `set` accepts a positional `<key> <value>` or a JSON object patch on stdin (what
-the Mac app pipes). A patch is **merged**: absent keys are untouched, so writing
-the five GUI fields never drops `mac_approvals` (extra to the Swift `SettingsDTO`
-and ignored by its decoder).
+the Mac app pipes). A patch is **merged**: absent keys are untouched. An unknown
+key in a patch is an error, so a typo cannot look like it took effect; a `settings.json`
+on disk carrying a key this build has retired still loads, and is rewritten without it.
+
+`mac_approvals` was a sixth field until 2026-08-08. Nothing ever read it, so it
+and its `mac-approvals --enable|--phone-only` verb were removed rather than wired
+up. See the commit for what happens to a settings file that still has it.
 
 ### `sigil pair list --json`
 ```json
