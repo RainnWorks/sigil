@@ -142,8 +142,13 @@ public final class SigilSeModule: Module {
 
       guard let blob = loadBlob(keyId) else { throw MissingKeyException() }
 
-      // `reason` is the generic Face-ID prompt string ("Approve request"); the
-      // provider-blind phone no longer names an account here (R5 removed).
+      // `reason` is the generic prompt string the JS layer passes ("Approve
+      // request", the only value any caller sends); the provider-blind phone no
+      // longer names an account here (R5 removed). Stated because it is not
+      // obvious from the signature: it currently reaches NOTHING. Setting it on
+      // the sheet would mean assigning `context.localizedReason`, which this does
+      // not do, so Face ID shows the system default wording. Left alone rather
+      // than quietly changed, since what that sheet says is a design decision.
       //
       // Clearing the fallback title only HIDES the "Enter Passcode" button. It
       // enforces nothing, and nothing here rests on it: key release is strictly
