@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sigil · gated secret injection for any CLI, approved from your phone</title>
-<meta name="description" content="Sigil is a personal instrument that gates the environment a command runs in: it holds the call, gets your approval on your phone, injects the approved secret, and runs it. The daemon at rest cannot produce a single secret. 1Password is the first provider; the seam is generic.">
+<meta name="description" content="Sigil is a personal instrument that gates the commands your tools run: it holds the call, gets your approval on your phone, injects whatever that rule seals, and runs it. It holds no credential for a tool that fetches its own, and the values it does hold stay ciphertext until your phone supplies the other share.">
 <link rel="stylesheet" href="sigil.css">
 </head>
 <body>
@@ -30,7 +30,7 @@
       <div class="hero-copy">
         <p class="kicker"><span class="dot"></span> Personal instrument · in development</p>
         <h1>Every secret your tools inject <span class="accent">waits for your thumb</span>.</h1>
-        <p class="hero-sub">Gated environment injection for any CLI: Sigil holds a command, asks your phone, injects the approved credential, and runs it.</p>
+        <p class="hero-sub">A gate in front of any CLI: Sigil holds the command, asks your phone, injects whatever that rule seals, and runs it.</p>
         <div class="hero-cta">
           <a class="btn btn-primary" href="#how">See the flow <span class="arrow">-&gt;</span></a>
           <a class="btn btn-ghost" href="trust.html">Read the trust model</a>
@@ -41,17 +41,14 @@
           <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="lbl">sigil status</span></div>
 <pre><span class="t-co">sigil</span> <span class="t-faint">·</span> <span class="t-ok">armed</span>
 
-  <span class="t-dim">daemon</span>       <span class="t-ok">●</span> running         <span class="t-dim">pid 4821 · 2d 14h</span>
-  <span class="t-dim">phone</span>        <span class="t-ok">●</span> Tom's iPhone    <span class="t-dim">direct · last seen 12s ago</span>
+  <span class="t-dim">daemon</span>     <span class="t-ok">●</span> listening        <span class="t-dim">/var/folders/…/sigil/daemon.sock</span>
+  <span class="t-dim">shim</span>       <span class="t-ok">✓</span> on PATH          <span class="t-dim">~/.sigil/bin/op</span>
+  <span class="t-dim">op</span>         <span class="t-ok">✓</span> found            <span class="t-dim">/usr/local/bin/op</span>
+  <span class="t-dim">sealed env</span> <span class="t-ok">✓</span> configured       <span class="t-dim">2 sealed secret(s)</span>
+  <span class="t-dim">factor</span>     <span class="t-ok">●</span> paired phone     <span class="t-dim">via relay.rainn.works</span>
+  <span class="t-dim">ssh</span>        <span class="t-ok">●</span> serving          <span class="t-dim">3 key(s) · point SSH_AUTH_SOCK: sigil sshagent</span>
 
-  <span class="t-dim">integrations</span>
-    <span class="t-dim">op shim</span>    <span class="t-ok">✓</span> on PATH         <span class="t-dim">~/.sigil/bin/op</span>
-    <span class="t-dim">ssh-agent</span>  <span class="t-ok">✓</span> SSH_AUTH_SOCK   <span class="t-dim">3 keys served</span>
-
-  <span class="t-dim">providers</span>
-    <span class="t-dim">1Password</span>  <span class="t-ok">✓</span> 2 accounts      <span class="t-dim">tokens healthy</span>
-
-  <span class="t-dim">today</span>        12 approved <span class="t-faint">·</span> 1 denied <span class="t-faint">·</span> 0 expired</pre>
+  <span class="t-faint">every op request is gated: lease, else a fresh approval; fails closed</span></pre>
         </div>
       </div>
     </div>
@@ -78,7 +75,7 @@
   <div class="wrap">
     <div class="sec-head">
       <h2>One gate, and everything plugs into it</h2>
-      <p>Sigil is a small core that does one thing: hold a command, get your approval, inject the approved credential, and run it. Everything else is a plug-in on one of two sides.</p>
+      <p>Sigil is a small core that does one thing: hold a command, get your approval, inject whatever the matching rule seals, and run it. Everything else is a plug-in on one of two sides.</p>
     </div>
     <div class="topo">
       <div class="topo-row">
@@ -86,9 +83,9 @@
           <h5>Integrations</h5>
           <div class="sub">how a request enters</div>
           <ul>
-            <li>a shimmed CLI on <code>PATH</code> <span class="tag-live">op today</span></li>
+            <li><code>sigil &lt;cmd&gt;</code>, any command <span class="tag-live">live</span></li>
+            <li>a transparent alias on <code>PATH</code>, so a bare <code>op</code> or <code>gcloud</code> routes through the gate <span class="tag-live">live</span></li>
             <li>the SSH agent, for signatures <span class="tag-live">live</span></li>
-            <li><code>sigil run -- cmd</code>, any command <span class="tag-soon">in development</span></li>
           </ul>
         </div>
         <div class="link"><span class="arrow">-&gt;</span><span class="lbl">argv · cwd<br>environment request</span></div>
@@ -96,10 +93,10 @@
           <h5>Core</h5>
           <div class="sub">gate · inject · run</div>
           <ul>
-            <li>pairing, approval, leases, transport</li>
-            <li>decrypts one credential per approval, then zeroes it</li>
-            <li>injects it into the command's environment</li>
-            <li class="cant">read the secret values the command resolves</li>
+            <li>rules, pairing, approval, leases, transport</li>
+            <li>refuses any command no rule matches</li>
+            <li>opens its own sealed values only with the phone's share, then zeroes them</li>
+            <li class="cant">read the secret bytes the command resolves</li>
           </ul>
         </div>
         <div class="link"><span class="arrow">&lt;-</span><span class="lbl">one live resolve<br>per approval</span></div>
@@ -107,9 +104,10 @@
           <h5>Providers</h5>
           <div class="sub">where secrets come from</div>
           <ul>
-            <li>1Password, through <code>op</code> <span class="tag-live">live</span></li>
-            <li>Bitwarden, AWS, Doppler <span class="tag-soon">in development</span></li>
-            <li>a plain env-file <span class="tag-soon">in development</span></li>
+            <li><code>op</code>, gated but never held <span class="tag-live">live</span></li>
+            <li>sealed inline env values <span class="tag-live">live</span></li>
+            <li>a plain env-file <span class="tag-live">live</span></li>
+            <li>Bitwarden, AWS, Doppler <span class="tag-soon">planned</span></li>
           </ul>
         </div>
       </div>
@@ -118,7 +116,7 @@
         <span class="chip">the approval your phone shows carries an <b>opaque reference</b>, never provider mechanics</span>
       </div>
     </div>
-    <p class="mt-m muted" style="font-size:0.92rem;max-width:74ch">Today one provider is wired (1Password) and one CLI is shimmed (<code>op</code>), plus the SSH agent. The <code>SecretProvider</code> seam, the provider-blind approval protocol, and the injected-credential model all exist in the core now. The second provider, the config-driven shim for any CLI, and the generic <code>sigil run</code> wrapper are in development. They are fills of a seam that is already there, not a rewrite.</p>
+    <p class="mt-m muted" style="font-size:0.92rem;max-width:74ch">Three providers are wired today: <code>op</code> as a plain gate that Sigil never holds a credential for, a plaintext env-file, and inline env values sealed under the threshold split. Any command can be gated by a rule you author, either as <code>sigil &lt;cmd&gt;</code> or through a transparent alias on <code>PATH</code>, and the SSH agent is live. A hosted-vault provider such as Bitwarden or AWS Secrets Manager is a fill of the same <code>SecretProvider</code> seam, not a rewrite, and none of them exist yet.</p>
   </div>
 </section>
 
@@ -127,16 +125,16 @@
   <div class="wrap">
     <div class="claim">
       <span class="k">The property everything rests on</span>
-      <p><strong>Approving is not permission. It is the missing half of the cryptography.</strong> A provider's credential sits encrypted under a key the Mac never holds. The unwrap key lives on the phone, sealed behind Face ID, and is delivered fresh inside each approval. A stolen daemon is a box of ciphertext.</p>
-      <p>The second property: no caching, ever. Each approved request resolves live, so a rotated secret is correct on the very next call, and the source stays locked on the Mac. Secret values stream from the provider's child process straight to the caller's file descriptor and never pass through the daemon's memory.</p>
+      <p><strong>The daemon holds as little as the job allows, and what it does hold is inert.</strong> For a command that fetches its own secret, <code>op</code> above all, Sigil holds no credential at all: it gates the call and runs the real binary, which authenticates itself as it always did. For the values you seal into Sigil yourself, the decryption key exists in no one place. It is reassembled per approval from two shares, one on the Mac and one computed inside the phone's Secure Enclave, which never releases it. A stolen daemon is a box of ciphertext and a share that opens nothing.</p>
+      <p>The second property: no caching, except the window you explicitly open. Each approved request resolves live, so a rotated secret is correct on the very next call. Secret values stream from the gated child process straight to the caller's file descriptor and never pass through the daemon's memory. A lease, when a rule allows one and you choose it, is the one exception, and it is bounded, visible, and revocable.</p>
     </div>
     <div class="mt-l">
       <h3>Three parties, three boundaries</h3>
       <p class="muted mt-s" style="font-size:0.95rem;max-width:64ch">The boundary is not a policy. It is what the cryptography structurally allows each party to hold.</p>
       <ul class="notes mt-s">
         <li><b>Your tools</b> receive the one secret they asked for, after approval, and can retain nothing else.</li>
-        <li><b>The daemon</b> brokers every request but cannot decrypt a credential without a live approval, nor read the secret values it pipes.</li>
-        <li><b>The phone</b> holds the unwrap key behind a biometric, yet never sees a credential or a resolved secret value.</li>
+        <li><b>The daemon</b> brokers every request but cannot open a sealed value without a live approval from the phone, nor read the secret bytes it pipes.</li>
+        <li><b>The phone</b> supplies the other share behind a biometric, yet never holds the key, a credential, or a resolved secret value.</li>
       </ul>
       <p class="mt-s"><a href="trust.html">The full trust model, party by party <span class="arrow" style="font-family:var(--mono)">-&gt;</span></a></p>
     </div>
@@ -152,14 +150,14 @@
     </div>
     <ol class="flow">
       <li><span class="who">integration &rarr; core</span>A tool runs <code>op item get ".env" --vault "Engineering" --format json</code>. The shim forwards argv, cwd, and the environment request over the local socket, byte-for-byte compatible with the real CLI.</li>
-      <li><span class="who">core</span>Routes the request to its provider and account, loads that account's <em>encrypted</em> credential, computes a risk level, and queues a signed, sealed request for the phone. Fires the content-free push in parallel.</li>
+      <li><span class="who">core</span>Matches the argv against the configured rules. No match means refusal. A match names the source, whether the rule may open a lease, and what that rule covers, and the core queues a signed, sealed request carrying exactly that. Fires the content-free push in parallel.</li>
       <li><span class="who">phone</span>The push arrives and wakes a handler that reaches the Mac down the transport ladder, pulls the sealed request, and rewrites the notification on-device. Apple only ever carried "Approval requested".</li>
-      <li><span class="who">you</span>Glance: which provider and account, which item or fields, which process, from which directory, how long until it expires. Approve with a biometric, or deny with one tap.</li>
-      <li><span class="who">phone &rarr; core</span>On approve, the biometric unlocks the hardware key, the unwrap key is re-wrapped to this request's ephemeral key, and the signed response returns. Replay-proof: single-use id, monotonic counter, short window.</li>
-      <li><span class="who">core</span>Unwraps the key, decrypts the one credential, and injects it into the child's environment. The child resolves and streams its secrets straight onto the caller's fd, so no value enters daemon memory. Zeroes the key and credential. Writes an audit entry of names and metadata, never values.</li>
+      <li><span class="who">you</span>Glance: which command, which source and account, which process, from which directory, how long until it expires, and whether this rule can be left open for a window. Approve with a biometric, or deny with one tap.</li>
+      <li><span class="who">phone &rarr; core</span>On approve, the biometric gate passes, hardware only, with no passcode fallback. For a sealed source the enclave then computes this request's share; a plain gate needs no share, because there is nothing to open. The signed, sealed response returns. Replay is caught by a single-use request id inside a 150-second freshness window, and every envelope carries a fresh ephemeral key.</li>
+      <li><span class="who">core</span>For a plain gate, runs the real binary and gets out of the way. For a sealed source, combines the two shares, decrypts only that source's values, injects them into the child's environment, and zeroes the key and the plaintext. Either way the child resolves and streams its output straight onto the caller's fd, so no secret value enters daemon memory. Writes an audit entry of names and metadata, never values.</li>
       <li><span class="who">integration</span>The command runs exactly as if the secret had been present all along. On deny or timeout the shim exits non-zero with a clear stderr line, which is what the caller's error path already expects.</li>
     </ol>
-    <p class="mt-m muted" style="font-size:0.92rem;max-width:66ch">One dev session can fire dozens of requests. Approving "for this session" turns an approval into a <strong>lease</strong>: the unwrapped credential is held in RAM, scoped to the verified caller fingerprint, command, and request type, until its short TTL expires and it is zeroed. Lockdown, restart, or expiry kills a lease instantly. A lease reduces fatigue; it does not widen the boundary, which is why leases are triple-scoped, TTL-bound, and memory-only.</p>
+    <p class="mt-m muted" style="font-size:0.92rem;max-width:66ch">One dev session can fire dozens of requests, so a rule may be marked <strong>leasable</strong>. Then one approval can open a window instead of answering one command, and anything that rule matches runs inside it without asking again. That is a real widening, stated plainly: for a sealed source the unsealed values are held in RAM for the window's duration. What bounds it is that run-once is the default, the daemon clamps the window to the rule's cap whatever the phone asks for, <code>sigil lease list</code> shows every live window with its countdown and what it covers, <code>sigil lease revoke</code> ends one at once, and expiry, a restart, or an edit to the rule kills it. Nothing is written to disk.</p>
   </div>
 </section>
 
@@ -167,8 +165,8 @@
 <section id="approval">
   <div class="wrap">
     <div class="sec-head">
-      <h2>Friction scales with risk. Deny never does.</h2>
-      <p>The core computes risk from source sensitivity, process novelty, and target host. Risk changes exactly one thing: the shape of the approve control. Refusing is always a single calm tap.</p>
+      <h2>Approving is one tap. So is refusing.</h2>
+      <p>The sheet's job is to show you what you are answering: the command, the process chain that led to it, the directory, and what the rule covers. The only thing a rule changes is whether that one tap may also leave a window open behind it.</p>
     </div>
     <div class="stage">
       <div>
@@ -195,20 +193,21 @@
             <div><span class="k">machine</span><span class="v">studio.local</span></div>
             <div><span class="k">when</span><span class="v">just now</span></div>
           </div>
-          <div class="risk-line">Production source. First request from this process.</div>
-          <div class="slide"><span class="knob">&rsaquo;</span><span class="lbl">Slide to approve</span></div>
+          <div class="covers-line"><span>Covers <code>op read</code> for this caller. Leasable up to 15 minutes.</span></div>
+          <div class="approvebtn">Approve</div>
           <div class="denybtn">Deny</div>
         </div></div>
-        <p class="mock-cap">Design mockup of the approval sheet at elevated risk: a brass gauge counting to expiry, the reference leading the readout, provenance in mono, a slide instead of a tap.</p>
+        <p class="mock-cap">Design mockup of the approval sheet: a brass gauge counting to expiry, the reference leading the readout, provenance in mono, and the rule's coverage stated in the same words <code>sigil lease list</code> will use if a window opens.</p>
       </div>
       <div>
         <div class="ladder mt-s">
-          <div class="rung"><span class="lv" style="color:var(--cobalt)">routine</span><span>Known process, dev source</span><span class="act">tap to approve</span></div>
-          <div class="rung"><span class="lv" style="color:var(--brass)">elevated</span><span>Production source, or a process seen for the first time, with one reason line</span><span class="act">slide to approve</span></div>
-          <div class="rung"><span class="lv" style="color:var(--deny)">critical</span><span>Signature to a production host, bulk reads</span><span class="act">hold to approve</span></div>
+          <div class="rung"><span class="lv" style="color:var(--cobalt)">run-once</span><span>The default. Every invocation asks again, and no window is ever offered. The daemon refuses a lease on this rule even if the phone sends one</span><span class="act">one tap, each time</span></div>
+          <div class="rung"><span class="lv" style="color:var(--brass)">leasable</span><span>The rule permits a window. The phone may offer "approve for N minutes", and the daemon clamps N down to the cap the rule sets</span><span class="act">one tap, plus a window</span></div>
+          <div class="rung"><span class="lv" style="color:var(--deny)">deny</span><span>Needs no biometric, no reason, and no policy. It is the cheapest action on the sheet, deliberately</span><span class="act">one tap, always</span></div>
         </div>
         <div class="prose mt-m">
-          <p>Every approve additionally passes a hardware biometric: the secure element will not release the unwrap key without it, so a stolen unlocked phone still cannot approve. A long press on deny offers "deny and block this process for an hour". Because the approval carries a provider-blind reference and a display hint, the same sheet renders a 1Password read, a wrapped command, or an SSH challenge without knowing any provider's internals.</p>
+          <p>Every approve passes a biometric on the phone, hardware only: the passcode fallback is disabled, so there is no second route past a failed face or thumb. Be precise about what that buys, because the two paths differ. A <strong>plain gate</strong>, which is what every <code>op</code> rule is today and therefore the path most people are on, is authorised by that biometric and nothing else, since there is nothing to decrypt. A <strong>sealed source</strong> additionally needs the phone's Secure Enclave to compute this request's share, an operation nothing else on the device can perform. So the enclave stands behind sealed values specifically, not behind every approval: someone who can pass your biometry on your unlocked phone can approve a plain gate.</p>
+          <p>Because the approval carries a provider-blind reference and a display hint, the same sheet renders a gated command, a sealed environment injection, or an SSH challenge without knowing any provider's internals.</p>
           <p>Deny is framed as the easy, safe default, never an alarm. There is no fear copy anywhere in the product: no shields, no glowing locks, no "you are protected". It is your own tool talking to you.</p>
         </div>
       </div>
@@ -243,7 +242,7 @@
         <p class="muted mt-s" style="font-size:0.95rem">Its complete behaviour is enumerable, and every entry is neutralized in client code you can read and build.</p>
         <ul class="notes mt-s">
           <li>Read a request, or learn a secret name, account, provider, or command.</li>
-          <li>Mint an approval, or replay or reorder a real one.</li>
+          <li>Mint an approval. Replaying a real one is caught by a single-use request id inside a 150-second freshness window, and a stale response cannot decrypt against a later request because every envelope carries a fresh ephemeral key. The <a href="trust.html#relay">trust model</a> states what that leaves open.</li>
           <li>Learn who you are: no accounts, no email, no push token. Mailboxes are a hash of the two paired public keys, self-authenticating and squat-proof.</li>
         </ul>
       </div>
@@ -260,8 +259,8 @@
 <section id="providers">
   <div class="wrap">
     <div class="sec-head">
-      <h2>One provider today, a registry by design</h2>
-      <p>A provider is a small plug-in that turns an approval into a live secret. The core hands it a resolved request and gets an exit code back; it never sees the values. Swapping the source does not touch the gate, the phone, or the protocol.</p>
+      <h2>Three providers today, a registry by design</h2>
+      <p>A provider decides what an approval does. Some hold nothing and simply let the gated command run; others inject values Sigil holds sealed. The core hands a provider a resolved request and gets an exit code back; it never reads the values. Swapping the source does not touch the gate, the phone, or the protocol.</p>
     </div>
 
     <div class="feat">
@@ -269,7 +268,7 @@
         <div>
           <span class="st st-live">live today</span>
           <h3 class="feat-h">Sigil for 1Password</h3>
-          <p class="muted" style="max-width:44ch">Your project's dev secrets already live in a 1Password item. The <code>op</code> shim routes every <code>op read</code>, <code>op item get</code>, and <code>op run</code> through the gate, so existing scripts, dev servers, and the 1Password SSH agent keep working, now answered from your phone.</p>
+          <p class="muted" style="max-width:44ch">Your project's dev secrets already live in a 1Password item. A rule routes every <code>op read</code>, <code>op item get</code>, and <code>op run</code> through the gate, so existing scripts and dev servers keep working, now answered from your phone. Sigil never holds <code>op</code>'s credentials; it decides whether <code>op</code> runs at all.</p>
           <p class="mt-s"><a class="btn btn-ghost" href="uses-1password.html">See the 1Password flow <span class="arrow">-&gt;</span></a></p>
         </div>
         <div>
@@ -277,22 +276,23 @@
             <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="lbl">rowm-api · dev shell</span></div>
 <pre><span class="t-faint">$</span> op read <span class="t-ink">"op://Engineering/AWS-prod/access-key"</span>
   <span class="t-brass">⠿</span> <span class="t-dim">awaiting approval on Tom's iPhone</span>
-  <span class="t-ok">✓</span> <span class="t-dim">approved 3.1s · value on stdout, never in the daemon</span>
+  <span class="t-ok">✓</span> <span class="t-dim">approved 3.1s · op ran · value on stdout, never in the daemon</span>
 
 <span class="t-faint">$</span> op run --env-file=.env.op -- <span class="t-ink">pnpm dev</span>
-  <span class="t-ok">✓</span> <span class="t-dim">approved via lease · env injected · server up</span></pre>
+  <span class="t-ok">✓</span> <span class="t-dim">approved via an open lease on this rule · server up</span></pre>
           </div>
         </div>
       </div>
     </div>
 
-    <h4 class="mt-l">Providers in development</h4>
-    <p class="muted mt-s" style="font-size:0.92rem;max-width:62ch">Each is a fill of the same <code>SecretProvider</code> trait behind the same gate, not a new product. None of them resolve secrets yet.</p>
+    <h4 class="mt-l">Also live</h4>
+    <p class="muted mt-s" style="font-size:0.92rem;max-width:62ch">Two more fills of the same <code>SecretProvider</code> trait, behind the same gate. <b>Sealed env</b> holds KEY=VALUE pairs encrypted under the threshold split and injects them into the approved command; it is the only provider whose values Sigil itself decrypts. <b>env-file</b> reads a plaintext file you already keep, and offers no at-rest protection beyond the gate, which it says so plainly.</p>
+    <h4 class="mt-l">Planned</h4>
+    <p class="muted mt-s" style="font-size:0.92rem;max-width:62ch">None of these resolve a secret yet.</p>
     <div class="pill-row mt-s">
       <span class="status-pill">Bitwarden</span>
       <span class="status-pill">AWS Secrets Manager</span>
       <span class="status-pill">Doppler</span>
-      <span class="status-pill">env-file</span>
     </div>
   </div>
 </section>
@@ -348,29 +348,34 @@
       <p>The <code>sigil</code> CLI carries the same restraint as the apps: aligned columns, one cobalt accent, semantic green, brass, and rust, no banners. It respects <code>NO_COLOR</code> and non-TTY output.</p>
     </div>
     <div class="term plain">
-      <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="lbl">sigil logs -f</span></div>
-<pre><span class="t-faint">$</span> sigil logs -f
-<span class="t-dim">14:02:11</span>  read  Engineering/.env <span class="t-faint">›</span> graphql-api  <span class="t-dim">claude · ~/Projects/rowm</span>  <span class="t-ok">✓ approved</span> <span class="t-dim">8.2s phone</span>
-<span class="t-dim">14:02:40</span>  ssh   github-deploy <span class="t-faint">→</span> git@github.com  <span class="t-dim">ssh · ~/Projects/rowm</span>    <span class="t-ok">✓ approved</span> <span class="t-dim">0.1s lease</span>
-<span class="t-dim">14:31:07</span>  read  AWS-prod/access-key           <span class="t-dim">zsh · ~/Projects/infra</span>   <span class="t-deny">✗ denied</span> <span class="t-dim">"not me"</span>
-<span class="t-dim">15:12:44</span>  read  Engineering/.env <span class="t-faint">›</span> admin-app    <span class="t-dim">claude · ~/Projects/rowm</span> <span class="t-brass">⠿ awaiting 0:52</span></pre>
+      <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="lbl">sigil history</span></div>
+<pre><span class="t-faint">$</span> sigil history
+
+<span class="t-co">history</span>
+
+  <span class="t-ok">✓</span> op read op://Engineering/…    <span class="t-dim">rowmhq.1password.eu</span>  <span class="t-faint">claude · phone</span>
+  <span class="t-ok">✓</span> ssh github-deploy                                  <span class="t-faint">ssh · lease</span>
+  <span class="t-deny">✗</span> op read op://AWS-prod/…                            <span class="t-faint">zsh · phone</span>
+  <span class="t-ok">✓</span> pnpm dev                      <span class="t-dim">rowm-api-env</span>         <span class="t-faint">zsh · phone</span></pre>
     </div>
 
     <div class="tblwrap mt-m">
       <table>
         <tr><th class="mono">command</th><th>does</th></tr>
-        <tr><td class="mono">sigil setup</td><td>first run: keys, encrypted store, shim install, service registration, pairing QR; ends by printing the status panel</td></tr>
-        <tr><td class="mono">sigil pair</td><td>QR plus six-word fingerprint in the terminal, for re-pairing or a second device</td></tr>
-        <tr><td class="mono">sigil account add · list · rotate · remove</td><td>per-provider credential lifecycle; credentials arrive via stdin, never argv</td></tr>
-        <tr><td class="mono">sigil status · logs [-f]</td><td>the panels above; the audit log is append-only, names never values</td></tr>
-        <tr><td class="mono">sigil lockdown [--clear]</td><td>seal or unseal; clearing needs a biometric</td></tr>
-        <tr><td class="mono">sigil doctor</td><td>PATH shim check, socket health, credential validity, routing table, clock skew</td></tr>
+        <tr><td class="mono">sigil &lt;cmd&gt; [args]</td><td>the primitive: gate <code>cmd</code> on your phone when a rule matches it, inject that rule's sealed values, and run it. An unmatched command is refused</td></tr>
+        <tr><td class="mono">sigil setup</td><td>guided first run: shim, PATH, launchd, then pairing</td></tr>
+        <tr><td class="mono">sigil up</td><td>the daemon-ensure verb: install the binary and agent, heal a dead or wedged daemon, wire the shim, check pairing. Idempotent</td></tr>
+        <tr><td class="mono">sigil pair · pair list · pair remove &lt;id&gt; · unpair</td><td>add a device by QR and six-word fingerprint, see what is paired, drop one, or drop them all</td></tr>
+        <tr><td class="mono">sigil status · history · pending</td><td>the panels above; the audit log is append-only, names and metadata, never values</td></tr>
+        <tr><td class="mono">sigil lease list · lease revoke &lt;prefix&gt;</td><td>see every open auto-approve window with its countdown and coverage, or end one immediately</td></tr>
+        <tr><td class="mono">sigil doctor</td><td>shim drift, socket health, the approving factor, relay reachability, and whether <code>op</code> is on PATH</td></tr>
+        <tr><td class="mono">sigil-config add · rule · source</td><td>authoring lives in a second binary, so a program literally named <code>config</code> stays gateable as <code>sigil&nbsp;config</code></td></tr>
       </table>
     </div>
 
     <div class="mt-l">
       <h3>Getting it</h3>
-      <p class="muted mt-s" style="font-size:0.92rem;max-width:64ch">No builds are published yet. The protocol core and the 1Password provider are under construction in the open; once the daemon lands, first run is a single command that walks the pairing ceremony and prints the status panel.</p>
+      <p class="muted mt-s" style="font-size:0.92rem;max-width:64ch">No builds are published yet, and this is pre-release: the cryptography has had an independent adversarial review, but the surface is still moving. Read the code before you trust it with anything that matters. First run is a single command that wires the shim, registers the agent, and walks the pairing ceremony.</p>
       <div class="install mt-s">
         <code><span class="p">$</span> sigil setup</code>
         <button class="copybtn" type="button" data-copy="sigil setup">Copy</button>
@@ -410,7 +415,7 @@
         </div>
       </div>
     </div>
-    <p class="foot-fine">No secret caching. No analytics. No accounts. Everything fails closed.</p>
+    <p class="foot-fine">No analytics. No accounts. No telemetry. Leases are opt-in, bounded, and never written to disk. Everything fails closed.</p>
   </div>
 </footer>
 
