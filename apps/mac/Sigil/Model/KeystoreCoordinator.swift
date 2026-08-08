@@ -29,9 +29,17 @@
 //  nothing sanctioned did that, and the app says so loudly rather than quietly
 //  re-wrapping over the evidence.
 //
+//  That question has THREE answers, not two. The keychain can say yes, say no, or
+//  refuse to answer (locked, unavailable, an entitlement the running build does
+//  not carry). Only a clear no licenses an adopt, because adopting is what
+//  overwrites the evidence the check exists to find. "Could not determine"
+//  therefore raises the alarm alongside a confirmed downgrade rather than being
+//  rounded down to absence.
+//
 //  Fails closed and stays honest: no state here ever writes plaintext as a
-//  fallback, and a Mac that cannot wrap says so rather than quietly leaving the
-//  file bare while the UI implies otherwise.
+//  fallback, no unknown is read as a benign known, and a Mac that cannot wrap
+//  says so rather than quietly leaving the file bare while the UI implies
+//  otherwise.
 
 import Foundation
 import Observation
@@ -57,6 +65,11 @@ enum KeystoreProtection: Equatable, Sendable {
     /// Plaintext on disk while the wrapping key still exists. No sanctioned path
     /// produces this, so it is reported as what it is and never papered over.
     case downgraded(path: String)
+    /// Plaintext on disk, and the keychain would not say whether the wrapping key
+    /// is still there. From here that is indistinguishable from `downgraded`, and
+    /// it is treated as one: the only other move is to adopt, which would erase
+    /// the evidence before anyone read it.
+    case downgradeUnverified(path: String, reason: String)
     /// Something failed: the wrap, the decrypt, or the write.
     case failed(path: String, reason: String)
 
@@ -64,7 +77,8 @@ enum KeystoreProtection: Equatable, Sendable {
         switch self {
         case .checking: return ""
         case .absent(let p), .sealed(let p), .downgraded(let p): return p
-        case .sealedUnprovisioned(let p, _), .plaintext(let p, _), .failed(let p, _): return p
+        case .sealedUnprovisioned(let p, _), .plaintext(let p, _), .failed(let p, _),
+             .downgradeUnverified(let p, _): return p
         }
     }
 
@@ -72,15 +86,21 @@ enum KeystoreProtection: Equatable, Sendable {
     var blocksDaemon: Bool {
         switch self {
         case .sealedUnprovisioned, .failed: return true
-        case .checking, .absent, .sealed, .plaintext, .downgraded: return false
+        // The two downgrade states do not block anything: the file is plaintext,
+        // which is precisely what makes them a security fact rather than an
+        // outage. They are loud for a different reason.
+        case .checking, .absent, .sealed, .plaintext, .downgraded, .downgradeUnverified: return false
         }
     }
 
     /// Whether this is a state the human must look at now, rather than a fact
-    /// about the machine they can read whenever.
+    /// about the machine they can read whenever. Exhaustive on purpose: a new
+    /// state has to answer this question rather than inherit a quiet default.
     var isAlarm: Bool {
-        if case .downgraded = self { return true }
-        return false
+        switch self {
+        case .downgraded, .downgradeUnverified: return true
+        case .checking, .absent, .sealed, .sealedUnprovisioned, .plaintext, .failed: return false
+        }
     }
 }
 
@@ -135,8 +155,18 @@ final class KeystoreCoordinator {
             // Plaintext plus a surviving wrapping key is the downgrade signal.
             // Re-wrapping here would destroy the only evidence that the file was
             // replaced, so this stops and says so.
-            if (try? await wrapper.keyExists()) == true {
-                state = .downgraded(path: wrapper.path)
+            //
+            // A keychain that throws is NOT a keychain that said no. Swallowing
+            // the throw would send a real downgrade down the adopt path, where a
+            // daemon that happens to be down renders it as the calm "left as it
+            // is" line and the alarm never fires. Only an answered no continues.
+            do {
+                if try await wrapper.keyExists() {
+                    state = .downgraded(path: wrapper.path)
+                    return
+                }
+            } catch {
+                state = .downgradeUnverified(path: wrapper.path, reason: Self.reason(error))
                 return
             }
             await adopt(material: material, daemon: daemon)
@@ -150,8 +180,14 @@ final class KeystoreCoordinator {
     /// Separate from `sync` on purpose: recovering from a downgrade is a decision
     /// the human makes after seeing the alarm, never something that happens on a
     /// reconnect while they are not looking.
+    ///
+    /// Both alarm states qualify, which is what keeps the control that the alarm
+    /// puts on screen from being a button that does nothing. If the keychain is
+    /// still refusing to answer, the wrap throws on the same lookup and this
+    /// lands on `.failed` with the reason, which is the honest outcome; it cannot
+    /// mint a second key over a first one it could not read.
     func rewrapAfterDowngrade(daemon: DaemonClient) async {
-        guard !inert, case .downgraded = state else { return }
+        guard !inert, state.isAlarm else { return }
         guard case .plaintext(let material) = await wrapper.read() else {
             await sync(daemon: daemon)
             return

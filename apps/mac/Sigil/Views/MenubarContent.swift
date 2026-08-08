@@ -44,10 +44,10 @@ struct MenubarContent: View {
     /// looking idle while nothing could possibly run; silence in the second would
     /// hide the only evidence that the file was replaced.
     ///
-    /// Three states reach this strip, so it branches three ways. Two of them are
-    /// sealed-and-unusable and could-not-be-opened, which are different facts with
-    /// different fixes; collapsing them told a person with an unreadable keystore
-    /// to go and provision it.
+    /// Four states reach this strip, so it branches four ways. They are
+    /// sealed-and-unusable, could-not-be-opened, protection-removed, and
+    /// protection-removed-but-unconfirmed: different facts with different fixes,
+    /// and collapsing any of them told a person the wrong thing to go and do.
     ///
     /// The glyph is never `exclamationmark.triangle`: `errorStrip` above already
     /// owns that shape in brass, and two triangles in different colors stacked in
@@ -57,6 +57,13 @@ struct MenubarContent: View {
         let (glyph, headline, action): (String, String, String) = switch model.keystore.state {
         case .downgraded:
             ("lock.open", "Keystore protection was removed outside Sigil.", "Open Sigil to see what happened.")
+        case .downgradeUnverified:
+            // A distinct shape, not a softer wording of the same one: the file is
+            // plaintext either way, and the difference is only whether this Mac
+            // would confirm it. The strip says which of the two it is looking at.
+            ("lock.trianglebadge.exclamationmark",
+             "Keystore plaintext; this Mac will not say whether its key survived.",
+             "Open Sigil to see what happened.")
         case .failed:
             ("xmark.octagon", "The keystore could not be opened.", "Open Sigil for the reason.")
         default:
