@@ -12,7 +12,7 @@ import {
   type ResolutionStatus,
 } from "@/src/protocol";
 import { secretRefLabel, sshLabel } from "@/src/lib/format";
-import { toActiveLeases } from "@/src/domain/leases";
+import { revokeResolution, toActiveLeases } from "@/src/domain/leases";
 import {
   type AppState,
   type HistoryEntry,
@@ -283,10 +283,14 @@ class Store {
    * to look at it. It returns the section to "not checked yet", which is a true
    * description of what this phone then knows.
    *
-   * Unconfirmed revokes SURVIVE this. They are warnings, not an enumeration, and
-   * the whole point of one is that it outlasts the screen that produced it.
+   * Unconfirmed revokes SURVIVE this, but only while they are still an open
+   * question. They are warnings rather than an enumeration, and the whole point
+   * of one is that it outlasts the screen that produced it; once the window has
+   * run out on its own there is nothing left to warn about, and a warning that
+   * never resolves is one people stop reading.
    */
   clearLeaseSnapshot(): void {
+    const now = Date.now();
     this.patchLeases({
       rows: [],
       askedAt: 0,
@@ -294,7 +298,9 @@ class Store {
       asking: false,
       unreachable: false,
       noBiometric: false,
-      revokes: this.state.leases.revokes.filter((r) => r.unconfirmed),
+      revokes: this.state.leases.revokes.filter(
+        (r) => r.unconfirmed && revokeResolution(r, this.state.history, now) === "standing",
+      ),
       note: null,
     });
   }

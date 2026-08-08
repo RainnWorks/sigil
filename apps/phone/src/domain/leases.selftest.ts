@@ -36,7 +36,9 @@ import {
   REVOKE_FALLBACK_CAVEAT,
   REVOKE_FALLBACK_LIST,
   REVOKE_FALLBACK_REVOKE,
+  lapsedRevokeLine,
   revokeNoteLine,
+  revokeResolution,
   revokeState,
   snapshotFresh,
   toActiveLeases,
@@ -76,8 +78,29 @@ function view(over: Partial<LeaseView> = {}): LeaseView {
 }
 
 function revoke(over: Partial<PendingRevoke> = {}): PendingRevoke {
-  return { requestId: REQ, leaseId: LEASE, scope: "op-eu", sentAt: NOW, unconfirmed: false, ...over };
+  return {
+    requestId: REQ,
+    leaseId: LEASE,
+    scope: "op-eu",
+    sentAt: NOW,
+    windowExpiresAt: NOW + 600_000,
+    unconfirmed: false,
+    ...over,
+  };
 }
+
+/** A minimal history row; only `decision` and `at` are ever read here. */
+const historyEntry = {
+  id: "h1",
+  kind: "secret_read" as const,
+  label: "",
+  origin: "",
+  process: "",
+  cwd: "",
+  decision: "approved" as const,
+  at: NOW,
+  via: "phone",
+};
 
 function main(): void {
   console.log("leaseListStatus (the three no-list situations are three sentences)");
@@ -391,6 +414,32 @@ function main(): void {
     eq(unconfirmedRevokes(silent).length, 1, "and raises a standing warning");
     eq(revokeState(silent, LEASE2), "idle", "a different window is unaffected");
 
+    // TTL retirement. A warning with no dismiss is right, but one that never
+    // resolves stops being read, and a lease is TTL-bounded so there is an honest
+    // end to it: past the window's own expiry it is closed whether or not the
+    // revoke landed. This also catches a genuine success answered a second after
+    // the reply timeout, which had to be dropped.
+    const r = revoke({ unconfirmed: true, sentAt: NOW, windowExpiresAt: NOW + 60_000 });
+    eq(revokeResolution(r, [], NOW), "standing", "before the window expires, still an open question");
+    eq(revokeResolution(r, [], NOW + 60_001), "lapsed", "past its expiry, it ran out on its own");
+    ok(
+      lapsedRevokeLine(r).includes("run out on its own"),
+      "and says so rather than claiming the revoke worked",
+    );
+
+    // A refresh extends an existing window, so an approval since the revoke went
+    // out could have renewed it. That cannot be observed, so it is inferred
+    // conservatively: any approval, and any request another device resolved,
+    // keeps the warning standing. Over-warning is the safe direction.
+    const approved = [{ ...historyEntry, decision: "approved" as const, at: NOW + 10 }];
+    eq(revokeResolution(r, approved, NOW + 60_001), "standing", "an approval since could have renewed it");
+    const elsewhere = [{ ...historyEntry, decision: "superseded" as const, at: NOW + 10 }];
+    eq(revokeResolution(r, elsewhere, NOW + 60_001), "standing", "so could another device resolving one");
+    const denied = [{ ...historyEntry, decision: "denied" as const, at: NOW + 10 }];
+    eq(revokeResolution(r, denied, NOW + 60_001), "lapsed", "a denial cannot have renewed anything");
+    const before = [{ ...historyEntry, decision: "approved" as const, at: NOW - 10 }];
+    eq(revokeResolution(r, before, NOW + 60_001), "lapsed", "an approval from before the revoke is irrelevant");
+
     // The warning has to stand on its own once the snapshot behind it is gone.
     const orphaned = view({ revokes: [revoke({ unconfirmed: true })] });
     eq(unconfirmedRevokes(orphaned).length, 1, "a warning outlives its snapshot");
@@ -433,6 +482,7 @@ function main(): void {
         .map((v) => leaseListStatus(v, NOW))
         .flatMap((s) => [s.line, s.detail ?? ""]),
       unconfirmedRevokeLine(revoke({ unconfirmed: true })),
+      lapsedRevokeLine(revoke({ unconfirmed: true })),
       REVOKE_FALLBACK_CAVEAT,
       REVOKE_FALLBACK_LIST,
       REVOKE_FALLBACK_REVOKE,
@@ -462,6 +512,7 @@ function main(): void {
       .flatMap((s) => [s.line, s.detail ?? ""])
       .concat(
         unconfirmedRevokeLine(revoke({ unconfirmed: true })),
+        lapsedRevokeLine(revoke({ unconfirmed: true })),
         revokeNoteLine("closed"),
         revokeNoteLine("alreadyGone"),
       );

@@ -12,6 +12,7 @@ import { usePushDiag } from "@/src/lib/push";
 import { refreshLeases, revokeLease, unpair } from "@/src/session/controller";
 import {
   coverageSentence,
+  lapsedRevokeLine,
   leaseListStatus,
   liveLeases,
   remainingSentence,
@@ -19,12 +20,18 @@ import {
   REVOKE_FALLBACK_LIST,
   REVOKE_FALLBACK_REVOKE,
   revokeNoteLine,
+  revokeResolution,
   revokeState,
   unconfirmedRevokeDetail,
   unconfirmedRevokeLine,
   unconfirmedRevokes,
 } from "@/src/domain/leases";
-import { type ActiveLease, type LeaseView, type PendingRevoke } from "@/src/domain/types";
+import {
+  type ActiveLease,
+  type HistoryEntry,
+  type LeaseView,
+  type PendingRevoke,
+} from "@/src/domain/types";
 import { DEMO, store, useAppState } from "@/src/state/store";
 
 /**
@@ -58,7 +65,7 @@ export default function SettingsScreen() {
       contentInsetAdjustmentBehavior="automatic"
       contentContainerStyle={{ padding: space.lg, gap: space.xl, paddingBottom: 48 }}
     >
-      <LeaseSection view={s.leases} />
+      <LeaseSection view={s.leases} history={s.history} />
 
       {/* approvals */}
       <View>
@@ -198,7 +205,7 @@ export default function SettingsScreen() {
  *   - A row that runs out of time simply goes. That is not a revoke and is never
  *     reported as one.
  */
-function LeaseSection({ view }: { view: LeaseView }) {
+function LeaseSection({ view, history }: { view: LeaseView; history: HistoryEntry[] }) {
   const p = useTheme();
   const [now, setNow] = useState(() => Date.now());
 
@@ -239,7 +246,11 @@ function LeaseSection({ view }: { view: LeaseView }) {
         {warnings.map((r, i) => (
           <View key={r.requestId}>
             {i > 0 ? <Hairline inset={space.lg} /> : null}
-            <UnconfirmedRevoke revoke={r} now={now} />
+            <UnconfirmedRevoke
+              revoke={r}
+              resolution={revokeResolution(r, history, now)}
+              now={now}
+            />
           </View>
         ))}
         {warnings.length > 0 ? <Hairline inset={space.lg} /> : null}
@@ -302,8 +313,30 @@ function LeaseSection({ view }: { view: LeaseView }) {
  * revoke everything while reporting success. The human reads the real one off
  * `sigil lease list` on the Mac, where it cannot have been mangled in transit.
  */
-function UnconfirmedRevoke({ revoke, now }: { revoke: PendingRevoke; now: number }) {
+function UnconfirmedRevoke({
+  revoke,
+  resolution,
+  now,
+}: {
+  revoke: PendingRevoke;
+  resolution: "standing" | "lapsed";
+  now: number;
+}) {
   const p = useTheme();
+  // A lapsed warning has no action left in it: the window ran out on its own, so
+  // the Mac steps would be busywork. It stays on screen until the section is left
+  // rather than vanishing under the reader, so the resolution is something they
+  // see happen rather than something that silently stopped being true.
+  if (resolution === "lapsed") {
+    return (
+      <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, padding: space.lg }}>
+        <Sf name="clock" color={p.faint} size={15} />
+        <Sans size={13} tone="muted" style={{ flex: 1 }}>
+          {lapsedRevokeLine(revoke)}
+        </Sans>
+      </View>
+    );
+  }
   return (
     <View style={{ padding: space.lg, gap: 4 }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
@@ -353,7 +386,7 @@ function LeaseRow({
             confirmation sheet costs time at exactly the moment someone wants a
             window shut. */}
         <Pressable
-          onPress={() => void revokeLease(lease.leaseId, lease.scope)}
+          onPress={() => void revokeLease(lease.leaseId, lease.scope, lease.expiresAt)}
           disabled={state !== "idle"}
         >
           <Sans size={15} style={{ color: state === "idle" ? p.deny : p.faint }}>

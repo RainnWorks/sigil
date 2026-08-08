@@ -149,6 +149,14 @@ export interface PendingRevoke {
   /** When the revoke left this device, unix ms. */
   sentAt: number;
   /**
+   * The window's own expiry as the snapshot reported it, unix ms. A lease is
+   * TTL-bounded, so once this has passed the window is closed whether or not the
+   * revoke ever landed, and the warning can retire itself instead of standing
+   * forever. Arrival-stamped like the row it came from, so it errs late, which is
+   * the right way for a warning to err.
+   */
+  windowExpiresAt: number;
+  /**
    * True once the reply window has passed with no answer. The warning STAYS,
    * outliving the snapshot it came from, until something actually settles it: a
    * suppressed reply must never leave the human believing a window closed.

@@ -328,9 +328,15 @@ export async function refreshLeases(): Promise<LeaseQueryOutcome> {
  * and the brief cites this list as the containment for a rule-wide window.
  *
  * `scope` is carried only so a standing warning can name what it is about after
- * the snapshot behind it has been thrown away.
+ * the snapshot behind it has been thrown away, and `windowExpiresAt` so the
+ * warning can retire itself once the window has run out on its own rather than
+ * standing indefinitely (see `revokeResolution`).
  */
-export async function revokeLease(leaseId: string, scope: string | null): Promise<void> {
+export async function revokeLease(
+  leaseId: string,
+  scope: string | null,
+  windowExpiresAt: number,
+): Promise<void> {
   const sentAt = Date.now();
   // A revoke that never left the device still needs an id to key its warning by,
   // and it must be one no reply can ever name: the prefix keeps it out of the
@@ -340,7 +346,7 @@ export async function revokeLease(leaseId: string, scope: string | null): Promis
     // Nothing left the device, so nothing can be assumed about the window. It is
     // recorded as an unconfirmed revoke, not as a failure to send, because from
     // the human's side those have the same consequence: unknown, so assume open.
-    store.leaseRevokeStarted({ requestId: unsent, leaseId, scope, sentAt, unconfirmed: true });
+    store.leaseRevokeStarted({ requestId: unsent, leaseId, scope, windowExpiresAt, sentAt, unconfirmed: true });
     return;
   }
   let requestId: string;
@@ -350,10 +356,10 @@ export async function revokeLease(leaseId: string, scope: string | null): Promis
     );
   } catch (e) {
     console.warn(`[lease] revoke dispatch failed: ${errText(e)}`);
-    store.leaseRevokeStarted({ requestId: unsent, leaseId, scope, sentAt, unconfirmed: true });
+    store.leaseRevokeStarted({ requestId: unsent, leaseId, scope, windowExpiresAt, sentAt, unconfirmed: true });
     return;
   }
-  store.leaseRevokeStarted({ requestId, leaseId, scope, sentAt, unconfirmed: false });
+  store.leaseRevokeStarted({ requestId, leaseId, scope, windowExpiresAt, sentAt, unconfirmed: false });
   outstanding.issue(requestId, "revoke", sentAt);
   // The daemon sends no error for a revoke it will not act on, so silence covers
   // both a dropped message and a rejected one. Either way the window's state is

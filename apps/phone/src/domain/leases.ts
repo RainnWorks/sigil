@@ -23,7 +23,12 @@
 import { relativeTime, remainingWindow, safeLabel } from "@/src/lib/format";
 import { LEASE_LABEL_MAX_CHARS, type LeaseRow } from "@/src/protocol";
 
-import { type ActiveLease, type LeaseView, type PendingRevoke } from "./types";
+import {
+  type ActiveLease,
+  type HistoryEntry,
+  type LeaseView,
+  type PendingRevoke,
+} from "./types";
 
 /**
  * How long a snapshot still counts as describing now.
@@ -126,11 +131,11 @@ export function snapshotFresh(view: LeaseView, nowMs: number): boolean {
 /**
  * The daemon's own snapshot time as a wall clock, e.g. "14:23:07".
  *
- * Displayed verbatim from `asOfMs`, but the staleness decision above deliberately
- * uses local elapsed time since arrival instead. The two clocks are only loosely
- * tied (the envelope freshness window is the only thing keeping them near each
- * other), and a daemon clock running fast must not be able to make an old
- * snapshot look current.
+ * DISPLAY ONLY. It is the daemon's claim about its own clock, and nothing
+ * authenticates it as a time source: a daemon running fast could otherwise make
+ * an old snapshot look current. The staleness DECISION is {@link snapshotFresh},
+ * which ages from the moment this phone sent the query and never touches this
+ * value. Display their claim, decide on your own clock.
  */
 export function asOfClock(asOfMs: number): string {
   const d = new Date(asOfMs);
@@ -152,6 +157,45 @@ export function revokeState(view: LeaseView, leaseId: string): "idle" | "sending
 /** The revokes that went out and were never answered. */
 export function unconfirmedRevokes(view: LeaseView): PendingRevoke[] {
   return view.revokes.filter((r) => r.unconfirmed);
+}
+
+/**
+ * Whether an unanswered revoke is still an open question, or has been settled by
+ * the window simply running out.
+ *
+ * A warning with no dismiss is the right shape here, because a dismissible
+ * warning about an open window is one people clear reflexively. But "forever" has
+ * its own failure mode: a warning that never resolves stops being read. A lease
+ * is TTL-bounded, so there is an honest end to this one. Once the window's own
+ * expiry has passed it is closed regardless of whether the revoke arrived, which
+ * also catches the case where a genuinely successful revoke was answered a second
+ * after the reply timeout and the answer had to be dropped.
+ *
+ * The exception is a REFRESH: a later approval extends an existing window rather
+ * than starting a new one, so a window this phone watched expire may have been
+ * renewed since. That cannot be observed directly, because the phone holds no
+ * lease state, so it is inferred conservatively from the only evidence there is.
+ * Any approval recorded after the revoke went out could have been the one that
+ * renewed it, and a request another device resolved could have been too, since
+ * this phone is never told whether that was an approve. Either keeps the warning
+ * standing. Over-warning is the safe direction.
+ */
+export function revokeResolution(
+  revoke: PendingRevoke,
+  history: HistoryEntry[],
+  nowMs: number,
+): "standing" | "lapsed" {
+  if (nowMs <= revoke.windowExpiresAt) return "standing";
+  const renewable = history.some(
+    (h) => h.at >= revoke.sentAt && (h.decision === "approved" || h.decision === "superseded"),
+  );
+  return renewable ? "standing" : "lapsed";
+}
+
+/** The line for an unanswered revoke whose window has since run out on its own. */
+export function lapsedRevokeLine(revoke: PendingRevoke): string {
+  const what = revoke.scope ? `The revoke of ${revoke.scope}` : "A revoke this phone sent";
+  return `${what} was never confirmed, but that window has since run out on its own.`;
 }
 
 /**
