@@ -613,12 +613,17 @@ impl Core {
             provisioned: AtomicBool::new(false),
             unwrap_requests: UnwrapRequests::default(),
         };
-        // Hand every paired device the live lease store, so the phone's lease
+        // Hand every paired device a lease-control handle, so the phone's lease
         // screen lists and revokes the same windows the CLI does. The approvers
         // are built before the core exists (inside `build_gate`), which is why
         // this is a post-construction attach rather than a constructor argument.
+        //
+        // The handle is the narrow `LeaseControl` trait, never the store: a paired
+        // phone may see which windows are open and close one, and is structurally
+        // unable to open one, extend one, or read what one holds.
         for approver in &remote_listeners {
-            approver.attach_leases(core.leases.clone());
+            let control: Arc<dyn lease::LeaseControl> = core.leases.clone();
+            approver.attach_leases(control);
         }
         Ok((core, remote_listeners, direct_acceptors))
     }
@@ -1293,12 +1298,27 @@ async fn serve(
     let listener_handles: Vec<std::thread::JoinHandle<()>> = remote_listeners
         .into_iter()
         .enumerate()
-        .map(|(i, approver)| {
+        .flat_map(|(i, approver)| {
             let stop = listener_shutdown.clone();
-            std::thread::Builder::new()
-                .name(format!("sigil-todaemon-owner-{i}"))
-                .spawn(move || approver.run_todaemon_owner(&stop))
-                .expect("spawning the ToDaemon owner")
+            let owner = {
+                let approver = approver.clone();
+                std::thread::Builder::new()
+                    .name(format!("sigil-todaemon-owner-{i}"))
+                    .spawn(move || approver.run_todaemon_owner(&stop))
+                    .expect("spawning the ToDaemon owner")
+            };
+            // The lease-control reply pump for the same device, on its own thread.
+            // It exists so a reply deposit can never park the owner above, which is
+            // the sole reader of the channel an approval RESPONSE arrives on: a
+            // human's approval must never wait behind a lease list. It shares the
+            // shutdown flag and returns immediately when the device has no
+            // lease-control handle attached.
+            let stop = listener_shutdown.clone();
+            let pump = std::thread::Builder::new()
+                .name(format!("sigil-lease-replies-{i}"))
+                .spawn(move || approver.run_lease_reply_pump(&stop))
+                .expect("spawning the lease reply pump");
+            [owner, pump]
         })
         .collect();
 

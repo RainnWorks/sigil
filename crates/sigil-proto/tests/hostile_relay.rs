@@ -726,36 +726,37 @@ fn the_lease_coverage_label_rides_inside_the_seal() {
 //
 // Lease control is the second controller over a live window: the phone can now
 // LIST the daemon's windows and REVOKE one, where before only `sigil lease
-// revoke` on the Mac could. That makes four new payloads the relay would like to
-// touch, and the interesting one is the revoke, because a window it can kill is a
-// window the human's approval no longer covers.
+// revoke` on the Mac could. The relay would like to touch all four payloads, and
+// the interesting one is the revoke, because a window it can kill is a window the
+// human's approval no longer covers.
 //
-// The relay's four options and where each dies:
+// These cases prove the ENVELOPE half: the relay can neither read, forge, re-aim,
+// nor replay any of the four. Two attacks are deliberately NOT here because the
+// envelope does not stop them and the application layer must:
 //
-// * FORGE a revoke (or a list reply): it does not hold either signing key, so
-//   nothing it manufactures opens. Proven below for both directions.
-// * TAMPER with one, to re-aim it at a different window: every field is inside
-//   the seal and under the signature, so a bit-flip is a `BadSignature`.
-// * REPLAY one: a captured revoke is single-use inside the freshness window and
-//   stale outside it. The one case that leaves -- a daemon whose in-memory guard
-//   restarted inside the window -- is covered NOT here but by the instance
-//   binding, exercised in `sigil::remote`'s
-//   `a_replayed_revoke_cannot_kill_a_later_window_with_the_same_grant_key`.
-//   That is the seam: the envelope makes a replay hard, the instance makes a
-//   replay that gets through inert.
-// * DROP one: it can, and that is a stated residual. A censored revoke leaves the
-//   window alive until its TTL, `sigil lease revoke` on the Mac, or a daemon
-//   restart. The relay cannot cause a release this way, only withhold a
-//   revocation, and the phone learns of it by getting no reply.
+// * **A revoke replayed after a daemon restart.** The guard is RAM-only, so a
+//   restart inside the freshness window accepts it. It is made inert by the
+//   opaque per-window lease id, proven in `sigil::remote`'s
+//   `a_replayed_revoke_cannot_kill_a_later_window`.
+// * **A captured reply passed off as the answer to a later request.** The phone's
+//   guard is RAM-only too, and it is emptied every time the app is killed. It is
+//   made inert by `inReplyTo`, which the phone matches against what it has
+//   outstanding; the daemon's half is proven in `sigil::remote`'s
+//   `a_reply_names_the_envelope_that_asked_so_a_capture_cannot_pass_for_it`.
 //
-// And the payloads themselves are zero-knowledge to the relay: a list carries
-// rule names, a coverage label, an account label, and two clocks -- never an
-// argv, a secret reference, or a secret value.
+// The relay's one uncontested power is to DROP. A censored revoke leaves the
+// window alive until its TTL, `sigil lease revoke` on the Mac, or a restart. It
+// can withhold a revocation; it can never cause a release. The phone learns of it
+// by getting no reply, which is why an unanswered revoke must render as
+// unconfirmed rather than as either outcome.
+
+const LEASE_ID: &str = "fedcba9876543210fedcba9876543210";
+const REQ_ID: &str = "01920000-0000-7000-8000-00000000c0de";
 
 /// Seal a phone -> daemon lease revoke, as the daemon would receive it.
-fn seal_revoke(fx: &Fixture, counter: u64, grant: &str, instance: &str) -> Envelope {
+fn seal_revoke(fx: &Fixture, counter: u64, lease_id: &str) -> Envelope {
     Envelope::seal(
-        &LeaseRevoke::new("q-1", grant, instance),
+        &LeaseRevoke::new(lease_id),
         fx.pairing_id,
         counter,
         &fx.sender.signing,
@@ -764,19 +765,15 @@ fn seal_revoke(fx: &Fixture, counter: u64, grant: &str, instance: &str) -> Envel
     .expect("seal")
 }
 
-const GRANT_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-const INSTANCE_HEX: &str = "fedcba9876543210fedcba9876543210";
-
 #[test]
 fn relay_cannot_forge_or_tamper_a_lease_revoke() {
     let mut fx = Fixture::new();
-    let env = seal_revoke(&fx, 1, GRANT_HEX, INSTANCE_HEX);
+    let env = seal_revoke(&fx, 1, LEASE_ID);
 
     // Not readable: the relay knows both public identities and still cannot see
-    // which window is being closed.
+    // which window is being closed, or that a window is being closed at all.
     let on_the_wire = serde_json::to_string(&env).expect("serialize");
-    assert!(!on_the_wire.contains(GRANT_HEX));
-    assert!(!on_the_wire.contains(INSTANCE_HEX));
+    assert!(!on_the_wire.contains(LEASE_ID));
     assert!(!on_the_wire.contains("leaseRevoke"));
 
     // Not forgeable: a revoke signed by the relay's own key never opens, so the
@@ -815,23 +812,20 @@ fn relay_cannot_forge_or_tamper_a_lease_revoke() {
         .open(&fx.sender_pub(), &fx.recipient.agreement, &mut fx.guard)
         .expect("open");
     match ToDaemonMessage::from_value(value).expect("classifies") {
-        ToDaemonMessage::LeaseRevoke(r) => {
-            assert_eq!(
-                r.target(),
-                Some(("q-1", GRANT_HEX.to_string(), INSTANCE_HEX.to_string()))
-            );
-        }
+        ToDaemonMessage::LeaseRevoke(r) => assert_eq!(r.target(), Some(LEASE_ID.to_string())),
         other => panic!("expected a LeaseRevoke, got {other:?}"),
     }
 }
 
 #[test]
 fn a_captured_lease_revoke_cannot_be_replayed_or_backdated() {
-    // The whole point of binding freshness: a revoke the relay stored cannot be
-    // re-delivered to close a window later. Inside the freshness window the
-    // single-use request id catches it; outside, the timestamp does.
+    // The envelope's half of replay protection: a revoke the relay stored cannot
+    // be re-delivered to close a window later. Inside the freshness window the
+    // single-use request id catches it; outside, the timestamp does. (The gap
+    // both leave -- a restarted, empty guard -- is closed by the lease id, in
+    // `sigil::remote`.)
     let mut fx = Fixture::new();
-    let env = seal_revoke(&fx, 1, GRANT_HEX, INSTANCE_HEX);
+    let env = seal_revoke(&fx, 1, LEASE_ID);
     env.open::<serde_json::Value>(&fx.sender_pub(), &fx.recipient.agreement, &mut fx.guard)
         .expect("the genuine revoke opens once");
 
@@ -843,9 +837,8 @@ fn a_captured_lease_revoke_cannot_be_replayed_or_backdated() {
 
     // The relay's remaining timing move is to HOLD a valid revoke and deliver it
     // late (it cannot alter `ts`; that is under the signature). The freshness gate
-    // rejects it before the id is even consulted, so a relay cannot bank one for
-    // tomorrow's window either.
-    let held = seal_revoke(&fx, 2, GRANT_HEX, INSTANCE_HEX);
+    // rejects it before the id is even consulted.
+    let held = seal_revoke(&fx, 2, LEASE_ID);
     let late_now = held.ts + REPLAY_WINDOW_MS + 1;
     assert_eq!(
         ReplayGuard::new().check_and_record(
@@ -883,9 +876,7 @@ fn a_lease_query_cannot_be_forged_and_a_list_reply_leaks_nothing() {
     let pairing_id = [0x6d; 32];
     let mut guard = ReplayGuard::new();
 
-    // Phone -> daemon query: forging it fails, tampering fails, honest delivery
-    // classifies as a query.
-    let q = LeaseQuery::new("q-7");
+    let q = LeaseQuery::new();
     let q_env =
         Envelope::seal(&q, pairing_id, 1, &phone.signing, &daemon.peer_identity()).expect("seal");
     let forged = MaliciousRelay::new().forge(pairing_id, &daemon.peer_identity(), 1);
@@ -909,16 +900,14 @@ fn a_lease_query_cannot_be_forged_and_a_list_reply_leaks_nothing() {
     // nothing from it and must not be able to manufacture one (a fabricated
     // "no active leases" would be a lie the human might act on).
     let row = LeaseRow::new(
-        GRANT_HEX,
-        INSTANCE_HEX,
+        LEASE_ID,
         "op",
         "op with --account \"rowmhq.1password.eu\"",
         "rowm",
         60_000,
-        5_000,
     )
     .expect("well-formed row");
-    let reply = LeaseListReply::new("q-7", vec![row]);
+    let reply = LeaseListReply::new(REQ_ID, 1_720_000_000_000, vec![row]);
     let r_env = Envelope::seal(
         &reply,
         pairing_id,
@@ -929,7 +918,7 @@ fn a_lease_query_cannot_be_forged_and_a_list_reply_leaks_nothing() {
     .expect("seal");
 
     let on_the_wire = serde_json::to_string(&r_env).expect("serialize");
-    for leak in [GRANT_HEX, INSTANCE_HEX, "rowmhq", "leaseListReply"] {
+    for leak in [LEASE_ID, REQ_ID, "rowmhq", "leaseListReply"] {
         assert!(
             !on_the_wire.contains(leak),
             "{leak} is visible to the relay"
@@ -986,7 +975,7 @@ fn a_revoke_reply_cannot_be_forged_into_a_false_confirmation() {
     let phone = DeviceIdentity::generate();
     let pairing_id = [0x6e; 32];
 
-    let reply = LeaseRevokeReply::new("q-9", GRANT_HEX, true);
+    let reply = LeaseRevokeReply::new(REQ_ID, LEASE_ID, true);
     let env = Envelope::seal(
         &reply,
         pairing_id,
@@ -1024,5 +1013,76 @@ fn a_revoke_reply_cannot_be_forged_into_a_false_confirmation() {
     assert_eq!(
         ToPhoneMessage::from_value(value).unwrap(),
         ToPhoneMessage::LeaseRevoke(reply)
+    );
+}
+
+#[test]
+fn every_lease_control_envelope_is_one_ciphertext_length() {
+    // Padding closes the last thing the relay could read off a lease-control
+    // envelope: how many windows are open, and which of the four messages it is.
+    let daemon = DeviceIdentity::generate();
+    let phone = DeviceIdentity::generate();
+    let pairing_id = [0x6f; 32];
+    let row = || {
+        LeaseRow::new(
+            LEASE_ID,
+            "op-account-rowmhq",
+            "op with --account \"rowmhq.1password.eu\"",
+            "Rowm work",
+            60_000,
+        )
+        .expect("row")
+    };
+    let mut lengths = Vec::new();
+    for n in [0usize, 1, 3, 5] {
+        let reply = LeaseListReply::new(REQ_ID, 1, (0..n).map(|_| row()).collect());
+        lengths.push(
+            Envelope::seal(
+                &reply,
+                pairing_id,
+                1,
+                &daemon.signing,
+                &phone.peer_identity(),
+            )
+            .expect("seal")
+            .ciphertext
+            .len(),
+        );
+    }
+    for other in [
+        Envelope::seal(
+            &LeaseRevokeReply::new(REQ_ID, LEASE_ID, true),
+            pairing_id,
+            1,
+            &daemon.signing,
+            &phone.peer_identity(),
+        )
+        .expect("seal"),
+        Envelope::seal(
+            &LeaseRevoke::new(LEASE_ID),
+            pairing_id,
+            1,
+            &phone.signing,
+            &daemon.peer_identity(),
+        )
+        .expect("seal"),
+        Envelope::seal(
+            &LeaseQuery::new(),
+            pairing_id,
+            1,
+            &phone.signing,
+            &daemon.peer_identity(),
+        )
+        .expect("seal"),
+    ] {
+        lengths.push(other.ciphertext.len());
+    }
+    assert_eq!(
+        lengths
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        1,
+        "lease control must be one ciphertext length in both directions: {lengths:?}"
     );
 }
