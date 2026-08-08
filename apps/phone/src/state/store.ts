@@ -198,6 +198,22 @@ class Store {
    * took AFTER the revoke was sent is confirmed closed by the daemon's own
    * account of itself, which is stronger evidence than the revoke reply. A window
    * still present stays pending, warning and all, because it really is still open.
+   *
+   * THAT INFERENCE BORROWS AN INVARIANT FROM THE DAEMON, so say where it is
+   * pinned. It is sound only because a lease id goes live to dead and never back:
+   * a refresh keeps the id (it extends one window rather than starting another),
+   * and no id is ever handed to a second window. So an omission proves the window
+   * was dead when the snapshot was computed, and dead is permanent, whatever a
+   * relay does to ordering. The daemon pins that from this consumer's side in
+   * `a_live_window_keeps_its_id_and_a_dead_one_never_lends_it_out`
+   * (crates/sigil/src/lease.rs). If anyone ever reuses an id across re-grants for
+   * continuity, that test fails first and this code starts lying second; the two
+   * must be revisited together.
+   *
+   * It also depends on there being ONE list question in flight, which the session
+   * controller enforces: two could interleave and let an older snapshot arrive
+   * last, and an omission from a snapshot taken before the window existed proves
+   * nothing about now.
    */
   leaseListReceived(rows: LeaseRow[], asOfMs: number, sentAt: number, receivedAt: number): void {
     const live = toActiveLeases(rows, receivedAt);
