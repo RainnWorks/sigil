@@ -290,7 +290,13 @@ pub struct Core {
     /// once at arm time. A record here is opened by the two-party combine (the
     /// phone's partial `Z_F` plus the Mac share `m`), never a key at rest.
     threshold: Mutex<crate::threshold::ThresholdStore>,
-    leases: LeaseStore,
+    /// The live lease windows. `Arc` rather than a plain field because it has two
+    /// controllers now: this core (the control socket's `lease_list`/`lease_revoke`,
+    /// the config-reload invalidation, the shutdown wipe) and each paired phone,
+    /// which reaches it through the [`RemoteApprover`] it is attached to. Both act
+    /// on the SAME store, so a window revoked from a phone is gone from
+    /// `sigil lease list` and vice versa.
+    leases: Arc<LeaseStore>,
     gate: ApprovalGate,
     pending: Arc<PendingRegistry>,
     /// The remote approvers, one per paired phone (#36 multi-device), when the
@@ -588,7 +594,7 @@ impl Core {
         let core = Self {
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(threshold),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate,
             pending,
             remote: remote_listeners.clone(),
@@ -607,6 +613,13 @@ impl Core {
             provisioned: AtomicBool::new(false),
             unwrap_requests: UnwrapRequests::default(),
         };
+        // Hand every paired device the live lease store, so the phone's lease
+        // screen lists and revokes the same windows the CLI does. The approvers
+        // are built before the core exists (inside `build_gate`), which is why
+        // this is a post-construction attach rather than a constructor argument.
+        for approver in &remote_listeners {
+            approver.attach_leases(core.leases.clone());
+        }
         Ok((core, remote_listeners, direct_acceptors))
     }
 
@@ -3214,7 +3227,7 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending: pending.clone(),
             proc_table,
@@ -3339,7 +3352,7 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
             proc_table: Box::new(StubTable),
@@ -3595,7 +3608,7 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(Arc::new(MemoryKeystore::new())),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(CountingApprover::new(
                 calls.clone(),
                 Duration::from_secs(60),
@@ -4303,7 +4316,7 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
             proc_table: Box::new(StubTable),
@@ -4412,7 +4425,7 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
             proc_table: Box::new(StubTable),
@@ -4499,7 +4512,7 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
             proc_table: Box::new(StubTable),
@@ -4618,7 +4631,7 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(store),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(
                 CountingApprover::new(calls.clone(), lease_ttl).with_partial(zf),
             )),
@@ -5496,7 +5509,7 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(CountingApprover::new(
                 calls.clone(),
                 Duration::from_secs(60),
@@ -5607,7 +5620,7 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
             proc_table: Box::new(StubTable),
@@ -5690,7 +5703,7 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
             proc_table: Box::new(StubTable),
@@ -5780,7 +5793,7 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
             proc_table: Box::new(StubTable),
@@ -5965,7 +5978,7 @@ mod tests {
         let core = Arc::new(Core {
             keystore: KeystoreCell::new(Arc::new(MemoryKeystore::new())), // no DEK at rest
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver.clone())),
             remote: vec![approver.clone()],
             pending,
@@ -6438,7 +6451,7 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate,
             pending,
             proc_table: Box::new(StubTable),
@@ -7450,7 +7463,7 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
             proc_table: Box::new(StubTable),
@@ -7529,7 +7542,7 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
             proc_table: Box::new(StubTable),

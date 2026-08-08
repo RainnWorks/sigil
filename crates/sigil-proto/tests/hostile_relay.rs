@@ -10,9 +10,9 @@
 
 use sigil_proto::{
     ApprovalRequest, ApprovalResponse, DeliveryReceipt, DeviceIdentity, Envelope, InstallLease,
-    LeasePolicy, OpenError, PeerIdentity, Provenance, PushRegister, ReplayError, ReplayGuard,
-    RequestKind, ResolutionBroadcast, ResolutionStatus, ToDaemonMessage, ToPhoneMessage,
-    REPLAY_WINDOW_MS,
+    LeaseListReply, LeasePolicy, LeaseQuery, LeaseRevoke, LeaseRevokeReply, LeaseRow, OpenError,
+    PeerIdentity, Provenance, PushRegister, ReplayError, ReplayGuard, RequestKind,
+    ResolutionBroadcast, ResolutionStatus, ToDaemonMessage, ToPhoneMessage, REPLAY_WINDOW_MS,
 };
 
 /// A paired sender (phone) and recipient (daemon), plus the honest replay guard
@@ -719,5 +719,310 @@ fn the_lease_coverage_label_rides_inside_the_seal() {
     assert_eq!(
         env.open::<ApprovalRequest>(&sender.peer_identity(), &recipient.agreement, &mut guard),
         Err(OpenError::Replay(ReplayError::DuplicateRequest))
+    );
+}
+
+// --- phone lease control rides the same hostile-relay proofs ------------------
+//
+// Lease control is the second controller over a live window: the phone can now
+// LIST the daemon's windows and REVOKE one, where before only `sigil lease
+// revoke` on the Mac could. That makes four new payloads the relay would like to
+// touch, and the interesting one is the revoke, because a window it can kill is a
+// window the human's approval no longer covers.
+//
+// The relay's four options and where each dies:
+//
+// * FORGE a revoke (or a list reply): it does not hold either signing key, so
+//   nothing it manufactures opens. Proven below for both directions.
+// * TAMPER with one, to re-aim it at a different window: every field is inside
+//   the seal and under the signature, so a bit-flip is a `BadSignature`.
+// * REPLAY one: a captured revoke is single-use inside the freshness window and
+//   stale outside it. The one case that leaves -- a daemon whose in-memory guard
+//   restarted inside the window -- is covered NOT here but by the instance
+//   binding, exercised in `sigil::remote`'s
+//   `a_replayed_revoke_cannot_kill_a_later_window_with_the_same_grant_key`.
+//   That is the seam: the envelope makes a replay hard, the instance makes a
+//   replay that gets through inert.
+// * DROP one: it can, and that is a stated residual. A censored revoke leaves the
+//   window alive until its TTL, `sigil lease revoke` on the Mac, or a daemon
+//   restart. The relay cannot cause a release this way, only withhold a
+//   revocation, and the phone learns of it by getting no reply.
+//
+// And the payloads themselves are zero-knowledge to the relay: a list carries
+// rule names, a coverage label, an account label, and two clocks -- never an
+// argv, a secret reference, or a secret value.
+
+/// Seal a phone -> daemon lease revoke, as the daemon would receive it.
+fn seal_revoke(fx: &Fixture, counter: u64, grant: &str, instance: &str) -> Envelope {
+    Envelope::seal(
+        &LeaseRevoke::new("q-1", grant, instance),
+        fx.pairing_id,
+        counter,
+        &fx.sender.signing,
+        &fx.recipient.peer_identity(),
+    )
+    .expect("seal")
+}
+
+const GRANT_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const INSTANCE_HEX: &str = "fedcba9876543210fedcba9876543210";
+
+#[test]
+fn relay_cannot_forge_or_tamper_a_lease_revoke() {
+    let mut fx = Fixture::new();
+    let env = seal_revoke(&fx, 1, GRANT_HEX, INSTANCE_HEX);
+
+    // Not readable: the relay knows both public identities and still cannot see
+    // which window is being closed.
+    let on_the_wire = serde_json::to_string(&env).expect("serialize");
+    assert!(!on_the_wire.contains(GRANT_HEX));
+    assert!(!on_the_wire.contains(INSTANCE_HEX));
+    assert!(!on_the_wire.contains("leaseRevoke"));
+
+    // Not forgeable: a revoke signed by the relay's own key never opens, so the
+    // relay cannot close a window the human wanted open.
+    let forged = MaliciousRelay::new().forge(fx.pairing_id, &fx.recipient.peer_identity(), 1);
+    assert_eq!(
+        forged.open::<serde_json::Value>(
+            &fx.sender_pub(),
+            &fx.recipient.agreement,
+            &mut ReplayGuard::new()
+        ),
+        Err(OpenError::BadSignature),
+        "a revoke not signed by the paired phone must never open"
+    );
+
+    // Not re-aimable: the target is inside the seal and under the signature, so
+    // the relay cannot point a genuine revoke at a different window.
+    for mutated in [
+        MaliciousRelay::flip_ciphertext(&env),
+        MaliciousRelay::flip_signature(&env),
+        MaliciousRelay::bump_counter(&env),
+    ] {
+        assert_eq!(
+            mutated.open::<serde_json::Value>(
+                &fx.sender_pub(),
+                &fx.recipient.agreement,
+                &mut ReplayGuard::new()
+            ),
+            Err(OpenError::BadSignature)
+        );
+    }
+
+    // Delivered honestly it opens once, classifies as a revoke, and names exactly
+    // the window the phone chose.
+    let value: serde_json::Value = env
+        .open(&fx.sender_pub(), &fx.recipient.agreement, &mut fx.guard)
+        .expect("open");
+    match ToDaemonMessage::from_value(value).expect("classifies") {
+        ToDaemonMessage::LeaseRevoke(r) => {
+            assert_eq!(
+                r.target(),
+                Some(("q-1", GRANT_HEX.to_string(), INSTANCE_HEX.to_string()))
+            );
+        }
+        other => panic!("expected a LeaseRevoke, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_captured_lease_revoke_cannot_be_replayed_or_backdated() {
+    // The whole point of binding freshness: a revoke the relay stored cannot be
+    // re-delivered to close a window later. Inside the freshness window the
+    // single-use request id catches it; outside, the timestamp does.
+    let mut fx = Fixture::new();
+    let env = seal_revoke(&fx, 1, GRANT_HEX, INSTANCE_HEX);
+    env.open::<serde_json::Value>(&fx.sender_pub(), &fx.recipient.agreement, &mut fx.guard)
+        .expect("the genuine revoke opens once");
+
+    assert_eq!(
+        env.open::<serde_json::Value>(&fx.sender_pub(), &fx.recipient.agreement, &mut fx.guard),
+        Err(OpenError::Replay(ReplayError::DuplicateRequest)),
+        "re-delivering a revoke must never close a second window"
+    );
+
+    // The relay's remaining timing move is to HOLD a valid revoke and deliver it
+    // late (it cannot alter `ts`; that is under the signature). The freshness gate
+    // rejects it before the id is even consulted, so a relay cannot bank one for
+    // tomorrow's window either.
+    let held = seal_revoke(&fx, 2, GRANT_HEX, INSTANCE_HEX);
+    let late_now = held.ts + REPLAY_WINDOW_MS + 1;
+    assert_eq!(
+        ReplayGuard::new().check_and_record(
+            held.request_id,
+            held.counter,
+            held.ts,
+            late_now,
+            REPLAY_WINDOW_MS
+        ),
+        Err(ReplayError::TimestampOutOfWindow {
+            ts: held.ts,
+            now: late_now,
+            window_ms: REPLAY_WINDOW_MS,
+        })
+    );
+    // And backdating it to look fresh breaks the signature that covers `ts`.
+    let backdated = MaliciousRelay::backdate(&held, REPLAY_WINDOW_MS + 1_000);
+    assert_eq!(
+        backdated.open::<serde_json::Value>(
+            &fx.sender_pub(),
+            &fx.recipient.agreement,
+            &mut ReplayGuard::new()
+        ),
+        Err(OpenError::BadSignature)
+    );
+}
+
+#[test]
+fn a_lease_query_cannot_be_forged_and_a_list_reply_leaks_nothing() {
+    // The query direction: a forged one would only make the daemon seal a list to
+    // the pinned phone, but it must still be impossible, and the reply that comes
+    // back must be opaque to the relay and unforgeable toward the phone.
+    let daemon = DeviceIdentity::generate();
+    let phone = DeviceIdentity::generate();
+    let pairing_id = [0x6d; 32];
+    let mut guard = ReplayGuard::new();
+
+    // Phone -> daemon query: forging it fails, tampering fails, honest delivery
+    // classifies as a query.
+    let q = LeaseQuery::new("q-7");
+    let q_env =
+        Envelope::seal(&q, pairing_id, 1, &phone.signing, &daemon.peer_identity()).expect("seal");
+    let forged = MaliciousRelay::new().forge(pairing_id, &daemon.peer_identity(), 1);
+    assert_eq!(
+        forged.open::<serde_json::Value>(
+            &phone.peer_identity(),
+            &daemon.agreement,
+            &mut ReplayGuard::new()
+        ),
+        Err(OpenError::BadSignature)
+    );
+    let value: serde_json::Value = q_env
+        .open(&phone.peer_identity(), &daemon.agreement, &mut guard)
+        .expect("open");
+    assert_eq!(
+        ToDaemonMessage::from_value(value).unwrap(),
+        ToDaemonMessage::LeaseList(q)
+    );
+
+    // Daemon -> phone reply. It describes live windows, so the relay must learn
+    // nothing from it and must not be able to manufacture one (a fabricated
+    // "no active leases" would be a lie the human might act on).
+    let row = LeaseRow::new(
+        GRANT_HEX,
+        INSTANCE_HEX,
+        "op",
+        "op with --account \"rowmhq.1password.eu\"",
+        "rowm",
+        60_000,
+        5_000,
+    )
+    .expect("well-formed row");
+    let reply = LeaseListReply::new("q-7", vec![row]);
+    let r_env = Envelope::seal(
+        &reply,
+        pairing_id,
+        2,
+        &daemon.signing,
+        &phone.peer_identity(),
+    )
+    .expect("seal");
+
+    let on_the_wire = serde_json::to_string(&r_env).expect("serialize");
+    for leak in [GRANT_HEX, INSTANCE_HEX, "rowmhq", "leaseListReply"] {
+        assert!(
+            !on_the_wire.contains(leak),
+            "{leak} is visible to the relay"
+        );
+    }
+    let stranger = DeviceIdentity::generate();
+    assert_eq!(
+        r_env.open::<LeaseListReply>(
+            &daemon.peer_identity(),
+            &stranger.agreement,
+            &mut ReplayGuard::new()
+        ),
+        Err(OpenError::Decrypt)
+    );
+    let tampered = MaliciousRelay::flip_ciphertext(&r_env);
+    assert_eq!(
+        tampered.open::<serde_json::Value>(
+            &daemon.peer_identity(),
+            &phone.agreement,
+            &mut ReplayGuard::new()
+        ),
+        Err(OpenError::BadSignature),
+        "a relay cannot rewrite the list of windows the human is shown"
+    );
+
+    // Honest delivery reproduces it byte-for-byte and classifies as a list reply;
+    // a replay of the same bytes is rejected, so a stale list cannot be redelivered
+    // to make a live window look absent.
+    let mut phone_guard = ReplayGuard::new();
+    let value: serde_json::Value = r_env
+        .open(&daemon.peer_identity(), &phone.agreement, &mut phone_guard)
+        .expect("open");
+    assert_eq!(
+        ToPhoneMessage::from_value(value).unwrap(),
+        ToPhoneMessage::LeaseList(reply)
+    );
+    assert_eq!(
+        r_env.open::<serde_json::Value>(
+            &daemon.peer_identity(),
+            &phone.agreement,
+            &mut phone_guard
+        ),
+        Err(OpenError::Replay(ReplayError::DuplicateRequest))
+    );
+}
+
+#[test]
+fn a_revoke_reply_cannot_be_forged_into_a_false_confirmation() {
+    // The reply is what tells the human "that window is closed". A relay that
+    // could manufacture `revoked: true` would turn the revoke control back into
+    // the consent theatre this feature exists to end, so it must be exactly as
+    // unforgeable as a decision.
+    let daemon = DeviceIdentity::generate();
+    let phone = DeviceIdentity::generate();
+    let pairing_id = [0x6e; 32];
+
+    let reply = LeaseRevokeReply::new("q-9", GRANT_HEX, true);
+    let env = Envelope::seal(
+        &reply,
+        pairing_id,
+        1,
+        &daemon.signing,
+        &phone.peer_identity(),
+    )
+    .expect("seal");
+
+    // A relay-signed confirmation never opens.
+    let forged = MaliciousRelay::new().forge(pairing_id, &phone.peer_identity(), 1);
+    assert_eq!(
+        forged.open::<serde_json::Value>(
+            &daemon.peer_identity(),
+            &phone.agreement,
+            &mut ReplayGuard::new()
+        ),
+        Err(OpenError::BadSignature)
+    );
+    // And the boolean cannot be flipped in flight, in either direction.
+    let tampered = MaliciousRelay::flip_ciphertext(&env);
+    assert_eq!(
+        tampered.open::<serde_json::Value>(
+            &daemon.peer_identity(),
+            &phone.agreement,
+            &mut ReplayGuard::new()
+        ),
+        Err(OpenError::BadSignature)
+    );
+
+    let mut guard = ReplayGuard::new();
+    let value: serde_json::Value = env
+        .open(&daemon.peer_identity(), &phone.agreement, &mut guard)
+        .expect("open");
+    assert_eq!(
+        ToPhoneMessage::from_value(value).unwrap(),
+        ToPhoneMessage::LeaseRevoke(reply)
     );
 }

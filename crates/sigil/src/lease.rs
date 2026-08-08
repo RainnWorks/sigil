@@ -536,6 +536,25 @@ impl LeaseBinding {
 /// removal path drops the `Zeroizing` token and wipes it.
 struct Lease {
     grant: [u8; 32],
+    /// This window's instance id: 16 bytes of OS randomness, minted when the
+    /// window OPENS and preserved for its whole life (a refresh extends one
+    /// window, it does not start another).
+    ///
+    /// It exists because a grant key is DETERMINISTIC. The same caller chain
+    /// running the same rule derives the same key tomorrow, so a key names a
+    /// *lease shape*, not a *lease*. Any controller that names only the key is
+    /// therefore aiming at every window that shape will ever have, which is fine
+    /// for a human typing `sigil lease revoke <prefix>` at a terminal and not fine
+    /// for a message that crossed a hostile relay and could be handed back to a
+    /// later daemon. The remote revoke path
+    /// ([`LeaseStore::revoke_instance`]) binds both, so a stale revoke can only
+    /// ever name a window that has already ended.
+    ///
+    /// Random rather than a granted-at timestamp: two windows granted in the same
+    /// millisecond would share a timestamp, and a clock is a thing that moves. 16
+    /// bytes from the CSPRNG collide with nothing, including with themselves after
+    /// a daemon restart.
+    instance: [u8; 16],
     binding: LeaseBinding,
     /// The daemon-rendered coverage label for the rule this window covers, e.g.
     /// `op read`. Display only, and deliberately NOT part of [`LeaseBinding`]:
@@ -551,6 +570,11 @@ struct Lease {
 #[derive(Debug, Clone)]
 pub struct LeaseInfo {
     pub grant_hex: String,
+    /// This window's instance id as lowercase hex (32 chars). Unlike
+    /// [`Self::grant_hex`] it names ONE window and is never derived from anything,
+    /// so a controller that must not act on a later window binds to it. See
+    /// [`Lease::instance`].
+    pub instance_hex: String,
     pub account: String,
     /// The rule name the lease covers. Display must make the breadth plain: the
     /// lease covers any command that rule matches, not the one that opened it.
@@ -602,10 +626,16 @@ impl LeaseStore {
             l.token = token;
             l.covers = covers.to_string();
             l.expires = now + ttl;
+            // The instance is deliberately NOT re-minted. A refresh extends the
+            // one window the human is already looking at, so a revoke they aimed
+            // at it before the refresh must still land. A new instance is minted
+            // only when a window genuinely ended and a fresh approval opened
+            // another, which is exactly the case a stale revoke must not reach.
             return;
         }
         leases.push(Lease {
             grant,
+            instance: new_instance(),
             binding: binding.clone(),
             covers: covers.to_string(),
             token,
@@ -637,6 +667,7 @@ impl LeaseStore {
             .iter()
             .map(|l| LeaseInfo {
                 grant_hex: hex32(&l.grant),
+                instance_hex: hex16(&l.instance),
                 account: l.binding.account.clone(),
                 scope: l.binding.scope.clone(),
                 covers: l.covers.clone(),
@@ -655,6 +686,35 @@ impl LeaseStore {
         let before = leases.len();
         leases.retain(|l| !hex32(&l.grant).starts_with(prefix));
         before - leases.len()
+    }
+
+    /// Revoke the ONE live lease whose grant key is exactly `grant_hex` AND whose
+    /// instance is exactly `instance_hex`. Returns whether one was found and
+    /// zeroized.
+    ///
+    /// This is the remote (phone) revoke path, and it is deliberately stricter
+    /// than [`revoke`](Self::revoke) in two ways:
+    ///
+    /// * **Exact, not prefix.** A prefix is a convenience for a human typing at a
+    ///   terminal who can see what they are aiming at. A message that crossed a
+    ///   relay gets no such latitude: it kills one window or none.
+    /// * **Instance-bound.** A grant key is deterministic, so naming only the key
+    ///   aims at every window that key will ever have, including ones that do not
+    ///   exist yet. Binding the instance ([`Lease::instance`]) makes a stale or
+    ///   replayed revoke inert rather than dangerous: it names a window that has
+    ///   already ended, and the answer is a clean `false`.
+    ///
+    /// Expired leases are purged (and zeroized) first, so a window that lapsed on
+    /// its own reports `false` exactly like one that was never held. The caller
+    /// must not distinguish the reasons for `false`; see
+    /// [`LeaseRevokeReply`](sigil_proto::LeaseRevokeReply).
+    pub fn revoke_instance(&self, grant_hex: &str, instance_hex: &str) -> bool {
+        let now = Instant::now();
+        let mut leases = self.inner.lock().expect("lease store poisoned");
+        leases.retain(|l| l.expires > now);
+        let before = leases.len();
+        leases.retain(|l| hex32(&l.grant) != grant_hex || hex16(&l.instance) != instance_hex);
+        before != leases.len()
     }
 
     /// Revoke every lease whose scope is exactly `scope`. The config-change path:
@@ -687,11 +747,29 @@ impl LeaseStore {
 
 /// Lowercase hex of a 32-byte key.
 pub fn hex32(bytes: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
+    hex(bytes)
+}
+
+/// Lowercase hex of a 16-byte lease instance id.
+pub fn hex16(bytes: &[u8; 16]) -> String {
+    hex(bytes)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// A fresh lease instance id from the OS CSPRNG. See [`Lease::instance`] for why
+/// this is random rather than a timestamp or a counter.
+fn new_instance() -> [u8; 16] {
+    use rand_core::RngCore;
+    let mut id = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut id);
+    id
 }
 
 /// The peer process id on the far end of a unix socket, verified by the kernel.
@@ -1853,6 +1931,94 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         assert!(store.token_for(&gk, &b).is_none(), "the window lapsed");
         assert_eq!(store.active(), 0, "and the values were purged with it");
+    }
+
+    /// The instance id is what lets a controller name ONE window rather than a
+    /// shape of window. Three properties make it worth having, and all three are
+    /// load-bearing for the phone's revoke path.
+    #[test]
+    fn a_window_instance_names_one_window_and_survives_a_refresh() {
+        let store = LeaseStore::new();
+        let gk = [0xa1; 32];
+        let b = gate("Rowm", "op");
+
+        // 1. Minted when the window opens.
+        store.grant(gk, &b, COVERS, token("t"), Duration::from_secs(60));
+        let first = store.list()[0].instance_hex.clone();
+        assert_eq!(first.len(), 32, "16 bytes of lowercase hex");
+        assert!(first
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+
+        // 2. Preserved across a REFRESH. A later approval under the same key
+        //    extends the window the human is already looking at; a revoke they
+        //    aimed at it before the refresh must still land.
+        store.grant(gk, &b, COVERS, token("t2"), Duration::from_secs(600));
+        assert_eq!(store.active(), 1, "a refresh does not open a second window");
+        assert_eq!(store.list()[0].instance_hex, first, "same window, same id");
+
+        // 3. A genuinely NEW window gets a new id, even though the grant key is
+        //    deterministic and recurs. This is the whole point: the key cannot
+        //    distinguish yesterday's window from today's, and the instance can.
+        assert!(store.revoke_instance(&store.list()[0].grant_hex.clone(), &first));
+        store.grant(gk, &b, COVERS, token("t3"), Duration::from_secs(60));
+        let second = store.list()[0].instance_hex.clone();
+        assert_eq!(store.list()[0].grant_hex, hex32(&gk), "the key recurs");
+        assert_ne!(second, first, "the instance does not");
+    }
+
+    /// The remote revoke path is exact on BOTH legs and silent about misses, so a
+    /// stale or mis-aimed revoke can never take down a window it was not aimed at
+    /// and never reveals what this daemon holds.
+    #[test]
+    fn revoke_by_instance_is_exact_on_both_legs() {
+        let store = LeaseStore::new();
+        let a = gate("A", "rule-a");
+        let b = gate("B", "rule-b");
+        store.grant([0xb1; 32], &a, COVERS, token("a"), Duration::from_secs(60));
+        store.grant([0xb2; 32], &b, COVERS, token("b"), Duration::from_secs(60));
+        let rows = store.list();
+        let one = rows.iter().find(|l| l.scope == "rule-a").unwrap();
+        let two = rows.iter().find(|l| l.scope == "rule-b").unwrap();
+
+        // A prefix is not a target: the remote path takes the whole key.
+        assert!(!store.revoke_instance(&one.grant_hex[..8], &one.instance_hex));
+        // Right key, wrong instance: nothing.
+        assert!(!store.revoke_instance(&one.grant_hex, &two.instance_hex));
+        // Right instance, wrong key: nothing. (Both legs must match.)
+        assert!(!store.revoke_instance(&two.grant_hex, &one.instance_hex));
+        // A key this store has never held: nothing, and no error.
+        assert!(!store.revoke_instance(&"f".repeat(64), &one.instance_hex));
+        assert_eq!(store.active(), 2, "no near miss killed anything");
+
+        // The exact pair kills exactly one window, and only once.
+        assert!(store.revoke_instance(&one.grant_hex, &one.instance_hex));
+        assert_eq!(store.active(), 1);
+        assert!(
+            !store.revoke_instance(&one.grant_hex, &one.instance_hex),
+            "idempotent: revoking a dead window is a clean false, never an error"
+        );
+        assert_eq!(store.list()[0].scope, "rule-b", "the other survives");
+    }
+
+    #[test]
+    fn revoke_by_instance_reports_false_for_a_window_that_already_lapsed() {
+        // An expired window and a window that never existed must be
+        // indistinguishable, so the reply is not an oracle for what this daemon
+        // holds. Both are a bare `false`.
+        let store = LeaseStore::new();
+        let b = gate("Rowm", "op");
+        store.grant(
+            [0xc1; 32],
+            &b,
+            COVERS,
+            token("t"),
+            Duration::from_millis(15),
+        );
+        let row = store.list()[0].clone();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!store.revoke_instance(&row.grant_hex, &row.instance_hex));
+        assert!(!store.revoke_instance(&"e".repeat(64), &row.instance_hex));
     }
 
     #[test]

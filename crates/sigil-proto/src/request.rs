@@ -740,17 +740,326 @@ impl ResolutionBroadcast {
     }
 }
 
+// --- Phone lease control: list and revoke live windows from the approver ------
+
+/// The character width of a grant key rendered as lowercase hex (32 bytes).
+pub const GRANT_HEX_CHARS: usize = 64;
+
+/// The character width of a lease **instance** id rendered as lowercase hex
+/// (16 bytes). See [`LeaseRow::instance`] for what it is and why it exists.
+pub const LEASE_INSTANCE_CHARS: usize = 32;
+
+/// The bound every human-readable field of a [`LeaseRow`] is sanitized to. The
+/// same bound as [`COVERS_MAX_CHARS`], because these strings render on the same
+/// consent surface as the coverage label and must hold to one rule.
+pub const LEASE_LABEL_MAX_CHARS: usize = COVERS_MAX_CHARS;
+
+/// The bound on a correlation id ([`LeaseQuery::query_id`] and friends). A uuid
+/// is 36 characters; this leaves room for another shape without letting a peer
+/// put an unbounded string in a message the daemon echoes back.
+pub const QUERY_ID_MAX_CHARS: usize = 64;
+
+/// Normalize an ASCII-hex field of exactly `chars` characters to lowercase, or
+/// `None` if it is not exactly that. Accepting either case and emitting only
+/// lowercase keeps the wire canonical without making a peer's capitalization a
+/// failure; anything else (short, long, non-hex) is rejected outright, so a
+/// malformed identifier never reaches the lease store and is never echoed back.
+fn hex_field(raw: &str, chars: usize) -> Option<String> {
+    if raw.len() != chars || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(raw.to_ascii_lowercase())
+}
+
+/// Validate a correlation id: non-empty printable ASCII, at most
+/// [`QUERY_ID_MAX_CHARS`]. Rejected rather than sanitized, because unlike a
+/// display label a correlation id has no useful degraded form: a phone that gets
+/// back an id it did not send cannot match it to a screen anyway, so the honest
+/// handling of a malformed one is to drop the whole message.
+fn valid_query_id(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.chars().count() <= QUERY_ID_MAX_CHARS
+        && raw.chars().all(|c| c.is_ascii_graphic())
+}
+
+/// A phone -> daemon request to enumerate the daemon's live leases.
+///
+/// **Wire contract (locked, shared with `apps/phone`).**
+/// `{"type":"leaseList","queryId":"<id>"}`. It carries no body beyond the
+/// correlation id: the daemon lists everything it holds, exactly as
+/// `sigil lease list` does, because the phone is the same single human.
+///
+/// It rides the established session box with the same seal, signature, and
+/// [`ReplayGuard`](crate::ReplayGuard) as an [`ApprovalResponse`], so a relay can
+/// neither forge nor replay one; and it grants nothing, releases nothing, and
+/// gates nothing, so even a (cryptographically impossible) forged one would only
+/// cause the daemon to seal a list to the pinned phone that asked.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseQuery {
+    /// The wire discriminator. Always [`LeaseQuery::TYPE`] on a conforming
+    /// message; validated by [`ToDaemonMessage::from_value`] before dispatch.
+    #[serde(rename = "type")]
+    pub message_type: String,
+    /// Correlates the [`LeaseListReply`] back to the screen that asked. Opaque to
+    /// the daemon, which only validates and echoes it.
+    pub query_id: String,
+}
+
+impl LeaseQuery {
+    /// The locked `type` discriminator value.
+    pub const TYPE: &'static str = "leaseList";
+
+    /// Build a query under `query_id`, stamping the discriminator.
+    pub fn new(query_id: impl Into<String>) -> Self {
+        Self {
+            message_type: Self::TYPE.to_string(),
+            query_id: query_id.into(),
+        }
+    }
+
+    /// The correlation id if it is well-formed, else `None` (drop the message).
+    pub fn query_id(&self) -> Option<&str> {
+        valid_query_id(&self.query_id).then_some(self.query_id.as_str())
+    }
+}
+
+/// A phone -> daemon request to kill ONE live lease window.
+///
+/// **Wire contract (locked, shared with `apps/phone`).**
+/// `{"type":"leaseRevoke","queryId":"<id>","grantHex":"<64 hex>","instance":"<32 hex>"}`.
+///
+/// # Why `instance` is required, and what it is for
+///
+/// A grant key is **deterministic**: the same rule run by the same caller chain
+/// derives the same `grantHex` tomorrow. So `grantHex` alone names a *key*, not a
+/// *window*, and a captured revoke that named only the key could kill a FUTURE
+/// window that happened to share it. `instance` is 16 bytes of OS randomness
+/// minted when a window OPENS and carried unchanged for its whole life, so a
+/// revoke names one window and no other. Replaying it against any later window
+/// is a clean no-op ([`LeaseRevokeReply::revoked`] = `false`).
+///
+/// This binds *on top of* the envelope's own replay protection rather than
+/// instead of it; see the module-level reasoning in `crates/sigil/PROTOCOL.md`
+/// for exactly which gate covers which case and what is left over.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseRevoke {
+    /// The wire discriminator. Always [`LeaseRevoke::TYPE`] on a conforming
+    /// message; validated by [`ToDaemonMessage::from_value`] before dispatch.
+    #[serde(rename = "type")]
+    pub message_type: String,
+    /// Correlates the [`LeaseRevokeReply`] back to the screen that asked.
+    pub query_id: String,
+    /// The grant key to revoke, lowercase hex, exactly [`GRANT_HEX_CHARS`]. Taken
+    /// verbatim from a [`LeaseRow`]; never a prefix (the CLI's prefix match is a
+    /// separate, local-only affordance).
+    pub grant_hex: String,
+    /// The window instance to revoke, lowercase hex, exactly
+    /// [`LEASE_INSTANCE_CHARS`]. Taken verbatim from the same [`LeaseRow`].
+    pub instance: String,
+}
+
+impl LeaseRevoke {
+    /// The locked `type` discriminator value.
+    pub const TYPE: &'static str = "leaseRevoke";
+
+    /// Build a revoke for one listed window, stamping the discriminator.
+    pub fn new(
+        query_id: impl Into<String>,
+        grant_hex: impl Into<String>,
+        instance: impl Into<String>,
+    ) -> Self {
+        Self {
+            message_type: Self::TYPE.to_string(),
+            query_id: query_id.into(),
+            grant_hex: grant_hex.into(),
+            instance: instance.into(),
+        }
+    }
+
+    /// The `(query_id, grant_hex, instance)` this names, all validated and
+    /// normalized, or `None` if any of the three is malformed.
+    ///
+    /// Fail closed as ONE decision: a message whose target the daemon cannot parse
+    /// is dropped whole, with no reply at all. That is deliberate. Replying to a
+    /// malformed target would echo peer-chosen bytes back onto a screen, and
+    /// there is nothing useful to say: a phone that sends a target it did not read
+    /// off a [`LeaseRow`] has a bug, not a lease.
+    pub fn target(&self) -> Option<(&str, String, String)> {
+        let query_id = self.query_id()?;
+        let grant = hex_field(&self.grant_hex, GRANT_HEX_CHARS)?;
+        let instance = hex_field(&self.instance, LEASE_INSTANCE_CHARS)?;
+        Some((query_id, grant, instance))
+    }
+
+    /// The correlation id if it is well-formed, else `None`.
+    pub fn query_id(&self) -> Option<&str> {
+        valid_query_id(&self.query_id).then_some(self.query_id.as_str())
+    }
+}
+
+/// One live lease window, as the daemon describes it to the approver.
+///
+/// **Everything here is display-safe by construction.** The three human-readable
+/// fields go through [`sanitize_label`] at [`LEASE_LABEL_MAX_CHARS`] in
+/// [`LeaseRow::new`], the only constructor the daemon uses, so the same allowlist
+/// that protects the approval sheet's coverage caption protects the lease list.
+/// None of them is ever a raw argv, a secret reference, or a secret value:
+/// `scope` is the matched RULE's name and `covers` is the daemon-rendered
+/// coverage label, both already on the consent surface the human said yes to, and
+/// `account` is the source label a window injects from.
+///
+/// A renderer must still re-filter (the phone ports this same allowlist): this
+/// type describes what the daemon promises to send, not what a screen may assume
+/// it received.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseRow {
+    /// The grant key, lowercase hex, [`GRANT_HEX_CHARS`] wide. Stable across the
+    /// life of the window and equal for any future window with the same caller
+    /// chain and rule, which is why a revoke must also name `instance`.
+    pub grant_hex: String,
+    /// This window's instance id, lowercase hex, [`LEASE_INSTANCE_CHARS`] wide.
+    /// Minted from the OS CSPRNG when the window opens, preserved when the window
+    /// is REFRESHED by a later approval under the same key (a refresh extends one
+    /// window, it does not start another), and never reused. This is the field a
+    /// [`LeaseRevoke`] binds to.
+    pub instance: String,
+    /// The matched rule's name. Display must make the breadth plain: the window
+    /// covers anything that rule matches for that caller chain, not the one
+    /// command that opened it.
+    pub scope: String,
+    /// The daemon-rendered coverage label for that rule (`op read`, `op with
+    /// --account "…"`). **Empty means no label was rendered**: show no coverage
+    /// clause rather than inventing one.
+    pub covers: String,
+    /// The source/account label the window injects from. Empty for a plain gate,
+    /// which injects nothing.
+    pub account: String,
+    /// Milliseconds left before the window lapses on its own.
+    pub remaining_ms: u64,
+    /// Milliseconds since the window opened.
+    pub age_ms: u64,
+}
+
+impl LeaseRow {
+    /// Build a row, sanitizing every display field and validating both
+    /// identifiers. `None` when `grant_hex` or `instance` is not exactly-width
+    /// ASCII hex, so a row the phone could not act on is never sent at all.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        grant_hex: &str,
+        instance: &str,
+        scope: &str,
+        covers: &str,
+        account: &str,
+        remaining_ms: u64,
+        age_ms: u64,
+    ) -> Option<Self> {
+        Some(Self {
+            grant_hex: hex_field(grant_hex, GRANT_HEX_CHARS)?,
+            instance: hex_field(instance, LEASE_INSTANCE_CHARS)?,
+            scope: sanitize_label(scope, LEASE_LABEL_MAX_CHARS),
+            covers: sanitize_label(covers, LEASE_LABEL_MAX_CHARS),
+            account: sanitize_label(account, LEASE_LABEL_MAX_CHARS),
+            remaining_ms,
+            age_ms,
+        })
+    }
+}
+
+/// The daemon's answer to a [`LeaseQuery`]: every live window, newest first.
+///
+/// **Wire contract (locked, shared with `apps/phone`).**
+/// `{"type":"leaseListReply","queryId":"<echoed>","leases":[LeaseRow, …]}`.
+/// `leases` is always present and may be empty (no live windows). The phone MUST
+/// match `queryId` against the query it sent and drop a reply it did not ask for,
+/// so a late answer to a previous screen-open cannot repaint a newer list.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseListReply {
+    /// The wire discriminator. Always [`LeaseListReply::TYPE`].
+    #[serde(rename = "type")]
+    pub message_type: String,
+    /// Echoes the query's `queryId` verbatim.
+    pub query_id: String,
+    /// The live windows. Empty is a complete, meaningful answer: no windows.
+    pub leases: Vec<LeaseRow>,
+}
+
+impl LeaseListReply {
+    /// The locked `type` discriminator value.
+    pub const TYPE: &'static str = "leaseListReply";
+
+    /// Build a reply for `query_id` over `leases`, stamping the discriminator.
+    pub fn new(query_id: impl Into<String>, leases: Vec<LeaseRow>) -> Self {
+        Self {
+            message_type: Self::TYPE.to_string(),
+            query_id: query_id.into(),
+            leases,
+        }
+    }
+}
+
+/// The daemon's answer to a [`LeaseRevoke`].
+///
+/// **Wire contract (locked, shared with `apps/phone`).**
+/// `{"type":"leaseRevokeReply","queryId":"<echoed>","grantHex":"<echoed>","revoked":bool}`.
+///
+/// `revoked` is `true` **only** when a live window with that exact
+/// `(grantHex, instance)` was found and zeroized. It is `false` — never an error,
+/// never a distinguishable failure — for every other case: the window already
+/// lapsed, it was already revoked (from here or from `sigil lease revoke`), the
+/// instance names a window that has been replaced, or the grant key is not held
+/// at all. The four are deliberately indistinguishable, so a `revoked: false` is
+/// not an oracle for whether a given grant key exists on this daemon.
+///
+/// A revoke is therefore **idempotent**: sending it twice is `true` then `false`,
+/// and both are successful outcomes. The phone should re-list after a revoke
+/// rather than treat `revoked` as the new state of the world.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseRevokeReply {
+    /// The wire discriminator. Always [`LeaseRevokeReply::TYPE`].
+    #[serde(rename = "type")]
+    pub message_type: String,
+    /// Echoes the revoke's `queryId` verbatim.
+    pub query_id: String,
+    /// Echoes the revoke's normalized `grantHex`, so a phone tracking several
+    /// rows can attribute the answer without holding the query id alone.
+    pub grant_hex: String,
+    /// Whether a live window with that exact instance was found and killed.
+    pub revoked: bool,
+}
+
+impl LeaseRevokeReply {
+    /// The locked `type` discriminator value.
+    pub const TYPE: &'static str = "leaseRevokeReply";
+
+    /// Build a reply, stamping the discriminator.
+    pub fn new(query_id: impl Into<String>, grant_hex: impl Into<String>, revoked: bool) -> Self {
+        Self {
+            message_type: Self::TYPE.to_string(),
+            query_id: query_id.into(),
+            grant_hex: grant_hex.into(),
+            revoked,
+        }
+    }
+}
+
 /// A daemon -> phone message on an established session's `ToPhone` channel.
 ///
-/// Two shapes share this channel: the (untagged, legacy) [`ApprovalRequest`] and
-/// the tagged [`ResolutionBroadcast`]. This mirrors [`ToDaemonMessage`] on the
-/// return path: the daemon's demux there tells a response from a tagged
-/// registration/receipt; the phone's demux here tells a request from a tagged
-/// resolution. The discriminator is the `type` field: `"resolution"` selects
-/// [`ResolutionBroadcast`]; its absence is an [`ApprovalRequest`]. A hand-rolled
-/// peek is used deliberately instead of a `#[serde(untagged)]` enum so
-/// [`ApprovalRequest`]'s wire shape stays byte-for-byte unchanged (the pinned
-/// vectors and the pairing transcript must not shift).
+/// Four shapes share this channel: the (untagged, legacy) [`ApprovalRequest`] and
+/// the tagged [`ResolutionBroadcast`], [`LeaseListReply`], and
+/// [`LeaseRevokeReply`]. This mirrors [`ToDaemonMessage`] on the return path: the
+/// daemon's demux there tells a response from a tagged
+/// registration/receipt/lease-control message; the phone's demux here tells a
+/// request from a tagged resolution or lease reply. The discriminator is the
+/// `type` field; its absence is an [`ApprovalRequest`]. A hand-rolled peek is used
+/// deliberately instead of a `#[serde(untagged)]` enum so [`ApprovalRequest`]'s
+/// wire shape stays byte-for-byte unchanged (the pinned vectors and the pairing
+/// transcript must not shift).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ToPhoneMessage {
     /// A fresh approval request to display.
@@ -758,6 +1067,10 @@ pub enum ToPhoneMessage {
     /// A resolution of an already-shown request: dismiss it. Never a decision and
     /// never a release; display only.
     Resolution(ResolutionBroadcast),
+    /// The live lease windows this daemon holds. Display only.
+    LeaseList(LeaseListReply),
+    /// The outcome of one revoke. Reports what happened; changes nothing itself.
+    LeaseRevoke(LeaseRevokeReply),
 }
 
 impl ToPhoneMessage {
@@ -770,6 +1083,8 @@ impl ToPhoneMessage {
         let tag = value.get("type").and_then(serde_json::Value::as_str);
         match tag {
             Some(ResolutionBroadcast::TYPE) => Ok(Self::Resolution(serde_json::from_value(value)?)),
+            Some(LeaseListReply::TYPE) => Ok(Self::LeaseList(serde_json::from_value(value)?)),
+            Some(LeaseRevokeReply::TYPE) => Ok(Self::LeaseRevoke(serde_json::from_value(value)?)),
             _ => Ok(Self::Request(Box::new(serde_json::from_value(value)?))),
         }
     }
@@ -777,14 +1092,20 @@ impl ToPhoneMessage {
 
 /// A phone -> daemon message on an established session's `ToDaemon` channel.
 ///
-/// Three shapes share this channel: the (untagged, legacy) [`ApprovalResponse`],
-/// the tagged [`PushRegister`], and the tagged [`DeliveryReceipt`]. This is the
-/// single place the daemon decides which one an opened payload is. The
-/// discriminator is the `type` field: `"pushRegister"` selects [`PushRegister`],
-/// `"delivered"` selects [`DeliveryReceipt`]; anything else (in practice, its
-/// absence) is an [`ApprovalResponse`]. A hand-rolled peek is used deliberately
-/// instead of a `#[serde(untagged)]` enum so [`ApprovalResponse`]'s wire shape
-/// stays byte-for-byte unchanged (the v2 pairing transcript must not shift).
+/// Five shapes share this channel: the (untagged, legacy) [`ApprovalResponse`],
+/// and the tagged [`PushRegister`], [`DeliveryReceipt`], [`LeaseQuery`], and
+/// [`LeaseRevoke`]. This is the single place the daemon decides which one an
+/// opened payload is. The discriminator is the `type` field: `"pushRegister"`,
+/// `"delivered"`, `"leaseList"`, and `"leaseRevoke"` select their tagged types;
+/// anything else (in practice, its absence) is an [`ApprovalResponse`]. A
+/// hand-rolled peek is used deliberately instead of a `#[serde(untagged)]` enum so
+/// [`ApprovalResponse`]'s wire shape stays byte-for-byte unchanged (the v2 pairing
+/// transcript must not shift).
+///
+/// **None of the tagged shapes can be mistaken for a decision.** An
+/// [`ApprovalResponse`] is the one payload with no `type` at all, so a lease
+/// message can never be routed to a waiting approval, and a lease message that
+/// fails to parse is an error the caller drops rather than a half-built one.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ToDaemonMessage {
     /// A decision on a pending approval.
@@ -794,6 +1115,12 @@ pub enum ToDaemonMessage {
     /// A receipt acknowledging the phone opened a request. Display only: it never
     /// releases a secret and never gates a decision.
     Delivered(DeliveryReceipt),
+    /// A request to enumerate the daemon's live lease windows. Reads state; grants
+    /// nothing.
+    LeaseList(LeaseQuery),
+    /// A request to kill ONE live lease window, named by grant key AND instance.
+    /// It can only ever narrow what is authorized, never widen it.
+    LeaseRevoke(LeaseRevoke),
 }
 
 impl ToDaemonMessage {
@@ -808,6 +1135,8 @@ impl ToDaemonMessage {
         match tag {
             Some(PushRegister::TYPE) => Ok(Self::Push(serde_json::from_value(value)?)),
             Some(DeliveryReceipt::TYPE) => Ok(Self::Delivered(serde_json::from_value(value)?)),
+            Some(LeaseQuery::TYPE) => Ok(Self::LeaseList(serde_json::from_value(value)?)),
+            Some(LeaseRevoke::TYPE) => Ok(Self::LeaseRevoke(serde_json::from_value(value)?)),
             _ => Ok(Self::Response(serde_json::from_value(value)?)),
         }
     }
@@ -1363,6 +1692,205 @@ mod tests {
         // real pending prompt.
         let bogus = serde_json::json!({ "type": "resolution" });
         assert!(ToPhoneMessage::from_value(bogus).is_err());
+    }
+
+    // --- phone lease control -------------------------------------------------
+
+    const GRANT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const INSTANCE: &str = "fedcba9876543210fedcba9876543210";
+
+    #[test]
+    fn lease_query_and_revoke_serialize_the_locked_wire_contract() {
+        let q = LeaseQuery::new("q-1");
+        let json = serde_json::to_string(&q).unwrap();
+        assert_eq!(json, "{\"type\":\"leaseList\",\"queryId\":\"q-1\"}");
+        assert_eq!(serde_json::from_str::<LeaseQuery>(&json).unwrap(), q);
+        assert_eq!(q.query_id(), Some("q-1"));
+
+        let r = LeaseRevoke::new("q-2", GRANT, INSTANCE);
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"type\":\"leaseRevoke\""));
+        assert!(json.contains("\"queryId\":\"q-2\""));
+        assert!(json.contains(&format!("\"grantHex\":\"{GRANT}\"")));
+        assert!(json.contains(&format!("\"instance\":\"{INSTANCE}\"")));
+        assert_eq!(serde_json::from_str::<LeaseRevoke>(&json).unwrap(), r);
+        assert_eq!(
+            r.target(),
+            Some(("q-2", GRANT.to_string(), INSTANCE.to_string()))
+        );
+    }
+
+    #[test]
+    fn a_revoke_with_a_malformed_target_has_no_target_at_all() {
+        // Fail closed as one decision: the daemon drops such a message whole and
+        // sends no reply, so peer-chosen bytes are never echoed back onto a screen.
+        let bad = |g: &str, i: &str| LeaseRevoke::new("q", g, i).target().is_none();
+        assert!(bad("", INSTANCE), "empty grant");
+        assert!(bad(&GRANT[..63], INSTANCE), "short grant");
+        assert!(bad(&format!("{GRANT}0"), INSTANCE), "long grant");
+        assert!(bad(&GRANT.replace('0', "z"), INSTANCE), "non-hex grant");
+        assert!(bad(GRANT, ""), "empty instance");
+        assert!(bad(GRANT, &INSTANCE[..31]), "short instance");
+        assert!(bad(GRANT, GRANT), "a grant is not an instance");
+        // A bad correlation id sinks it too: an id the phone did not send cannot
+        // be matched to a screen, so there is nothing useful to answer.
+        assert!(LeaseRevoke::new("", GRANT, INSTANCE).target().is_none());
+        assert!(LeaseRevoke::new("q\u{202e}", GRANT, INSTANCE)
+            .target()
+            .is_none());
+        assert!(
+            LeaseRevoke::new("x".repeat(QUERY_ID_MAX_CHARS + 1), GRANT, INSTANCE)
+                .target()
+                .is_none()
+        );
+        // Exactly at the bound is fine, and either hex case normalizes to lower.
+        assert!(
+            LeaseRevoke::new("x".repeat(QUERY_ID_MAX_CHARS), GRANT, INSTANCE)
+                .target()
+                .is_some()
+        );
+        let (_, g, i) = LeaseRevoke::new("q", GRANT.to_uppercase(), INSTANCE.to_uppercase())
+            .target()
+            .expect("uppercase hex normalizes");
+        assert_eq!((g.as_str(), i.as_str()), (GRANT, INSTANCE));
+    }
+
+    #[test]
+    fn a_lease_row_sanitizes_every_display_field_and_validates_both_ids() {
+        // The same allowlist that protects the approval sheet's coverage caption:
+        // a rule name carrying a direction override or a zero-width character
+        // cannot deform the lease list either.
+        let row = LeaseRow::new(
+            GRANT,
+            INSTANCE,
+            "op\u{202e}prod",
+            "  op   read  ",
+            "rowm\u{200b}hq",
+            60_000,
+            5_000,
+        )
+        .expect("well-formed ids");
+        assert_eq!(row.scope, "op\u{fffd}prod");
+        assert_eq!(row.covers, "op read");
+        assert_eq!(row.account, "rowm\u{fffd}hq");
+        for field in [&row.scope, &row.covers, &row.account] {
+            for ch in field.chars() {
+                assert!(
+                    ch.is_ascii_graphic()
+                        || ch == ' '
+                        || ch == LABEL_ELLIPSIS
+                        || ch == LABEL_REJECTED,
+                    "{ch:?} reached the lease list"
+                );
+            }
+            assert!(field.chars().count() <= LEASE_LABEL_MAX_CHARS);
+        }
+
+        // Every field is bounded, so no single row can spend an unbounded screen.
+        let long = LeaseRow::new(
+            GRANT,
+            INSTANCE,
+            &"s".repeat(500),
+            &"c".repeat(500),
+            &"a".repeat(500),
+            1,
+            1,
+        )
+        .expect("well-formed ids");
+        for field in [&long.scope, &long.covers, &long.account] {
+            assert_eq!(field.chars().count(), LEASE_LABEL_MAX_CHARS);
+            assert!(field.ends_with(LABEL_ELLIPSIS));
+        }
+
+        // A row the phone could not act on is never built at all.
+        assert!(LeaseRow::new("nope", INSTANCE, "s", "c", "a", 1, 1).is_none());
+        assert!(LeaseRow::new(GRANT, "nope", "s", "c", "a", 1, 1).is_none());
+    }
+
+    #[test]
+    fn lease_replies_serialize_the_locked_wire_contract() {
+        let row = LeaseRow::new(GRANT, INSTANCE, "op", "op read", "rowm", 60_000, 5_000).unwrap();
+        let list = LeaseListReply::new("q-1", vec![row]);
+        let json = serde_json::to_string(&list).unwrap();
+        assert!(json.contains("\"type\":\"leaseListReply\""));
+        assert!(json.contains("\"queryId\":\"q-1\""));
+        assert!(json.contains("\"remainingMs\":60000"));
+        assert!(json.contains("\"ageMs\":5000"));
+        // The display fields are always present, even when empty, so the phone
+        // never has to tell "absent" from "none".
+        assert!(json.contains("\"covers\":\"op read\""));
+        assert!(json.contains("\"account\":\"rowm\""));
+        assert_eq!(serde_json::from_str::<LeaseListReply>(&json).unwrap(), list);
+
+        // An empty list is a complete answer, not a missing one.
+        let empty = LeaseListReply::new("q-1", Vec::new());
+        assert!(serde_json::to_string(&empty)
+            .unwrap()
+            .contains("\"leases\":[]"));
+
+        let rev = LeaseRevokeReply::new("q-2", GRANT, true);
+        let json = serde_json::to_string(&rev).unwrap();
+        assert!(json.contains("\"type\":\"leaseRevokeReply\""));
+        assert!(json.contains("\"revoked\":true"));
+        assert!(json.contains(&format!("\"grantHex\":\"{GRANT}\"")));
+        assert_eq!(
+            serde_json::from_str::<LeaseRevokeReply>(&json).unwrap(),
+            rev
+        );
+    }
+
+    #[test]
+    fn lease_control_messages_classify_and_never_shadow_a_decision() {
+        // Phone -> daemon: both tags select their type.
+        let q = LeaseQuery::new("q-1");
+        assert_eq!(
+            ToDaemonMessage::from_value(serde_json::to_value(&q).unwrap()).unwrap(),
+            ToDaemonMessage::LeaseList(q)
+        );
+        let r = LeaseRevoke::new("q-2", GRANT, INSTANCE);
+        assert_eq!(
+            ToDaemonMessage::from_value(serde_json::to_value(&r).unwrap()).unwrap(),
+            ToDaemonMessage::LeaseRevoke(r)
+        );
+        // And an ApprovalResponse (no `type`) is still a Response, so a lease
+        // message can never be routed to a waiting approval.
+        let resp = ApprovalResponse::approve_gate("req-1", 1);
+        assert!(matches!(
+            ToDaemonMessage::from_value(serde_json::to_value(&resp).unwrap()).unwrap(),
+            ToDaemonMessage::Response(_)
+        ));
+
+        // Daemon -> phone: both reply tags select their type, and an
+        // ApprovalRequest is still a Request.
+        let list = LeaseListReply::new("q-1", Vec::new());
+        assert_eq!(
+            ToPhoneMessage::from_value(serde_json::to_value(&list).unwrap()).unwrap(),
+            ToPhoneMessage::LeaseList(list)
+        );
+        let rev = LeaseRevokeReply::new("q-2", GRANT, false);
+        assert_eq!(
+            ToPhoneMessage::from_value(serde_json::to_value(&rev).unwrap()).unwrap(),
+            ToPhoneMessage::LeaseRevoke(rev)
+        );
+    }
+
+    #[test]
+    fn half_built_lease_control_messages_fail_closed() {
+        // A tag with missing required fields is an error the caller drops, never a
+        // half-built message that could reach the lease store or a screen.
+        for bogus in [
+            serde_json::json!({ "type": "leaseList" }),
+            serde_json::json!({ "type": "leaseRevoke", "queryId": "q" }),
+            serde_json::json!({ "type": "leaseRevoke", "grantHex": GRANT }),
+        ] {
+            assert!(ToDaemonMessage::from_value(bogus).is_err());
+        }
+        for bogus in [
+            serde_json::json!({ "type": "leaseListReply" }),
+            serde_json::json!({ "type": "leaseRevokeReply", "queryId": "q" }),
+        ] {
+            assert!(ToPhoneMessage::from_value(bogus).is_err());
+        }
     }
 
     #[test]

@@ -238,6 +238,169 @@ cannot read the Mac share to seal with. `len == 0` removes the record. The calle
 is `sigil-config`, an unsigned CLI, so there is no code identity to demand; the
 boundary is the 0600 socket, the same one every other CLI verb has.
 
+## Phone lease control (sealed relay messages, NOT this socket)
+
+Everything above rides the local unix control socket. This section is different:
+it defines four messages that ride the **sealed envelope between the daemon and a
+paired phone**, on the same `ToDaemon` / `ToPhone` channels as approvals. It lives
+here because it is the second controller over the same lease store the
+`lease_list` / `lease_revoke` frames above drive, and the two must be read
+together. The Rust definitions are in `crates/sigil-proto/src/request.rs`; the
+daemon side is `RemoteApprover::answer_lease_list` / `answer_lease_revoke` in
+`crates/sigil/src/remote.rs`.
+
+`sigil lease revoke <prefix>` is unchanged. This **adds** a controller; it does
+not move the existing one.
+
+### Why it exists
+
+The brief cites phone-side visibility and revocation as the containment for a
+rule-wide lease window. Until now the phone's lease list and revoke control were
+demo state, which is worse than an absent control: a revoke button that silently
+does nothing teaches the human that the window is closed when it is open.
+
+### The four messages
+
+All four are **tagged by a `type` field** and demultiplexed alongside the existing
+traffic on their channel (`ToDaemonMessage` / `ToPhoneMessage`). An
+`ApprovalResponse` and an `ApprovalRequest` remain the only untagged payloads, so
+no lease message can ever be routed to a waiting approval.
+
+**Phone → daemon** (`ToDaemon`, same counter and replay guard as an approval):
+
+```jsonc
+{ "type": "leaseList",   "queryId": "<id>" }
+{ "type": "leaseRevoke", "queryId": "<id>",
+  "grantHex": "<64 lowercase hex>", "instance": "<32 lowercase hex>" }
+```
+
+**Daemon → phone** (`ToPhone`, same counter and seal as a request):
+
+```jsonc
+{ "type": "leaseListReply", "queryId": "<echoed>",
+  "leases": [ { "grantHex": str, "instance": str, "scope": str, "covers": str,
+                "account": str, "remainingMs": int, "ageMs": int } ] }
+{ "type": "leaseRevokeReply", "queryId": "<echoed>",
+  "grantHex": "<echoed>", "revoked": bool }
+```
+
+Field semantics, exactly:
+
+| Field | Meaning |
+|-------|---------|
+| `queryId` | Phone-generated correlation id. 1–64 printable-ASCII characters; the daemon validates and echoes it verbatim. The phone MUST drop a reply whose `queryId` it did not send, so a late answer cannot repaint a newer screen. |
+| `grantHex` | The grant key, exactly 64 hex characters. **Deterministic**: the same caller chain and rule derive it again tomorrow. It names a lease *shape*, not a lease. |
+| `instance` | This window's instance id, exactly 32 hex characters. 16 bytes of OS randomness minted when the window opens. Names ONE window. |
+| `scope` | The matched rule's name. Display must state the breadth: the window covers anything that rule matches, not the one command that opened it. |
+| `covers` | The daemon-rendered coverage label (`op read`). **Empty means none was rendered** — show no coverage clause rather than inventing one. |
+| `account` | The source label the window injects from. Empty for a plain gate, which injects nothing. |
+| `remainingMs` / `ageMs` | Milliseconds until the window lapses, and since it opened. |
+| `revoked` | `true` only when a live window with that exact `(grantHex, instance)` was found and zeroized. |
+
+`leases` is always present; empty is a complete answer meaning "no live windows".
+`covers` and `account` are always present; empty is their "none" value. Every
+input the phone accepts is case-normalised hex or an already-sanitised label; hex
+is emitted lowercase.
+
+### What is never on the wire
+
+`scope`, `covers`, and `account` are the only human-readable fields, and all three
+pass through `sanitize_label` at `LEASE_LABEL_MAX_CHARS` (72) — the same allowlist
+that protects the approval sheet's coverage caption: printable ASCII, whitespace
+runs collapsed, `…`, and one `U+FFFD` per run of anything else. So a rule name
+carrying a bidi override or a pile of combining marks cannot reorder or hide the
+lease list. **Renderers re-filter** rather than trusting this.
+
+There is no argv, no secret reference, and no secret value in any of the four
+messages. A revoke carries two identifiers; a list carries names and clocks.
+
+### Replay binding: what was chosen, and what it does not cover
+
+The problem is specific. A grant key is a hash of the daemon-verified caller
+identity plus the rule, so **it recurs**: the same tool tree running the same rule
+tomorrow derives the same `grantHex`. A `LeaseRevoke` that named only the key
+would be aiming at every window that key will ever have, and a copy of it captured
+off the wire would be a stored weapon against a future window the human just
+opened.
+
+**The envelope's own protection, stated honestly.** The per-pairing counter is
+**not** a replay gate in this codebase — it was retired (`crates/sigil-proto/src/replay.rs`)
+because an in-memory counter reset on either side and dropped genuine approvals as
+false replays. It still rides the wire inside the signed bytes, but it gates
+nothing, so it was not available as the freshness lever. What remains is two gates,
+both of which a lease message passes through exactly like an approval:
+
+1. **Ed25519 signature** over the canonical bytes. The relay holds neither signing
+   key, so it can neither forge a revoke nor re-aim a genuine one.
+2. **Freshness + single use**: the sender timestamp must be within
+   `REPLAY_WINDOW_MS` (150s) of now, and the uuidv7 request id must not have been
+   seen on that pairing.
+
+Those two catch a replay in every case but one. The guard is in-memory, so a
+**daemon restart inside the freshness window** starts with an empty seen-set: a
+captured revoke re-delivered in that gap is authentic and fresh, and opens. It is
+normally harmless (a restart clears every lease), but the sequence
+`restart → human re-approves → relay replays the captured revoke` would kill a
+window the human opened seconds earlier, with no visible cause. That is exactly
+the "future window sharing the key" case.
+
+**The choice: bind the window instance.** Every lease carries 16 bytes of OS
+randomness minted when the window opens, and a `LeaseRevoke` must name both
+`grantHex` and `instance`. `LeaseStore::revoke_instance` matches both exactly, so a
+replayed revoke names a window that has already ended and is a clean no-op.
+
+- **Random, not granted-at.** Two windows granted in the same millisecond would
+  share a timestamp, and a clock moves. 16 CSPRNG bytes collide with nothing.
+- **Preserved across a refresh.** A later approval under the same key extends the
+  one window the human is looking at; a revoke aimed at it before the refresh must
+  still land. A new instance is minted only when a window genuinely ended and a
+  fresh approval opened another — the case a stale revoke must not reach.
+- **Exact, not prefix.** A prefix is a convenience for a human at a terminal who
+  can see what they are aiming at. A message that crossed a relay gets no latitude.
+
+**What the instance binding does not cover** (residuals, for the reviewer):
+
+1. **A censoring relay.** The relay cannot forge, alter, or replay a revoke, but it
+   can **drop** one. A dropped revoke leaves the window alive until its TTL,
+   `sigil lease revoke` on the Mac, or a daemon restart. Phone-side revocation is
+   therefore best-effort by construction, and the containment story must say so:
+   the TTL and the Mac are the backstops, not the phone.
+2. **A lost reply looks like a failed revoke.** The daemon replies once,
+   best-effort, with no retry. A revoke whose reply is lost may or may not have
+   landed. The phone must treat a missing reply as *unknown* and re-list, never as
+   success or as failure.
+3. **Traffic analysis.** The relay sees an opaque envelope, but not a constant-size
+   one: a list reply's length grows with the number of windows, and
+   `"revoked":true` is one byte longer than `"revoked":false`. So a relay that is
+   also watching timing can infer "a list was fetched and it was short" or "a
+   revoke succeeded". It learns no identifier, label, or value. Padding would close
+   it; it is not implemented, and it is a strictly smaller leak than the
+   already-variable approval traffic on the same channel.
+4. **It does not authenticate the human.** A compromised *phone* (holding the
+   signing key) can revoke at will. Revocation only ever narrows what is
+   authorized, so this is a denial-of-convenience, never a release.
+
+### Rate limiting
+
+A lease **list** is answered at most once per 250ms per device; a query inside that
+floor is dropped with no reply. A list is idempotent, so the cost is a re-ask. A
+**revoke is never rate-limited** — it is an action the human just took, and
+silently dropping one would be the consent theatre this feature exists to end.
+
+### Fail-closed rules the daemon holds to
+
+- No lease store attached, a malformed `queryId`, or (for a revoke) a `grantHex` or
+  `instance` that is not exactly-width hex: the message is dropped **whole, with no
+  reply**. Peer-chosen bytes are never echoed back onto a screen.
+- Anything that fails verify, replay, or decode is dropped, exactly as an approval
+  response is.
+- A revoke that matches nothing is a **successful no-op** reporting
+  `revoked: false`, never an error. The four ways to reach `false` (already lapsed,
+  already revoked, superseded instance, key never held) are indistinguishable, so
+  the reply is not an oracle for what this daemon holds.
+- Neither message can release a secret, approve a request, or widen anything. A
+  list reads names and clocks; a revoke can only take a window away.
+
 ### The run path (not part of the control surface)
 
 `{"kind":"run","argv":[str],"cwd":str}` with the caller's stdout/stderr passed as

@@ -27,10 +27,11 @@ pub use pairing::{
 pub use replay::{ReplayError, ReplayGuard};
 pub use request::{
     sanitize_label, ApprovalRequest, ApprovalResponse, BlockDirective, Decision, DeliveryReceipt,
-    HostBinding, InstallLease, LeasePolicy, Provenance, PushRegister, RequestKind,
-    ResolutionBroadcast, ResolutionStatus, SecretRef, SshChallenge, ThresholdChallenge,
-    ThresholdPartial, ToDaemonMessage, ToPhoneMessage, COVERS_MAX_CHARS, LABEL_ELLIPSIS,
-    LABEL_REJECTED,
+    HostBinding, InstallLease, LeaseListReply, LeasePolicy, LeaseQuery, LeaseRevoke,
+    LeaseRevokeReply, LeaseRow, Provenance, PushRegister, RequestKind, ResolutionBroadcast,
+    ResolutionStatus, SecretRef, SshChallenge, ThresholdChallenge, ThresholdPartial,
+    ToDaemonMessage, ToPhoneMessage, COVERS_MAX_CHARS, GRANT_HEX_CHARS, LABEL_ELLIPSIS,
+    LABEL_REJECTED, LEASE_INSTANCE_CHARS, LEASE_LABEL_MAX_CHARS, QUERY_ID_MAX_CHARS,
 };
 pub use threshold::{
     aead_open, aead_seal, all_ephemerals_unique, combine, decode_partial, EcdhAlgo, MacShare,
