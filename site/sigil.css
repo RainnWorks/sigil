@@ -232,6 +232,17 @@ section.flush { border-top: none; }
   font-family: var(--mono); font-size: 0.72rem; text-transform: uppercase;
   letter-spacing: 0.12em; color: var(--cobalt); display: block; margin-bottom: 12px;
 }
+/* A claim whose content is an open question rather than an assertion. Brass is
+   the pending semantic, so the label reads as "not settled" before the prose
+   says so, and it cannot be mistaken for the page's confident claims. */
+.claim.open .k { color: var(--brass); }
+/* The label is 11.5px, so it needs 4.5:1. Light-theme --brass lands at 4.37 on
+   white; dropping L to 0.55 gives 4.96 without shifting the hue off brass. The
+   token itself is left alone because it is used at larger sizes elsewhere. */
+:root[data-theme="light"] .claim.open .k { color: oklch(0.55 0.115 75); }
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .claim.open .k { color: oklch(0.55 0.115 75); }
+}
 .claim p { font-size: 1.12rem; line-height: 1.5; }
 .claim p + p { margin-top: 12px; font-size: 1rem; color: var(--muted); }
 
