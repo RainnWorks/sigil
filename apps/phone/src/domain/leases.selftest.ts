@@ -33,6 +33,8 @@ import {
   LEASE_SNAPSHOT_FRESH_MS,
   leaseListStatus,
   liveLeases,
+  mergeRevoke,
+  partitionRevokes,
   REVOKE_FALLBACK_CAVEAT,
   REVOKE_FALLBACK_LIST,
   REVOKE_FALLBACK_REVOKE,
@@ -43,6 +45,7 @@ import {
   settledByAbsence,
   snapshotFresh,
   toActiveLeases,
+  unconfirmedRevokeDetail,
   unconfirmedRevokeLine,
   unconfirmedRevokes,
 } from "./leases";
@@ -85,6 +88,7 @@ function revoke(over: Partial<PendingRevoke> = {}): PendingRevoke {
     scope: "op-eu",
     sentAt: NOW,
     windowExpiresAt: NOW + 600_000,
+    inFlight: false,
     unconfirmed: false,
     ...over,
   };
@@ -194,6 +198,36 @@ function main(): void {
     // A prompt answer is still fresh: the fix must not make the definite claim
     // unreachable over an honest link.
     ok(snapshotFresh(view({ askedAt: NOW - 1_500, asOfMs: NOW }), NOW), "a 1.5s round trip stays fresh");
+  }
+
+  console.log("born stale: a snapshot that was never current on this screen");
+  {
+    // The 10 to 20 second band is the ordinary slow path down a relay rung, so
+    // this is not rare. "That snapshot has aged" would tell someone they saw a
+    // current list a moment ago when they never did.
+    const born = view({ askedAt: NOW - 15_000, arrivedAt: NOW - 1_000, asOfMs: NOW - 2_000 });
+    const s = leaseListStatus(born, NOW);
+    ok(s.detail?.includes("arrived too late to count as current") ?? false, "says it was born stale");
+    ok(!(s.detail?.includes("has aged") ?? false), "and not that it aged on screen");
+
+    // A prompt round trip that later ages still reads as having aged.
+    const aged = view({ askedAt: NOW - 15_000, arrivedAt: NOW - 14_000, asOfMs: NOW - 14_000 });
+    ok(leaseListStatus(aged, NOW).detail?.includes("has aged") ?? false, "an aged snapshot says so");
+
+    // Unreachable still wins: not being able to ask is the bigger fact.
+    const broken = view({ askedAt: NOW - 15_000, arrivedAt: NOW - 1_000, unreachable: true });
+    ok(
+      leaseListStatus(broken, NOW).detail?.includes("cannot reach your Mac") ?? false,
+      "unreachable outranks born stale",
+    );
+
+    // arrivedAt is display reasoning only and must never reach the freshness
+    // decision, which ages from askedAt so a stalled reply cannot buy currency.
+    ok(!snapshotFresh(born, NOW), "a born-stale snapshot is not fresh");
+    ok(
+      snapshotFresh(view({ askedAt: NOW - 1_000, arrivedAt: NOW - 30_000 }), NOW),
+      "and a bogus arrival time cannot change the freshness verdict",
+    );
   }
 
   console.log("leaseListStatus (rows)");
@@ -403,7 +437,7 @@ function main(): void {
     const rows = toActiveLeases([row()], NOW);
     eq(revokeState(view({ rows }), LEASE), "idle", "no revoke sent");
 
-    const sending = view({ rows, revokes: [revoke()] });
+    const sending = view({ rows, revokes: [revoke({ inFlight: true })] });
     eq(revokeState(sending, LEASE), "sending", "in flight");
     // The row is still there while in flight: nothing is cleared optimistically.
     eq(liveLeases(sending, NOW).length, 1, "an in-flight revoke does not clear its row");
@@ -414,6 +448,29 @@ function main(): void {
     eq(liveLeases(silent, NOW).length, 1, "an unconfirmed revoke leaves the row on screen");
     eq(unconfirmedRevokes(silent).length, 1, "and raises a standing warning");
     eq(revokeState(silent, LEASE2), "idle", "a different window is unaffected");
+
+    // MUST FIX 1. An unconfirmed revoke has to stay actionable. Dead here, the
+    // only way left to close the window was the Mac, which makes refusing heavier
+    // than approving on the one control that must never be, and contradicts the
+    // very argument used to justify having no confirmation step.
+    ok(revokeState(silent, LEASE) !== "sending", "unconfirmed is not an in-flight state");
+
+    // A retry is BOTH in flight and still unconfirmed, so the row can show work
+    // happening while the warning goes on standing.
+    const retrying = view({ rows, revokes: [revoke({ inFlight: true, unconfirmed: true })] });
+    eq(revokeState(retrying, LEASE), "retrying", "a retry is its own state");
+    eq(unconfirmedRevokes(retrying).length, 1, "and the warning survives it");
+
+    // The merge is what makes that true: a retry must not erase the warning it is
+    // retrying, and must not restart the clock the warning dates itself from.
+    const prior = revoke({ unconfirmed: true, sentAt: NOW });
+    const attempt = revoke({ requestId: REQ2, inFlight: true, unconfirmed: false, sentAt: NOW + 30_000 });
+    const merged = mergeRevoke(prior, attempt);
+    eq(merged.unconfirmed, true, "a retry keeps the unconfirmed flag");
+    eq(merged.sentAt, NOW, "and the original send time");
+    eq(merged.inFlight, true, "while being in flight again");
+    eq(merged.requestId, REQ2, "under the new request id");
+    eq(mergeRevoke(undefined, attempt), attempt, "a first attempt merges with nothing");
 
     // Settling by absence. The inference rests entirely on lease-id permanence,
     // NOT on the snapshot having been taken after the revoke went out, so a
@@ -445,9 +502,22 @@ function main(): void {
     const r = revoke({ unconfirmed: true, sentAt: NOW, windowExpiresAt: NOW + 60_000 });
     eq(revokeResolution(r, [], NOW), "standing", "before the window expires, still an open question");
     eq(revokeResolution(r, [], NOW + 60_001), "lapsed", "past its expiry, it ran out on its own");
+    // Leads with the resolution, then keeps the residual: saying only that it
+    // expired would quietly imply the revoke worked.
+    ok(lapsedRevokeLine(r).startsWith("The op-eu window has since run out"), "leads with the news");
+    ok(lapsedRevokeLine(r).includes("assume it was open until then"), "and keeps the residual");
     ok(
-      lapsedRevokeLine(r).includes("run out on its own"),
-      "and says so rather than claiming the revoke worked",
+      lapsedRevokeLine(revoke({ scope: null })).startsWith("That window has since run out"),
+      "the no-scope variant still reads as a sentence",
+    );
+    // Both warning lines are about the WINDOW, never the rule: "the revoke of
+    // op-eu" read as though the rule itself were being revoked.
+    ok(!lapsedRevokeLine(r).includes("revoke of"), "lapsed line does not revoke a rule");
+    ok(!unconfirmedRevokeLine(r).includes("revoke of"), "standing line does not revoke a rule");
+    eq(
+      unconfirmedRevokeLine(r),
+      "No reply about the op-eu window, so it may still be open.",
+      "standing line says no reply rather than never",
     );
 
     // A refresh extends an existing window, so an approval since the revoke went
@@ -463,6 +533,20 @@ function main(): void {
     const before = [{ ...historyEntry, decision: "approved" as const, at: NOW - 10 }];
     eq(revokeResolution(r, before, NOW + 60_001), "lapsed", "an approval from before the revoke is irrelevant");
 
+    // Standing and lapsed warnings go to different places on screen, so they are
+    // partitioned rather than filtered at the render site.
+    const mixed = view({
+      revokes: [
+        revoke({ unconfirmed: true, leaseId: LEASE, windowExpiresAt: NOW + 60_000 }),
+        revoke({ unconfirmed: true, leaseId: LEASE2, windowExpiresAt: NOW - 1 }),
+      ],
+    });
+    const parts = partitionRevokes(mixed, [], NOW);
+    eq(parts.standing.length, 1, "one still standing");
+    eq(parts.standing[0]!.leaseId, LEASE, "the one whose window has time left");
+    eq(parts.lapsed.length, 1, "one lapsed");
+    eq(parts.lapsed[0]!.leaseId, LEASE2, "the one whose window ran out");
+
     // The warning has to stand on its own once the snapshot behind it is gone.
     const orphaned = view({ revokes: [revoke({ unconfirmed: true })] });
     eq(unconfirmedRevokes(orphaned).length, 1, "a warning outlives its snapshot");
@@ -471,8 +555,13 @@ function main(): void {
       "the warning says the window may still be open",
     );
     ok(
-      unconfirmedRevokeLine(revoke({ scope: null, unconfirmed: true })).includes("A revoke this phone sent"),
+      unconfirmedRevokeLine(revoke({ scope: null })).includes("that window"),
       "a warning with no rule name still reads as a sentence",
+    );
+    // The detail offers the retry first, since it is the cheap path.
+    ok(
+      unconfirmedRevokeDetail(revoke({ unconfirmed: true }), NOW).includes("Tap Revoke again"),
+      "the detail names the retry",
     );
 
     // The Mac fallback names a placeholder, never an id from here: the CLI's
@@ -483,13 +572,19 @@ function main(): void {
     // siblings this phone never showed. Closing too much is safe; being
     // surprised by it is not (R7-F4).
     ok(REVOKE_FALLBACK_CAVEAT.includes("may close other windows"), "the fallback warns it closes more");
+    // ...and immediately says why that is not a reason to hesitate. Leaving a
+    // window open is the failure this feature exists to prevent.
+    ok(
+      REVOKE_FALLBACK_CAVEAT.includes("only costs another approval"),
+      "and tells the reader the over-shoot is cheap",
+    );
 
     // Both verdicts are successes, and the second must not read as a failure.
     eq(revokeNoteLine("closed"), "Window closed. The next matching command asks again.", "closed");
     eq(
       revokeNoteLine("alreadyGone"),
-      "That window was already closed. Nothing to revoke.",
-      "already gone reads as a success",
+      "That window was already closed. The next matching command asks again.",
+      "already gone states the same consequence as the closed line",
     );
   }
 

@@ -12,7 +12,7 @@ import {
   type ResolutionStatus,
 } from "@/src/protocol";
 import { secretRefLabel, sshLabel } from "@/src/lib/format";
-import { revokeResolution, settledByAbsence, toActiveLeases } from "@/src/domain/leases";
+import { mergeRevoke, revokeResolution, settledByAbsence, toActiveLeases } from "@/src/domain/leases";
 import {
   type AppState,
   type HistoryEntry,
@@ -231,6 +231,10 @@ class Store {
       // the two-timestamp note in the session controller.
       askedAt: sentAt,
       asOfMs,
+      // Display reasoning only, never freshness: it answers "was the round trip
+      // itself longer than the budget", so the copy can say a snapshot arrived
+      // too late to count rather than implying it was once current on screen.
+      arrivedAt: receivedAt,
       asking: false,
       unreachable: false,
       noBiometric: false,
@@ -245,8 +249,10 @@ class Store {
    * the reply must never be able to buy that claim by dropping one message.
    */
   leaseRevokeStarted(revoke: PendingRevoke): void {
+    const prior = this.state.leases.revokes.find((r) => r.leaseId === revoke.leaseId);
+    const merged = mergeRevoke(prior, revoke);
     const others = this.state.leases.revokes.filter((r) => r.leaseId !== revoke.leaseId);
-    this.patchLeases({ revokes: [...others, revoke], note: null });
+    this.patchLeases({ revokes: [...others, merged], note: null });
   }
 
   /**
@@ -275,7 +281,7 @@ class Store {
   leaseRevokeUnconfirmed(requestId: string): void {
     this.patchLeases({
       revokes: this.state.leases.revokes.map((r) =>
-        r.requestId === requestId ? { ...r, unconfirmed: true } : r,
+        r.requestId === requestId ? { ...r, inFlight: false, unconfirmed: true } : r,
       ),
     });
   }
@@ -310,6 +316,7 @@ class Store {
       rows: [],
       askedAt: 0,
       asOfMs: 0,
+      arrivedAt: 0,
       asking: false,
       unreachable: false,
       noBiometric: false,

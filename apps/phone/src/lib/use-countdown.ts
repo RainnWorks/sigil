@@ -15,11 +15,18 @@ export interface Countdown {
   phase: Phase;
 }
 
-/** `expiringThresholdMs`: when to flip to the "expiring" phase (default 10s). */
+/**
+ * `expiringThresholdMs`: when to flip to the "expiring" phase (default 10s).
+ * `tickMs`: how often to re-render (default 250ms, which is what the approval
+ * gauge's second-by-second readout needs). A caller whose string is coarser
+ * should ask for less: the lease list renders "41m left", so three of every four
+ * ticks at the default produced an identical string.
+ */
 export function useCountdown(
   expiresAt: number,
   timeoutMs: number,
   expiringThresholdMs = 10_000,
+  tickMs = 250,
 ): Countdown {
   const compute = (): Countdown => {
     const remainingMs = Math.max(0, expiresAt - Date.now());
@@ -41,12 +48,12 @@ export function useCountdown(
         clearInterval(raf.current);
         raf.current = null;
       }
-    }, 250);
+    }, tickMs);
     return () => {
       if (raf.current) clearInterval(raf.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expiresAt, timeoutMs]);
+  }, [expiresAt, timeoutMs, tickMs]);
 
   return value;
 }

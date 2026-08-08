@@ -58,6 +58,7 @@ export function emptyLeaseView(): LeaseView {
     rows: [],
     askedAt: 0,
     asOfMs: 0,
+    arrivedAt: 0,
     asking: false,
     unreachable: false,
     noBiometric: false,
@@ -148,10 +149,29 @@ export function asOfClock(asOfMs: number): string {
  * the revoke left this phone and nothing came back, so the window's state is
  * unknown and the screen must keep saying so.
  */
-export function revokeState(view: LeaseView, leaseId: string): "idle" | "sending" | "unconfirmed" {
+export type RevokeState = "idle" | "sending" | "retrying" | "unconfirmed";
+
+/**
+ * Where a revoke for one window stands.
+ *
+ * `"unconfirmed"` is the one that matters, and it is a state the control must be
+ * TAPPABLE in. Leaving the button dead there made refusing heavier than
+ * approving: twenty seconds after a silent revoke the only way left to close the
+ * window was the Mac, on a surface whose whole argument for having no
+ * confirmation step is that a revoke only ever narrows authority. That argument
+ * licenses the retry just as much: the transport may simply have recovered, and a
+ * second revoke can do no harm a first could not.
+ *
+ * `"retrying"` is in flight AND still unconfirmed, which is why the two facts are
+ * tracked separately: the row shows work happening while the warning goes on
+ * standing, rather than the warning blinking out for the twenty seconds an
+ * attempt is in the air.
+ */
+export function revokeState(view: LeaseView, leaseId: string): RevokeState {
   const p = view.revokes.find((r) => r.leaseId === leaseId);
   if (!p) return "idle";
-  return p.unconfirmed ? "unconfirmed" : "sending";
+  if (p.inFlight) return p.unconfirmed ? "retrying" : "sending";
+  return p.unconfirmed ? "unconfirmed" : "idle";
 }
 
 /**
@@ -196,6 +216,50 @@ export function unconfirmedRevokes(view: LeaseView): PendingRevoke[] {
 }
 
 /**
+ * Fold a fresh revoke attempt into whatever was already pending for that window.
+ *
+ * **A RETRY MUST NOT ERASE THE WARNING IT IS RETRYING.** Replacing the entry
+ * wholesale would clear `unconfirmed` for the twenty seconds the new attempt is
+ * in flight, so a window whose state is genuinely unknown would present as merely
+ * busy, which is the same false reassurance the whole feature exists to prevent.
+ * So `unconfirmed` is sticky: only a confirmed reply or the window's own expiry
+ * clears it.
+ *
+ * `sentAt` is likewise kept from the FIRST attempt. It dates how long this window
+ * has been unresolved, which is what the reader needs, and it keeps
+ * {@link revokeResolution}'s renewal check looking back across the whole
+ * unresolved span rather than only since the latest tap, which is the
+ * conservative direction.
+ */
+export function mergeRevoke(prior: PendingRevoke | undefined, next: PendingRevoke): PendingRevoke {
+  if (!prior) return next;
+  return { ...next, unconfirmed: prior.unconfirmed, sentAt: prior.sentAt };
+}
+
+/**
+ * Unanswered revokes still worth acting on, and those the window outlived,
+ * separated because they belong in different places on the screen.
+ *
+ * A standing warning is the most important thing the section can say and sits
+ * above everything. A lapsed one has no action left in it, so it sinks below the
+ * rows: left at the top it would push live windows down the screen and, worse,
+ * suppress the confirmed-revoke note behind something that is no longer news.
+ */
+export function partitionRevokes(
+  view: LeaseView,
+  history: HistoryEntry[],
+  nowMs: number,
+): { standing: PendingRevoke[]; lapsed: PendingRevoke[] } {
+  const standing: PendingRevoke[] = [];
+  const lapsed: PendingRevoke[] = [];
+  for (const r of unconfirmedRevokes(view)) {
+    if (revokeResolution(r, history, nowMs) === "standing") standing.push(r);
+    else lapsed.push(r);
+  }
+  return { standing, lapsed };
+}
+
+/**
  * Whether an unanswered revoke is still an open question, or has been settled by
  * the window simply running out.
  *
@@ -228,10 +292,27 @@ export function revokeResolution(
   return renewable ? "standing" : "lapsed";
 }
 
-/** The line for an unanswered revoke whose window has since run out on its own. */
+/**
+ * The subject both warning lines are about: the WINDOW, never the revoke and
+ * never the rule. "The revoke of op-eu" read as though the rule itself were being
+ * revoked, which is a much larger thing than a lease and not what happened.
+ */
+function windowPhrase(revoke: PendingRevoke): string {
+  return revoke.scope ? `the ${revoke.scope} window` : "that window";
+}
+
+/**
+ * The line for an unanswered revoke whose window has since run out on its own.
+ *
+ * Leads with the resolution, because that is the news, then keeps the residual
+ * the reader actually needs: the revoke was never confirmed, so the window has to
+ * be assumed to have been open for its whole remaining life. Saying only that it
+ * expired would quietly imply the revoke worked.
+ */
 export function lapsedRevokeLine(revoke: PendingRevoke): string {
-  const what = revoke.scope ? `The revoke of ${revoke.scope}` : "A revoke this phone sent";
-  return `${what} was never confirmed, but that window has since run out on its own.`;
+  const subject = windowPhrase(revoke);
+  const head = subject.charAt(0).toUpperCase() + subject.slice(1);
+  return `${head} has since run out on its own. The revoke was never confirmed, so assume it was open until then.`;
 }
 
 /**
@@ -253,17 +334,22 @@ export const REVOKE_FALLBACK_REVOKE = "sigil lease revoke <prefix>";
  * stays as it is; being surprised by it is not, so the screen says so first.
  */
 export const REVOKE_FALLBACK_CAVEAT =
-  "That command matches on a prefix, so it may close other windows opened by the same caller under that rule.";
+  "That command matches on a prefix, so it may close other windows opened by the same caller under that rule. Closing more than you meant to only costs another approval.";
 
-/** The standing warning for a revoke that was never confirmed. */
+/**
+ * The standing warning for a revoke that was never confirmed.
+ *
+ * Says "no reply" rather than "was never confirmed": twenty seconds of silence is
+ * not a settled outcome, and "never" reads final for something this recent and
+ * still retryable.
+ */
 export function unconfirmedRevokeLine(revoke: PendingRevoke): string {
-  const what = revoke.scope ? `The revoke of ${revoke.scope}` : "A revoke this phone sent";
-  return `${what} was never confirmed, so that window may still be open.`;
+  return `No reply about ${windowPhrase(revoke)}, so it may still be open.`;
 }
 
-/** When it was sent, so the reader can tell a fresh silence from an old one. */
+/** When it was first sent, so the reader can tell a fresh silence from an old one. */
 export function unconfirmedRevokeDetail(revoke: PendingRevoke, nowMs: number): string {
-  return `Sent ${relativeTime(revoke.sentAt, nowMs)} with no reply. To be certain it is closed, on the Mac run:`;
+  return `Sent ${relativeTime(revoke.sentAt, nowMs)} with no reply. Tap Revoke again to retry, or end it on the Mac:`;
 }
 
 /** One row's second line: what the window covers, in the daemon's words. */
@@ -340,9 +426,18 @@ export function leaseListStatus(view: LeaseView, nowMs: number): LeaseListStatus
   }
 
   const at = asOfClock(view.asOfMs);
+  // Three reasons a snapshot may not describe now, and they are different facts.
+  // Unreachable wins, because not being able to ask is the bigger one. Born stale
+  // comes next: if the round trip alone outran the freshness budget, this list was
+  // never current on the screen, and saying "has aged" would tell someone they saw
+  // a current list a moment ago when they never did. The 10 to 20 second band is
+  // the ordinary slow path down a relay rung, so this is not a rare case.
+  const bornStale = view.arrivedAt > 0 && view.arrivedAt - view.askedAt >= LEASE_SNAPSHOT_FRESH_MS;
   const doubt = view.unreachable
     ? `This phone cannot reach your Mac right now. ${AGED}`
-    : `That snapshot has aged. ${AGED}`;
+    : bornStale
+      ? `That answer arrived too late to count as current. ${AGED}`
+      : `That snapshot has aged. ${AGED}`;
   const rows = liveLeases(view, nowMs);
 
   if (rows.length === 0) {
@@ -372,5 +467,5 @@ export function leaseListStatus(view: LeaseView, nowMs: number): LeaseListStatus
 export function revokeNoteLine(outcome: "closed" | "alreadyGone"): string {
   return outcome === "closed"
     ? "Window closed. The next matching command asks again."
-    : "That window was already closed. Nothing to revoke.";
+    : "That window was already closed. The next matching command asks again.";
 }

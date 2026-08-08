@@ -346,7 +346,7 @@ export async function revokeLease(
     // Nothing left the device, so nothing can be assumed about the window. It is
     // recorded as an unconfirmed revoke, not as a failure to send, because from
     // the human's side those have the same consequence: unknown, so assume open.
-    store.leaseRevokeStarted({ requestId: unsent, leaseId, scope, windowExpiresAt, sentAt, unconfirmed: true });
+    store.leaseRevokeStarted({ requestId: unsent, leaseId, scope, windowExpiresAt, sentAt, inFlight: false, unconfirmed: true });
     return;
   }
   let requestId: string;
@@ -356,10 +356,10 @@ export async function revokeLease(
     );
   } catch (e) {
     console.warn(`[lease] revoke dispatch failed: ${errText(e)}`);
-    store.leaseRevokeStarted({ requestId: unsent, leaseId, scope, windowExpiresAt, sentAt, unconfirmed: true });
+    store.leaseRevokeStarted({ requestId: unsent, leaseId, scope, windowExpiresAt, sentAt, inFlight: false, unconfirmed: true });
     return;
   }
-  store.leaseRevokeStarted({ requestId, leaseId, scope, windowExpiresAt, sentAt, unconfirmed: false });
+  store.leaseRevokeStarted({ requestId, leaseId, scope, windowExpiresAt, sentAt, inFlight: true, unconfirmed: false });
   outstanding.issue(requestId, "revoke", sentAt);
   // The daemon sends no error for a revoke it will not act on, so silence covers
   // both a dropped message and a rejected one. Either way the window's state is

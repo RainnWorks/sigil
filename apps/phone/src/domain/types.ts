@@ -146,7 +146,13 @@ export interface PendingRevoke {
   /** The rule name as it was on screen, so a standing warning can name what it
    *  is about after the snapshot behind it has been dropped. */
   scope: string | null;
-  /** When the revoke left this device, unix ms. */
+  /**
+   * When the FIRST attempt left this device, unix ms. Deliberately not re-stamped
+   * by a retry: it dates how long this window has been unresolved, which is what
+   * the reader needs, and holding it still keeps `revokeResolution`'s renewal
+   * check looking back over the whole unresolved span rather than only the latest
+   * attempt, which is the conservative direction.
+   */
   sentAt: number;
   /**
    * The window's own expiry as the snapshot reported it, unix ms. A lease is
@@ -157,9 +163,17 @@ export interface PendingRevoke {
    */
   windowExpiresAt: number;
   /**
-   * True once the reply window has passed with no answer. The warning STAYS,
-   * outliving the snapshot it came from, until something actually settles it: a
-   * suppressed reply must never leave the human believing a window closed.
+   * A request for this window is outstanding right now. Separate from
+   * {@link unconfirmed} because a RETRY is both at once, and the two must not be
+   * collapsed: the row shows work in progress while the warning goes on standing.
+   */
+  inFlight: boolean;
+  /**
+   * True once a reply window has passed with no answer, and STICKY thereafter: a
+   * retry does not clear it, only a confirmed reply or the window's own expiry
+   * does. The warning outlives the snapshot it came from, because a suppressed
+   * reply must never leave the human believing a window closed, and it must not
+   * blink out for the twenty seconds a retry is in flight either.
    */
   unconfirmed: boolean;
 }
@@ -186,7 +200,7 @@ export interface RevokeNote {
  * The freshness fields are load-bearing, not decoration. The phone may state that
  * nothing is open ONLY from a fresh successful snapshot; a phone that cannot
  * reach the daemon saying "no active leases" is a false statement of fact about a
- * containment surface. `answeredAt === 0` means never answered, and that is a
+ * containment surface. `askedAt === 0` means never answered, and that is a
  * different sentence from "asked and got none".
  *
  * Everything here is RAM only and is cleared when the screen goes away. What
@@ -196,7 +210,7 @@ export interface RevokeNote {
  */
 export interface LeaseView {
   /** The rows from the last successful snapshot. Empty is meaningful only when
-   *  {@link answeredAt} is non-zero. */
+   *  {@link askedAt} is non-zero. */
   rows: ActiveLease[];
   /**
    * When the QUERY behind the current snapshot was sent, unix ms, local clock.
@@ -210,6 +224,20 @@ export interface LeaseView {
   /** When the DAEMON measured it, unix ms on its clock. Displayed, never used to
    *  decide freshness. 0 = never answered. */
   asOfMs: number;
+  /**
+   * When the snapshot ARRIVED here, unix ms, local clock. 0 = never answered.
+   *
+   * DISPLAY REASONING ONLY, and this restriction is the whole reason the field is
+   * documented rather than merely declared. It exists for exactly one question:
+   * was the round trip itself longer than the freshness budget, so this snapshot
+   * was never current on the screen at all? It is NEVER read by
+   * {@link snapshotFresh}, which ages from {@link askedAt} because a relay picks
+   * how long to stall a reply and must not be able to buy currency by doing so.
+   * A third timestamp in a type whose comments work this hard to police which one
+   * decides what is how that regression gets reintroduced; if you are reaching for
+   * this in a freshness decision, you want askedAt.
+   */
+  arrivedAt: number;
   /** A list query is in flight right now. */
   asking: boolean;
   /** The last query did not come back. Cleared by the next successful snapshot. */

@@ -15,16 +15,16 @@ import {
   lapsedRevokeLine,
   leaseListStatus,
   liveLeases,
+  partitionRevokes,
   remainingSentence,
   REVOKE_FALLBACK_CAVEAT,
   REVOKE_FALLBACK_LIST,
   REVOKE_FALLBACK_REVOKE,
   revokeNoteLine,
-  revokeResolution,
+  type RevokeState,
   revokeState,
   unconfirmedRevokeDetail,
   unconfirmedRevokeLine,
-  unconfirmedRevokes,
 } from "@/src/domain/leases";
 import {
   type ActiveLease,
@@ -234,26 +234,29 @@ function LeaseSection({ view, history }: { view: LeaseView; history: HistoryEntr
 
   const rows = liveLeases(view, now);
   const status = leaseListStatus(view, now);
-  const warnings = unconfirmedRevokes(view);
+  // Standing warnings sit above everything; lapsed ones sink below the rows,
+  // because they carry no action and would otherwise push live windows down the
+  // screen and suppress the confirmed-revoke note behind stale news.
+  const { standing, lapsed } = partitionRevokes(view, history, now);
 
   return (
     <View>
       <SectionHeader>Active leases</SectionHeader>
       <Card>
-        {/* Standing warnings first, and above the rows on purpose: an unresolved
-            revoke is the most important thing this screen can be saying, and it
-            has to survive the snapshot that produced it being thrown away. */}
-        {warnings.map((r, i) => (
-          <View key={r.requestId}>
+        {/* Above the rows on purpose: an unresolved revoke is the most important
+            thing this screen can be saying, and it has to survive the snapshot
+            that produced it being thrown away. */}
+        {standing.map((r, i) => (
+          <View key={r.leaseId}>
             {i > 0 ? <Hairline inset={space.lg} /> : null}
-            <UnconfirmedRevoke
-              revoke={r}
-              resolution={revokeResolution(r, history, now)}
-              now={now}
-            />
+            <StandingRevoke revoke={r} now={now} />
           </View>
         ))}
-        {warnings.length > 0 ? <Hairline inset={space.lg} /> : null}
+        {/* The Mac steps are hoisted below the last warning rather than repeated
+            inside each one: two warnings meant two identical command blocks, and
+            a command repeated is a command skimmed. */}
+        {standing.length > 0 ? <MacFallback /> : null}
+        {standing.length > 0 ? <Hairline inset={space.lg} /> : null}
 
         {rows.map((l, i) => (
           <View key={l.leaseId}>
@@ -263,7 +266,24 @@ function LeaseSection({ view, history }: { view: LeaseView; history: HistoryEntr
         ))}
         {rows.length > 0 ? <Hairline inset={space.lg} /> : null}
 
+        {lapsed.map((r) => (
+          <View key={r.leaseId}>
+            <LapsedRevoke revoke={r} />
+            <Hairline inset={space.lg} />
+          </View>
+        ))}
+
         <View style={{ padding: space.lg, gap: 4 }}>
+          {/* THE TONE INVERSION IS DELIBERATE. DO NOT NORMALISE IT. The
+              authoritative claim ("No active leases.") renders MUTED and the
+              uncertain one ("cannot check right now", "as of 14:23:07") renders
+              at full label weight, which is backwards from how these are usually
+              styled and is exactly why it will look like a mistake to someone
+              tidying tones later. It is what makes "none" and "cannot tell" read
+              apart at a glance, before either sentence is actually read: good news
+              recedes, doubt asserts itself. Weighting them the other way would
+              make the phone's most confident-looking state the one where it knows
+              least. */}
           <Sans size={13} tone={status.authoritative ? "muted" : "label"}>
             {status.line}
           </Sans>
@@ -272,30 +292,44 @@ function LeaseSection({ view, history }: { view: LeaseView; history: HistoryEntr
               {status.detail}
             </Sans>
           ) : null}
-          {view.note && warnings.length === 0 ? (
+          {view.note && standing.length === 0 ? (
             <Sans size={12} tone="muted" style={{ marginTop: 4 }}>
               {revokeNoteLine(view.note.outcome)}
             </Sans>
           ) : null}
-          {DEMO && rows.length > 0 ? (
+          {DEMO ? (
             <Sans size={12} tone="faint" style={{ marginTop: 4 }}>
-              Sample rows from the demo build, not a real window.
+              Demo build: any rows or warnings here are samples, not real windows.
             </Sans>
           ) : null}
         </View>
 
         <Hairline inset={space.lg} />
+        {/* The Face ID symbol stays in BOTH states. Disclosing the cost once and
+            then hiding it means every later check is a surprise; the cost does
+            not go away after the first ask, so neither should the sign of it.
+            Disabled outright when no biometric is enrolled, since that is a dead
+            end rather than something worth retrying. */}
         <Pressable
           onPress={() => void refreshLeases()}
-          disabled={view.asking}
-          style={{ flexDirection: "row", alignItems: "center", gap: space.md, padding: space.lg }}
+          disabled={view.asking || view.noBiometric}
+          style={({ pressed }) => ({
+            flexDirection: "row",
+            alignItems: "center",
+            gap: space.md,
+            padding: space.lg,
+            opacity: pressed ? 0.6 : 1,
+          })}
         >
           <Sf
-            name={view.askedAt > 0 ? "arrow.clockwise" : "faceid"}
-            color={view.asking ? p.faint : p.cobalt}
+            name="faceid"
+            color={view.asking || view.noBiometric ? p.faint : p.cobalt}
             size={16}
           />
-          <Sans size={16} style={{ flex: 1, color: view.asking ? p.faint : p.cobalt }}>
+          <Sans
+            size={16}
+            style={{ flex: 1, color: view.asking || view.noBiometric ? p.faint : p.cobalt }}
+          >
             {view.asking ? "Checking" : view.askedAt > 0 ? "Check again" : "Show active leases"}
           </Sans>
         </Pressable>
@@ -313,66 +347,82 @@ function LeaseSection({ view, history }: { view: LeaseView; history: HistoryEntr
  * revoke everything while reporting success. The human reads the real one off
  * `sigil lease list` on the Mac, where it cannot have been mangled in transit.
  */
-function UnconfirmedRevoke({
-  revoke,
-  resolution,
-  now,
-}: {
-  revoke: PendingRevoke;
-  resolution: "standing" | "lapsed";
-  now: number;
-}) {
+/**
+ * A revoke that went out and was never answered: the most important thing this
+ * section can say, so it reads at full label weight rather than in the faint tone
+ * the rest of the supporting copy uses. Brass stays on the ICON, where a colour
+ * signal is the point and the 3:1 non-text contrast threshold applies, instead of
+ * on 14pt body text where it does not reach AA. Brass and not rust: an
+ * unconfirmed revoke is pending, not denied.
+ */
+function StandingRevoke({ revoke, now }: { revoke: PendingRevoke; now: number }) {
   const p = useTheme();
-  // A lapsed warning has no action left in it: the window ran out on its own, so
-  // the Mac steps would be busywork. It stays on screen until the section is left
-  // rather than vanishing under the reader, so the resolution is something they
-  // see happen rather than something that silently stopped being true.
-  if (resolution === "lapsed") {
-    return (
-      <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, padding: space.lg }}>
-        <Sf name="clock" color={p.faint} size={15} />
-        <Sans size={13} tone="muted" style={{ flex: 1 }}>
-          {lapsedRevokeLine(revoke)}
-        </Sans>
-      </View>
-    );
-  }
   return (
     <View style={{ padding: space.lg, gap: 4 }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
         <Sf name="exclamationmark.triangle" color={p.brass} size={15} />
-        <Sans size={14} style={{ flex: 1, color: p.brass }}>
+        <Sans size={14} weight="medium" tone="label" style={{ flex: 1 }}>
           {unconfirmedRevokeLine(revoke)}
         </Sans>
       </View>
-      <Sans size={12} tone="faint">
+      <Sans size={12} tone="muted">
         {unconfirmedRevokeDetail(revoke, now)}
       </Sans>
-      <Mono size={12} tone="faint" selectable>
+    </View>
+  );
+}
+
+/**
+ * The Mac-side steps, rendered once below the last standing warning rather than
+ * inside each one. `sigil lease list` is selectable because it is meant to be
+ * copied; the revoke line is NOT, because it ends in a literal `<prefix>`
+ * placeholder and pasting that into zsh redirects to a file rather than running
+ * anything.
+ */
+function MacFallback() {
+  return (
+    <View style={{ paddingHorizontal: space.lg, paddingBottom: space.lg, gap: 4 }}>
+      <Mono size={12} tone="muted" selectable>
         {REVOKE_FALLBACK_LIST}
       </Mono>
-      <Sans size={12} tone="faint">
+      <Sans size={12} tone="muted">
         then end the window it shows:
       </Sans>
-      <Mono size={12} tone="faint" selectable>
+      <Mono size={12} tone="muted">
         {REVOKE_FALLBACK_REVOKE}
       </Mono>
-      <Sans size={12} tone="faint">
+      <Sans size={12} tone="muted">
         {REVOKE_FALLBACK_CAVEAT}
       </Sans>
     </View>
   );
 }
 
-function LeaseRow({
-  lease,
-  state,
-}: {
-  lease: ActiveLease;
-  state: "idle" | "sending" | "unconfirmed";
-}) {
+/**
+ * A warning whose window has since run out on its own. Demoted to the palette's
+ * existing Expired vocabulary (clock on faint) and sunk below the live rows,
+ * because there is no action left in it. It stays visible until the section is
+ * left, so the resolution is something the reader watches happen rather than
+ * something that silently stopped being true.
+ */
+function LapsedRevoke({ revoke }: { revoke: PendingRevoke }) {
   const p = useTheme();
-  const { remainingMs } = useCountdown(lease.expiresAt, lease.windowMs);
+  return (
+    <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, padding: space.lg }}>
+      <Sf name="clock" color={p.faint} size={15} />
+      <Sans size={13} tone="muted" style={{ flex: 1 }}>
+        {lapsedRevokeLine(revoke)}
+      </Sans>
+    </View>
+  );
+}
+
+function LeaseRow({ lease, state }: { lease: ActiveLease; state: RevokeState }) {
+  const p = useTheme();
+  // 1Hz, not the gauge's 4Hz: remainingWindow is coarse above a minute, so three
+  // of every four re-renders produced an identical string. The approval sheet's
+  // countdown is a different problem with a different budget.
+  const { remainingMs } = useCountdown(lease.expiresAt, lease.windowMs, 10_000, 1_000);
   return (
     <View style={{ padding: space.lg, gap: 4 }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: space.md }}>
@@ -384,13 +434,26 @@ function LeaseRow({
             deny control set the precedent that refusing is never made heavier
             than allowing. An accidental revoke costs one extra approval; a
             confirmation sheet costs time at exactly the moment someone wants a
-            window shut. */}
+            window shut.
+
+            That same argument is why an UNCONFIRMED revoke stays tappable. Dead
+            here, the only way left to close the window was the Mac, which is
+            refusing made heavier than approving on the one control that must not
+            be. Only an attempt actually in flight disables it.
+
+            hitSlop because the label alone is roughly 55x18pt against a 44pt
+            minimum, and this is the last control that should be fiddly. */}
         <Pressable
           onPress={() => void revokeLease(lease.leaseId, lease.scope, lease.expiresAt)}
-          disabled={state !== "idle"}
+          disabled={state === "sending" || state === "retrying"}
+          hitSlop={12}
+          style={({ pressed }) => ({ opacity: pressed ? 0.6 : 1 })}
         >
-          <Sans size={15} style={{ color: state === "idle" ? p.deny : p.faint }}>
-            {state === "idle" ? "Revoke" : "Revoking"}
+          <Sans
+            size={15}
+            style={{ color: state === "sending" || state === "retrying" ? p.faint : p.deny }}
+          >
+            {state === "sending" || state === "retrying" ? "Revoking" : "Revoke"}
           </Sans>
         </Pressable>
       </View>
