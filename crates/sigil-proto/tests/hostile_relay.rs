@@ -867,7 +867,14 @@ fn a_captured_lease_revoke_cannot_be_replayed_or_backdated() {
 }
 
 #[test]
-fn a_lease_query_cannot_be_forged_and_a_list_reply_leaks_nothing() {
+fn a_lease_query_cannot_be_forged_and_a_list_reply_reveals_no_plaintext() {
+    // Scope, precisely: this proves CONFIDENTIALITY of the contents -- no field of
+    // either message appears on the wire, a stranger cannot decrypt, and neither
+    // can be forged or rewritten. It says nothing about ciphertext LENGTH, which
+    // is a separate property with a separate and deliberately bounded proof in
+    // `lease_control_is_one_ciphertext_length_within_a_bucket`. "Leaks nothing"
+    // would have been false on length, so the name does not claim it.
+    //
     // The query direction: a forged one would only make the daemon seal a list to
     // the pinned phone, but it must still be impossible, and the reply that comes
     // back must be opaque to the relay and unforgeable toward the phone.
@@ -1017,9 +1024,26 @@ fn a_revoke_reply_cannot_be_forged_into_a_false_confirmation() {
 }
 
 #[test]
-fn every_lease_control_envelope_is_one_ciphertext_length() {
-    // Padding closes the last thing the relay could read off a lease-control
-    // envelope: how many windows are open, and which of the four messages it is.
+fn lease_control_is_one_ciphertext_length_within_a_bucket() {
+    // Padding hides the live-window count, but only WITHIN one bucket, and the
+    // name and the assertions here have to say so because this test is cited as
+    // the proof.
+    //
+    // What it buys: inside a bucket, zero windows and five look identical, and a
+    // revoke is indistinguishable from a list in both directions. So the relay
+    // cannot count open windows off an envelope, and cannot tell which of the four
+    // messages it is holding.
+    //
+    // What it does NOT buy, asserted below rather than hoped for: a reply that
+    // outgrows its bucket rolls to the next one and the length MOVES. Measured on
+    // this wire, the first crossing is at 8 rows with short labels, 6 with
+    // realistic ones, and 3 when all three labels sit at LEASE_LABEL_MAX_CHARS.
+    // Three rows is reachable, not theoretical, for anyone with verbose rule names.
+    //
+    // The residual is therefore precise: the relay learns which BAND the open-window
+    // count falls in, never the count, and never anything about which rules. That is
+    // judged not worth padding every list to a fixed maximum, which would cost real
+    // bytes on every exchange to hide a band.
     let daemon = DeviceIdentity::generate();
     let phone = DeviceIdentity::generate();
     let pairing_id = [0x6f; 32];
@@ -1084,5 +1108,51 @@ fn every_lease_control_envelope_is_one_ciphertext_length() {
             .len(),
         1,
         "lease control must be one ciphertext length in both directions: {lengths:?}"
+    );
+
+    // And here is where it stops holding. Each of these is the FIRST row count
+    // that outgrows one bucket for that label width, so the pair proves both
+    // halves: n-1 still hides, n does not. If padding ever silently stopped
+    // applying, the first loop would fail; if the bucket moved, this one would.
+    let one_bucket = lengths[0];
+    let seal_list = |rows: Vec<LeaseRow>| {
+        Envelope::seal(
+            &LeaseListReply::new(REQ_ID, 1, rows),
+            pairing_id,
+            1,
+            &daemon.signing,
+            &phone.peer_identity(),
+        )
+        .expect("seal")
+        .ciphertext
+        .len()
+    };
+    let filled = |n: usize, w: usize| -> Vec<LeaseRow> {
+        (0..n)
+            .map(|_| {
+                LeaseRow::new(
+                    LEASE_ID,
+                    &"s".repeat(w),
+                    &"c".repeat(w),
+                    &"a".repeat(w),
+                    60_000,
+                )
+                .expect("row")
+            })
+            .collect()
+    };
+    // Realistic labels: 5 rows still share the bucket, 6 crosses.
+    assert_eq!(seal_list((0..5).map(|_| row()).collect()), one_bucket);
+    assert!(
+        seal_list((0..6).map(|_| row()).collect()) > one_bucket,
+        "six realistic rows must be visibly larger, and the docs must say so"
+    );
+    // Maximum-length labels: the crossing arrives at THREE rows, which is the
+    // reachable case a verbose rule set produces.
+    let max = sigil_proto::LEASE_LABEL_MAX_CHARS;
+    assert_eq!(seal_list(filled(2, max)), one_bucket);
+    assert!(
+        seal_list(filled(3, max)) > one_bucket,
+        "three maximal rows must be visibly larger"
     );
 }

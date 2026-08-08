@@ -370,13 +370,29 @@ Left over, stated plainly:
    unpadded message would make a version skew between the two halves fail silently
    and closed, and a revoke that vanishes is exactly what this feature exists to
    end. A peer that does not pad leaks its own lengths.
-3. **The bucket is 1024, not the 512 first specified**, because 512 does not buy
-   the property. Measured on this wire: a row is 115 bytes with short labels, 169
-   with realistic ones, 318 with all three labels at the 72-char bound. 512 holds
-   two realistic rows and rolls at three, leaking the count in the range that
-   matters; 1024 holds five. The relay still learns THAT lease control was used and
-   when, and a list that overflows the bucket reveals that it did (six realistic
-   rows, or four maximal). Widening only moves that boundary.
+3. **Padding hides the window count only within a bucket.** This is the residual
+   with the most careful wording, because the test that proves it is cited as the
+   proof, and an earlier version of both claimed a universal property.
+
+   The bucket is 1024, not the 512 first specified, because 512 does not buy the
+   property: measured on this wire a row is 115 bytes with short labels, 169 with
+   realistic ones (`op with --account "rowmhq.1password.eu"`), and 318 with all
+   three labels at the 72-character bound, so 512 rolls at three realistic rows.
+   At 1024 the first crossing is **8 rows with short labels, 6 with realistic
+   ones, and 3 when every label is at the bound** — the last of which is reachable,
+   not theoretical, for a verbose rule set.
+
+   So: **the relay learns which band the open-window count falls in, and nothing
+   about which rules.** Never the count itself, never a label, never an identifier.
+   Closing it would mean padding every list to a fixed maximum, paying real bytes
+   on every exchange to hide a band, and it is deliberately not done.
+
+   Timing is a separate, inherent residual: a lease-control exchange is visible as
+   an exchange, so the relay learns that lease control was used and when. It is
+   *narrower* than a polling design would make it — the phone issues at most one
+   `leaseList` per deliberate human action, not one every 15 seconds — so the
+   signal is "the human opened the lease screen", not a periodic beacon announcing
+   that it is still open.
 4. **A compromised phone can revoke at will.** It holds the signing key. Revocation
    only ever narrows what is authorized, so this is a denial of convenience, never
    a release.

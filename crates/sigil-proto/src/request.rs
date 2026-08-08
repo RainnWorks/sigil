@@ -1993,10 +1993,13 @@ mod tests {
         );
     }
 
-    /// F7: every lease-control plaintext is padded to a fixed bucket, so
-    /// ciphertext length carries neither the row count nor which message it is.
+    /// F7: every lease-control plaintext pads to a bucket boundary, so within a
+    /// bucket the length carries neither the row count nor which message it is.
+    /// The bounded half (what happens when a list outgrows its bucket) is asserted
+    /// at the end, and proved at the ciphertext layer by the hostile-relay suite's
+    /// `lease_control_is_one_ciphertext_length_within_a_bucket`.
     #[test]
-    fn every_lease_control_plaintext_pads_to_one_bucket() {
+    fn lease_control_plaintexts_pad_to_a_bucket_boundary() {
         let row = |n: usize| LeaseRow::new(LEASE_ID, &"s".repeat(n), "op read", "rowm", 60_000);
         let len = |v: &serde_json::Value| serde_json::to_vec(v).unwrap().len();
 

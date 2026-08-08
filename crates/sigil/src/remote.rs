@@ -982,10 +982,30 @@ impl RemoteApprover {
     /// and still not deliver anything useful.
     ///
     /// The seal shares the daemon->phone [`counter`](Self::counter) with every
-    /// other deposit, so a relay sees one more opaque envelope. No push hint is
-    /// forwarded: a lease reply answers a screen the human is already looking at,
-    /// and ringing the APNs doorbell for it would correlate lease-control use to
-    /// the relay and to Apple for no benefit.
+    /// other deposit, and the payload was padded to
+    /// [`LEASE_PAD_BUCKET`](sigil_proto::LEASE_PAD_BUCKET) before sealing.
+    ///
+    /// **What that does and does not buy, stated exactly**, because an earlier
+    /// version of this comment claimed a relay "learns nothing about which of the
+    /// daemon's messages it is", which was false on length:
+    ///
+    /// * It buys equal lengths WITHIN a bucket. A list of zero windows and a list
+    ///   of five seal to one length, and a revoke reply is that same length, so a
+    ///   relay cannot count open windows or tell the four messages apart by size.
+    /// * It does not buy equal lengths across buckets. A reply that outgrows one
+    ///   rolls to the next, so the relay learns which BAND the open-window count
+    ///   falls in (first crossing: 8 rows with short labels, 6 with realistic
+    ///   ones, 3 with all labels at the length bound). Never the count itself, and
+    ///   never anything about which rules. Padding every list to a fixed maximum
+    ///   would close that at a real cost in bytes on every exchange, and is
+    ///   deliberately not done.
+    /// * It does not buy anything about TIMING. A lease-control exchange is
+    ///   visible as an exchange, and the relay learns that lease control was used
+    ///   and when.
+    ///
+    /// No push hint is forwarded: a lease reply answers a screen the human is
+    /// already looking at, and ringing the APNs doorbell for it would correlate
+    /// lease-control use to the relay and to Apple for no benefit.
     fn queue_lease_reply<T: serde::Serialize>(&self, msg: &T) {
         let counter = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         let Ok(env) = Envelope::seal(
