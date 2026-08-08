@@ -40,6 +40,7 @@ import {
   revokeNoteLine,
   revokeResolution,
   revokeState,
+  settledByAbsence,
   snapshotFresh,
   toActiveLeases,
   unconfirmedRevokeLine,
@@ -413,6 +414,28 @@ function main(): void {
     eq(liveLeases(silent, NOW).length, 1, "an unconfirmed revoke leaves the row on screen");
     eq(unconfirmedRevokes(silent).length, 1, "and raises a standing warning");
     eq(revokeState(silent, LEASE2), "idle", "a different window is unaffected");
+
+    // Settling by absence. The inference rests entirely on lease-id permanence,
+    // NOT on the snapshot having been taken after the revoke went out, so a
+    // snapshot computed before the revoke settles it just the same. This is
+    // pinned because the ordering guard looks necessary and is not, and a reader
+    // who reinstated one would likely reach for asOfMs, the daemon's
+    // unauthenticated clock, which nothing here may decide on.
+    const rowsNow = toActiveLeases([row()], NOW);
+    const pending = revoke({ unconfirmed: true, sentAt: NOW });
+    eq(settledByAbsence([pending], rowsNow).length, 0, "a window still listed is not settled");
+    eq(settledByAbsence([pending], []).length, 1, "a window absent from a snapshot is settled");
+    // Absence proves death at compute time and death is permanent, so a snapshot
+    // the daemon computed BEFORE this revoke was even sent still settles it.
+    const stale = revoke({ unconfirmed: true, sentAt: NOW + 60_000 });
+    eq(settledByAbsence([stale], []).length, 1, "ordering does not enter into it");
+    // The converse is conservative rather than wrong: still listed, still pending.
+    eq(settledByAbsence([stale], rowsNow).length, 0, "and still-listed stays pending either way");
+    // Only the absent one settles when several are pending.
+    const other = revoke({ unconfirmed: true, leaseId: LEASE2 });
+    const both = settledByAbsence([pending, other], rowsNow);
+    eq(both.length, 1, "one of two pending revokes settles");
+    eq(both[0]!.leaseId, LEASE2, "and it is the one the snapshot does not list");
 
     // TTL retirement. A warning with no dismiss is right, but one that never
     // resolves stops being read, and a lease is TTL-bounded so there is an honest

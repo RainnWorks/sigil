@@ -154,6 +154,42 @@ export function revokeState(view: LeaseView, leaseId: string): "idle" | "sending
   return p.unconfirmed ? "unconfirmed" : "sending";
 }
 
+/**
+ * The pending revokes a snapshot has just proved closed, by not containing them.
+ *
+ * **ORDERING IS IRRELEVANT HERE, and that is worth stating because the obvious
+ * guard looks necessary and is not.** This deliberately does NOT check that the
+ * snapshot was taken after the revoke was sent. It does not need to, and a check
+ * implying otherwise would invite a later reader to "fix" it into something
+ * `asOfMs`-based, which would be actively wrong: `asOfMs` is the daemon's
+ * unauthenticated clock, and nothing here may decide anything on it.
+ *
+ * The whole inference rests on lease-id PERMANENCE instead. An id goes live to
+ * dead and never back: a refresh keeps the id (it extends one window rather than
+ * starting another), and no id is ever handed to a second window. So a genuine
+ * snapshot omitting an id proves that id was dead when the snapshot was computed,
+ * and dead is permanent, so it is still dead now. That holds whether the snapshot
+ * was computed before or after the revoke went out, and whatever a relay does to
+ * ordering.
+ *
+ * The converse is the safe direction too: a snapshot computed before the revoke
+ * that still SHOWS the window leaves it pending, which is conservative rather
+ * than wrong. The property is pinned daemon-side in
+ * `a_live_window_keeps_its_id_and_a_dead_one_never_lends_it_out`
+ * (crates/sigil/src/lease.rs), from this consumer's side.
+ *
+ * The one thing it does depend on is exactly one list question being in flight,
+ * which the session controller enforces: two could interleave and let an older
+ * snapshot arrive last.
+ */
+export function settledByAbsence(
+  revokes: PendingRevoke[],
+  rows: ActiveLease[],
+): PendingRevoke[] {
+  const present = new Set(rows.map((l) => l.leaseId));
+  return revokes.filter((r) => !present.has(r.leaseId));
+}
+
 /** The revokes that went out and were never answered. */
 export function unconfirmedRevokes(view: LeaseView): PendingRevoke[] {
   return view.revokes.filter((r) => r.unconfirmed);

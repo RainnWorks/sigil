@@ -12,7 +12,7 @@ import {
   type ResolutionStatus,
 } from "@/src/protocol";
 import { secretRefLabel, sshLabel } from "@/src/lib/format";
-import { revokeResolution, toActiveLeases } from "@/src/domain/leases";
+import { revokeResolution, settledByAbsence, toActiveLeases } from "@/src/domain/leases";
 import {
   type AppState,
   type HistoryEntry,
@@ -194,10 +194,12 @@ class Store {
    * `rows`, `askedAt` and `asOfMs`, and therefore the only thing that can
    * entitle the screen to say the list is complete.
    *
-   * It also settles pending revokes: a window missing from a snapshot the daemon
-   * took AFTER the revoke was sent is confirmed closed by the daemon's own
-   * account of itself, which is stronger evidence than the revoke reply. A window
-   * still present stays pending, warning and all, because it really is still open.
+   * It also settles pending revokes: a window missing from a snapshot is
+   * confirmed closed by the daemon's own account of itself, which is stronger
+   * evidence than the revoke reply. A window still present stays pending, warning
+   * and all, because it really is still open. Note "a snapshot", with no
+   * requirement that it was taken after the revoke was sent: see
+   * {@link settledByAbsence} for why ordering does not enter into it.
    *
    * THAT INFERENCE BORROWS AN INVARIANT FROM THE DAEMON, so say where it is
    * pinned. It is sound only because a lease id goes live to dead and never back:
@@ -217,10 +219,7 @@ class Store {
    */
   leaseListReceived(rows: LeaseRow[], asOfMs: number, sentAt: number, receivedAt: number): void {
     const live = toActiveLeases(rows, receivedAt);
-    const present = new Set(live.map((l) => l.leaseId));
-    const settled = this.state.leases.revokes.filter(
-      (r) => r.sentAt < receivedAt && !present.has(r.leaseId),
-    );
+    const settled = settledByAbsence(this.state.leases.revokes, live);
     const note =
       settled.length > 0
         ? { leaseId: settled[0]!.leaseId, outcome: "closed" as const, at: receivedAt }
