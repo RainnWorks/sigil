@@ -2052,6 +2052,20 @@ mod tests {
         // The filler is inert: it never escapes, so the padded length is exact.
         let padded = LeaseQuery::new();
         assert!(padded.pad.chars().all(|c| c == '.'));
+
+        // Padding is IDEMPOTENT, which matters for more than tidiness: a message
+        // padded twice must not grow, or a resend would be a different size from
+        // the original and the relay could spot it as a resend. It holds because
+        // `padded` clears the field before measuring.
+        for once in [
+            serde_json::to_value(LeaseQuery::new().padded()).unwrap(),
+            serde_json::to_value(LeaseRevoke::new(LEASE_ID).padded()).unwrap(),
+            serde_json::to_value(LeaseRevokeReply::new(REQ_ID, LEASE_ID, true).padded()).unwrap(),
+            serde_json::to_value(LeaseListReply::new(REQ_ID, 1, vec![row(20).unwrap()]).padded())
+                .unwrap(),
+        ] {
+            assert_eq!(len(&once), LEASE_PAD_BUCKET, "re-padding must not grow it");
+        }
     }
 
     #[test]

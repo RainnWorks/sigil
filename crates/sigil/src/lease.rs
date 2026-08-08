@@ -2025,6 +2025,89 @@ mod tests {
         assert_ne!(store.list()[0].lease_id, first, "the id does not");
     }
 
+    /// **R7-F5: lease id PERMANENCE, which a remote controller reasons from.**
+    ///
+    /// The phone infers "a window absent from a later list has closed". That
+    /// inference is only sound if a live window's id never moves, so this pins the
+    /// property from the consumer's side rather than from the implementation's:
+    ///
+    /// * A live window appears in every snapshot under the SAME id, no matter what
+    ///   happens to other windows around it (grants, revokes, expiries, repeated
+    ///   listing). If an id could be re-minted for a continuing window, the phone
+    ///   would report a still-open window as closed, which is the dangerous
+    ///   direction.
+    /// * An id is never handed to a second window. If one could be reused, the
+    ///   phone could carry stale row state onto a window it never saw approved.
+    ///
+    /// There is exactly ONE assignment of `Lease::id` in this file (the insert in
+    /// `grant`), and nothing ever reassigns it; that is what makes the property
+    /// hold. If a future change adds continuity by reusing an id across re-grants,
+    /// this test fails and the phone's inference must be revisited with it.
+    #[test]
+    fn a_live_window_keeps_its_id_and_a_dead_one_never_lends_it_out() {
+        let store = LeaseStore::new();
+        let gk = [0xf1; 32];
+        let b = gate("Rowm", "op");
+        store.grant(gk, &b, COVERS, token("t"), Duration::from_secs(60));
+        let watched = store.list()[0].lease_id.clone();
+
+        // Churn everything AROUND the watched window: other windows opened, other
+        // windows revoked by both paths, an unrelated window left to lapse, and a
+        // config-driven scope revoke. The watched id must not move once.
+        let id_of = |scope: &str| {
+            store
+                .list()
+                .into_iter()
+                .find(|l| l.scope == scope)
+                .map(|l| l.lease_id)
+        };
+        store.grant(
+            [0xf2; 32],
+            &gate("A", "other"),
+            COVERS,
+            token("a"),
+            Duration::from_secs(60),
+        );
+        store.grant(
+            [0xf3; 32],
+            &gate("B", "doomed"),
+            COVERS,
+            token("b"),
+            Duration::from_millis(10),
+        );
+        let other = id_of("other").expect("filed");
+        assert!(store.revoke_id(&other));
+        store.revoke_scope("nothing-matches-this");
+        std::thread::sleep(Duration::from_millis(30)); // the doomed one lapses
+        for _ in 0..5 {
+            assert_eq!(
+                id_of("op").as_deref(),
+                Some(watched.as_str()),
+                "a live window must appear under one unchanging id"
+            );
+        }
+        // A refresh is the case most likely to re-mint by accident.
+        store.grant(gk, &b, COVERS, token("t2"), Duration::from_secs(600));
+        assert_eq!(id_of("op").as_deref(), Some(watched.as_str()));
+
+        // And the converse the phone relies on: once the window is gone, its id is
+        // gone from every later snapshot, so an omission really does mean closed.
+        assert!(store.revoke_id(&watched));
+        assert_eq!(id_of("op"), None);
+
+        // No id is ever handed out twice, across many open/close cycles under the
+        // SAME grant key and binding (the shape that would recur in real use).
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(watched);
+        seen.insert(other);
+        for _ in 0..200 {
+            store.grant(gk, &b, COVERS, token("t"), Duration::from_secs(60));
+            let id = store.list()[0].lease_id.clone();
+            assert!(store.revoke_id(&id));
+            assert!(seen.insert(id), "a lease id was reused for a later window");
+        }
+    }
+
     /// Two live windows can share ONE grant key with different bindings. That is
     /// exactly why the grant key cannot be the remote revoke target: killing "the
     /// row I tapped" by key would take unseen siblings with it. The id does not
