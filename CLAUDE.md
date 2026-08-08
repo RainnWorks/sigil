@@ -44,7 +44,13 @@ independent adversarial pass, never self-certification.
 
 ```sh
 cargo test && cargo clippy -- -D warnings && cargo fmt --check   # gate for crates/
+cargo run -p sigil-doccheck    # docs/security-claims.md citation report
 ```
+
+`cargo test` includes the citation gate: a claim row in docs/security-claims.md
+may not name a proving test that is not in the tree. The already-dead citations
+are recorded in `KNOWN_STALE` (crates/sigil-doccheck/src/lib.rs), a list that
+must only shrink.
 
 `reference/op-remote/` is read-only prior art (wyattjoh's repo, own .git);
 never modify it.

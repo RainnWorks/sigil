@@ -1410,6 +1410,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sigil-doccheck"
+version = "0.1.0"
+
+[[package]]
 name = "sigil-proto"
 version = "0.1.0"
 dependencies = [
