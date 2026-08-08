@@ -2041,8 +2041,16 @@ mod tests {
     ///
     /// There is exactly ONE assignment of `Lease::id` in this file (the insert in
     /// `grant`), and nothing ever reassigns it; that is what makes the property
-    /// hold. If a future change adds continuity by reusing an id across re-grants,
-    /// this test fails and the phone's inference must be revisited with it.
+    /// hold.
+    ///
+    /// **Who breaks if this changes:** `leaseListReceived` in
+    /// `apps/phone/src/state/store.ts`, which settles a pending revoke when a
+    /// later snapshot omits the window. Its comment names this test, and this one
+    /// names it back, because the coupling is invisible from either side alone: a
+    /// reader here would not guess that a phone is reasoning from it, and a reader
+    /// there cannot see what pins it. If a future change adds continuity by
+    /// reusing an id across re-grants, this test fails FIRST and that code starts
+    /// lying second. The two must be revisited together.
     #[test]
     fn a_live_window_keeps_its_id_and_a_dead_one_never_lends_it_out() {
         let store = LeaseStore::new();
