@@ -170,10 +170,16 @@ export interface PendingRevoke {
   inFlight: boolean;
   /**
    * True once a reply window has passed with no answer, and STICKY thereafter: a
-   * retry does not clear it, only a confirmed reply or the window's own expiry
-   * does. The warning outlives the snapshot it came from, because a suppressed
-   * reply must never leave the human believing a window closed, and it must not
-   * blink out for the twenty seconds a retry is in flight either.
+   * retry does not clear it, and only a confirmed reply does. The window's own
+   * expiry does NOT clear this flag; it makes `revokeResolution` return "lapsed",
+   * which retires the DISPLAY and lets `clearLeaseSnapshot` drop the entry on
+   * blur. The distinction matters in this file: the flag records that a reply
+   * never came, which stays true forever, while the resolution records whether
+   * there is still anything to do about it.
+   *
+   * The warning outlives the snapshot it came from, because a suppressed reply
+   * must never leave the human believing a window closed, and it must not blink
+   * out for the twenty seconds a retry is in flight either.
    */
   unconfirmed: boolean;
 }

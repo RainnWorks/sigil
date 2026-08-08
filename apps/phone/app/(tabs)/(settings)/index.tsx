@@ -18,6 +18,7 @@ import {
   partitionRevokes,
   remainingSentence,
   REVOKE_FALLBACK_CAVEAT,
+  REVOKE_FALLBACK_LEAD,
   REVOKE_FALLBACK_LIST,
   REVOKE_FALLBACK_REVOKE,
   revokeNoteLine,
@@ -249,7 +250,11 @@ function LeaseSection({ view, history }: { view: LeaseView; history: HistoryEntr
         {standing.map((r, i) => (
           <View key={r.leaseId}>
             {i > 0 ? <Hairline inset={space.lg} /> : null}
-            <StandingRevoke revoke={r} now={now} />
+            <StandingRevoke
+              revoke={r}
+              retrying={revokeState(view, r.leaseId) === "retrying"}
+              now={now}
+            />
           </View>
         ))}
         {/* The Mac steps are hoisted below the last warning rather than repeated
@@ -287,8 +292,14 @@ function LeaseSection({ view, history }: { view: LeaseView; history: HistoryEntr
           <Sans size={13} tone={status.authoritative ? "muted" : "label"}>
             {status.line}
           </Sans>
+          {/* Muted, not faint: this line carries the doubt sentence ("That
+              snapshot has aged", "This phone cannot reach your Mac right now"),
+              and the tone inversion above makes the headline assert itself when
+              the phone is unsure. Leaving the explanation of that unsureness as
+              the dimmest text in the section undoes the inversion's whole point.
+              The DEMO caption below stays faint; that one is genuinely ambient. */}
           {status.detail ? (
-            <Sans size={12} tone="faint">
+            <Sans size={12} tone="muted">
               {status.detail}
             </Sans>
           ) : null}
@@ -339,15 +350,6 @@ function LeaseSection({ view, history }: { view: LeaseView; history: HistoryEntr
 }
 
 /**
- * A revoke that went out and was never answered. It names what it was about, when
- * it was sent, and the Mac-side steps that settle it for certain.
- *
- * The Mac command is a LITERAL placeholder, not an id printed from here:
- * `sigil lease revoke` is prefix matched, so an id that arrived truncated would
- * revoke everything while reporting success. The human reads the real one off
- * `sigil lease list` on the Mac, where it cannot have been mangled in transit.
- */
-/**
  * A revoke that went out and was never answered: the most important thing this
  * section can say, so it reads at full label weight rather than in the faint tone
  * the rest of the supporting copy uses. Brass stays on the ICON, where a colour
@@ -355,7 +357,15 @@ function LeaseSection({ view, history }: { view: LeaseView; history: HistoryEntr
  * on 14pt body text where it does not reach AA. Brass and not rust: an
  * unconfirmed revoke is pending, not denied.
  */
-function StandingRevoke({ revoke, now }: { revoke: PendingRevoke; now: number }) {
+function StandingRevoke({
+  revoke,
+  retrying,
+  now,
+}: {
+  revoke: PendingRevoke;
+  retrying: boolean;
+  now: number;
+}) {
   const p = useTheme();
   return (
     <View style={{ padding: space.lg, gap: 4 }}>
@@ -366,7 +376,7 @@ function StandingRevoke({ revoke, now }: { revoke: PendingRevoke; now: number })
         </Sans>
       </View>
       <Sans size={12} tone="muted">
-        {unconfirmedRevokeDetail(revoke, now)}
+        {unconfirmedRevokeDetail(revoke, now, retrying)}
       </Sans>
     </View>
   );
@@ -382,6 +392,9 @@ function StandingRevoke({ revoke, now }: { revoke: PendingRevoke; now: number })
 function MacFallback() {
   return (
     <View style={{ paddingHorizontal: space.lg, paddingBottom: space.lg, gap: 4 }}>
+      <Sans size={12} tone="muted">
+        {REVOKE_FALLBACK_LEAD}
+      </Sans>
       <Mono size={12} tone="muted" selectable>
         {REVOKE_FALLBACK_LIST}
       </Mono>

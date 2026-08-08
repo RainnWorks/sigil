@@ -144,11 +144,7 @@ export function asOfClock(asOfMs: number): string {
   return `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`;
 }
 
-/**
- * Where a revoke for one window stands. `"unconfirmed"` is the one that matters:
- * the revoke left this phone and nothing came back, so the window's state is
- * unknown and the screen must keep saying so.
- */
+/** The four states a revoke can be in; {@link revokeState} explains each. */
 export type RevokeState = "idle" | "sending" | "retrying" | "unconfirmed";
 
 /**
@@ -323,6 +319,7 @@ export function lapsedRevokeLine(revoke: PendingRevoke): string {
  * The human reads the real id off `sigil lease list` on the Mac, where it cannot
  * have been mangled in transit.
  */
+export const REVOKE_FALLBACK_LEAD = "To end a window for certain, on the Mac run:";
 export const REVOKE_FALLBACK_LIST = "sigil lease list";
 export const REVOKE_FALLBACK_REVOKE = "sigil lease revoke <prefix>";
 
@@ -347,9 +344,26 @@ export function unconfirmedRevokeLine(revoke: PendingRevoke): string {
   return `No reply about ${windowPhrase(revoke)}, so it may still be open.`;
 }
 
-/** When it was first sent, so the reader can tell a fresh silence from an old one. */
-export function unconfirmedRevokeDetail(revoke: PendingRevoke, nowMs: number): string {
-  return `Sent ${relativeTime(revoke.sentAt, nowMs)} with no reply. Tap Revoke again to retry, or end it on the Mac:`;
+/**
+ * When it was first sent, so the reader can tell a fresh silence from an old one,
+ * and what to do about it.
+ *
+ * The second half VARIES WITH THE CONTROL, because the earlier version did not
+ * and contradicted it: while a retry was in flight the card said "Tap Revoke
+ * again to retry" beside a disabled button already reading "Revoking". Keeping
+ * `sentAt` at the first attempt is right and makes that worse, since "Sent 4m ago
+ * with no reply" reads as nothing happening at the moment something is.
+ *
+ * Neither form ends in a colon: the Mac steps moved out to their own block with
+ * its own lead-in, so a trailing colon here would point at the next warning.
+ */
+export function unconfirmedRevokeDetail(
+  revoke: PendingRevoke,
+  nowMs: number,
+  retrying: boolean,
+): string {
+  const sent = `Sent ${relativeTime(revoke.sentAt, nowMs)} with no reply.`;
+  return retrying ? `${sent} Trying again now.` : `${sent} Tap Revoke again to retry.`;
 }
 
 /** One row's second line: what the window covers, in the daemon's words. */

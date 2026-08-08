@@ -36,6 +36,7 @@ import {
   mergeRevoke,
   partitionRevokes,
   REVOKE_FALLBACK_CAVEAT,
+  REVOKE_FALLBACK_LEAD,
   REVOKE_FALLBACK_LIST,
   REVOKE_FALLBACK_REVOKE,
   lapsedRevokeLine,
@@ -558,11 +559,24 @@ function main(): void {
       unconfirmedRevokeLine(revoke({ scope: null })).includes("that window"),
       "a warning with no rule name still reads as a sentence",
     );
-    // The detail offers the retry first, since it is the cheap path.
-    ok(
-      unconfirmedRevokeDetail(revoke({ unconfirmed: true }), NOW).includes("Tap Revoke again"),
-      "the detail names the retry",
-    );
+    // MUST FIX A. The detail line has to agree with the control beside it. While
+    // a retry is in flight the button is disabled and reads "Revoking", so
+    // telling the human to tap it would point at a dead control that already says
+    // it is working. And because sentAt stays at the first attempt, "Sent 4m ago
+    // with no reply" alone reads as nothing happening while something is.
+    const idleDetail = unconfirmedRevokeDetail(revoke({ unconfirmed: true }), NOW, false);
+    ok(idleDetail.includes("Tap Revoke again"), "idle offers the retry");
+    const retryDetail = unconfirmedRevokeDetail(revoke({ unconfirmed: true }), NOW, true);
+    ok(retryDetail.includes("Trying again now"), "retrying says work is happening");
+    ok(!retryDetail.includes("Tap Revoke again"), "and never points at the disabled control");
+    // Neither form may end in a colon: the Mac steps moved to their own block, so
+    // a trailing colon would point at whatever renders next, which with two
+    // standing warnings is the other warning.
+    ok(!idleDetail.trimEnd().endsWith(":"), "idle detail does not dangle a colon");
+    ok(!retryDetail.trimEnd().endsWith(":"), "retrying detail does not dangle a colon");
+    // MUST FIX B. The hoisted block carries the lead-in the per-warning line lost.
+    ok(REVOKE_FALLBACK_LEAD.trimEnd().endsWith(":"), "the Mac block introduces its commands");
+    ok(REVOKE_FALLBACK_LEAD.includes("on the Mac"), "and says where they are run");
 
     // The Mac fallback names a placeholder, never an id from here: the CLI's
     // revoke is prefix matched, so a truncated id would revoke everything.
@@ -601,6 +615,9 @@ function main(): void {
         .flatMap((s) => [s.line, s.detail ?? ""]),
       unconfirmedRevokeLine(revoke({ unconfirmed: true })),
       lapsedRevokeLine(revoke({ unconfirmed: true })),
+      unconfirmedRevokeDetail(revoke({ unconfirmed: true }), NOW, false),
+      unconfirmedRevokeDetail(revoke({ unconfirmed: true }), NOW, true),
+      REVOKE_FALLBACK_LEAD,
       REVOKE_FALLBACK_CAVEAT,
       REVOKE_FALLBACK_LIST,
       REVOKE_FALLBACK_REVOKE,
