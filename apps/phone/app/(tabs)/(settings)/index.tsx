@@ -12,15 +12,18 @@ import { usePushDiag } from "@/src/lib/push";
 import { refreshLeases, revokeLease, unpair } from "@/src/session/controller";
 import {
   coverageSentence,
-  LEASE_POLL_MS,
   leaseListStatus,
   liveLeases,
   remainingSentence,
-  revokeFallback,
+  REVOKE_FALLBACK_LIST,
+  REVOKE_FALLBACK_REVOKE,
   revokeNoteLine,
   revokeState,
+  unconfirmedRevokeDetail,
+  unconfirmedRevokeLine,
+  unconfirmedRevokes,
 } from "@/src/domain/leases";
-import { type ActiveLease, type LeaseView } from "@/src/domain/types";
+import { type ActiveLease, type LeaseView, type PendingRevoke } from "@/src/domain/types";
 import { DEMO, store, useAppState } from "@/src/state/store";
 
 /**
@@ -175,16 +178,22 @@ export default function SettingsScreen() {
 }
 
 /**
- * The active-lease list: what the daemon says is open, and the control that ends
- * one. The rules this screen is built around, all of them non-negotiable:
+ * The active-lease list: a snapshot of what the daemon says is open, and the
+ * control that ends one. The rules this screen is built around, none negotiable:
  *
- *   - It never says "No active leases" without a fresh successful answer. The
+ *   - It never says "No active leases" without a fresh successful snapshot. The
  *     three no-list situations (never asked, cannot ask, asked and got none) read
  *     as three different sentences, because they are three different facts.
+ *   - What it shows is a snapshot and it says so, stamped with the daemon's own
+ *     time and visibly ageing, rather than sitting there implying it still
+ *     describes the Mac.
  *   - A revoke never clears its row optimistically. The row stays, in flight,
- *     until the daemon confirms; if nothing comes back it says the window may
- *     still be open and names the Mac-side fallback. A relay that drops one
- *     message must not be able to buy the claim that a window closed.
+ *     until a reply CORRELATED to that exact request arrives; if nothing comes
+ *     back it becomes a standing warning that outlives this screen. Failing here
+ *     means failing toward "the window may still be open", never toward a
+ *     clean-looking list.
+ *   - Asking costs a biometric, because a pulled list is a schedule of what will
+ *     release without a tap. Revoking costs nothing, because it is a deny.
  *   - A row that runs out of time simply goes. That is not a revoke and is never
  *     reported as one.
  */
@@ -192,43 +201,56 @@ function LeaseSection({ view }: { view: LeaseView }) {
   const p = useTheme();
   const [now, setNow] = useState(() => Date.now());
 
-  // Everything here is gated on focus, and both halves matter. The poll keeps the
-  // list a live account of the daemon rather than a snapshot whose age the human
-  // has to guess, which is what lets the copy say "no active leases" at all. The
-  // tick drives the "checked N ago" wording and drops rows whose window has run
-  // out; a lapsed row leaving is arithmetic on the daemon's own number, never a
-  // claim that anything was revoked.
+  // One clock while the screen is up: it ages the snapshot wording and drops rows
+  // whose window has run out. A lapsed row leaving is arithmetic on the daemon's
+  // own number, never a claim that anything was revoked.
+  //
+  // There is deliberately NO polling. Asking passes a biometric, so the list is
+  // an explicit one-shot pull rather than a live view, and on leaving the screen
+  // the snapshot is thrown away: a held enumeration of live auto-approve windows
+  // should not outlive the moment someone chose to look at it.
   useFocusEffect(
     useCallback(() => {
       setNow(Date.now());
-      void refreshLeases();
-      const poll = setInterval(() => void refreshLeases(), LEASE_POLL_MS);
       const tick = setInterval(() => {
         const t = Date.now();
         setNow(t);
         store.expireLeases(t);
       }, 1000);
       return () => {
-        clearInterval(poll);
         clearInterval(tick);
+        store.clearLeaseSnapshot();
       };
     }, []),
   );
 
   const rows = liveLeases(view, now);
   const status = leaseListStatus(view, now);
+  const warnings = unconfirmedRevokes(view);
 
   return (
     <View>
       <SectionHeader>Active leases</SectionHeader>
       <Card>
-        {rows.map((l, i) => (
-          <View key={l.instance}>
+        {/* Standing warnings first, and above the rows on purpose: an unresolved
+            revoke is the most important thing this screen can be saying, and it
+            has to survive the snapshot that produced it being thrown away. */}
+        {warnings.map((r, i) => (
+          <View key={r.requestId}>
             {i > 0 ? <Hairline inset={space.lg} /> : null}
-            <LeaseRow lease={l} state={revokeState(view, l.instance)} />
+            <UnconfirmedRevoke revoke={r} now={now} />
+          </View>
+        ))}
+        {warnings.length > 0 ? <Hairline inset={space.lg} /> : null}
+
+        {rows.map((l, i) => (
+          <View key={l.leaseId}>
+            {i > 0 ? <Hairline inset={space.lg} /> : null}
+            <LeaseRow lease={l} state={revokeState(view, l.leaseId)} />
           </View>
         ))}
         {rows.length > 0 ? <Hairline inset={space.lg} /> : null}
+
         <View style={{ padding: space.lg, gap: 4 }}>
           <Sans size={13} tone={status.authoritative ? "muted" : "label"}>
             {status.line}
@@ -249,18 +271,58 @@ function LeaseSection({ view }: { view: LeaseView }) {
             </Sans>
           ) : null}
         </View>
+
         <Hairline inset={space.lg} />
         <Pressable
           onPress={() => void refreshLeases()}
           disabled={view.asking}
           style={{ flexDirection: "row", alignItems: "center", gap: space.md, padding: space.lg }}
         >
-          <Sf name="arrow.clockwise" color={view.asking ? p.faint : p.cobalt} size={16} />
+          <Sf
+            name={view.answeredAt > 0 ? "arrow.clockwise" : "faceid"}
+            color={view.asking ? p.faint : p.cobalt}
+            size={16}
+          />
           <Sans size={16} style={{ flex: 1, color: view.asking ? p.faint : p.cobalt }}>
-            {view.asking ? "Checking" : "Check again"}
+            {view.asking ? "Checking" : view.answeredAt > 0 ? "Check again" : "Show active leases"}
           </Sans>
         </Pressable>
       </Card>
+    </View>
+  );
+}
+
+/**
+ * A revoke that went out and was never answered. It names what it was about, when
+ * it was sent, and the Mac-side steps that settle it for certain.
+ *
+ * The Mac command is a LITERAL placeholder, not an id printed from here:
+ * `sigil lease revoke` is prefix matched, so an id that arrived truncated would
+ * revoke everything while reporting success. The human reads the real one off
+ * `sigil lease list` on the Mac, where it cannot have been mangled in transit.
+ */
+function UnconfirmedRevoke({ revoke, now }: { revoke: PendingRevoke; now: number }) {
+  const p = useTheme();
+  return (
+    <View style={{ padding: space.lg, gap: 4 }}>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
+        <Sf name="exclamationmark.triangle" color={p.brass} size={15} />
+        <Sans size={14} style={{ flex: 1, color: p.brass }}>
+          {unconfirmedRevokeLine(revoke)}
+        </Sans>
+      </View>
+      <Sans size={12} tone="faint">
+        {unconfirmedRevokeDetail(revoke, now)}
+      </Sans>
+      <Mono size={12} tone="faint" selectable>
+        {REVOKE_FALLBACK_LIST}
+      </Mono>
+      <Sans size={12} tone="faint">
+        then end the window it shows:
+      </Sans>
+      <Mono size={12} tone="faint" selectable>
+        {REVOKE_FALLBACK_REVOKE}
+      </Mono>
     </View>
   );
 }
@@ -273,28 +335,29 @@ function LeaseRow({
   state: "idle" | "sending" | "unconfirmed";
 }) {
   const p = useTheme();
-  const { remainingMs } = useCountdown(lease.expiresAt, lease.expiresAt - lease.grantedAt);
+  const { remainingMs } = useCountdown(lease.expiresAt, lease.windowMs);
   return (
     <View style={{ padding: space.lg, gap: 4 }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: space.md }}>
         <Mono size={14} weight="medium" style={{ flex: 1 }}>
           {lease.scope ?? "unnamed rule"}
         </Mono>
-        {/* No confirmation step, deliberately. Revoking can only narrow what the
-            Mac will serve, so it is the safe direction, and the deny control set
-            the precedent that refusing is never made heavier than allowing. An
-            accidental revoke costs one extra approval; a confirmation sheet costs
-            time at exactly the moment someone wants a window shut. */}
+        {/* No confirmation step and no biometric, deliberately. Revoking can only
+            narrow what the Mac will serve, so it is the safe direction, and the
+            deny control set the precedent that refusing is never made heavier
+            than allowing. An accidental revoke costs one extra approval; a
+            confirmation sheet costs time at exactly the moment someone wants a
+            window shut. */}
         <Pressable
-          onPress={() => void revokeLease(lease.grantHex, lease.instance)}
-          disabled={state === "sending"}
+          onPress={() => void revokeLease(lease.leaseId, lease.scope)}
+          disabled={state !== "idle"}
         >
-          <Sans size={15} style={{ color: state === "sending" ? p.faint : p.deny }}>
-            {state === "sending" ? "Revoking" : "Revoke"}
+          <Sans size={15} style={{ color: state === "idle" ? p.deny : p.faint }}>
+            {state === "idle" ? "Revoke" : "Revoking"}
           </Sans>
         </Pressable>
       </View>
-      {/* The scope is a RULE name, and one lease covers every command that rule
+      {/* The scope is a RULE name, and one window covers every command that rule
           matches for the caller that opened it. The row says so outright rather
           than letting a rule name read as a command line, and states the breadth
           in the daemon's own words (the same string the approval sheet's caption
@@ -305,19 +368,6 @@ function LeaseRow({
       <Mono size={12} tone="faint">
         {remainingSentence(lease, remainingMs)}
       </Mono>
-      {state === "unconfirmed" ? (
-        <View style={{ gap: 2, marginTop: 4 }}>
-          <Sans size={12} style={{ color: p.brass }}>
-            No reply from your Mac, so this window may still be open.
-          </Sans>
-          <Sans size={12} tone="faint">
-            To be certain it is closed, run this on the Mac:
-          </Sans>
-          <Mono size={12} tone="faint" selectable>
-            {revokeFallback(lease.grantHex)}
-          </Mono>
-        </View>
-      ) : null}
     </View>
   );
 }

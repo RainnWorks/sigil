@@ -34,6 +34,7 @@ import { faceGate } from "@/src/lib/biometric";
 import { LEASE_REPLY_TIMEOUT_MS } from "@/src/domain/leases";
 import { store } from "@/src/state/store";
 import { PhoneRelay } from "@/src/transport/phone-relay";
+import { type OutstandingKind, OutstandingRequests } from "./outstanding";
 import { type LeaseControlReply, SigilSession } from "./session";
 import { clearPairing, loadPairing, type StoredPairing } from "./keystore";
 
@@ -162,132 +163,165 @@ export async function nudgeTransport(): Promise<void> {
 // ---- lease control ---------------------------------------------------------
 //
 // The phone half of PHONE LEASE CONTROL: ask the daemon what windows are open,
-// and end one. Both are READ-PATH actions. Listing releases nothing, and revoking
-// only ever narrows authority, so neither passes the biometric: the Face ID gate
-// belongs to release (invariant #4), and putting it in front of the control that
-// CLOSES a window would make containment heavier than consent, which is the same
-// mistake as making deny heavier than approve.
+// and end one.
 //
-// The reply timers live here rather than in the store, because this module is
-// what asked the question. Their whole job is to decide the moment silence has to
-// be reported as silence: a relay that drops the answer must leave the human
-// looking at "this window may still be open", never at a closed row.
+// The two halves are gated differently, and the asymmetry is the point.
+// LISTING passes a local biometric (design review F5). It releases nothing, but
+// it changes what a stolen or coerced phone can produce on demand: a complete
+// schedule of which auto-approve windows are live, on which rules, and how many
+// seconds each has left, which is a map of what will release with no human tap.
+// REVOKING is completely ungated, because a revoke is a deny, it can only ever
+// narrow what the Mac will serve, and a deny is never made heavier than an
+// approve.
+//
+// CORRELATION IS THE SECURITY PROPERTY HERE, not bookkeeping (design review F3).
+// The envelope layer no longer gates on the counter; its replay protection is a
+// freshness window plus a single-use id set held in RAM on both ends, and that
+// set is empty again after any restart. A phone being killed or backgrounded is
+// routine. So a relay can capture a genuine LeaseRevokeReply{revoked:true}, wait
+// out a restart, suppress the human's next outgoing revoke, and deliver the
+// captured reply into a fresh guard: unseen id, valid signature, inside the
+// freshness window, because the message really is genuine. Without the map
+// below, the phone would tell the human a window closed while it is open, which
+// is strictly worse than the "revoke on your Mac" badge this feature replaced.
+//
+// So: every outbound question is recorded here under the envelope request id it
+// was sent with, a reply is applied ONLY if it names an outstanding one, and the
+// entry is CONSUMED on the match. The map dies with the process, which is exactly
+// what makes a captured reply replayed into a fresh session match nothing.
 
-// The correlation ids this phone is currently waiting on. A reply that names an
-// id we did not send is dropped: the daemon's contract says so, and it is what
-// keeps a late answer to a previous screen-open from repainting a newer list.
-let pendingListQueryId: string | null = null;
-let leaseListTimer: ReturnType<typeof setTimeout> | null = null;
-const leaseRevokeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+// The questions this session has asked and not yet had answered. See
+// OutstandingRequests for why this is the security mechanism rather than
+// bookkeeping. Timers ride alongside, keyed by the same id.
+const outstanding = new OutstandingRequests();
+const leaseTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function armLeaseTimer(requestId: string, onLapse: () => void): void {
+  leaseTimers.set(
+    requestId,
+    setTimeout(() => {
+      leaseTimers.delete(requestId);
+      outstanding.abandon(requestId);
+      onLapse();
+    }, LEASE_REPLY_TIMEOUT_MS),
+  );
+}
 
 function clearLeaseTimers(): void {
-  if (leaseListTimer) clearTimeout(leaseListTimer);
-  leaseListTimer = null;
-  pendingListQueryId = null;
-  for (const t of leaseRevokeTimers.values()) clearTimeout(t);
-  leaseRevokeTimers.clear();
-}
-
-function newQueryId(): string {
-  return crypto.randomUUID();
-}
-
-/** Route a verified answer to the store and stand its timer down. */
-function handleLeaseReply(msg: LeaseControlReply): void {
-  if (msg.kind === "leaseList") {
-    // An unsolicited or superseded answer changes nothing on screen.
-    if (msg.reply.queryId !== pendingListQueryId) return;
-    pendingListQueryId = null;
-    if (leaseListTimer) clearTimeout(leaseListTimer);
-    leaseListTimer = null;
-    store.leaseListReceived(msg.reply.leases, Date.now());
-    return;
-  }
-  const { queryId } = msg.reply;
-  const t = leaseRevokeTimers.get(queryId);
-  if (!t) return; // not a revoke this phone is waiting on
-  clearTimeout(t);
-  leaseRevokeTimers.delete(queryId);
-  store.leaseRevokeConfirmed(queryId, msg.reply.revoked, Date.now());
-  // The daemon's own guidance: a revoke is idempotent, so re-list rather than
-  // treat one verdict as the new state of the world.
-  void refreshLeases();
+  for (const t of leaseTimers.values()) clearTimeout(t);
+  leaseTimers.clear();
+  outstanding.clear();
 }
 
 /**
- * Ask the daemon for its live lease windows. Unarmed or a failed send both land
- * in "cannot check right now": the phone records that it could not ask, and never
- * that there is nothing to see. Resolves once the question has left the device;
- * the answer arrives later through {@link handleLeaseReply}.
+ * Claim an outstanding request, standing its timer down. False is the drop path,
+ * and it is silent: an uncorrelated reply is not evidence about anything, so it
+ * must not move the UI in either direction.
  */
-export async function refreshLeases(): Promise<void> {
-  if (!live) {
-    store.leaseQueryFailed();
+function claim(inReplyTo: string, kind: OutstandingKind): boolean {
+  if (!outstanding.claim(inReplyTo, kind)) return false;
+  const t = leaseTimers.get(inReplyTo);
+  if (t) clearTimeout(t);
+  leaseTimers.delete(inReplyTo);
+  return true;
+}
+
+/** Route a correlated answer to the store. Anything uncorrelated is dropped. */
+function handleLeaseReply(msg: LeaseControlReply): void {
+  if (msg.kind === "leaseList") {
+    if (!claim(msg.reply.inReplyTo, "list")) return;
+    store.leaseListReceived(msg.reply.leases, msg.reply.asOf, Date.now());
     return;
   }
-  const queryId = newQueryId();
+  if (!claim(msg.reply.inReplyTo, "revoke")) return;
+  store.leaseRevokeConfirmed(msg.reply.inReplyTo, msg.reply.revoked, Date.now());
+}
+
+export type LeaseQueryOutcome = "asked" | "refused" | "no-biometric" | "cannot-ask";
+
+/**
+ * Ask the daemon for a snapshot of its live windows, behind the biometric.
+ *
+ * A declined biometric returns "refused" and changes nothing: no question was
+ * asked, so nothing new is unknown, and the screen must not raise "cannot check
+ * right now" over it. Unarmed or a failed send land in "cannot ask": the phone
+ * records that it could not ask, never that there is nothing to see. Resolves
+ * once the question has left the device; the answer arrives later through
+ * {@link handleLeaseReply}.
+ */
+export async function refreshLeases(): Promise<LeaseQueryOutcome> {
+  if (!live) {
+    store.leaseQueryFailed();
+    return "cannot-ask";
+  }
+  // The gate goes BEFORE the send, so a declined check leaks nothing: no
+  // question reaches the daemon and no answer is ever in flight.
+  const gate = await faceGate("Show active leases");
+  if (!gate.ok) {
+    // No biometric enrolled is a different fact from a declined one, and the
+    // screen says so rather than looking broken: this device cannot show the
+    // list at all, and the Mac is where to look instead. Fail closed either way.
+    store.leaseQueryCancelled(gate.reason === "unavailable");
+    return gate.reason === "unavailable" ? "no-biometric" : "refused";
+  }
   store.leaseQueryStarted();
+  let requestId: string;
   try {
-    await live.session.sendToDaemon<LeaseListMessage>({ type: "leaseList", queryId });
+    requestId = await live.session.sendToDaemon<LeaseListMessage>({ type: "leaseList" });
   } catch (e) {
     console.warn(`[lease] list request failed: ${errText(e)}`);
     store.leaseQueryFailed();
-    return;
+    return "cannot-ask";
   }
-  pendingListQueryId = queryId;
+  outstanding.issue(requestId, "list");
+  armLeaseTimer(requestId, () => store.leaseQueryFailed());
   // Hurry the answer down the ladder rather than waiting out the poll backstop.
   void live.transport.wake();
-  if (leaseListTimer) clearTimeout(leaseListTimer);
-  leaseListTimer = setTimeout(() => {
-    leaseListTimer = null;
-    // Only report silence if this is still the question we are waiting on.
-    if (pendingListQueryId !== queryId) return;
-    pendingListQueryId = null;
-    store.leaseQueryFailed();
-  }, LEASE_REPLY_TIMEOUT_MS);
+  return "asked";
 }
 
 /**
- * Revoke ONE live window, named by both identifiers the daemon sent for it. The
- * `instance` is what binds the revoke to the window the human actually read: a
- * grant key is stable across windows, so naming it alone could land on a window
- * granted after they looked.
+ * Revoke ONE live window by the opaque id the daemon sent for it. No biometric
+ * and no confirmation: revoking is a deny, and a deny is never made heavier than
+ * an approve.
  *
- * The row is NOT cleared here. It is marked in flight and stays put until the
- * daemon confirms, or until the reply window lapses and it is marked unconfirmed.
- * Optimistically clearing it would let a hostile or broken relay buy the claim
- * that a window closed simply by dropping one message, and the brief cites this
- * list as the containment for a rule-wide window.
+ * The row is NOT cleared here. It is marked in flight and stays put until a
+ * CORRELATED reply arrives, or until the reply window lapses and it becomes a
+ * standing warning that outlives the snapshot. Optimistically clearing it would
+ * let a relay buy the claim that a window closed simply by dropping one message,
+ * and the brief cites this list as the containment for a rule-wide window.
+ *
+ * `scope` is carried only so a standing warning can name what it is about after
+ * the snapshot behind it has been thrown away.
  */
-export async function revokeLease(grantHex: string, instance: string): Promise<void> {
-  const queryId = newQueryId();
+export async function revokeLease(leaseId: string, scope: string | null): Promise<void> {
   const sentAt = Date.now();
-  store.leaseRevokeStarted({ queryId, grantHex, instance, sentAt, unconfirmed: false });
+  // A revoke that never left the device still needs an id to key its warning by,
+  // and it must be one no reply can ever name: the prefix keeps it out of the
+  // uuid shape `inReplyTo` is validated against, so nothing can confirm it.
+  const unsent = `unsent:${crypto.randomUUID()}`;
   if (!live) {
-    // Nothing left the device, so nothing can be assumed about the window.
-    store.leaseRevokeUnconfirmed(queryId);
+    // Nothing left the device, so nothing can be assumed about the window. It is
+    // recorded as an unconfirmed revoke, not as a failure to send, because from
+    // the human's side those have the same consequence: unknown, so assume open.
+    store.leaseRevokeStarted({ requestId: unsent, leaseId, scope, sentAt, unconfirmed: true });
     return;
   }
+  let requestId: string;
   try {
-    await live.session.sendToDaemon<LeaseRevokeMessage>({
+    requestId = await live.session.sendToDaemon<LeaseRevokeMessage>({
       type: "leaseRevoke",
-      queryId,
-      grantHex,
-      instance,
+      leaseId,
     });
   } catch (e) {
     console.warn(`[lease] revoke dispatch failed: ${errText(e)}`);
-    store.leaseRevokeUnconfirmed(queryId);
+    store.leaseRevokeStarted({ requestId: unsent, leaseId, scope, sentAt, unconfirmed: true });
     return;
   }
+  store.leaseRevokeStarted({ requestId, leaseId, scope, sentAt, unconfirmed: false });
+  outstanding.issue(requestId, "revoke");
+  armLeaseTimer(requestId, () => store.leaseRevokeUnconfirmed(requestId));
   void live.transport.wake();
-  leaseRevokeTimers.set(
-    queryId,
-    setTimeout(() => {
-      leaseRevokeTimers.delete(queryId);
-      store.leaseRevokeUnconfirmed(queryId);
-    }, LEASE_REPLY_TIMEOUT_MS),
-  );
 }
 
 export type ApproveOutcome = "sent" | "refused" | "no-session" | "error";

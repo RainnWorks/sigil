@@ -1,31 +1,44 @@
 /**
  * Unit checks for the lease list's honesty rules: which sentence the settings
- * screen is entitled to say, what a wire answer turns into, and what the phone
- * refuses to believe.
+ * screen is entitled to say, what a wire snapshot turns into, what the phone
+ * refuses to believe, and the correlation that stops a captured reply from
+ * confirming a revoke that never happened.
  *
- * These are pinned here rather than left to a device pass because the failure
- * they guard against is silent. A list that renders beautifully while saying "No
+ * These are pinned here rather than left to a device pass because the failures
+ * they guard against are silent. A list that renders beautifully while saying "No
  * active leases" to a phone that cannot reach the daemon looks exactly like a
- * working list, and the brief cites this surface as the containment for a
- * rule-wide window.
+ * working list, and a revoke that reports success on a replayed reply looks
+ * exactly like a revoke.
  *
  * House style matches src/lib/format.selftest.ts: a plain `bun run` script with
  * an `ok()` harness (no `bun:test`, so tsc stays clean and no new dep).
  * Run: `bun run src/domain/leases.selftest.ts`.
  */
-import { classifyToPhone, type LeaseRow, parseLeaseListReply } from "../protocol/requests";
-import { LABEL_REJECTED } from "../lib/format";
 import {
+  classifyToPhone,
+  LEASE_ID_CHARS,
+  type LeaseRow,
+  parseLeaseListReply,
+  parseLeaseRevokeReply,
+} from "../protocol/requests";
+import { LABEL_REJECTED } from "../lib/format";
+import { OutstandingRequests } from "../session/outstanding";
+import {
+  asOfClock,
   emptyLeaseView,
-  LEASE_ANSWER_FRESH_MS,
+  LEASE_SNAPSHOT_FRESH_MS,
   leaseListStatus,
   liveLeases,
-  revokeFallback,
+  REVOKE_FALLBACK_LIST,
+  REVOKE_FALLBACK_REVOKE,
   revokeNoteLine,
   revokeState,
+  snapshotFresh,
   toActiveLeases,
+  unconfirmedRevokeLine,
+  unconfirmedRevokes,
 } from "./leases";
-import { type LeaseView } from "./types";
+import { type LeaseView, type PendingRevoke } from "./types";
 
 let failures = 0;
 function eq<T>(a: T, b: T, label: string): void {
@@ -41,28 +54,24 @@ function ok(cond: boolean, label: string): void {
 }
 
 const NOW = 1_700_000_000_000;
-// Exactly-width identifiers: the daemon promises 64 hex for a grant key and 32
-// for a window instance, and the phone treats any other width as malformed.
+/** 128 opaque bits as 32 lowercase hex: the exact width the daemon promises. */
+const LEASE = "0f1e2d3c4b5a6978".repeat(2);
+const LEASE2 = "1122334455667788".repeat(2);
+const REQ = "0192f0a1-b2c3-7d4e-8f90-1a2b3c4d5e6f";
+const REQ2 = "0192f0a1-b2c3-7d4e-8f90-aabbccddeeff";
+/** A grant key width, which must never appear on this surface at all. */
 const GRANT = "a1b2c3d4e5f60718".repeat(4);
-const INST = "0f1e2d3c4b5a6978".repeat(2);
-const INST2 = "1122334455667788".repeat(2);
-const QUERY = "q-0001";
 
 function row(over: Partial<LeaseRow> = {}): LeaseRow {
-  return {
-    grantHex: GRANT,
-    instance: INST,
-    scope: "op-eu",
-    covers: "",
-    account: "",
-    remainingMs: 600_000,
-    ageMs: 60_000,
-    ...over,
-  };
+  return { leaseId: LEASE, scope: "op-eu", covers: "", account: "", remainingMs: 600_000, ...over };
 }
 
 function view(over: Partial<LeaseView> = {}): LeaseView {
   return { ...emptyLeaseView(), ...over };
+}
+
+function revoke(over: Partial<PendingRevoke> = {}): PendingRevoke {
+  return { requestId: REQ, leaseId: LEASE, scope: "op-eu", sentAt: NOW, unconfirmed: false, ...over };
 }
 
 function main(): void {
@@ -71,6 +80,7 @@ function main(): void {
     const never = leaseListStatus(view(), NOW);
     eq(never.kind, "never", "never asked");
     eq(never.line, "Not checked yet.", "never asked line");
+    ok(never.detail?.includes("Face ID") ?? false, "never asked says asking costs a biometric");
     ok(!never.authoritative, "never asked is not authoritative");
 
     const asking = leaseListStatus(view({ asking: true }), NOW);
@@ -83,24 +93,34 @@ function main(): void {
     ok(!cannot.authoritative, "unreachable is not authoritative");
     // The whole point: this state must never produce the empty-list sentence.
     ok(!cannot.line.startsWith("No active leases"), "unreachable never claims emptiness");
+
+    // A device with no enrolled biometric cannot ask at all, which is a dead end
+    // rather than a fault in the link, and reads as one.
+    const noBio = leaseListStatus(view({ noBiometric: true }), NOW);
+    eq(noBio.line, "Cannot check from this device.", "no biometric enrolled");
+    ok(noBio.detail?.includes("sigil lease list") ?? false, "and names the Mac instead");
+    ok(!noBio.authoritative, "no biometric is not authoritative");
   }
 
   console.log("leaseListStatus (an empty list is a claim that has to be earned)");
   {
-    const fresh = leaseListStatus(view({ answeredAt: NOW - 1_000 }), NOW);
-    eq(fresh.kind, "empty", "fresh answer, no rows");
+    const answered = { answeredAt: NOW - 1_000, asOf: NOW - 1_000 };
+    const fresh = leaseListStatus(view(answered), NOW);
+    eq(fresh.kind, "empty", "fresh snapshot, no rows");
     eq(fresh.line, "No active leases.", "fresh empty line");
-    ok(fresh.authoritative, "a fresh answer is authoritative");
+    ok(fresh.detail?.startsWith("Snapshot as of ") ?? false, "fresh empty stamps the snapshot");
+    ok(fresh.authoritative, "a fresh snapshot is authoritative");
 
-    // Same answer, one tick past the freshness window: the sentence weakens.
-    const old = leaseListStatus(view({ answeredAt: NOW - LEASE_ANSWER_FRESH_MS - 1 }), NOW);
-    eq(old.line, "No active leases when this phone last checked.", "stale empty line");
-    ok(!old.authoritative, "a stale answer is not authoritative");
+    // One tick past the freshness window: the sentence weakens and dates itself.
+    const agedAt = NOW - LEASE_SNAPSHOT_FRESH_MS - 1;
+    const old = leaseListStatus(view({ answeredAt: agedAt, asOf: agedAt }), NOW);
+    eq(old.line, `No active leases as of ${asOfClock(agedAt)}.`, "stale empty line dates itself");
+    ok(!old.authoritative, "a stale snapshot is not authoritative");
+    ok(old.detail?.includes("Check again") ?? false, "a stale snapshot says what to do");
 
-    // A recent answer plus a failed query since: also not authoritative, because
-    // the world may have moved and this phone would not have heard.
-    const broken = leaseListStatus(view({ answeredAt: NOW - 1_000, unreachable: true }), NOW);
-    eq(broken.line, "No active leases when this phone last checked.", "unreachable weakens a fresh answer");
+    // A recent snapshot plus a failed query since: also not authoritative,
+    // because the world may have moved and this phone would not have heard.
+    const broken = leaseListStatus(view({ ...answered, unreachable: true }), NOW);
     ok(!broken.authoritative, "unreachable is never authoritative");
     ok(
       broken.detail?.includes("cannot reach your Mac right now") ?? false,
@@ -108,32 +128,43 @@ function main(): void {
     );
   }
 
+  console.log("snapshot freshness (10s, measured locally, not on the daemon's clock)");
+  {
+    ok(!snapshotFresh(view(), NOW), "never answered is never fresh");
+    ok(snapshotFresh(view({ answeredAt: NOW - 9_000, asOf: NOW }), NOW), "9s old is fresh");
+    ok(!snapshotFresh(view({ answeredAt: NOW - 11_000, asOf: NOW }), NOW), "11s old is stale");
+    // A daemon clock running fast must not be able to refresh an old snapshot.
+    ok(
+      !snapshotFresh(view({ answeredAt: NOW - 60_000, asOf: NOW + 3_600_000 }), NOW),
+      "a future asOf cannot make an old snapshot look current",
+    );
+    eq(asOfClock(new Date(2026, 0, 2, 14, 3, 7).getTime()), "14:03:07", "asOf renders as a clock");
+  }
+
   console.log("leaseListStatus (rows)");
   {
     const rows = toActiveLeases([row()], NOW);
-    const fresh = leaseListStatus(view({ rows, answeredAt: NOW }), NOW);
+    const fresh = leaseListStatus(view({ rows, answeredAt: NOW, asOf: NOW }), NOW);
     eq(fresh.kind, "rows", "fresh rows");
-    eq(fresh.line, "Checked just now.", "fresh rows say when");
+    eq(fresh.line, `Snapshot as of ${asOfClock(NOW)}.`, "fresh rows stamp the snapshot");
     ok(fresh.detail === undefined, "fresh rows need no caveat");
 
-    const stale = leaseListStatus(
-      view({ rows, answeredAt: NOW - LEASE_ANSWER_FRESH_MS - 60_000 }),
-      NOW,
-    );
-    eq(stale.detail, "This may be out of date.", "stale rows carry a caveat");
+    const agedAt = NOW - LEASE_SNAPSHOT_FRESH_MS - 60_000;
+    const stale = leaseListStatus(view({ rows, answeredAt: agedAt, asOf: agedAt }), NOW);
+    ok(stale.detail?.includes("Check again") ?? false, "stale rows carry a caveat");
 
     // Rows that have all run out read as an empty list, not as rows.
-    const lapsed = leaseListStatus(view({ rows, answeredAt: NOW }), NOW + 600_001);
+    const lapsed = leaseListStatus(view({ rows, answeredAt: NOW, asOf: NOW }), NOW + 600_001);
     eq(lapsed.kind, "empty", "every row lapsed");
   }
 
-  console.log("toActiveLeases (stamping the daemon's durations onto this clock)");
+  console.log("toActiveLeases (stamping the daemon's snapshot onto this clock)");
   {
     const [l] = toActiveLeases([row()], NOW);
     ok(l !== undefined, "one row in, one row out");
+    eq(l!.leaseId, LEASE, "the opaque window id is the row identity");
     eq(l!.expiresAt, NOW + 600_000, "expiry is arrival plus remaining");
-    eq(l!.grantedAt, NOW - 60_000, "granted is arrival minus age");
-    eq(l!.instance, INST, "the window id is carried through as the row identity");
+    eq(l!.windowMs, 600_000, "the countdown scale is remaining-on-arrival");
     eq(l!.scope, "op-eu", "scope survives the allowlist");
     eq(l!.covers, null, "an empty covers is null, never an empty gap");
     eq(l!.account, null, "an empty account is null");
@@ -141,109 +172,148 @@ function main(): void {
     // Already lapsed on arrival: dropped rather than rendered at zero.
     eq(toActiveLeases([row({ remainingMs: 0 })], NOW).length, 0, "expired row dropped");
 
-    // The daemon sanitizes first; this pass is defence in depth, exactly as the
-    // approval sheet's coverage caption does it.
-    const nasty = toActiveLeases([row({ scope: "op‮eu" })], NOW);
+    // scope and account are raw config text the user wrote, so the daemon
+    // sanitizes and this pass repeats it. Defence in depth, not ceremony.
+    const nasty = toActiveLeases([row({ scope: "op‮eu", account: "prod​vault" })], NOW);
     eq(nasty[0]!.scope, `op${LABEL_REJECTED}eu`, "bidi override in a rule name is marked");
+    eq(nasty[0]!.account, `prod${LABEL_REJECTED}vault`, "zero width in an account is marked");
 
-    // Oldest window first: the one open longest is the one worth seeing first.
+    // Least time left first: the long window is the one worth ending.
     const two = toActiveLeases(
-      [row({ ageMs: 10_000 }), row({ instance: INST2, ageMs: 900_000 })],
+      [row({ remainingMs: 900_000 }), row({ leaseId: LEASE2, remainingMs: 60_000 })],
       NOW,
     );
-    eq(two[0]!.instance, INST2, "oldest first");
+    eq(two[0]!.leaseId, LEASE2, "soonest to lapse first");
   }
 
-  console.log("parseLeaseListReply (one bad row voids the answer)");
+  console.log("parseLeaseListReply (correlated, stamped, and all-or-nothing)");
   {
-    const good = parseLeaseListReply({ type: "leaseListReply", queryId: QUERY, leases: [row()] });
-    eq(good?.leases.length, 1, "a well formed answer parses");
-    eq(good?.queryId, QUERY, "the correlation id is carried through");
+    const good = parseLeaseListReply({
+      type: "leaseListReply",
+      inReplyTo: REQ,
+      asOf: NOW,
+      leases: [row()],
+    });
+    eq(good?.leases.length, 1, "a well formed snapshot parses");
+    eq(good?.inReplyTo, REQ, "the correlation id is carried through");
+    eq(good?.asOf, NOW, "the snapshot time is carried through");
 
-    const empty = parseLeaseListReply({ type: "leaseListReply", queryId: QUERY, leases: [] });
-    eq(empty?.leases.length, 0, "an empty answer is a valid answer");
+    const list = (leases: unknown[], over: Record<string, unknown> = {}) =>
+      parseLeaseListReply({ type: "leaseListReply", inReplyTo: REQ, asOf: NOW, ...over, leases });
 
-    eq(
-      parseLeaseListReply({ type: "leaseListReply", leases: [] }),
-      null,
-      "an answer with no correlation id is dropped",
-    );
+    eq(list([])?.leases.length, 0, "an empty snapshot is a valid snapshot");
+    eq(list([], { inReplyTo: undefined }), null, "a snapshot with no correlation id is dropped");
+    eq(list([], { inReplyTo: "not-a-uuid" }), null, "a malformed correlation id is dropped");
+    eq(list([], { asOf: undefined }), null, "an unstamped snapshot is dropped");
 
     // Under-reporting is the one direction this surface must not fail in: a
     // shorter list reads as "that is everything", so a bad row voids the lot and
     // the screen falls back to saying it does not know.
-    const list = (leases: unknown[]) =>
-      parseLeaseListReply({ type: "leaseListReply", queryId: QUERY, leases });
-    eq(list([row(), { grantHex: "nope" }]), null, "a malformed row voids the whole answer");
-    eq(list([row({ grantHex: "../../etc" })]), null, "a non-hex grant key is rejected");
-    eq(list([row({ grantHex: GRANT.slice(1) })]), null, "a short grant key is rejected");
-    eq(list([row({ instance: "" })]), null, "a missing window id is rejected");
+    eq(list([row(), { leaseId: "nope" }]), null, "a malformed row voids the whole snapshot");
+    eq(list([row({ leaseId: GRANT })]), null, "a grant-key-width id is not a lease id");
+    eq(list([row({ leaseId: LEASE.slice(1) })]), null, "a short lease id is rejected");
     eq(list([{ ...row(), remainingMs: "10" }]), null, "a non-numeric remaining is rejected");
     eq(list([{ ...row(), scope: 42 }]), null, "a non-string rule name is rejected");
-    eq(
-      parseLeaseListReply({ type: "leaseListReply", queryId: QUERY }),
-      null,
-      "a missing list is not an empty list",
-    );
-    eq(parseLeaseListReply(null), null, "null is not an answer");
+    eq(parseLeaseListReply({ type: "leaseListReply", inReplyTo: REQ, asOf: NOW }), null, "a missing list is not an empty list");
+    eq(parseLeaseListReply(null), null, "null is not a snapshot");
+  }
+
+  console.log("parseLeaseRevokeReply (nothing confirms without a correlation id)");
+  {
+    const base = { type: "leaseRevokeReply", inReplyTo: REQ, leaseId: LEASE, revoked: true };
+    eq(parseLeaseRevokeReply(base)?.revoked, true, "a well formed verdict parses");
+    eq(parseLeaseRevokeReply({ ...base, inReplyTo: undefined }), null, "no correlation id, no confirmation");
+    eq(parseLeaseRevokeReply({ ...base, revoked: "yes" }), null, "a non-boolean verdict is dropped");
+    eq(parseLeaseRevokeReply({ ...base, leaseId: GRANT }), null, "a grant-key-width id is dropped");
   }
 
   console.log("classifyToPhone (lease answers demux, and fail closed)");
   {
-    const listed = classifyToPhone({ type: "leaseListReply", queryId: QUERY, leases: [] });
-    eq(listed?.kind, "leaseList", "a list reply is recognized");
+    const listed = classifyToPhone({ type: "leaseListReply", inReplyTo: REQ, asOf: NOW, leases: [] });
+    eq(listed?.kind, "leaseList", "a snapshot is recognized");
     const revoked = classifyToPhone({
       type: "leaseRevokeReply",
-      queryId: QUERY,
-      grantHex: GRANT,
+      inReplyTo: REQ,
+      leaseId: LEASE,
       revoked: true,
     });
-    eq(revoked?.kind, "leaseRevoke", "a revoke reply is recognized");
+    eq(revoked?.kind, "leaseRevoke", "a verdict is recognized");
     eq(
-      classifyToPhone({ type: "leaseRevokeReply", queryId: QUERY, grantHex: GRANT }),
+      classifyToPhone({ type: "leaseRevokeReply", leaseId: LEASE, revoked: true }),
       null,
-      "a revoke reply with no verdict is dropped",
-    );
-    eq(
-      classifyToPhone({ type: "leaseRevokeReply", queryId: QUERY, grantHex: GRANT, revoked: "yes" }),
-      null,
-      "a non-boolean verdict is dropped",
-    );
-    eq(
-      classifyToPhone({ type: "leaseRevokeReply", grantHex: GRANT, revoked: true }),
-      null,
-      "a revoke reply with no correlation id is dropped",
+      "an uncorrelated verdict never reaches the app",
     );
     // An untagged payload is still an approval request: the existing wire shape
     // must not shift under the new tags.
     eq(classifyToPhone({ requestId: "r1" })?.kind, "request", "untagged is still a request");
   }
 
-  console.log("revoke state and copy");
+  console.log("OutstandingRequests (F3: the captured-reply replay)");
+  {
+    const o = new OutstandingRequests();
+    o.issue(REQ, "revoke");
+    ok(o.claim(REQ, "revoke"), "a reply to a question we asked is claimed");
+    ok(!o.claim(REQ, "revoke"), "the same reply cannot be claimed twice");
+    eq(o.size, 0, "claiming consumes the entry");
+
+    o.issue(REQ, "revoke");
+    ok(!o.claim(REQ, "list"), "a reply of the wrong kind is not claimed");
+    ok(!o.claim(REQ2, "revoke"), "a reply naming a question we never asked is not claimed");
+
+    o.issue(REQ2, "list");
+    o.abandon(REQ2);
+    ok(!o.claim(REQ2, "list"), "a question given up on cannot be answered later");
+
+    // The attack, end to end. The relay captured a genuine revoked:true from an
+    // earlier session; the app was killed, which is what empties both this set
+    // and the envelope guard's; the human taps revoke and the relay suppresses
+    // the request and delivers the captured reply. A fresh process has no entry
+    // for it, so it confirms nothing and the row stays put.
+    const afterRestart = new OutstandingRequests();
+    const captured = REQ;
+    afterRestart.issue(REQ2, "revoke"); // the human's new, suppressed revoke
+    ok(
+      !afterRestart.claim(captured, "revoke"),
+      "a captured reply replayed into a fresh session confirms nothing",
+    );
+    ok(afterRestart.size === 1, "and the human's real question is still outstanding");
+  }
+
+  console.log("revoke state, standing warnings, and copy");
   {
     const rows = toActiveLeases([row()], NOW);
-    eq(revokeState(view({ rows }), INST), "idle", "no revoke sent");
-    const sending = view({
-      rows,
-      revokes: [{ queryId: QUERY, grantHex: GRANT, instance: INST, sentAt: NOW, unconfirmed: false }],
-    });
-    eq(revokeState(sending, INST), "sending", "in flight");
+    eq(revokeState(view({ rows }), LEASE), "idle", "no revoke sent");
+
+    const sending = view({ rows, revokes: [revoke()] });
+    eq(revokeState(sending, LEASE), "sending", "in flight");
     // The row is still there while in flight: nothing is cleared optimistically.
     eq(liveLeases(sending, NOW).length, 1, "an in-flight revoke does not clear its row");
+    eq(unconfirmedRevokes(sending).length, 0, "in flight is not yet a warning");
 
-    const silent = view({
-      rows,
-      revokes: [{ queryId: QUERY, grantHex: GRANT, instance: INST, sentAt: NOW, unconfirmed: true }],
-    });
-    eq(revokeState(silent, INST), "unconfirmed", "no reply came back");
-    // Keyed on the window, not the key: a later window under the same grant key
-    // must not inherit the previous one's in-flight state.
-    eq(revokeState(silent, INST2), "idle", "a different window is unaffected");
+    const silent = view({ rows, revokes: [revoke({ unconfirmed: true })] });
+    eq(revokeState(silent, LEASE), "unconfirmed", "no reply came back");
     eq(liveLeases(silent, NOW).length, 1, "an unconfirmed revoke leaves the row on screen");
+    eq(unconfirmedRevokes(silent).length, 1, "and raises a standing warning");
+    eq(revokeState(silent, LEASE2), "idle", "a different window is unaffected");
 
-    eq(revokeFallback(GRANT), "sigil lease revoke a1b2c3d4e5f6", "fallback names the real prefix");
+    // The warning has to stand on its own once the snapshot behind it is gone.
+    const orphaned = view({ revokes: [revoke({ unconfirmed: true })] });
+    eq(unconfirmedRevokes(orphaned).length, 1, "a warning outlives its snapshot");
+    ok(
+      unconfirmedRevokeLine(revoke({ unconfirmed: true })).includes("may still be open"),
+      "the warning says the window may still be open",
+    );
+    ok(
+      unconfirmedRevokeLine(revoke({ scope: null, unconfirmed: true })).includes("A revoke this phone sent"),
+      "a warning with no rule name still reads as a sentence",
+    );
 
-    // Both outcomes are successes, and the second must not read as a failure.
+    // The Mac fallback names a placeholder, never an id from here: the CLI's
+    // revoke is prefix matched, so a truncated id would revoke everything.
+    ok(REVOKE_FALLBACK_REVOKE.includes("<prefix>"), "the fallback is a placeholder");
+    ok(REVOKE_FALLBACK_LIST === "sigil lease list", "and is preceded by the listing step");
+
+    // Both verdicts are successes, and the second must not read as a failure.
     eq(revokeNoteLine("closed"), "Window closed. The next matching command asks again.", "closed");
     eq(
       revokeNoteLine("alreadyGone"),
@@ -252,17 +322,49 @@ function main(): void {
     );
   }
 
+  console.log("no grant key reaches this surface, in any string");
+  {
+    // A grant key is not unique per window, is a stable correlator that would
+    // outlive the window and survive a re-pair, and is what the CLI's prefix
+    // matcher over-matches on. The phone must never render or hold one, so every
+    // string this module can produce is checked for anything of that shape.
+    const rows = toActiveLeases([row()], NOW);
+    const strings = [
+      ...[view(), view({ asking: true }), view({ unreachable: true }), view({ answeredAt: NOW, asOf: NOW }), view({ rows, answeredAt: NOW, asOf: NOW })]
+        .map((v) => leaseListStatus(v, NOW))
+        .flatMap((s) => [s.line, s.detail ?? ""]),
+      unconfirmedRevokeLine(revoke({ unconfirmed: true })),
+      REVOKE_FALLBACK_LIST,
+      REVOKE_FALLBACK_REVOKE,
+      revokeNoteLine("closed"),
+      revokeNoteLine("alreadyGone"),
+      JSON.stringify(rows),
+    ];
+    for (const s of strings) {
+      ok(!/[0-9a-f]{33,}/i.test(s), `no grant-key-shaped hex: ${JSON.stringify(s.slice(0, 60))}`);
+    }
+    // The row keeps its opaque id, which is exactly the permitted width.
+    eq(rows[0]!.leaseId.length, LEASE_ID_CHARS, "the row's id is a lease id, not a grant key");
+  }
+
   console.log("voice (a consent-adjacent surface: no em-dashes, no emoji)");
   {
+    const rows = toActiveLeases([row()], NOW);
     const strings = [
-      leaseListStatus(view(), NOW),
-      leaseListStatus(view({ asking: true }), NOW),
-      leaseListStatus(view({ unreachable: true }), NOW),
-      leaseListStatus(view({ answeredAt: NOW }), NOW),
-      leaseListStatus(view({ answeredAt: NOW - 10 * 60_000, unreachable: true }), NOW),
+      view(),
+      view({ asking: true }),
+      view({ unreachable: true }),
+      view({ answeredAt: NOW, asOf: NOW }),
+      view({ answeredAt: NOW - 10 * 60_000, asOf: NOW - 10 * 60_000, unreachable: true }),
+      view({ rows, answeredAt: NOW, asOf: NOW }),
     ]
+      .map((v) => leaseListStatus(v, NOW))
       .flatMap((s) => [s.line, s.detail ?? ""])
-      .concat(revokeNoteLine("closed"), revokeNoteLine("alreadyGone"));
+      .concat(
+        unconfirmedRevokeLine(revoke({ unconfirmed: true })),
+        revokeNoteLine("closed"),
+        revokeNoteLine("alreadyGone"),
+      );
     for (const s of strings) {
       ok(!/[—–]/.test(s), `no dash rule: ${JSON.stringify(s)}`);
       ok(!/\p{Extended_Pictographic}/u.test(s), `no emoji: ${JSON.stringify(s)}`);

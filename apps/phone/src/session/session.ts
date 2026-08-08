@@ -168,12 +168,20 @@ export class SigilSession {
    * request/response flow (e.g. {@link PushRegisterMessage}). Shares the
    * outbound counter and pairing id with `respond`, so both ride the same
    * per-direction replay sequence.
+   *
+   * Returns the ENVELOPE's single-use uuidv7 request id. For a payload the
+   * daemon answers, that id is the correlation handle: the daemon echoes it as
+   * `inReplyTo`, and the caller matches the reply against the request it issued.
+   * That application-layer match is load-bearing rather than decorative, because
+   * the envelope guard's single-use id set lives in RAM and is empty again after
+   * any restart (see `LeaseRevokeReplyMessage.inReplyTo`).
    */
-  async sendToDaemon<T>(payload: T): Promise<void> {
-    await this.sealAndSend(payload);
+  async sendToDaemon<T>(payload: T): Promise<string> {
+    return this.sealAndSend(payload);
   }
 
-  private async sealAndSend<T>(payload: T): Promise<void> {
+  /** Seals, sends, and returns the envelope's single-use request id. */
+  private async sealAndSend<T>(payload: T): Promise<string> {
     const envelope = seal(this.cfg.sodium, payload, {
       pairingId: this.cfg.pairingId,
       counter: ++this.outboundCounter,
@@ -181,5 +189,6 @@ export class SigilSession {
       recipient: this.cfg.daemonPub,
     });
     await this.cfg.transport.send(envelope);
+    return envelope.requestId;
   }
 }

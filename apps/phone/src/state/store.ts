@@ -151,50 +151,71 @@ class Store {
   // Every writer below records only what the DAEMON said, and when. Nothing here
   // removes a row on the phone's own initiative, because the phone holds no lease
   // state: the daemon's `LeaseStore` is the only authority, and a local edit that
-  // looked like a revoke would be exactly the consent theatre this replaced
-  // (security review F7). The one local removal is expiry, which is arithmetic on
-  // the daemon's own number, and it is never reported as a revoke.
+  // looked like a revoke would be exactly the consent theatre this replaced. The
+  // one local removal is expiry, which is arithmetic on the daemon's own number,
+  // and it is never reported as a revoke.
+  //
+  // A reply reaches these writers only after the session controller has matched
+  // it to a request THIS session issued and consumed that entry (design review
+  // F3). Nothing here confirms anything on a reply's say-so alone.
 
   /** A list query has left this phone. */
   leaseQueryStarted(): void {
-    this.patchLeases({ asking: true });
+    this.patchLeases({ asking: true, noBiometric: false });
   }
 
   /**
    * The list query could not be sent, or nothing came back in time. Records
-   * inability, never emptiness: `rows` and `answeredAt` are left exactly as they
-   * were, so the screen goes on describing the last real answer (and says how old
-   * it is) instead of inventing a fresh one.
+   * inability, never emptiness: `rows`, `answeredAt` and `asOf` are left exactly
+   * as they were, so the screen goes on describing the last real snapshot (and
+   * says it has aged) instead of inventing a fresh one.
    */
   leaseQueryFailed(): void {
     this.patchLeases({ asking: false, unreachable: true });
   }
 
   /**
-   * A fresh, verified answer from the daemon. This is the ONLY writer of `rows`
-   * and `answeredAt`, and therefore the only thing that can entitle the screen to
-   * say the list is complete.
+   * The biometric did not pass, so no question was asked. Distinct from
+   * {@link leaseQueryFailed} on purpose: nothing failed and nothing is unknown
+   * that was not already unknown, so a declined check must not raise "cannot
+   * check right now", which would read as a fault in the link.
    *
-   * It also settles pending revokes: a window missing from an answer the daemon
-   * produced AFTER the revoke was sent is confirmed closed by the daemon's own
+   * `noBiometric` separates "you cancelled" from "this device has nothing to
+   * cancel with". The first needs no explanation; the second is a dead end the
+   * screen has to name, because the list is gated on a biometric and this device
+   * cannot produce one.
+   */
+  leaseQueryCancelled(noBiometric = false): void {
+    this.patchLeases({ asking: false, noBiometric });
+  }
+
+  /**
+   * A fresh, correlated snapshot from the daemon. This is the ONLY writer of
+   * `rows`, `answeredAt` and `asOf`, and therefore the only thing that can
+   * entitle the screen to say the list is complete.
+   *
+   * It also settles pending revokes: a window missing from a snapshot the daemon
+   * took AFTER the revoke was sent is confirmed closed by the daemon's own
    * account of itself, which is stronger evidence than the revoke reply. A window
    * still present stays pending, warning and all, because it really is still open.
    */
-  leaseListReceived(rows: LeaseRow[], receivedAt: number): void {
+  leaseListReceived(rows: LeaseRow[], asOf: number, receivedAt: number): void {
     const live = toActiveLeases(rows, receivedAt);
-    const present = new Set(live.map((l) => l.instance));
+    const present = new Set(live.map((l) => l.leaseId));
     const settled = this.state.leases.revokes.filter(
-      (r) => r.sentAt < receivedAt && !present.has(r.instance),
+      (r) => r.sentAt < receivedAt && !present.has(r.leaseId),
     );
     const note =
       settled.length > 0
-        ? { instance: settled[0]!.instance, outcome: "closed" as const, at: receivedAt }
+        ? { leaseId: settled[0]!.leaseId, outcome: "closed" as const, at: receivedAt }
         : this.state.leases.note;
     this.patchLeases({
       rows: live,
       answeredAt: receivedAt,
+      asOf,
       asking: false,
       unreachable: false,
+      noBiometric: false,
       revokes: this.state.leases.revokes.filter((r) => !settled.includes(r)),
       note,
     });
@@ -202,45 +223,41 @@ class Store {
 
   /**
    * A revoke has left this phone. The row deliberately STAYS: clearing it here
-   * would be an optimistic claim that a window closed, and a hostile or broken
-   * relay suppressing the reply must never be able to buy that claim.
+   * would be an optimistic claim that a window closed, and a relay suppressing
+   * the reply must never be able to buy that claim by dropping one message.
    */
   leaseRevokeStarted(revoke: PendingRevoke): void {
-    const others = this.state.leases.revokes.filter((r) => r.instance !== revoke.instance);
+    const others = this.state.leases.revokes.filter((r) => r.leaseId !== revoke.leaseId);
     this.patchLeases({ revokes: [...others, revoke], note: null });
   }
 
   /**
-   * The daemon answered a revoke, attributed by the correlation id this phone
-   * sent. Both answers are successes: `revoked` true means it ended a live
-   * window, false means it had no such window (already lapsed, already revoked,
-   * replaced, or never held, and the daemon deliberately does not distinguish
-   * them). Either way that window is closed, so the row goes, and the note says
-   * which it was rather than letting the second case read as a failure.
-   *
-   * A reply whose id this phone did not send is not routed here at all; the
-   * session controller drops it.
+   * The daemon answered a revoke, and the controller matched that answer to a
+   * request this session issued. Both verdicts are successes: `revoked` true
+   * means it ended a live window, false means it had none to end. Either way that
+   * window is closed, so the row goes, and the note says which it was rather than
+   * letting the second case read as a failure.
    */
-  leaseRevokeConfirmed(queryId: string, revoked: boolean, at: number): void {
-    const p = this.state.leases.revokes.find((r) => r.queryId === queryId);
+  leaseRevokeConfirmed(requestId: string, revoked: boolean, at: number): void {
+    const p = this.state.leases.revokes.find((r) => r.requestId === requestId);
     if (!p) return;
     this.patchLeases({
-      rows: this.state.leases.rows.filter((l) => l.instance !== p.instance),
-      revokes: this.state.leases.revokes.filter((r) => r.queryId !== queryId),
-      note: { instance: p.instance, outcome: revoked ? "closed" : "alreadyGone", at },
+      rows: this.state.leases.rows.filter((l) => l.leaseId !== p.leaseId),
+      revokes: this.state.leases.revokes.filter((r) => r.requestId !== requestId),
+      note: { leaseId: p.leaseId, outcome: revoked ? "closed" : "alreadyGone", at },
     });
   }
 
   /**
-   * The revoke went out and nothing came back. The row stays, flagged, and the
-   * screen names the Mac-side fallback: the honest reading is that the window may
-   * still be open, and saying anything else here would be the failure mode this
-   * whole feature exists to avoid.
+   * The revoke went out and nothing came back. The warning stays, and outlives
+   * the snapshot it came from: the honest reading is that the window may still be
+   * open, and saying anything else here would be the failure mode this whole
+   * feature exists to avoid.
    */
-  leaseRevokeUnconfirmed(queryId: string): void {
+  leaseRevokeUnconfirmed(requestId: string): void {
     this.patchLeases({
       revokes: this.state.leases.revokes.map((r) =>
-        r.queryId === queryId ? { ...r, unconfirmed: true } : r,
+        r.requestId === requestId ? { ...r, unconfirmed: true } : r,
       ),
     });
   }
@@ -253,10 +270,29 @@ class Store {
   expireLeases(nowMs: number): void {
     const rows = this.state.leases.rows.filter((l) => l.expiresAt > nowMs);
     if (rows.length === this.state.leases.rows.length) return;
-    const kept = new Set(rows.map((l) => l.instance));
+    this.patchLeases({ rows });
+  }
+
+  /**
+   * Throw the snapshot away when the screen goes away: render and drop, never
+   * persist. A held list of live auto-approve windows is a schedule of what will
+   * release with no human tap, and it should not outlive the moment someone chose
+   * to look at it. It returns the section to "not checked yet", which is a true
+   * description of what this phone then knows.
+   *
+   * Unconfirmed revokes SURVIVE this. They are warnings, not an enumeration, and
+   * the whole point of one is that it outlasts the screen that produced it.
+   */
+  clearLeaseSnapshot(): void {
     this.patchLeases({
-      rows,
-      revokes: this.state.leases.revokes.filter((r) => kept.has(r.instance)),
+      rows: [],
+      answeredAt: 0,
+      asOf: 0,
+      asking: false,
+      unreachable: false,
+      noBiometric: false,
+      revokes: this.state.leases.revokes.filter((r) => r.unconfirmed),
+      note: null,
     });
   }
 

@@ -313,83 +313,75 @@ export interface ResolutionBroadcastMessage {
 }
 
 /**
- * The exact width of a grant key rendered as lowercase hex, mirroring proto
- * `GRANT_HEX_CHARS`. Exact, not a range: a row the phone could not act on is
- * never sent, so anything else is a malformed message rather than a lease.
+ * The exact width of a lease id rendered as lowercase hex: 128 opaque random
+ * bits, mirroring the daemon's own constant.
+ *
+ * A lease id and NOT a grant key, deliberately, and this is the one thing about
+ * lease control the phone must never get wrong. A grant key is a hash of the
+ * caller chain plus the rule: it is not unique to a window, it is a stable
+ * correlator that would outlive the window in anything the phone kept and would
+ * survive a re-pair, and the daemon's CLI revoke is PREFIX matched, so a
+ * truncated or empty one would silently revoke every window while reporting
+ * success. The phone therefore never handles, stores, renders or logs a grant
+ * key; it echoes back the opaque per-window id it was handed and nothing else.
  */
-export const GRANT_HEX_CHARS = 64;
-
-/** The exact width of a lease instance id in hex, mirroring `LEASE_INSTANCE_CHARS`. */
-export const LEASE_INSTANCE_CHARS = 32;
-
-/** The longest correlation id the daemon will echo, mirroring `QUERY_ID_MAX_CHARS`. */
-export const QUERY_ID_MAX_CHARS = 64;
+export const LEASE_ID_CHARS = 32;
 
 /**
  * Phone -> daemon: list the daemon's live lease windows (PHONE LEASE CONTROL).
  *
  * Sealed over the live session like {@link PushRegisterMessage}, outside the
- * request/response flow. It releases nothing and gates nothing, so it is a
- * READ-PATH action: passcode tier, no biometric, because the biometric belongs to
- * release and not to looking.
+ * request/response flow, and carrying no body: the correlation id is the
+ * ENVELOPE's single-use uuidv7 request id, which the daemon echoes as
+ * {@link LeaseListReplyMessage.inReplyTo}.
  *
- * `queryId` is what the daemon echoes in its {@link LeaseListReplyMessage}. The
- * phone MUST drop a reply whose id it did not send, so a late answer to a
- * previous screen-open cannot repaint a newer list.
+ * Unlike the rest of the read path this one IS gated on a local biometric before
+ * it is issued (design review F5). Listing releases nothing, but it changes what
+ * a stolen or coerced phone can produce on demand: a complete schedule of which
+ * auto-approve windows are live, on which rules, and how many seconds each has
+ * left, which is a map of what will release with no human tap. Revoking stays
+ * completely ungated, because a revoke is a deny and a deny is never made heavier
+ * than an approve.
  */
 export interface LeaseListMessage {
   type: "leaseList";
-  queryId: string;
 }
 
 /**
- * Phone -> daemon: end ONE live lease window.
+ * Phone -> daemon: end ONE live lease window, named by its opaque id.
  *
- * Both identifiers come verbatim from a {@link LeaseRow} the daemon itself sent;
- * the zero-knowledge phone cannot compute either and never invents one. Naming
- * `instance` as well as `grantHex` is what makes the revoke bind to the window
- * the human is actually looking at: a grant key is stable across windows, so a
- * revoke that named only the key could land on a window granted after the human
- * read the row.
+ * `leaseId` comes verbatim from a {@link LeaseRow} the daemon itself sent. The
+ * phone cannot compute one and never invents one. See {@link LEASE_ID_CHARS} for
+ * why this is not a grant key.
  *
  * Revoking only ever NARROWS authority, so like a deny it needs no biometric and
  * no confirmation.
  */
 export interface LeaseRevokeMessage {
   type: "leaseRevoke";
-  queryId: string;
-  /** From a {@link LeaseRow}, verbatim. Never a prefix. */
-  grantHex: string;
-  /** From the same {@link LeaseRow}, verbatim: which window, not which key. */
-  instance: string;
+  leaseId: string;
 }
 
 /**
- * One live lease window as the daemon reports it, mirroring proto `LeaseRow`.
- * Display only, in every field: nothing here is parsed, matched on, or branched
- * upon, and the two identifiers are opaque handles to hand back on a revoke.
+ * One live lease window as the daemon reports it. Display only, in every field:
+ * nothing here is parsed, matched on, or branched upon, and `leaseId` is an
+ * opaque handle to hand back on a revoke.
  *
  * The daemon sanitizes `scope`, `covers`, and `account` through its own label
- * allowlist before sending. The phone re-runs that allowlist anyway (`safeLabel`
- * in src/lib/format.ts), exactly as the approval sheet's coverage caption does:
- * this type describes what the daemon promises, not what a screen may assume it
- * received.
+ * allowlist before sending, because all three are raw config text the user wrote.
+ * The phone re-runs that allowlist anyway (`safeLabel` in src/lib/format.ts),
+ * exactly as the approval sheet's coverage caption does: this type describes what
+ * the daemon promises, not what a screen may assume it received.
  *
- * `remainingMs` and `ageMs` are relative to the moment the DAEMON measured them,
- * so the phone stamps them against arrival time to get absolute local clocks
- * (see `toActiveLeases` in src/domain/leases.ts). Transit delay therefore makes
- * the phone's countdown very slightly generous, which is the safe direction: it
- * can overstate how long a window is open, never understate it.
+ * There is no age field. It was dropped from the wire because it lies across a
+ * refresh: a window extended by a later approval is one window, and an age
+ * measured from the first approval would describe something the human never
+ * agreed to as a single span.
  */
 export interface LeaseRow {
-  /** The grant key, lowercase hex, {@link GRANT_HEX_CHARS} wide. Stable across
-   *  the life of a window and equal for a later window with the same caller
-   *  chain and rule, which is why a revoke must also name {@link instance}. */
-  grantHex: string;
-  /** This window's id, lowercase hex, {@link LEASE_INSTANCE_CHARS} wide. Minted
-   *  when the window opens, preserved across a refresh, never reused. This is
-   *  the row's identity on the phone, and what a revoke binds to. */
-  instance: string;
+  /** The opaque per-window id, lowercase hex, {@link LEASE_ID_CHARS} wide. The
+   *  row's identity, and the only thing a revoke names. */
+  leaseId: string;
   /**
    * The matched RULE's name. One window covers ANY command that rule matches for
    * the caller chain that opened it, so no renderer may let this read as a
@@ -397,8 +389,8 @@ export interface LeaseRow {
    */
   scope: string;
   /**
-   * The daemon's own one-line description of the rule's breadth, the same string
-   * the approval sheet's caption consented to. **Empty means no label was
+   * The daemon's one-line description of the rule's breadth, the same string the
+   * approval sheet's caption consented to. **Empty means no label was
    * rendered**: show no coverage clause rather than inventing one, and never read
    * empty as "narrow".
    */
@@ -406,14 +398,16 @@ export interface LeaseRow {
   /** The source label the window injects from. Empty for a plain gate, which
    *  injects nothing. */
   account: string;
-  /** Milliseconds left when the daemon measured it. */
+  /** Milliseconds left when the daemon took the snapshot. */
   remainingMs: number;
-  /** Milliseconds since the window opened, when the daemon measured it. */
-  ageMs: number;
 }
 
 /**
  * Daemon -> phone: the answer to a {@link LeaseListMessage}.
+ *
+ * A SNAPSHOT, and the type says so: `asOf` is when the daemon measured it, and
+ * the screen renders that timestamp and goes visibly stale rather than sitting
+ * there looking like a live view of the Mac.
  *
  * An empty `leases` array is a POSITIVE statement that nothing is open, and it
  * is the only thing that entitles the phone to say so. The absence of a reply is
@@ -421,31 +415,50 @@ export interface LeaseRow {
  */
 export interface LeaseListReplyMessage {
   type: "leaseListReply";
-  /** Echoes the query's id; a reply the phone did not ask for is dropped. */
-  queryId: string;
+  /** The envelope request id of the {@link LeaseListMessage} this answers. */
+  inReplyTo: string;
+  /** When the daemon took this snapshot, unix ms on the daemon's clock. */
+  asOf: number;
   leases: LeaseRow[];
 }
 
 /**
  * Daemon -> phone: the answer to a {@link LeaseRevokeMessage}.
  *
- * `revoked: true` means a live window with that exact instance was found and
- * zeroized. `revoked: false` means there was none, and the daemon deliberately
- * does not distinguish already-lapsed from already-revoked from never-held, so
- * the answer is not an oracle for which grant keys exist. Every `false` is a
+ * `revoked: true` means a live window with that id was found and zeroized;
+ * `false` means there was none, and the daemon deliberately does not distinguish
+ * already-lapsed from already-revoked from never-held. Every `false` is a
  * SUCCESS: the window is closed either way, and the UI says so plainly rather
- * than dressing it as a failure. The only real failure is no reply at all, which
- * leaves the window's state unknown.
+ * than dressing it as a failure.
  *
- * A revoke is idempotent, so the daemon's own guidance is to re-list afterwards
- * rather than treat `revoked` as the new state of the world.
+ * The only real failure is no reply at all, and that one is never reported as a
+ * success: see {@link inReplyTo}.
  */
 export interface LeaseRevokeReplyMessage {
   type: "leaseRevokeReply";
-  /** Echoes the revoke's id; this is what attributes the answer to its row. */
-  queryId: string;
-  /** Echoes the revoke's normalized grant key. */
-  grantHex: string;
+  /**
+   * The envelope request id of the {@link LeaseRevokeMessage} this answers, and
+   * the whole defence against the attack that made this feature worse than the
+   * badge it replaced (design review F3).
+   *
+   * The envelope layer's replay guard is a 90 second freshness window plus a
+   * single-use id set held in RAM, and that set is empty again after any restart.
+   * The phone being killed or backgrounded is routine. So a relay can capture a
+   * genuine `revoked: true`, wait for a restart, suppress the human's next
+   * outgoing revoke, and deliver the captured reply into a fresh guard: unseen
+   * id, valid signature, inside the freshness window, because the message really
+   * is genuine. The phone would tell the human a window closed while it is open.
+   *
+   * The correlation is what closes it. The phone applies a reply ONLY if this
+   * matches a request it issued in THIS session and has not yet answered, and it
+   * consumes that entry on the match. A captured reply replayed after a restart
+   * matches nothing, because the outstanding set died with the process, and is
+   * dropped. This is single-use at the application layer and is load-bearing on
+   * its own, not belt-and-braces over the envelope guard.
+   */
+  inReplyTo: string;
+  /** Echoes the revoked lease id. */
+  leaseId: string;
   revoked: boolean;
 }
 
@@ -455,10 +468,11 @@ function hexField(v: unknown, chars: number): string | null {
   return /^[0-9a-fA-F]+$/.test(v) ? v.toLowerCase() : null;
 }
 
-/** A correlation id: non-empty, bounded, and printable enough to compare. */
-function queryIdField(v: unknown): string | null {
-  if (typeof v !== "string" || v.length === 0 || v.length > QUERY_ID_MAX_CHARS) return null;
-  return v;
+/** A uuid correlation id: the shape `seal` mints for an envelope request id. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function uuidField(v: unknown): string | null {
+  return typeof v === "string" && UUID.test(v) ? v.toLowerCase() : null;
 }
 
 function isMs(v: unknown): v is number {
@@ -473,20 +487,17 @@ function isMs(v: unknown): v is number {
 function parseLeaseRow(v: unknown): LeaseRow | null {
   if (typeof v !== "object" || v === null) return null;
   const r = v as Record<string, unknown>;
-  const grantHex = hexField(r.grantHex, GRANT_HEX_CHARS);
-  const instance = hexField(r.instance, LEASE_INSTANCE_CHARS);
-  if (!grantHex || !instance) return null;
+  const leaseId = hexField(r.leaseId, LEASE_ID_CHARS);
+  if (!leaseId) return null;
   if (typeof r.scope !== "string" || typeof r.covers !== "string") return null;
   if (typeof r.account !== "string") return null;
-  if (!isMs(r.remainingMs) || !isMs(r.ageMs)) return null;
+  if (!isMs(r.remainingMs)) return null;
   return {
-    grantHex,
-    instance,
+    leaseId,
     scope: r.scope,
     covers: r.covers,
     account: r.account,
     remainingMs: r.remainingMs,
-    ageMs: r.ageMs,
   };
 }
 
@@ -502,8 +513,8 @@ function parseLeaseRow(v: unknown): LeaseRow | null {
 export function parseLeaseListReply(payload: unknown): LeaseListReplyMessage | null {
   if (typeof payload !== "object" || payload === null) return null;
   const p = payload as Record<string, unknown>;
-  const queryId = queryIdField(p.queryId);
-  if (!queryId) return null;
+  const inReplyTo = uuidField(p.inReplyTo);
+  if (!inReplyTo || !isMs(p.asOf)) return null;
   if (!Array.isArray(p.leases)) return null;
   const leases: LeaseRow[] = [];
   for (const raw of p.leases) {
@@ -511,18 +522,18 @@ export function parseLeaseListReply(payload: unknown): LeaseListReplyMessage | n
     if (!row) return null;
     leases.push(row);
   }
-  return { type: "leaseListReply", queryId, leases };
+  return { type: "leaseListReply", inReplyTo, asOf: p.asOf, leases };
 }
 
 /** Validate a revoke reply. Fails closed: a malformed one confirms nothing. */
 export function parseLeaseRevokeReply(payload: unknown): LeaseRevokeReplyMessage | null {
   if (typeof payload !== "object" || payload === null) return null;
   const p = payload as Record<string, unknown>;
-  const queryId = queryIdField(p.queryId);
-  const grantHex = hexField(p.grantHex, GRANT_HEX_CHARS);
-  if (!queryId || !grantHex) return null;
+  const inReplyTo = uuidField(p.inReplyTo);
+  const leaseId = hexField(p.leaseId, LEASE_ID_CHARS);
+  if (!inReplyTo || !leaseId) return null;
   if (typeof p.revoked !== "boolean") return null;
-  return { type: "leaseRevokeReply", queryId, grantHex, revoked: p.revoked };
+  return { type: "leaseRevokeReply", inReplyTo, leaseId, revoked: p.revoked };
 }
 
 /**

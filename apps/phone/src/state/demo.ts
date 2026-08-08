@@ -171,21 +171,20 @@ export const demoRelayOrigin: RelayOrigin = { ip: "203.0.113.7", atMs: now };
  */
 export const demoLeases: ActiveLease[] = [
   {
-    grantHex: "d3m0".repeat(16),
-    instance: "d3m0".repeat(8),
+    leaseId: "d3m0".repeat(8),
     // A rule name, not a secret path: the lease covers every command that rule
     // matches for this caller until it lapses.
     scope: "op-eu",
     covers: 'op with --account "rowmhq.1password.eu"',
     account: "rowmhq.1password.eu",
-    grantedAt: now - 19 * 60_000,
     expiresAt: now + 41 * 60_000,
+    windowMs: 41 * 60_000,
   },
 ];
 
-/** A demo lease view: answered a moment ago, so the sample rows read as fresh. */
+/** A demo lease view: a snapshot taken a moment ago, so the samples read fresh. */
 export function demoLeaseView(): LeaseView {
-  return { ...emptyLeaseView(), rows: demoLeases, answeredAt: now };
+  return { ...emptyLeaseView(), rows: demoLeases, answeredAt: now, asOf: now };
 }
 
 export const demoHistory: HistoryEntry[] = [
