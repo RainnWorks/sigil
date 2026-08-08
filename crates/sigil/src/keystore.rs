@@ -197,16 +197,62 @@ impl FileKeystore {
         }
     }
 
+    /// Write the store back.
+    ///
+    /// **The ordering is the security property, not an implementation detail:
+    /// the mode is narrowed to 0600 while the file is still empty, and the
+    /// content only ever reaches `self.path` through an atomic rename.** Writing
+    /// the content first and chmodding after (which this did until 2026-08-08)
+    /// publishes the daemon identity and the Mac threshold share `m` at the
+    /// umask default, 0644 on a stock account, for the width of a syscall. Do
+    /// not reintroduce a `fs::write(path, json)` here, and do not move the
+    /// permission call below the `write_all`. Same discipline as
+    /// [`crate::threshold::ThresholdStore::save`] and
+    /// [`crate::keystore_seal::write_private`].
+    ///
+    /// The rename also means a concurrent reader sees either the whole old file
+    /// or the whole new one, never a half-written store that would read as a
+    /// vanished pairing.
     fn write(&self, state: &FileState) -> Result<(), KeystoreError> {
-        use std::os::unix::fs::PermissionsExt;
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| KeystoreError::Backend(e.to_string()))?;
-        }
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let backend = |e: std::io::Error| KeystoreError::Backend(e.to_string());
+        let dir = self.path.parent().unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(dir).map_err(backend)?;
         let json =
             serde_json::to_vec_pretty(state).map_err(|e| KeystoreError::Backend(e.to_string()))?;
-        std::fs::write(&self.path, json).map_err(|e| KeystoreError::Backend(e.to_string()))?;
-        std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| KeystoreError::Backend(e.to_string()))?;
+
+        let tmp = dir.join(format!(
+            ".{}.tmp.{}",
+            self.path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "keystore.json".into()),
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(backend)?;
+            // `mode` above applies only when the file is created. A temp left
+            // behind by a crashed writer with this pid would keep whatever mode
+            // it had, so narrow it explicitly, still before any content exists.
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(backend)?;
+            f.write_all(&json).map_err(backend)?;
+            // The bytes must be on the platter before the rename makes them the
+            // store: a crash in between should lose the write, not the pairing.
+            f.sync_all().map_err(backend)?;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &self.path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(backend(e));
+        }
         Ok(())
     }
 }
@@ -645,6 +691,53 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_store_lands_on_a_fresh_0600_inode_instead_of_being_widened_in_place() {
+        // The daemon identity and the Mac share must never exist in a file that
+        // anyone but the owner can read, not even for the width of a syscall.
+        // Observing that window directly would be a racy test, so this asserts
+        // the mechanism that removes it: the content reaches the destination
+        // only by renaming a file that was 0600 before it held a byte. Put a
+        // world-readable file at the destination first, and the inode must
+        // CHANGE. A write-then-chmod implementation keeps the inode (and holds
+        // the content at 0666 until the chmod), so it fails here deterministically
+        // rather than depending on the ambient umask or on timing.
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let dir = std::env::temp_dir().join(format!(
+            "sigil-ks-mode-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keystore.json");
+        std::fs::write(&path, b"{\"blobs\":{}}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let wide_inode = std::fs::metadata(&path).unwrap().ino();
+
+        FileKeystore::new(path.clone())
+            .store_blob("pairing.daemon-identity.v1", b"the-identity")
+            .unwrap();
+
+        let after = std::fs::metadata(&path).unwrap();
+        assert_ne!(
+            wide_inode,
+            after.ino(),
+            "the content must land on a new file, never be written into the world-readable one"
+        );
+        assert_eq!(after.permissions().mode() & 0o777, 0o600);
+
+        // And the temp the rename came from is gone, not left holding a copy.
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "keystore.json")
+            .collect();
+        assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
