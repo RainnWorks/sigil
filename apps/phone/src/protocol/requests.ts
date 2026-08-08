@@ -500,8 +500,9 @@ export interface LeaseRevokeReplyMessage {
    * the whole defence against the attack that made this feature worse than the
    * badge it replaced (design review F3).
    *
-   * The envelope layer's replay guard is a 90 second freshness window plus a
-   * single-use id set held in RAM, and that set is empty again after any restart.
+   * The envelope layer's replay guard is a 150 second freshness window
+   * (`REPLAY_WINDOW_MS`) plus a single-use id set held in RAM, and that set is
+   * empty again after any restart.
    * The phone being killed or backgrounded is routine. So a relay can capture a
    * genuine `revoked: true`, wait for a restart, suppress the human's next
    * outgoing revoke, and deliver the captured reply into a fresh guard: unseen

@@ -5,7 +5,9 @@
  * Sealed with crypto_box (X25519 + XSalsa20-Poly1305) to the pinned recipient
  * agreement key using a fresh per-envelope ephemeral (forward secrecy), signed
  * with Ed25519 by the pinned sender over the canonical bytes below, and
- * replay-protected by a single-use uuidv7 id + monotonic counter + timestamp.
+ * replay-protected by a single-use uuidv7 id inside a freshness window on the
+ * timestamp. The counter below is a signed wire field, not a gate: see
+ * `replay.ts` for both gates, the window, and why the counter was retired.
  *
  * `canonicalBytes` MUST be byte-identical to the Rust `canonical_bytes`: the
  * signature covers exactly these length-prefixed fields in this order.

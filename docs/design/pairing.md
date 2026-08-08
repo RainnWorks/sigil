@@ -369,5 +369,9 @@ device layers land:
 - **NEEDS VERIFICATION:** QR camera capture fidelity and the practical upper
   bound on payload size (endpoints list length) for reliable single-frame scans.
 - **NEEDS VERIFICATION:** clock skew between Mac and phone against the 180s TTL in
-  the field; the envelope layer already enforces a separate 90s window on
-  subsequent traffic.
+  the field; the envelope layer separately enforces a **150s** freshness window
+  (`REPLAY_WINDOW_MS`) on subsequent traffic, so skew past 150s starts rejecting
+  genuine envelopes well before the pairing TTL is the binding constraint. That
+  window is one of two replay gates, not the whole guard: see `replay.rs` for the
+  single-use request-id set beside it, and for why the per-pairing counter no
+  longer gates anything.
