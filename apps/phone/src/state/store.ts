@@ -199,7 +199,7 @@ class Store {
    * account of itself, which is stronger evidence than the revoke reply. A window
    * still present stays pending, warning and all, because it really is still open.
    */
-  leaseListReceived(rows: LeaseRow[], asOf: number, receivedAt: number): void {
+  leaseListReceived(rows: LeaseRow[], asOf: number, sentAt: number, receivedAt: number): void {
     const live = toActiveLeases(rows, receivedAt);
     const present = new Set(live.map((l) => l.leaseId));
     const settled = this.state.leases.revokes.filter(
@@ -211,7 +211,10 @@ class Store {
         : this.state.leases.note;
     this.patchLeases({
       rows: live,
-      answeredAt: receivedAt,
+      // Aged from when the QUESTION went out, never from when the answer turned
+      // up: the relay picks the delay, so arrival is a number it controls. See
+      // the two-timestamp note in the session controller.
+      askedAt: sentAt,
       asOf,
       asking: false,
       unreachable: false,
@@ -286,7 +289,7 @@ class Store {
   clearLeaseSnapshot(): void {
     this.patchLeases({
       rows: [],
-      answeredAt: 0,
+      askedAt: 0,
       asOf: 0,
       asking: false,
       unreachable: false,

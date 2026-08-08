@@ -190,10 +190,15 @@ export interface LeaseView {
   /** The rows from the last successful snapshot. Empty is meaningful only when
    *  {@link answeredAt} is non-zero. */
   rows: ActiveLease[];
-  /** When the snapshot ARRIVED on this phone, unix ms, local clock. 0 = never.
-   *  Staleness is measured from this, not from {@link asOf}, so a daemon clock
-   *  running fast cannot make an old snapshot look current. */
-  answeredAt: number;
+  /**
+   * When the QUERY behind the current snapshot was sent, unix ms, local clock.
+   * 0 = never answered. This is the freshness base, and it is deliberately not
+   * the arrival time: a relay chooses how long to stall a reply, so arrival is a
+   * number the adversary controls, while send time is an upper bound on the
+   * answer's age that only this phone can set. Nor is it {@link asOf}, which a
+   * daemon clock running fast could use to make an old snapshot look current.
+   */
+  askedAt: number;
   /** When the DAEMON measured it, unix ms on its clock. Displayed, never used to
    *  decide freshness. 0 = never answered. */
   asOf: number;

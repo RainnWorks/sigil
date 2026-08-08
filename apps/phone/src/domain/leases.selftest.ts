@@ -29,6 +29,7 @@ import {
   LEASE_SNAPSHOT_FRESH_MS,
   leaseListStatus,
   liveLeases,
+  REVOKE_FALLBACK_CAVEAT,
   REVOKE_FALLBACK_LIST,
   REVOKE_FALLBACK_REVOKE,
   revokeNoteLine,
@@ -104,7 +105,7 @@ function main(): void {
 
   console.log("leaseListStatus (an empty list is a claim that has to be earned)");
   {
-    const answered = { answeredAt: NOW - 1_000, asOf: NOW - 1_000 };
+    const answered = { askedAt: NOW - 1_000, asOf: NOW - 1_000 };
     const fresh = leaseListStatus(view(answered), NOW);
     eq(fresh.kind, "empty", "fresh snapshot, no rows");
     eq(fresh.line, "No active leases.", "fresh empty line");
@@ -113,7 +114,7 @@ function main(): void {
 
     // One tick past the freshness window: the sentence weakens and dates itself.
     const agedAt = NOW - LEASE_SNAPSHOT_FRESH_MS - 1;
-    const old = leaseListStatus(view({ answeredAt: agedAt, asOf: agedAt }), NOW);
+    const old = leaseListStatus(view({ askedAt: agedAt, asOf: agedAt }), NOW);
     eq(old.line, `No active leases as of ${asOfClock(agedAt)}.`, "stale empty line dates itself");
     ok(!old.authoritative, "a stale snapshot is not authoritative");
     ok(old.detail?.includes("Check again") ?? false, "a stale snapshot says what to do");
@@ -131,30 +132,56 @@ function main(): void {
   console.log("snapshot freshness (10s, measured locally, not on the daemon's clock)");
   {
     ok(!snapshotFresh(view(), NOW), "never answered is never fresh");
-    ok(snapshotFresh(view({ answeredAt: NOW - 9_000, asOf: NOW }), NOW), "9s old is fresh");
-    ok(!snapshotFresh(view({ answeredAt: NOW - 11_000, asOf: NOW }), NOW), "11s old is stale");
+    ok(snapshotFresh(view({ askedAt: NOW - 9_000, asOf: NOW }), NOW), "9s old is fresh");
+    ok(!snapshotFresh(view({ askedAt: NOW - 11_000, asOf: NOW }), NOW), "11s old is stale");
     // A daemon clock running fast must not be able to refresh an old snapshot.
     ok(
-      !snapshotFresh(view({ answeredAt: NOW - 60_000, asOf: NOW + 3_600_000 }), NOW),
+      !snapshotFresh(view({ askedAt: NOW - 60_000, asOf: NOW + 3_600_000 }), NOW),
       "a future asOf cannot make an old snapshot look current",
     );
     eq(asOfClock(new Date(2026, 0, 2, 14, 3, 7).getTime()), "14:03:07", "asOf renders as a clock");
   }
 
+  console.log("a stalled reply cannot buy currency (R7-F1)");
+  {
+    // The relay picks how long to sit on an answer. Stalling it 19s, just inside
+    // the 20s reply timeout, must not produce a snapshot that reads as current:
+    // age is measured from when the QUESTION went out, which no one but this
+    // phone can push later.
+    const sentAt = NOW - 19_000;
+    const stalled = view({ askedAt: sentAt, asOf: NOW - 100 });
+    ok(!snapshotFresh(stalled, NOW), "a 19s stalled reply is not fresh");
+    const s = leaseListStatus(stalled, NOW);
+    eq(s.line, `No active leases as of ${asOfClock(NOW - 100)}.`, "and cannot claim emptiness flatly");
+    ok(!s.authoritative, "a stalled reply is never authoritative");
+
+    // Had it been stamped at arrival, this same answer would have read as brand
+    // new. That is the bug this pins, so state it as an assertion rather than
+    // trusting the constant above to stay put.
+    ok(
+      snapshotFresh(view({ askedAt: NOW, asOf: NOW - 100 }), NOW),
+      "the same answer stamped at arrival would have looked current",
+    );
+
+    // A prompt answer is still fresh: the fix must not make the definite claim
+    // unreachable over an honest link.
+    ok(snapshotFresh(view({ askedAt: NOW - 1_500, asOf: NOW }), NOW), "a 1.5s round trip stays fresh");
+  }
+
   console.log("leaseListStatus (rows)");
   {
     const rows = toActiveLeases([row()], NOW);
-    const fresh = leaseListStatus(view({ rows, answeredAt: NOW, asOf: NOW }), NOW);
+    const fresh = leaseListStatus(view({ rows, askedAt: NOW, asOf: NOW }), NOW);
     eq(fresh.kind, "rows", "fresh rows");
     eq(fresh.line, `Snapshot as of ${asOfClock(NOW)}.`, "fresh rows stamp the snapshot");
     ok(fresh.detail === undefined, "fresh rows need no caveat");
 
     const agedAt = NOW - LEASE_SNAPSHOT_FRESH_MS - 60_000;
-    const stale = leaseListStatus(view({ rows, answeredAt: agedAt, asOf: agedAt }), NOW);
+    const stale = leaseListStatus(view({ rows, askedAt: agedAt, asOf: agedAt }), NOW);
     ok(stale.detail?.includes("Check again") ?? false, "stale rows carry a caveat");
 
     // Rows that have all run out read as an empty list, not as rows.
-    const lapsed = leaseListStatus(view({ rows, answeredAt: NOW, asOf: NOW }), NOW + 600_001);
+    const lapsed = leaseListStatus(view({ rows, askedAt: NOW, asOf: NOW }), NOW + 600_001);
     eq(lapsed.kind, "empty", "every row lapsed");
   }
 
@@ -168,6 +195,18 @@ function main(): void {
     eq(l!.scope, "op-eu", "scope survives the allowlist");
     eq(l!.covers, null, "an empty covers is null, never an empty gap");
     eq(l!.account, null, "an empty account is null");
+
+    // THE ASYMMETRY, pinned so nobody "makes it consistent" later. Remaining
+    // time is stamped at ARRIVAL, which over-reports how long a window is open
+    // and so prompts a revoke. Snapshot age is measured from SEND, which
+    // over-reports staleness and so withholds the "none" claim. Both err toward
+    // "assume more is open than you can see".
+    const arrived = NOW + 19_000; // a relay stalled the reply this long
+    const stamped = toActiveLeases([row({ remainingMs: 600_000 })], arrived);
+    ok(
+      stamped[0]!.expiresAt > NOW + 600_000,
+      "remaining time is stamped at arrival, so a stalled reply over-reports the window",
+    );
 
     // Already lapsed on arrival: dropped rather than rendered at zero.
     eq(toActiveLeases([row({ remainingMs: 0 })], NOW).length, 0, "expired row dropped");
@@ -251,18 +290,32 @@ function main(): void {
   console.log("OutstandingRequests (F3: the captured-reply replay)");
   {
     const o = new OutstandingRequests();
-    o.issue(REQ, "revoke");
-    ok(o.claim(REQ, "revoke"), "a reply to a question we asked is claimed");
-    ok(!o.claim(REQ, "revoke"), "the same reply cannot be claimed twice");
+    o.issue(REQ, "revoke", NOW);
+    ok(o.claim(REQ, "revoke") !== null, "a reply to a question we asked is claimed");
+    ok(o.claim(REQ, "revoke") === null, "the same reply cannot be claimed twice");
     eq(o.size, 0, "claiming consumes the entry");
 
-    o.issue(REQ, "revoke");
-    ok(!o.claim(REQ, "list"), "a reply of the wrong kind is not claimed");
-    ok(!o.claim(REQ2, "revoke"), "a reply naming a question we never asked is not claimed");
+    o.issue(REQ, "revoke", NOW);
+    ok(o.claim(REQ, "list") === null, "a reply of the wrong kind is not claimed");
+    ok(o.claim(REQ2, "revoke") === null, "a reply naming a question we never asked is not claimed");
 
-    o.issue(REQ2, "list");
+    o.issue(REQ2, "list", NOW);
     o.abandon(REQ2);
-    ok(!o.claim(REQ2, "list"), "a question given up on cannot be answered later");
+    ok(o.claim(REQ2, "list") === null, "a question given up on cannot be answered later");
+
+    // The send time rides with the question, because the answer's age is
+    // measured from it rather than from whenever the reply turns up.
+    const timed = new OutstandingRequests();
+    timed.issue(REQ, "list", NOW - 19_000);
+    eq(timed.claim(REQ, "list")?.sentAt, NOW - 19_000, "the send time comes back with the claim");
+
+    // Only one list question may be outstanding: two would let an older snapshot
+    // land after a newer one and repaint the screen backwards.
+    const many = new OutstandingRequests();
+    many.issue(REQ, "list", NOW);
+    many.issue(REQ2, "revoke", NOW);
+    eq(many.idsOfKind("list").length, 1, "outstanding list questions are enumerable");
+    eq(many.idsOfKind("list")[0], REQ, "and the caller can stand the old one down");
 
     // The attack, end to end. The relay captured a genuine revoked:true from an
     // earlier session; the app was killed, which is what empties both this set
@@ -271,9 +324,9 @@ function main(): void {
     // for it, so it confirms nothing and the row stays put.
     const afterRestart = new OutstandingRequests();
     const captured = REQ;
-    afterRestart.issue(REQ2, "revoke"); // the human's new, suppressed revoke
+    afterRestart.issue(REQ2, "revoke", NOW); // the human's new, suppressed revoke
     ok(
-      !afterRestart.claim(captured, "revoke"),
+      afterRestart.claim(captured, "revoke") === null,
       "a captured reply replayed into a fresh session confirms nothing",
     );
     ok(afterRestart.size === 1, "and the human's real question is still outstanding");
@@ -312,6 +365,10 @@ function main(): void {
     // revoke is prefix matched, so a truncated id would revoke everything.
     ok(REVOKE_FALLBACK_REVOKE.includes("<prefix>"), "the fallback is a placeholder");
     ok(REVOKE_FALLBACK_LIST === "sigil lease list", "and is preceded by the listing step");
+    // The Mac's revoke is a prefix match over the grant key, so it can close
+    // siblings this phone never showed. Closing too much is safe; being
+    // surprised by it is not (R7-F4).
+    ok(REVOKE_FALLBACK_CAVEAT.includes("may close other windows"), "the fallback warns it closes more");
 
     // Both verdicts are successes, and the second must not read as a failure.
     eq(revokeNoteLine("closed"), "Window closed. The next matching command asks again.", "closed");
@@ -330,10 +387,11 @@ function main(): void {
     // string this module can produce is checked for anything of that shape.
     const rows = toActiveLeases([row()], NOW);
     const strings = [
-      ...[view(), view({ asking: true }), view({ unreachable: true }), view({ answeredAt: NOW, asOf: NOW }), view({ rows, answeredAt: NOW, asOf: NOW })]
+      ...[view(), view({ asking: true }), view({ unreachable: true }), view({ askedAt: NOW, asOf: NOW }), view({ rows, askedAt: NOW, asOf: NOW })]
         .map((v) => leaseListStatus(v, NOW))
         .flatMap((s) => [s.line, s.detail ?? ""]),
       unconfirmedRevokeLine(revoke({ unconfirmed: true })),
+      REVOKE_FALLBACK_CAVEAT,
       REVOKE_FALLBACK_LIST,
       REVOKE_FALLBACK_REVOKE,
       revokeNoteLine("closed"),
@@ -354,9 +412,9 @@ function main(): void {
       view(),
       view({ asking: true }),
       view({ unreachable: true }),
-      view({ answeredAt: NOW, asOf: NOW }),
-      view({ answeredAt: NOW - 10 * 60_000, asOf: NOW - 10 * 60_000, unreachable: true }),
-      view({ rows, answeredAt: NOW, asOf: NOW }),
+      view({ askedAt: NOW, asOf: NOW }),
+      view({ askedAt: NOW - 10 * 60_000, asOf: NOW - 10 * 60_000, unreachable: true }),
+      view({ rows, askedAt: NOW, asOf: NOW }),
     ]
       .map((v) => leaseListStatus(v, NOW))
       .flatMap((s) => [s.line, s.detail ?? ""])

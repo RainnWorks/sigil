@@ -34,7 +34,7 @@ import { faceGate } from "@/src/lib/biometric";
 import { LEASE_REPLY_TIMEOUT_MS } from "@/src/domain/leases";
 import { store } from "@/src/state/store";
 import { PhoneRelay } from "@/src/transport/phone-relay";
-import { type OutstandingKind, OutstandingRequests } from "./outstanding";
+import { type Outstanding, type OutstandingKind, OutstandingRequests } from "./outstanding";
 import { type LeaseControlReply, SigilSession } from "./session";
 import { clearPairing, loadPairing, type StoredPairing } from "./keystore";
 
@@ -214,23 +214,46 @@ function clearLeaseTimers(): void {
 }
 
 /**
- * Claim an outstanding request, standing its timer down. False is the drop path,
+ * Claim an outstanding request, standing its timer down. Null is the drop path,
  * and it is silent: an uncorrelated reply is not evidence about anything, so it
  * must not move the UI in either direction.
  */
-function claim(inReplyTo: string, kind: OutstandingKind): boolean {
-  if (!outstanding.claim(inReplyTo, kind)) return false;
+function claim(inReplyTo: string, kind: OutstandingKind): Outstanding | null {
+  const o = outstanding.claim(inReplyTo, kind);
+  if (!o) return null;
   const t = leaseTimers.get(inReplyTo);
   if (t) clearTimeout(t);
   leaseTimers.delete(inReplyTo);
-  return true;
+  return o;
+}
+
+/** Stand down a question we no longer want the answer to. */
+function abandonLease(requestId: string): void {
+  const t = leaseTimers.get(requestId);
+  if (t) clearTimeout(t);
+  leaseTimers.delete(requestId);
+  outstanding.abandon(requestId);
 }
 
 /** Route a correlated answer to the store. Anything uncorrelated is dropped. */
 function handleLeaseReply(msg: LeaseControlReply): void {
   if (msg.kind === "leaseList") {
-    if (!claim(msg.reply.inReplyTo, "list")) return;
-    store.leaseListReceived(msg.reply.leases, msg.reply.asOf, Date.now());
+    const asked = claim(msg.reply.inReplyTo, "list");
+    if (!asked) return;
+    // TWO TIMESTAMPS, AND THEY ARE DELIBERATELY DIFFERENT. Do not "make these
+    // consistent": the safe direction differs, so the correct stamp differs.
+    //
+    //   asked.sentAt  ages the SNAPSHOT. A relay picks how long to stall a
+    //     reply, so stamping arrival would let it hand over a nineteen second
+    //     old answer that reads as current, and "No active leases." would rest
+    //     on information a minute stale. Measuring from send over-reports age,
+    //     which withholds the definite claim.
+    //   Date.now()    stamps each row's REMAINING time. Arrival over-reports
+    //     how long a window is open, which prompts a revoke.
+    //
+    // Both err toward "assume more is open than you can see", which is the one
+    // direction this surface is allowed to be wrong in.
+    store.leaseListReceived(msg.reply.leases, msg.reply.asOf, asked.sentAt, Date.now());
     return;
   }
   if (!claim(msg.reply.inReplyTo, "revoke")) return;
@@ -264,6 +287,12 @@ export async function refreshLeases(): Promise<LeaseQueryOutcome> {
     store.leaseQueryCancelled(gate.reason === "unavailable");
     return gate.reason === "unavailable" ? "no-biometric" : "refused";
   }
+  // At most ONE list question outstanding at a time. Two would let an older
+  // snapshot land after a newer one and repaint the screen backwards, and the
+  // reasoning that lets an omitted window count as proof it closed depends on
+  // there being a single answer in flight to reason about.
+  for (const id of outstanding.idsOfKind("list")) abandonLease(id);
+  const sentAt = Date.now();
   store.leaseQueryStarted();
   let requestId: string;
   try {
@@ -273,7 +302,7 @@ export async function refreshLeases(): Promise<LeaseQueryOutcome> {
     store.leaseQueryFailed();
     return "cannot-ask";
   }
-  outstanding.issue(requestId, "list");
+  outstanding.issue(requestId, "list", sentAt);
   armLeaseTimer(requestId, () => store.leaseQueryFailed());
   // Hurry the answer down the ladder rather than waiting out the poll backstop.
   void live.transport.wake();
@@ -319,7 +348,7 @@ export async function revokeLease(leaseId: string, scope: string | null): Promis
     return;
   }
   store.leaseRevokeStarted({ requestId, leaseId, scope, sentAt, unconfirmed: false });
-  outstanding.issue(requestId, "revoke");
+  outstanding.issue(requestId, "revoke", sentAt);
   armLeaseTimer(requestId, () => store.leaseRevokeUnconfirmed(requestId));
   void live.transport.wake();
 }

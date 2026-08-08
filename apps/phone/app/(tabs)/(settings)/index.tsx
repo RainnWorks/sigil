@@ -15,6 +15,7 @@ import {
   leaseListStatus,
   liveLeases,
   remainingSentence,
+  REVOKE_FALLBACK_CAVEAT,
   REVOKE_FALLBACK_LIST,
   REVOKE_FALLBACK_REVOKE,
   revokeNoteLine,
@@ -260,7 +261,7 @@ function LeaseSection({ view }: { view: LeaseView }) {
               {status.detail}
             </Sans>
           ) : null}
-          {view.note ? (
+          {view.note && warnings.length === 0 ? (
             <Sans size={12} tone="muted" style={{ marginTop: 4 }}>
               {revokeNoteLine(view.note.outcome)}
             </Sans>
@@ -279,12 +280,12 @@ function LeaseSection({ view }: { view: LeaseView }) {
           style={{ flexDirection: "row", alignItems: "center", gap: space.md, padding: space.lg }}
         >
           <Sf
-            name={view.answeredAt > 0 ? "arrow.clockwise" : "faceid"}
+            name={view.askedAt > 0 ? "arrow.clockwise" : "faceid"}
             color={view.asking ? p.faint : p.cobalt}
             size={16}
           />
           <Sans size={16} style={{ flex: 1, color: view.asking ? p.faint : p.cobalt }}>
-            {view.asking ? "Checking" : view.answeredAt > 0 ? "Check again" : "Show active leases"}
+            {view.asking ? "Checking" : view.askedAt > 0 ? "Check again" : "Show active leases"}
           </Sans>
         </Pressable>
       </Card>
@@ -323,6 +324,9 @@ function UnconfirmedRevoke({ revoke, now }: { revoke: PendingRevoke; now: number
       <Mono size={12} tone="faint" selectable>
         {REVOKE_FALLBACK_REVOKE}
       </Mono>
+      <Sans size={12} tone="faint">
+        {REVOKE_FALLBACK_CAVEAT}
+      </Sans>
     </View>
   );
 }

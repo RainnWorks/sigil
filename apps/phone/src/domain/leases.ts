@@ -51,7 +51,7 @@ export const ACCOUNT_MAX_CHARS = 48;
 export function emptyLeaseView(): LeaseView {
   return {
     rows: [],
-    answeredAt: 0,
+    askedAt: 0,
     asOf: 0,
     asking: false,
     unreachable: false,
@@ -66,9 +66,16 @@ export function emptyLeaseView(): LeaseView {
  *
  * The daemon sends a duration, not a deadline, so `receivedAt` fixes it to a
  * local timeline the countdown can tick against. Transit delay makes the result
- * very slightly generous (the window really closes a round trip earlier than the
- * row says), which is the direction to err: overstating how long a window is open
- * prompts a revoke, understating it would invite the human to relax.
+ * generous: the window really closes a round trip earlier than the row says. On
+ * an honest link that is a few hundred milliseconds. Under a hostile one it is
+ * as much as the reply timeout, because the relay chooses the delay, so state
+ * the bound as up to {@link LEASE_REPLY_TIMEOUT_MS} rather than "a moment".
+ *
+ * Arrival is still the right stamp HERE, and the asymmetry with
+ * {@link snapshotFresh} is deliberate: overstating how long a window is open
+ * prompts a revoke, while understating it would invite the human to relax. Age
+ * the snapshot from send, age the window from arrival, and both err toward
+ * "assume more is open than you can see".
  *
  * Rows already past their expiry are dropped rather than rendered at zero, and
  * every display string goes through the daemon's own label allowlist a second
@@ -99,10 +106,21 @@ export function liveLeases(view: LeaseView, nowMs: number): ActiveLease[] {
   return view.rows.filter((l) => l.expiresAt > nowMs);
 }
 
-/** Whether the snapshot on screen still counts as describing now. */
+/**
+ * Whether the snapshot on screen still counts as describing now.
+ *
+ * Aged from when the QUERY WAS SENT ({@link LeaseView.askedAt}), not from when
+ * the reply arrived, and this is a security property rather than a detail. A
+ * relay decides how long to sit on a reply, so arrival time is a number the
+ * adversary picks: stalling an answer for nineteen seconds, just inside the
+ * reply timeout, would hand this phone a nineteen second old answer reading as
+ * current, and the unqualified "No active leases." would then rest on
+ * information nearly a minute stale. Send time cannot be pushed later by anyone
+ * but this phone, so it is the correct upper bound on the answer's age.
+ */
 export function snapshotFresh(view: LeaseView, nowMs: number): boolean {
-  if (view.answeredAt === 0) return false;
-  return nowMs - view.answeredAt < LEASE_SNAPSHOT_FRESH_MS && !view.unreachable;
+  if (view.askedAt === 0) return false;
+  return nowMs - view.askedAt < LEASE_SNAPSHOT_FRESH_MS && !view.unreachable;
 }
 
 /**
@@ -146,6 +164,16 @@ export function unconfirmedRevokes(view: LeaseView): PendingRevoke[] {
  */
 export const REVOKE_FALLBACK_LIST = "sigil lease list";
 export const REVOKE_FALLBACK_REVOKE = "sigil lease revoke <prefix>";
+
+/**
+ * The caveat that has to travel with the fallback. The Mac's revoke matches on a
+ * prefix of the GRANT KEY, and one grant key can have more than one live window
+ * under it (different accounts or sources), so the command may close siblings
+ * this phone never showed. Closing too much is the safe direction and the command
+ * stays as it is; being surprised by it is not, so the screen says so first.
+ */
+export const REVOKE_FALLBACK_CAVEAT =
+  "That command matches on a prefix, so it may close other windows opened by the same caller under that rule.";
 
 /** The standing warning for a revoke that was never confirmed. */
 export function unconfirmedRevokeLine(revoke: PendingRevoke): string {
@@ -197,7 +225,7 @@ const AGED = "Check again for what is open now.";
  * ternary in the screen.
  */
 export function leaseListStatus(view: LeaseView, nowMs: number): LeaseListStatus {
-  const answered = view.answeredAt > 0;
+  const answered = view.askedAt > 0;
   const fresh = snapshotFresh(view, nowMs);
 
   if (!answered) {
