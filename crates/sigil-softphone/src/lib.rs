@@ -435,6 +435,10 @@ mod tests {
             threshold: None,
             expires_at: NOW + 90_000,
             timeout_ms: 90_000,
+            // No challenge: these fixtures predate the approve proof, and the
+            // softphone's own tests do not exercise it. A real daemon mints one
+            // for every request.
+            proof_challenge: None,
         }
     }
 

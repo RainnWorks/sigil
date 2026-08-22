@@ -11,6 +11,7 @@ pub mod envelope;
 pub mod fingerprint;
 pub mod identity;
 pub mod pairing;
+pub mod proof;
 pub mod replay;
 pub mod request;
 pub mod threshold;
@@ -24,6 +25,7 @@ pub use pairing::{
     PairingError, PairingPayload, PairingResponse, PairingSecret, PairingState, PhonePairing,
     PAIRING_SECRET_TTL_MS,
 };
+pub use proof::{approve_proof, ApproveChallenge, ProofError, APPROVE_PROOF_DOMAIN, PROOF_LEN};
 pub use replay::{ReplayError, ReplayGuard};
 pub use request::{
     sanitize_label, ApprovalRequest, ApprovalResponse, BlockDirective, Decision, DeliveryReceipt,

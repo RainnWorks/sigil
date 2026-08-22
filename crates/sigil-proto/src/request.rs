@@ -456,6 +456,18 @@ pub struct ApprovalRequest {
     /// single-account form is implemented here.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub threshold: Option<ThresholdChallenge>,
+    /// The per-request approve challenge `C = c·G`, ANSI X9.63 (65 bytes),
+    /// standard-base64. Minted fresh for EVERY request, whatever its kind, and
+    /// answered on approve by [`ApprovalResponse::proof`].
+    ///
+    /// Unconditional by construction, not by convention: it is minted in
+    /// `RemoteApprover::build_request`, the single production site that builds one
+    /// of these, precisely so that a future request kind cannot forget to carry one
+    /// and thereby silently stop requiring a proof. `Option` only so an
+    /// older/omitting peer deserializes; a daemon that issued a challenge refuses
+    /// any approve that does not answer it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub proof_challenge: Option<String>,
     /// Absolute expiry, unix ms.
     pub expires_at: u64,
     /// Full-scale window for the countdown gauge, ms.
@@ -468,6 +480,18 @@ pub struct ApprovalRequest {
 pub enum Decision {
     Approved,
     Denied,
+}
+
+impl Decision {
+    /// The exact wire tag this decision serializes to. The approve proof binds
+    /// this string ([`crate::proof::approve_proof`]), so both sides must derive it
+    /// from here rather than spelling it out at a call site.
+    pub fn wire_tag(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+        }
+    }
 }
 
 /// An "approve for this session" grant: the auto-approve WINDOW the approver
@@ -526,6 +550,16 @@ pub struct ApprovalResponse {
     /// On "deny and block": the process to mute and for how long, else absent.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub block: Option<BlockDirective>,
+    /// The approve proof, 32 bytes, standard-base64: evidence that a
+    /// biometrically-gated hardware key answered THIS request's challenge with
+    /// THIS decision (see [`crate::proof`]).
+    ///
+    /// Required on every approve of a request that carried a
+    /// [`ApprovalRequest::proof_challenge`]; absent on deny, which stays
+    /// frictionless because a denial can never release anything. An approve
+    /// without it is a denial at the daemon.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub proof: Option<String>,
     pub decided_at: u64,
 }
 
@@ -545,6 +579,7 @@ impl ApprovalResponse {
             }),
             lease: None,
             block: None,
+            proof: None,
             decided_at,
         }
     }
@@ -558,6 +593,7 @@ impl ApprovalResponse {
             partial: None,
             lease: None,
             block: None,
+            proof: None,
             decided_at,
         }
     }
@@ -571,14 +607,39 @@ impl ApprovalResponse {
             partial: None,
             lease: None,
             block: None,
+            proof: None,
             decided_at,
         }
     }
 
     /// Attach a session lease to an approve response.
+    ///
+    /// **Order matters.** The approve proof binds the lease TTL, so this must be
+    /// applied BEFORE [`with_proof`](Self::with_proof); attaching a lease after
+    /// the proof yields a response the daemon denies. [`proof_binding`] is what
+    /// callers hash, and it reads the lease off `self`, so building in that order
+    /// is self-enforcing.
     pub fn with_lease(mut self, lease: InstallLease) -> Self {
         self.lease = Some(lease);
         self
+    }
+
+    /// Attach the approve proof. Applied last, over a response that is otherwise
+    /// final.
+    pub fn with_proof(mut self, proof_b64: String) -> Self {
+        self.proof = Some(proof_b64);
+        self
+    }
+
+    /// The binding this response's proof must cover: its request id, its decision
+    /// tag, and the lease window it requests. Both sides derive the preimage from
+    /// here so the phone cannot hash one thing and send another.
+    pub fn proof_binding(&self) -> (&str, &'static str, Option<u64>) {
+        (
+            &self.request_id,
+            self.decision.wire_tag(),
+            self.lease.as_ref().map(|l| l.ttl_ms),
+        )
     }
 
     /// Decode the carried partial `Z_F` and its account id, if any. Returns
@@ -1294,6 +1355,7 @@ mod tests {
             lease_policy: LeasePolicy::RunOnce,
             reason: None,
             threshold: None,
+            proof_challenge: None,
             expires_at: 1_720_000_090_000,
             timeout_ms: 90_000,
         };
@@ -1621,6 +1683,7 @@ mod tests {
             lease_policy: LeasePolicy::RunOnce,
             reason: None,
             threshold: None,
+            proof_challenge: None,
             expires_at: 2,
             timeout_ms: 90_000,
         };
@@ -1791,6 +1854,7 @@ mod tests {
             lease_policy: LeasePolicy::RunOnce,
             reason: None,
             threshold: None,
+            proof_challenge: None,
             expires_at: 2,
             timeout_ms: 90_000,
         };

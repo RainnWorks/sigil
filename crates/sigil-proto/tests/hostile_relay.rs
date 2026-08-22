@@ -670,6 +670,7 @@ fn the_lease_coverage_label_rides_inside_the_seal() {
         lease_policy: LeasePolicy::leasable(900).with_covers(covers),
         reason: None,
         threshold: None,
+        proof_challenge: None,
         expires_at: 2,
         timeout_ms: 1,
     };

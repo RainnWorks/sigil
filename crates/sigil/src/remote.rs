@@ -403,6 +403,16 @@ impl RemoteApprover {
             threshold: ctx.threshold.clone(),
             expires_at: now + timeout_ms,
             timeout_ms,
+            // NOT YET MINTED. This is the single production construction site,
+            // and the design requires a fresh per-request challenge here
+            // UNCONDITIONALLY, so that a request path cannot silently opt out of
+            // the proof by forgetting to mint one. It is absent for now because
+            // the phone ships first (answering a challenge when one is present)
+            // and the daemon second (minting one and requiring the answer). Do
+            // not make minting conditional when it lands; the whole point of
+            // putting it here is that the failure mode is structurally excluded
+            // rather than tested for.
+            proof_challenge: None,
         }
     }
 
