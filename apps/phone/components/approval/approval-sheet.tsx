@@ -26,7 +26,7 @@ import { space } from "@/theme/tokens";
 import { faceGate } from "@/src/lib/biometric";
 import { isArmed, liveApprove, liveDeny } from "@/src/session/controller";
 import { hapticCommit } from "@/src/lib/haptics";
-import { commandWord, durationWindow } from "@/src/lib/format";
+import { commandWord, coverageLabel, durationWindow } from "@/src/lib/format";
 import { type Decision } from "@/src/protocol";
 import { type PendingRequest } from "@/src/domain/types";
 import { store, useSelector } from "@/src/state/store";
@@ -77,7 +77,12 @@ export function ApprovalSheet({
   // The window is BROADER than a re-run of this exact argv, on three axes, and
   // the caption below has to carry all three or the consent is not informed
   // (security review F1/F2):
-  //   1. other commands the rule matches, not just this argv;
+  //   1. other commands the rule matches, not just this argv. The daemon now
+  //      states this axis exactly, in `leasePolicy.covers`: a label it renders
+  //      from the user's own rule ("op read", "op with --vault", "any command
+  //      with the subcommand read"). The phone used to guess it from argv[0],
+  //      which could only ever name the command that happened to trip the rule,
+  //      never the rule. Display only: rendered, never parsed, never branched on;
   //   2. other SECRETS the rule matches, not just the reference in the readout
   //      well above. This is the axis the human is actually reading, so it is
   //      named explicitly and never left implied. The noun is "secrets", the
@@ -88,16 +93,19 @@ export function ApprovalSheet({
   //      so a second agent session in another terminal and another project has
   //      the same chain and rides the same window. "from anywhere on this Mac"
   //      is the honest phrasing; never claim "from this process".
-  // It hedges with "this rule matches" because the rule, not the command word,
-  // is the boundary, and only the daemon knows how narrow that rule is.
+  // Axis 3 makes the caption slightly BROADER than the grant (which also wants a
+  // matching caller code identity). That is deliberate: on a consent surface an
+  // over-broad claim is safe and an under-broad one is not.
   const lease = request.leasePolicy?.kind === "leasable" ? request.leasePolicy : null;
+  const covers = coverageLabel(lease?.covers);
   const terminal = state === "approved" || state === "denied" || state === "expired" || state === "superseded";
-  // The command word comes from argv[0], NOT from the process chain: the sheet
+  // The actor named on the deny control ("Deny and block op for 1h") and in the
+  // block note. It comes from argv[0], NOT from the process chain: the sheet
   // never renders request.command, and the daemon resolves the chain separately,
   // so the two can differ (a chain leaf may carry a subcommand). Null when argv
-  // is empty, in which case the caption drops the word and the deny control
-  // falls back to the chain leaf. One word for the actor across both adjacent
-  // controls, so they never name it two different ways.
+  // is empty, in which case the deny control falls back to the chain leaf. It
+  // deliberately does NOT describe the lease window any more; that is the
+  // daemon's `covers` label above.
   const cmd = commandWord(request.command);
   const chainLeaf = request.provenance.processChain[request.provenance.processChain.length - 1] ?? "process";
   const actor = cmd ?? chainLeaf;
@@ -255,10 +263,37 @@ export function ApprovalSheet({
                     committing={inFlight === "window"}
                     onApprove={() => void handleApprove({ ttlMs: lease.maxSecs * 1000 })}
                   />
+                  {/* The breadth of the window, in the daemon's words. "that
+                      rule" is load-bearing: it gives the pronoun an antecedent
+                      the label itself cannot be, and it stops the label reading
+                      as the thing that does the matching. Several of the real
+                      shapes are phrases rather than single words (`op with
+                      --account "rowmhq.1password.eu"`, `any command with the
+                      subcommand read`), so the label carries a weight bump to
+                      mark where the rule's description ends; it does NOT carry a
+                      tone bump, because on a consent surface the brightest text
+                      must not be the half that makes the grant sound contained.
+                      "every command and secret" and "from anywhere on this Mac"
+                      are the dangerous halves and they read at caption tone.
+                      When the daemon sent no label (one that predates the
+                      field), the sentence still states both remaining axes and
+                      simply cannot name the rule. It never guesses one. */}
                   <Sans size={13} tone="muted">
-                    {cmd
-                      ? `Also covers other ${cmd} commands and secrets this rule matches, from anywhere on this Mac.`
-                      : "Also covers other commands and secrets this rule matches, from anywhere on this Mac."}
+                    {covers ? (
+                      <>
+                        Covers{" "}
+                        {/* tone is restated, not omitted: Sans defaults to
+                            tone="label" and always writes a color, so leaving
+                            it off would brighten the label rather than inherit
+                            the caption's muted. */}
+                        <Sans size={13} weight="medium" tone="muted">
+                          {covers}
+                        </Sans>
+                        : every command and secret that rule matches, from anywhere on this Mac.
+                      </>
+                    ) : (
+                      "Covers every command and secret this rule matches, from anywhere on this Mac."
+                    )}
                   </Sans>
                 </View>
                 <ApproveControl

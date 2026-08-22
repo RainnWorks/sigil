@@ -113,7 +113,7 @@ pub fn socket_path() -> PathBuf {
 /// that emits a [`Reply::Event`] per pending-set change. The `Run` variant is the
 /// shim / `sigil <cmd>` separate SCM_RIGHTS secret path and is untouched by the
 /// control surface. Keystore/config *mutations* (account add/rotate/remove,
-/// command config, settings, wipe, mac-approvals, shim install, pairing) are
+/// command config, settings, wipe, shim install, pairing) are
 /// deliberately NOT here: they stay short-lived CLI operations so a compromised
 /// always-on daemon cannot perform them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

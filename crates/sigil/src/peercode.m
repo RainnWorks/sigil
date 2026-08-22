@@ -19,6 +19,8 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>
+#include <stdint.h>
+#include <string.h>
 
 // Same check, but keyed on the peer's AUDIT TOKEN rather than its pid. An audit
 // token identifies a specific process instance and is never reused, so unlike a
@@ -77,6 +79,184 @@ int sigil_audit_satisfies_requirement(const void *token, size_t token_len,
     CFRelease(code);
     CFRelease(req);
     return (st == errSecSuccess) ? 0 : 1;
+}
+
+// The code identity of the image RUNNING as `pid`, in one resolution: its
+// executable path and its cdhash (kSecCodeInfoUnique), plus whether the
+// signature has a signer.
+//
+// This is a MEASUREMENT, not an authorization: nothing here decides whether a
+// process may do anything. It exists so the lease grant key names an ancestor by
+// what the platform says that RUNNING PROCESS is.
+//
+// Keyed on the live pid, never on a path. SecCodeCopyGuestWithAttributes with
+// kSecGuestAttributePid resolves the pid to the code object the kernel is
+// actually running, and SecCodeCheckValidityWithErrors asks the platform whether
+// that image is still intact. That check is the load-bearing part:
+// kSecCodeInfoUnique is returned WITHOUT any validity check, so on its own a
+// cdhash is only whatever the CodeDirectory claims. Measured on this platform:
+// replace the file at a running process's path (in place or by rename) and the
+// signing information happily reports the substituted binary's cdhash while the
+// validity check turns into -67034 errSecCSStaticCodeChanged. So anything but
+// errSecSuccess is reported here as "could not measure", and the caller must not
+// coalesce on it. This is the same machinery sigil_peer_satisfies_requirement
+// uses for the keystore gate.
+//
+// `*adhoc_out` distinguishes a signature with a signer from an ad-hoc one (flags
+// & kSecCodeSignatureAdhoc). An ad-hoc signature has no signer at all: its
+// cdhash is a digest of the binary and nothing more, so the caller tags it as a
+// separate KIND of measurement rather than as a signing identity. A platform
+// binary carries no certificate chain either, but the kernel's trust cache
+// vouches for it, so it counts as signed.
+//
+// What the validity check catches is SUBSTITUTION: an image whose identity is
+// not the one the kernel executed. It is not a page check. Measured: patching
+// bytes under an intact CodeDirectory leaves the cdhash where it was and the
+// check still succeeds, because the identity genuinely did not move; the kernel
+// is what refuses to RUN a page-tampered image. A static re-validation would not
+// close that either -- with default flags SecStaticCodeCheckValidity passes a
+// page-tampered Mach-O, and the strict flags that refuse one
+// (kSecCSCheckAllArchitectures | kSecCSStrictValidate) cost ~200ms per binary.
+//
+// >0 = number of cdhash bytes written to `out`; `path_out` holds the running
+//      image's executable path and `*adhoc_out` is 0 (signer) or 1 (ad-hoc)
+//  0 = the image validated but reports no cdhash
+// -1 = bad arguments
+// -2 = the pid does not resolve to a live guest (exited, or its image is gone)
+// -3 = signing information unavailable
+// -4 = `out` or `path_out` is too small
+// -5 = the running image did not validate: it was swapped after exec
+//      (-67034), or it is unsigned, or the platform refused for another reason
+int sigil_guest_measure(int pid, unsigned char *out, size_t out_len, char *path_out,
+                        size_t path_len, int *adhoc_out) {
+    if (out == NULL || path_out == NULL || adhoc_out == NULL || path_len == 0) {
+        return -1;
+    }
+
+    pid_t p = (pid_t)pid;
+    CFNumberRef pid_num = CFNumberCreate(NULL, kCFNumberIntType, &p);
+    if (pid_num == NULL) {
+        return -3;
+    }
+    const void *keys[] = {kSecGuestAttributePid};
+    const void *values[] = {pid_num};
+    CFDictionaryRef attrs = CFDictionaryCreate(NULL, keys, values, 1,
+                                               &kCFTypeDictionaryKeyCallBacks,
+                                               &kCFTypeDictionaryValueCallBacks);
+    CFRelease(pid_num);
+    if (attrs == NULL) {
+        return -3;
+    }
+
+    SecCodeRef code = NULL;
+    OSStatus st = SecCodeCopyGuestWithAttributes(NULL, attrs, kSecCSDefaultFlags, &code);
+    CFRelease(attrs);
+    if (st != errSecSuccess || code == NULL) {
+        if (code != NULL) {
+            CFRelease(code);
+        }
+        return -2;
+    }
+
+    // Two operations here touch the file on disk: reading the signing information
+    // and asking whether the platform still vouches for the image. Read FIRST,
+    // validate SECOND, and use nothing from the read until the check has passed.
+    //
+    // What that order buys, at measured strength. This comment used to claim the
+    // ordering was the defence -- that validate-then-read "loses to ONE well-timed
+    // swap" and read-then-validate "turns that same swap into a refusal". That is
+    // FALSE, and measurement is what says so (R4-F2 as filed, corrected by R5-F3).
+    // Both orderings answer honestly, for the same reason: one SecCodeRef pins ONE
+    // snapshot of its static code on the first file-touching use, and every later
+    // read and validity check on that same object works from that snapshot.
+    // Whichever call touches the file first fixes the bytes; the other sees the
+    // same bytes. The two operations cannot disagree, so there is no window
+    // between them to lose.
+    //
+    // Measured by the round-5 security review, not by the author of this comment;
+    // the raw sequence and both results are in docs/security-claims.md, and the
+    // claim they replace was written here without measurement, which is the whole
+    // lesson. Darwin 25.3, live ad-hoc signed process, decoy of a different
+    // cdhash, driving this exact call sequence: validate, swap in the decoy, then
+    // read returned the HONEST cdhash, byte-identical to a no-swap control. The
+    // mirror-image attack on the order used here (decoy pre-placed so the read
+    // sees it, honest file restored before the check) returned the decoy's cdhash
+    // and -67034 from the check, which is the refusal the gate below turns into
+    // -5. Read-first is kept because it is harmless and puts both file-touching
+    // calls adjacent, NOT because it is safer than the other way round.
+    //
+    // The residual is what R4-F2 originally said it was, and it is about the
+    // snapshot rather than the ordering: memoization here is undocumented Apple
+    // behaviour, not a contract. An OS that re-read the file per call would create
+    // exactly the window this comment used to claim was already closed, and no
+    // arrangement of these two calls would close it. The containing answer depends
+    // on none of it -- the kernel's own csops(pid, CS_OPS_CDHASH) touches no file
+    // at all -- but it is SPI, so it is not taken here and the dependence is
+    // recorded as a residual rather than claimed closed.
+    //
+    // Not exploitable as things stand either way: an attacker who can write an
+    // ancestor's binary can simply exec it honestly and skip the question (see the
+    // reconstructible-chain residual in lease.rs). It is also loud. Every
+    // measurement that lands on a decoy answers -5, which drops that ancestor to
+    // Unmeasured, breaks the victim's leases, writes a daemon log line and raises
+    // a `sigil doctor` row.
+    CFDictionaryRef info = NULL;
+    st = SecCodeCopySigningInformation((SecStaticCodeRef)code, kSecCSDefaultFlags, &info);
+    if (st != errSecSuccess || info == NULL) {
+        if (info != NULL) {
+            CFRelease(info);
+        }
+        CFRelease(code);
+        return -3;
+    }
+
+    // Does the platform still vouch for the image this pid is running? This
+    // gates: everything below is reached only once it has succeeded. Sharing one
+    // snapshot with the read above (see above) is what makes gating sufficient
+    // rather than merely prudent -- a run whose read landed on a substituted
+    // binary is exactly the run that fails here, so a cdhash can never be returned
+    // from an image the platform refused.
+    st = SecCodeCheckValidityWithErrors(code, kSecCSDefaultFlags, NULL, NULL);
+    CFRelease(code);
+    if (st != errSecSuccess) {
+        CFRelease(info);
+        return -5;
+    }
+
+    // The path comes off the SAME guest object as the measurement, so the two can
+    // never describe different processes (a pid recycled between two independent
+    // lookups would).
+    CFURLRef exe = (CFURLRef)CFDictionaryGetValue(info, kSecCodeInfoMainExecutable);
+    if (exe == NULL ||
+        !CFURLGetFileSystemRepresentation(exe, true, (UInt8 *)path_out, (CFIndex)path_len)) {
+        CFRelease(info);
+        return -4;
+    }
+
+    uint32_t flags = 0;
+    CFNumberRef flags_num = (CFNumberRef)CFDictionaryGetValue(info, kSecCodeInfoFlags);
+    if (flags_num != NULL) {
+        CFNumberGetValue(flags_num, kCFNumberSInt32Type, &flags);
+    }
+    *adhoc_out = (flags & kSecCodeSignatureAdhoc) != 0 ? 1 : 0;
+
+    CFDataRef unique = (CFDataRef)CFDictionaryGetValue(info, kSecCodeInfoUnique);
+    if (unique == NULL) {
+        CFRelease(info);
+        return 0;
+    }
+    CFIndex len = CFDataGetLength(unique);
+    if (len <= 0) {
+        CFRelease(info);
+        return 0;
+    }
+    if ((size_t)len > out_len) {
+        CFRelease(info);
+        return -4;
+    }
+    memcpy(out, CFDataGetBytePtr(unique), (size_t)len);
+    CFRelease(info);
+    return (int)len;
 }
 
 // 0  = the peer satisfies the requirement

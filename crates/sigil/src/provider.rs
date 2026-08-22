@@ -24,10 +24,22 @@
 //! The brief invariant (#2) is "secret VALUES never enter daemon memory." A
 //! direct-injection provider ([`EnvFileProvider`], [`EnvProvider`]) *is* the
 //! source: it must place the actual values into the child's environment. Those
-//! values transit the daemon process — but **only** as the spawn env map, for the
-//! moment of the spawn: held in a [`Zeroizing`] buffer, never logged, wiped on
-//! drop; the child carries its own copy. This is why leasing is disabled for
-//! these providers (a lease would hold resolved values in RAM across its TTL).
+//! values transit the daemon process — but for a single ungated-by-lease run
+//! **only** as the spawn env map, for the moment of the spawn: held in a
+//! [`Zeroizing`] buffer, never logged, wiped on drop; the child carries its own
+//! copy.
+//!
+//! Leasing does NOT narrow that. Nothing keys leasing off the provider: the
+//! matched rule's [`LeasePolicy`](crate::config::LeasePolicy) is the sole
+//! authority ([`crate::lease`]). When a leasable rule covers a threshold-sealed
+//! [`EnvProvider`] source, the daemon caches the values it just opened in the
+//! lease's `Zeroizing` token and injects them from RAM on every later matching
+//! run, so for that one shape a credential DOES outlive a single request, for the
+//! window's whole TTL. That window dies on expiry, revoke, daemon restart, a
+//! config edit to the rule, and a re-seal of the source. Every other shape leases
+//! an empty presence marker instead: a plain gate has nothing to inject, and
+//! [`EnvFileProvider`] re-reads its own file per run, so its values still transit
+//! only the spawn instant.
 
 use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
@@ -124,9 +136,11 @@ pub trait SecretProvider: Send + Sync {
     /// (the inline `env` provider). When true the daemon fetches the source's
     /// sealed [`ThresholdRecord`](crate::threshold::ThresholdRecord), combines the
     /// phone's approval partial `Z_F` with the Mac share `m` to open it, and hands
-    /// the KEY=VALUE pairs to [`run`](Self::run) via [`ProviderRun::env`]. Never
-    /// leases: like env-file, resolved values must not persist across a TTL. A
-    /// plaintext env-file returns false (no seal at all).
+    /// the KEY=VALUE pairs to [`run`](Self::run) via [`ProviderRun::env`]. This
+    /// selects the injection shape only; it does not decide leasing. Under a
+    /// leasable rule the opened pairs are ALSO cached in the lease and re-injected
+    /// from RAM until the window lapses (see the module memory note). A plaintext
+    /// env-file returns false (no seal at all).
     fn needs_sealed_env(&self) -> bool {
         false
     }
@@ -371,9 +385,11 @@ impl SecretProvider for EnvFileProvider {
 /// VALUES are **threshold**-sealed at rest (opened per-approval with the phone's
 /// partial) rather than sourced from a plaintext file.
 ///
-/// It is the same direct-injection *shape* as [`EnvFileProvider`] — the resolved
-/// values transit daemon RAM only as the child's spawn env, for the spawn instant,
-/// and it never leases — with one difference: the values do not live in the clear
+/// It is the same direct-injection *shape* as [`EnvFileProvider`] — on a run the
+/// phone gates, the resolved values transit daemon RAM only as the child's spawn
+/// env, for the spawn instant (under a leasable rule they are additionally cached
+/// in the lease for its TTL; see the module memory note) — with one difference,
+/// which is at rest: the values do not live in the clear
 /// anywhere, and there is no key at rest that could open them. The config holds
 /// only the KEY *names* (public, for the readout); the VALUES are a sealed
 /// [`ThresholdRecord`](crate::threshold::ThresholdRecord) keyed by the source
@@ -943,7 +959,8 @@ mod tests {
     #[test]
     fn env_provider_flags_and_describe_shows_keys_not_values() {
         assert_eq!(EnvProvider.id(), "env");
-        // Direct-injection: no leasing; but it does open a threshold-sealed blob.
+        // Direct-injection, and it opens a threshold-sealed blob. The flag says
+        // nothing about leasing; the matched rule's policy decides that.
         assert!(EnvProvider.needs_sealed_env());
         // describe() surfaces the KEY names only (from config), never a value.
         let keys = vec!["FOO".to_string(), "BAR".to_string()];

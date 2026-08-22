@@ -14,6 +14,19 @@ struct LeasesView: View {
                 if model.leases.isEmpty {
                     empty
                 } else {
+                    // Each row names its rule and, in the daemon's own words, what
+                    // that rule matches. Those words describe a rule, not a command
+                    // line, so the breadth is stated once for the whole list rather
+                    // than repeated on every row (as `sigil lease list` does).
+                    //
+                    // "everything", not "any command": a rule that injects sealed
+                    // values also holds those values in RAM for the window, and the
+                    // narrower word would understate the grant. "covers everything
+                    // its rule matches ... from anywhere on this Mac" is the CLI's
+                    // LEASE_BREADTH verbatim; only the TTL tail is ours, since this
+                    // list is the one place with a live countdown beside it.
+                    Text("Each lease covers everything its rule matches, run from anywhere on this Mac, until it expires.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
                     // One shared clock drives every countdown.
                     TimelineView(.periodic(from: .now, by: 1)) { context in
                         VStack(spacing: 10) {
@@ -71,11 +84,21 @@ private struct LeaseRow: View {
                 }
                 // `scope` is the matched rule's name, not a command line: the
                 // lease auto-approves anything that rule matches for this
-                // caller. Say the breadth out loud next to the name.
+                // caller. Next to the name sits the daemon's coverage label for
+                // that rule, the same words the approver consented to; without
+                // one (an older daemon) the generic breadth stands in.
+                //
+                // Both halves are free text out of the user's config, so both go
+                // through `Lease.sanitized`: the rule name is sanitized nowhere
+                // else, and the label's daemon-side guarantee is worth re-earning
+                // here rather than trusting across a socket.
                 HStack(spacing: 5) {
-                    MonoText(lease.scope, size: 11, color: .secondary)
+                    MonoText(Lease.sanitized(lease.scope), size: 11, color: .secondary)
+                        .lineLimit(1)
                     Text("·").font(.system(size: 11)).foregroundStyle(.tertiary)
-                    Text("any matching command").font(.system(size: 11)).foregroundStyle(.tertiary)
+                    Text(lease.covers ?? "any matching command")
+                        .font(.system(size: 11)).foregroundStyle(.tertiary)
+                        .lineLimit(1)
                 }
                 MonoText("grant \(lease.grantHex)  ·  \(clockRemaining(remaining)) left",
                          size: 10, color: Color(.tertiaryLabelColor))

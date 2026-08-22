@@ -2,23 +2,22 @@
 //!
 //! These are the preferences the Mac app reads and writes over `sigil settings
 //! get|set --json`: the approval timeout, notification and motion prefs, the
-//! history retention window, the relay endpoint, and the `mac-approvals` mode.
-//! None of it is secret; the file is 0600 only for tidiness alongside the rest
-//! of `~/.sigil`.
+//! history retention window, and the relay endpoint. None of it is secret; the
+//! file is 0600 only for tidiness alongside the rest of `~/.sigil`.
 //!
 //! `set` is a *merge*: only the keys present in the incoming patch change, so
-//! `sigil settings set relay_url https://…` never disturbs `mac_approvals`, and
-//! the Mac app writing the five GUI fields never drops it either.
+//! `sigil settings set relay_url https://…` never disturbs the rest.
+//!
+//! Every field here must be read by something. A setting that persists and
+//! displays but governs no decision is worse than no setting: it tells the human
+//! they have hardened something they have not. `mac_approvals` was exactly that
+//! and was removed on 2026-08-08; an older `settings.json` may still carry the
+//! key, and [`Settings::load`] ignores unknown keys so those files keep loading.
 
 use serde::{Deserialize, Serialize};
 
 use crate::json::SettingsJson;
 use crate::paths;
-
-/// The `mac-approvals` mode: whether a local Mac Secure Enclave envelope is
-/// allowed to approve, or the daemon is hardened to require the phone.
-pub const MAC_APPROVALS_ENABLED: &str = "enabled";
-pub const MAC_APPROVALS_PHONE_ONLY: &str = "phone_only";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
@@ -48,8 +47,6 @@ pub struct Settings {
     pub relay_url: String,
     #[serde(default)]
     pub reduce_motion: bool,
-    #[serde(default = "default_mac_approvals")]
-    pub mac_approvals: String,
 }
 
 fn default_timeout() -> u32 {
@@ -61,9 +58,6 @@ fn default_true() -> bool {
 fn default_retention() -> u32 {
     30
 }
-fn default_mac_approvals() -> String {
-    MAC_APPROVALS_ENABLED.to_string()
-}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -73,7 +67,6 @@ impl Default for Settings {
             retention_days: default_retention(),
             relay_url: String::new(),
             reduce_motion: false,
-            mac_approvals: default_mac_approvals(),
         }
     }
 }
@@ -87,6 +80,11 @@ impl Settings {
     }
 
     /// Load the settings, returning defaults if the file does not exist.
+    ///
+    /// Unknown keys are ignored (serde's default, deliberately not
+    /// `deny_unknown_fields`): a file written by an older build carries keys a
+    /// newer one has retired, and refusing to load it would take the relay URL
+    /// and the timeout down with a setting nobody reads.
     pub fn load() -> Result<Self, SettingsError> {
         let path = Self::path()?;
         match std::fs::read(&path) {
@@ -110,8 +108,7 @@ impl Settings {
         Ok(())
     }
 
-    /// The GUI-facing DTO (also carries `mac_approvals` so a round-trip never
-    /// drops it).
+    /// The GUI-facing DTO.
     pub fn to_json(&self) -> SettingsJson {
         SettingsJson {
             approval_timeout_sec: self.approval_timeout_sec,
@@ -119,7 +116,6 @@ impl Settings {
             retention_days: self.retention_days,
             relay_url: self.relay_url.clone(),
             reduce_motion: self.reduce_motion,
-            mac_approvals: self.mac_approvals.clone(),
         }
     }
 
@@ -143,12 +139,6 @@ impl Settings {
             "relay_url" => self.relay_url = value.to_string(),
             "reduce_motion" => {
                 self.reduce_motion = parse_bool(value).ok_or_else(|| bad("true or false"))?
-            }
-            "mac_approvals" => {
-                if value != MAC_APPROVALS_ENABLED && value != MAC_APPROVALS_PHONE_ONLY {
-                    return Err(bad("enabled or phone_only"));
-                }
-                self.mac_approvals = value.to_string();
             }
             other => return Err(SettingsError::UnknownKey(other.to_string())),
         }
@@ -232,7 +222,36 @@ mod tests {
         let s = Settings::load().unwrap();
         assert_eq!(s, Settings::default());
         assert_eq!(s.approval_timeout_sec, 120);
-        assert_eq!(s.mac_approvals, MAC_APPROVALS_ENABLED);
+    }
+
+    #[test]
+    fn a_settings_file_carrying_a_retired_key_still_loads() {
+        // `mac_approvals` was written by every build before 2026-08-08, so real
+        // files have it. It governed nothing and was removed; an existing file
+        // must keep loading, with the keys that still exist intact, and the
+        // retired one dropped on the next save rather than carried forever.
+        let _home = HomeGuard::new("retired-key");
+        let path = Settings::path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            br#"{"approval_timeout_sec":45,"notifications":false,"retention_days":7,
+                 "relay_url":"https://relay.example","reduce_motion":true,
+                 "mac_approvals":"phone_only"}"#,
+        )
+        .unwrap();
+
+        let s = Settings::load().unwrap();
+        assert_eq!(s.approval_timeout_sec, 45);
+        assert_eq!(s.relay_url, "https://relay.example");
+        assert!(!s.notifications);
+
+        s.save().unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !written.contains("mac_approvals"),
+            "the retired key is not written back: {written}"
+        );
     }
 
     #[test]
@@ -255,23 +274,20 @@ mod tests {
     #[test]
     fn merge_json_leaves_absent_keys_untouched() {
         let mut s = Settings {
-            mac_approvals: MAC_APPROVALS_PHONE_ONLY.to_string(),
+            relay_url: "https://kept".into(),
             ..Settings::default()
         };
-        // The GUI writes the five settings fields, not mac_approvals.
         let patch = serde_json::json!({
             "approval_timeout_sec": 90,
             "notifications": true,
             "retention_days": 14,
-            "relay_url": "wss://r",
             "reduce_motion": true
         });
         s.merge_json(&patch).unwrap();
         assert_eq!(s.approval_timeout_sec, 90);
         assert_eq!(s.retention_days, 14);
         assert!(s.reduce_motion);
-        // mac_approvals survived the GUI round-trip.
-        assert_eq!(s.mac_approvals, MAC_APPROVALS_PHONE_ONLY);
+        assert_eq!(s.relay_url, "https://kept");
     }
 
     #[test]
@@ -285,9 +301,11 @@ mod tests {
             s.set("approval_timeout_sec", "soon"),
             Err(SettingsError::BadValue { .. })
         ));
+        // A retired key is not silently accepted either: `set` fails closed, so
+        // nobody can believe they set something that no longer exists.
         assert!(matches!(
-            s.set("mac_approvals", "sometimes"),
-            Err(SettingsError::BadValue { .. })
+            s.set("mac_approvals", "phone_only"),
+            Err(SettingsError::UnknownKey(_))
         ));
     }
 }

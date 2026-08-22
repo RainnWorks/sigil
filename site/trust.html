@@ -39,9 +39,15 @@
       <p>Everything downstream inherits its security from one in-person moment. There is no server in it.</p>
     </div>
     <div class="prose">
-      <p>At pairing, each device mints an Ed25519 signing key and an X25519 agreement key inside its own secure hardware: the Secure Enclave on iPhone, StrongBox or the hardware Keystore on Android, the Keychain and Secure Enclave on the Mac. The private halves never leave that hardware.</p>
+      <p>Each device mints its own Ed25519 signing key and X25519 agreement key at pairing, on the device, and the private halves are never sent anywhere. They are held by the platform's protected storage, the iOS Keychain, or AndroidKeyStore-encrypted app storage on Android, and loaded into app memory to sign and open messages. One key is different: on iPhone, the share that opens a sealed secret is generated inside the Secure Enclave and cannot be exported, by Sigil or anyone else. Android has no equivalent yet, so an Android phone can approve gated commands but cannot open threshold-sealed secrets.</p>
+      <p>On the Mac, the daemon's identity key sits in a 0600 file at <code>~/.sigil/keystore.json</code>, base64-encoded rather than encrypted, alongside the Mac's threshold share. The login Keychain is available instead, opt-in through <code>SIGIL_KEYSTORE</code>. The signed Mac app can additionally wrap that whole file under a Secure Enclave key, which is worth doing and buys exactly one thing: an offline copy of the file becomes useless, so a backup, a snapshot, or a resold disk yields nothing. It does not keep the key out of memory. The daemon is unsigned by design, and while it runs it holds that material in ordinary RAM, readable by anything running as the same user.</p>
+      <p>Read those two paragraphs precisely, because they say something narrower than they might look. An identity private key is never <em>transmitted</em>: it is minted on the device and stays there. But on none of the three platforms is it confined to a hardware security element; on all three it is loaded into ordinary process memory to do its work. This page used to claim the stronger thing. Exactly one key in this product is genuinely hardware-bound and non-exportable, and it is the iPhone threshold share.</p>
       <p>The public keys cross through a QR code rendered locally on one screen and read by the other camera, then confirmed by a six-word fingerprint that both screens display and you compare by eye. Once confirmed they are pinned forever. From that point every message in both directions is a NaCl-style sealed box (X25519 with XSalsa20-Poly1305) carrying an Ed25519 signature over pinned keys. A compromised network hop can neither read a request nor forge an approval.</p>
-      <p>The unwrap key that decrypts a provider's credentials, a 1Password service-account token today, is delivered to the phone once, at pairing, and then erased from the daemon. Optionally it is enveloped a second time to the Mac's Secure Enclave, which is what makes a local Touch ID approval a real cryptographic factor rather than a bypass. Hardened mode never mints that second envelope, making the phone strictly required.</p>
+      <p>Sigil holds no credential for a command that fetches its own. That is what <code>op</code> is: the shim gates the call, the real <code>op</code> runs and authenticates itself exactly as before, and Sigil never sees its token. What Sigil does hold are the values you seal into it yourself, and those are encrypted at rest under a key that exists in no one place. It is reconstructed for each approval from two shares: one the Mac keeps, and one that is computed inside the phone's Secure Enclave and never leaves it. The Mac's share opens nothing on its own.</p>
+      <p>That split is also what separates the two approval paths, and the difference is worth stating precisely. Approving a <strong>plain gate</strong> (every <code>op</code> rule today, and the shipping primary path) is authorised by a biometric on the phone and nothing else; no enclave key is used, because there is nothing to decrypt. Approving a <strong>sealed value</strong> additionally requires the enclave to compute that request's share, which is a hardware operation the phone cannot fake or delegate. On a paired install there is no Mac-local approval path to compare against: the daemon resolves exactly one approving factor when it arms, a pairing outranks the host biometric, and an approve issued at the Mac can only answer a request the Mac itself parked, which a phone-bound request never is. The Mac biometric is the factor only on a daemon with no phone paired at all.</p>
+      <p>Now put the phone's two custodies against that split, because the consequence matters more than the location. Anyone who obtains that stored identity, by reading it off the device or by restoring an encrypted backup onto another phone, can act as this phone toward your Mac: read the approval requests it receives, and approve any gated command. They cannot open a threshold-sealed secret, because the share that does that is generated inside this iPhone's Secure Enclave and cannot be copied.</p>
+      <p>Read that at its real strength. It is not only a forging capability: the agreement key is what opens the requests sealed to this phone, so it also discloses the command lines, the process provenance, and the secret references your Mac has been sending. And it does not require the biometric or the enclave, because neither guards the identity keys. What the enclave buys is the second half of the sentence, and that half is real.</p>
+      <p>Since this was written, the phone stores that record with a device-only accessibility class intended to keep it out of encrypted backups, with a migration for existing installs. It is not reflected above because it has not been verified on hardware: the test that settles it is to pair, take an encrypted backup, restore onto a second device, and confirm the restored app is unpaired. Until someone runs that, assume the backup path is open.</p>
     </div>
     <div class="term plain mt-m">
 <pre><span class="t-dim"># both screens must show the same three words twice</span>
@@ -66,8 +72,8 @@
     <div class="tblwrap">
       <table>
         <tr><th>Party</th><th>Sees</th><th>Can never see</th></tr>
-        <tr><td><strong>Daemon</strong></td><td>request metadata, ciphertext credentials, the routing table</td><td>a usable credential at rest; the secret bytes in flight, which pass fd to fd</td></tr>
-        <tr><td><strong>Phone</strong></td><td>request context, the unwrap key</td><td>provider credentials, resolved secret values</td></tr>
+        <tr><td><strong>Daemon</strong></td><td>request metadata, its own sealed values as ciphertext, the routing table</td><td>those values without a live phone approval; the secret bytes a gated command resolves, which pass fd to fd</td></tr>
+        <tr><td><strong>Phone</strong></td><td>request context: the command, its process chain and directory, and what the rule covers</td><td>any secret value; the Mac's share; the decryption key itself, which is only ever assembled on the Mac</td></tr>
         <tr><td><strong>Apple or Google push</strong></td><td>"a pairing has a request" and your signing identity</td><td>reasons, commands, secret names, accounts, keys</td></tr>
         <tr><td><strong>Network path</strong></td><td>sealed, signed packets between pinned keys</td><td>anything at all; every hop carries only ciphertext it cannot read or forge</td></tr>
         <tr><td><strong>Calling process</strong></td><td>the one secret it asked for, on stdout, after approval</td><td>anything it did not ask for; anything without an approval</td></tr>
@@ -94,7 +100,7 @@
         <ul class="notes mt-s">
           <li><b>Deliver.</b> The intended path. Verified end to end anyway.</li>
           <li><b>Drop or delay.</b> A denial of service. No envelope reaches the phone, so no approval returns, so no secret is released. Fails closed.</li>
-          <li><b>Duplicate or reorder.</b> Single-use request ids and a per-pairing monotonic counter reject the replay; the ephemeral per-request key makes a stale response undecryptable.</li>
+          <li><b>Duplicate or reorder.</b> Two gates reject the replay: a 150-second freshness window on the sender's timestamp, and a set of request ids that may each be accepted once. Behind both, a replayed response still names the request it answered, and the daemon drops any response it has no live waiter for.</li>
           <li><b>Observe.</b> Mailbox address, message timing, blob sizes. This is the real residue.</li>
         </ul>
       </div>
@@ -108,6 +114,8 @@
         </ul>
       </div>
     </div>
+    <p class="mt-m muted" style="font-size:0.92rem;max-width:66ch">The replay gates are worth stating with their residual. Both live in memory on each end, so a restart of the daemon or a new phone session starts with an empty set of seen ids. An envelope captured and replayed inside its 150-second window across that restart would clear both gates. What stops it is that the response still names the request it answered, and after a restart there is no longer anything waiting on that request, so it is dropped. For lease control the phone does the same thing in its own direction, applying a reply only if it matches an unanswered request from this session. That correlation is a gate the two ends had to build deliberately, and it is the one carrying the restart case.</p>
+    <p class="mt-m muted" style="font-size:0.92rem;max-width:66ch">The per-request ephemeral key is doing something else, and the two are easy to confuse because they sound alike. It gives forward secrecy against compromise of the <em>sender's</em> long-term key: traffic recorded today stays unreadable if that key falls tomorrow. It is not a replay defence, because a captured envelope carries its own ephemeral and opens perfectly well. And it does nothing for the other direction: a stolen recipient agreement key still opens everything sealed to it, recordings included, which is why the phone's stored identity is as consequential as the section above says. A per-pairing monotonic counter used to be a third replay gate and was deliberately retired: a restart reset it on either side and it began dropping genuine, human-approved envelopes as false replays.</p>
     <p class="mt-m muted" style="font-size:0.92rem;max-width:66ch">The mailbox address is a BLAKE2 hash of the two paired public keys: self-authenticating, squat-proof, and anonymous. The relay's only check, dropping envelopes not signed by one of those two keys, is anti-abuse and never load-bearing. The client verifies everything itself and would be equally safe against a relay that performed no checks at all. Self-host the Worker or the protocol-identical Bun server to keep even the metadata at home.</p>
   </div>
 </section>
@@ -120,7 +128,7 @@
       <p>A security claim you cannot check is marketing. Sigil is built so each one is a line you can follow.</p>
     </div>
     <div class="prose">
-      <p>The protocol core lives in <code>crates/sigil-proto</code>: the sealed and signed envelope, the pairing and fingerprint logic, the counters, and the mailbox hash. It has no I/O and no platform code, so it is exhaustively testable in isolation. That is where the proof lives too.</p>
+      <p>The protocol core lives in <code>crates/sigil-proto</code>: the sealed and signed envelope, the pairing and fingerprint logic, the replay guard, the threshold combine, and the mailbox hash. It has no I/O and no platform code, so it is exhaustively testable in isolation. That is where the proof lives too.</p>
       <p>The repository ships a deliberately hostile relay implementation whose whole job is to attack: it tampers with envelopes, replays old ones, reorders them, forges signatures, truncates ciphertext, and stalls. A client test suite runs the full protocol across that hostile relay and asserts that every attack is rejected and that every failure is closed, never open. Alongside it is a claim map: each sentence of the trust model points at the function that enforces it and the test that exercises the attack it defends against.</p>
       <p>None of this is aspirational scaffolding. It is the part being built first, because a protocol you cannot attack in CI is a protocol you are only hoping is correct.</p>
     </div>
@@ -141,14 +149,15 @@
     <div class="tblwrap">
       <table>
         <tr><th>Threat</th><th>Answer</th><th>Honest residue</th></tr>
-        <tr><td>Daemon store stolen</td><td>ciphertext without the phone or the Mac enclave</td><td>rotate tokens on suspicion anyway</td></tr>
-        <tr><td>Phone stolen</td><td>keys are enclave-gated; every approve needs a biometric</td><td>remote lockdown from the Mac, re-pair, rotate</td></tr>
+        <tr><td>Daemon store stolen</td><td>sealed values stay ciphertext: opening one needs the phone's per-request share</td><td>the Mac's share and the daemon identity sit together in one 0600 file, base64-encoded rather than encrypted, so a reader of that file gets both. Neither opens a sealed value alone. Wrapping the file under the signed app's enclave key closes the offline-copy case and nothing else; guard the file and rotate on suspicion</td></tr>
+        <tr><td>Phone stolen</td><td>every approve needs a biometric, hardware only, with the passcode fallback removed. For a sealed value the enclave must also compute that request's share</td><td>a plain gate is authorised by that biometric alone, so someone who can pass your biometry can approve. The biometric also guards only the app's flow, not the keys: anyone who obtains the stored identity, by reading it off the device or by restoring an encrypted backup onto another phone, can act as this phone without the app, read the approval requests your Mac sends it, and approve any gated command. They still cannot open a threshold-sealed secret. At the Mac: <code>sigil lease revoke &lt;prefix&gt;</code> to end open windows, <code>sigil lease list</code> and <code>sigil status</code> to see what is live, <code>sigil pair remove &lt;id&gt;</code> or <code>sigil unpair</code> to drop the device</td></tr>
         <tr><td>Malicious process calls the shim</td><td>every fulfillment needs a fresh out-of-band approval showing process and cwd</td><td>an approved request does deliver that secret; Sigil gates release, it does not sandbox the recipient</td></tr>
-        <tr><td>Approval replay</td><td>single-use ids, per-pairing counters, a short window, ephemeral per-request keys</td><td>aggressive clock skew rejects valid responses; doctor flags it</td></tr>
+        <tr><td>Approval replay</td><td>a 150-second freshness window and single-use request ids, then correlation: a response names the request it answered, and one with no live waiter is dropped</td><td>the window and the id set are in RAM, so a restart clears both and correlation is what carries that case; clock skew past the window rejects valid responses, and <code>sigil doctor</code> flags it</td></tr>
+        <tr><td>A device key compromised later</td><td>every envelope is sealed with a fresh per-envelope ephemeral key, so traffic captured earlier stays unreadable after the sender's long-term key falls</td><td>this is forward secrecy against <em>sender</em>-key compromise only. A stolen recipient agreement key still opens everything that was sealed to it, captured traffic included, which is the phone-identity case above</td></tr>
         <tr><td>Push spoofing</td><td>a push only wakes the app; the real request must carry the daemon's pinned signature</td><td>nuisance wake-ups at worst</td></tr>
-        <tr><td>Relay compromised</td><td>sees only sealed envelopes; cannot read, forge, or replay; dropping traffic fails closed</td><td>metadata: pairing id, timing, sizes; self-host to keep even that at home</td></tr>
-        <tr><td>SSH key exposure</td><td>held in daemon memory for one signature, then zeroed</td><td>removed later by enclave-resident keys that never leave hardware</td></tr>
-        <tr><td>Phone lost entirely</td><td>recovery is intentionally a rotation: pair a new phone, rotate every token; old ciphertext dies</td><td>hardened mode makes this the only path, by design</td></tr>
+        <tr><td>Relay compromised</td><td>sees only sealed envelopes; cannot read or forge; dropping traffic fails closed</td><td>a replay is bounded, not impossible: the freshness window and the seen-id set both live in RAM, so across a restart the correlation gate above is what refuses a captured envelope. Metadata stays visible: pairing id, timing, sizes; self-host to keep even that at home</td></tr>
+        <tr><td>SSH key exposure</td><td>held in daemon memory for one signature, then zeroed</td><td>the window is small but it is real, and nothing on this Mac removes it today. Enclave-resident SSH keys would, and they are not built</td></tr>
+        <tr><td>Phone lost entirely</td><td>recovery is intentionally a rotation: pair a new phone, rotate every token; old ciphertext dies</td><td>pairing a new phone is the only path, by design; there is no mode in which the Mac can approve instead</td></tr>
       </table>
     </div>
   </div>
@@ -159,9 +168,13 @@
   <div class="wrap-narrow">
     <div class="sec-head">
       <h2>The residual risks, stated plainly</h2>
-      <p>Three things are true that no amount of cryptography removes. A security tool that hid them would be lying.</p>
+      <p>Four things are true that no amount of cryptography removes. A security tool that hid them would be lying.</p>
     </div>
     <div class="resid">
+      <div class="r">
+        <div class="h">A lease approves things you have not seen yet</div>
+        <div class="b">A rule can be marked leasable, and then one approval may open a window instead of answering one command. Inside that window anything the rule matches, from anywhere on this Mac, runs without asking again, and for a sealed source the unsealed values are held in RAM for its duration. That is a real widening and it is the honest price of not tapping thirty times an hour. What bounds it: the default is run-once, a lease only exists when the rule allows it and you chose it, the daemon clamps the duration to the rule's cap, <code>sigil lease list</code> shows every live window with its countdown and what it covers, <code>sigil lease revoke</code> ends one immediately, and a restart, an expiry, or an edit to the rule kills it. Nothing is written to disk.</div>
+      </div>
       <div class="r">
         <div class="h">An approved consumer gets the secret</div>
         <div class="b">Sigil decides whether a secret is released, not what the caller does with it afterward. If you approve a request, that process receives that secret in cleartext on its stdout, exactly as if you had clicked the Mac prompt. The protection is that you saw the process, the directory, and the item first, and that nothing is released without that fresh decision.</div>
@@ -202,7 +215,7 @@
         </div>
       </div>
     </div>
-    <p class="foot-fine">No secret caching. No analytics. No accounts. Everything fails closed.</p>
+    <p class="foot-fine">No analytics. No accounts. No telemetry. Leases are opt-in, bounded, and never written to disk. Everything fails closed.</p>
   </div>
 </footer>
 

@@ -9,6 +9,31 @@ the gap named.
 Paths are relative to the repo root. Test names are the `#[test]` fn names;
 run any with `cargo test <name>`.
 
+> **KNOWN DEFECT IN THIS DOCUMENT, 2026-08-08. Roughly 30 rows name proving
+> tests that no longer exist in the tree, and roughly 20 rows are
+> inspection-only without the UNPROVEN mark this document's own convention
+> requires.** Most are v1 DEK-era rows (§2, §3, §6, §10, §14, §19) whose symbols
+> were retired with that model. A row citing a test that does not exist is worse
+> than a row citing none, because the citation is what stops a reader checking.
+> Until they are re-mapped, **treat any row whose test you cannot run as
+> UNPROVEN**, whatever the cell says. §6 and §19 were audited and corrected on
+> this date; the rest were identified but not repaired.
+>
+> The mechanical fix is now built: `crates/sigil-doccheck` extracts every
+> backticked citation from the "Proving test" column of every table in this file
+> and fails `cargo test` if it does not exist in the tree. It found 44 dead
+> citations, which are recorded in `KNOWN_STALE` (crates/sigil-doccheck/src/lib.rs)
+> so the backlog is visible and shrinking rather than blocking; a new dead
+> citation cannot be added. Run `cargo run -p sigil-doccheck` for the current
+> list, with the line number, the claim text, and the likely rename for each.
+> A comment cannot be tested; a claim naming a test can.
+>
+> What the checker expects of a row, so it can keep checking: cite the test in
+> backticks, as `file.rs::test_name`, a bare `test_name` continuing a list, or
+> the `file.rs::{a,b}` shorthand. Cite a non-Rust check by its file path
+> (`apps/phone/src/lib/format.selftest.ts`), since a `bun run` case is a string
+> rather than an identifier and cannot be resolved by name.
+
 **Authorship convention (review integrity).** The claim/code/test rows and the
 residuals are maintained by whoever touches the surface. But a *verdict*, any
 "reviewed and found sound" / "CONFIRMED SOUND" statement about whether a
@@ -111,12 +136,28 @@ Residuals for the security-reviewer to weigh:
 
 ## 6. Biometric gating is structural (invariant #5)
 
+> **Section audited 2026-08-08 by the security-reviewer.** Two things were wrong
+> with it and are corrected below. (1) It mapped only the Mac keystore factor:
+> **the phone-side gate, which is the sole authorization for every plain-gate
+> approve and therefore for every `op` rule on this machine, had no row anywhere
+> in this document.** That gap is what let R8-F1 (a passcode fallback enabled
+> under a comment denying it) live unnoticed. (2) Three cited symbols no longer
+> exist (`has_dek`, `unwrap_dek`, `se_paths_refuse_until_verified`); they are v1
+> DEK vocabulary retired with that model. Rows depending on them are struck and
+> marked, not silently deleted.
+
 | Claim | Enforcing code | Proving test |
 |-------|----------------|--------------|
-| A dev/in-memory keystore can never count as the biometric approving factor | `keystore.rs::Keystore::is_biometric` (default `false`), `approve.rs::LocalApprover::decide_local` (guard `is_biometric() && has_dek()`) | `keystore.rs::memory_keystore_is_not_a_biometric_factor`, `approve.rs::dev_autoapprove_grants_without_biometrics` (grant only via explicit dev switch) |
-| Only the macOS Secure Enclave keystore reports biometric, and its unwrap refuses until verified on hardware | `keystore_macos.rs::MacKeystore::is_biometric` (`true`), `unwrap_dek` (`NeedsVerification`) | `keystore_macos.rs::se_paths_refuse_until_verified` |
+| **No gate in the phone app accepts a device passcode.** `disableDeviceFallback: true` is the property; `false` (the library default) is what ENABLES iOS's "Use Passcode" button, and this shipped as `false` under a comment claiming the opposite (R8-F1) | `biometric-policy.ts::BIOMETRIC_ONLY` (fixed, parameterless, no weak variant to reach for), spread LAST in `biometric.ts::faceGate` so no caller argument can override it | `biometric.selftest.ts` (asserts the value, and that the policy grew no other knobs so reintroducing a parameter fails) |
+| All three phone gates share that one policy: plain-gate approve, lease list, and the pairing ceremony that mints the device identity | `controller.ts::liveApprove`, `controller.ts::refreshLeases`, `app/pairing/keys.tsx` | **UNPROVEN**: the selftest guards the policy VALUE, not the call-site wiring; `biometric.ts` imports native code and will not load headlessly (see rounds 6-8 verdict, residual 3) |
+| A plain-gate approve is authorized by biometry ALONE: nothing cryptographic is unlocked, so the gate is the whole authorization rather than a prompt in front of a key | `controller.ts::liveApprove` -> `faceGate` | **UNPROVEN**: no automated test covers the call-site wiring |
+| A threshold approve does not rely on the app-level gate at all; the Secure Enclave key-agreement is its own gate, enforced by the key's access control | `SigilSeModule.swift::computePartial` (fresh `LAContext` per call, no reuse), key created with `[.privateKeyUsage, .biometryCurrentSet]` | **UNPROVEN, hardware-only**: that flag combination admits biometry only per Apple's documentation, but has never been exercised on a device here. Until it is, **nothing may claim the threshold path is passcode-proof.** The NEEDS-VERIFICATION note in `biometric.ts` records this and must not be deleted |
+| The phone's identity keys cannot leave the device via backup or restore | `keystore.ts::IDENTITY_OPTIONS` (`WHEN_UNLOCKED_THIS_DEVICE_ONLY`), written under a fresh key name by `migrateIdentityToProtectedKey` so the class applies via `SecItemAdd` rather than the update path, which carries only `kSecValueData` | **UNPROVEN, hardware-only**: keychain accessibility cannot be exercised headlessly and the failure mode is silent. The proving test is: pair, take an encrypted backup, restore to a second device, confirm the restored app is unpaired. Note this class is what enforces "this phone", NOT `faceGate`, which binds to a device rather than a human: a restored clone enrols its own biometric and the gate opens for it as designed. A clone holding the seeds opens every plain gate (which is every `op` rule here) but cannot threshold-approve, since `f` is enclave-resident and does not travel |
+| Deny requires no biometric, ever, and revoking a lease requires none either | `controller.ts` deny path (never calls `faceGate`), `controller.ts::revokeLease` | rounds 6-8 verdict, R6-F8 (a deny must never be made heavier than an approve) |
+| A dev/in-memory keystore can never count as the biometric approving factor | `keystore.rs::Keystore::is_biometric` (default `false`) | `keystore.rs::memory_keystore_is_not_a_biometric_factor`, `approve.rs::dev_autoapprove_grants_without_biometrics` (grant only via explicit dev switch) |
 | Deny / timeout always fails closed (never a grant) | `approve.rs::LocalApprover::decide_local` (timeout → `Deny`), `remote.rs::RemoteApprover::decide` (`unwrap_or Deny`) | `approve.rs::local_timeout_fails_closed`, `daemon.rs::denied_request_fails_closed_and_delivers_no_secret` |
-| The Secure Enclave DEK unwrap fires Touch ID on real hardware | `keystore_macos.rs::unwrap_dek` | **UNPROVEN, PARTIAL**: FFI is documented but returns `NeedsVerification`; must be exercised on a Mac (see NEEDS-VERIFICATION block). Until then, the shipping local approver falls through to the control socket (see Residuals). |
+| ~~Only the macOS Secure Enclave keystore reports biometric, and its unwrap refuses until verified on hardware~~ | ~~`keystore_macos.rs::unwrap_dek`~~ | **STALE, 2026-08-08**: `unwrap_dek`/`has_dek` and the test `se_paths_refuse_until_verified` no longer exist; there is no DEK. The Mac presence gate is now `presence.m` (`LAContext`, biometrics-only policy). Needs re-mapping by whoever owns that surface |
+| ~~The Secure Enclave DEK unwrap fires Touch ID on real hardware~~ | ~~`keystore_macos.rs::unwrap_dek`~~ | **STALE, 2026-08-08**: same retirement. The live hardware question is now the phone SE row above and the Mac keystore-wrap key |
 
 ## 7. Caller identity is daemon-verified (invariant #6)
 
@@ -126,7 +167,12 @@ Residuals for the security-reviewer to weigh:
 | Ancestry is walked kernel-side; the grant key binds code identity, never pids | `lease.rs::walk_ancestry`, `grant_key` (excludes pids) | `lease.rs::ancestry_walk_is_root_first_and_stops_at_init`, `grant_key_ignores_recycled_pids`, `grant_key_changes_with_root_scope_or_ancestry` |
 | The ancestry walk terminates on cycles / bounded depth | `lease.rs::walk_ancestry` (`MAX_ANCESTRY_DEPTH`, `seen` set) | `lease.rs::ancestry_walk_terminates_on_a_cycle` |
 | A phone-claimed grant key is ignored; the daemon derives and trusts its own | `daemon.rs::fulfill` (uses `gk`), `request.rs::InstallLease` (echo only), `softphone/lib.rs` (empty `grant_key`) | reviewed by inspection; exercised by `daemon.rs::lease_decision_covers_the_next_identical_request` |
-| The ancestor "code identity" is a real code-signing measurement | `lease.rs::SysProcessTable::identity` | **UNPROVEN, PARTIAL**: interim BLAKE2b of the exe bytes; the design calls for the cdhash / Developer ID (NEEDS-VERIFICATION in `lease.rs`) |
+| The ancestor "code identity" is the platform's measurement of the image that ancestor is RUNNING | `lease.rs::{measure_running_image,CodeIdentity,SysProcessTable::resolve}`, `peercode.rs::measure_guest`, `peercode.m::sigil_guest_measure` (`SecCodeCopyGuestWithAttributes` by pid + `SecCodeCheckValidityWithErrors` + `kSecCodeInfoUnique`, all off one guest object) | `peercode.rs::{a_running_signed_binary_measures_as_itself_and_names_its_own_path,an_ad_hoc_signature_is_reported_as_having_no_signer,a_pid_that_is_not_a_live_process_measures_as_nothing}`, `lease.rs::{a_running_signed_binary_measures_as_the_platform_identity,an_ad_hoc_process_measures_under_its_own_tag,a_pid_that_names_no_process_yields_no_identity_at_all,swapping_the_file_under_a_running_process_does_not_change_what_it_measures_as,a_stamp_preserving_rewrite_is_never_served_the_old_identity}`. **Scope of the claim (implementer's statement, not a verdict):** it is a measurement, not an authentication, and it is **not tamper-evidence** and must not be described as such. It answers "what does the platform say this live pid is running", nothing more: it says nothing about what that process later loaded or, for an interpreter, what script it is running. The validity check is what makes the answer about the running image rather than about a file: a post-exec swap of the executable answers `-67034` and the ancestor drops to `Unmeasured`, keyed to its own process instance and to nothing the attacker chose (see the row below). It catches SUBSTITUTION, not page tampering: measured here, patching bytes under an intact CodeDirectory does not move the cdhash and the check still succeeds (the identity did not move; the kernel is what refuses to run a page-tampered image). Residual, unchanged and dominant: an attacker who can run code as this user spawns UNDER the honest ancestors instead, and that chain matches by construction. **Reviewer verdict (round 4, independent, 2026-08-07): R3-F1 CLOSED, and this row is PROVEN on its own terms.** Re-checked on `e895c5d`: `sigil_cdhash_for_path` no longer exists, no ancestor executable is read from disk by this crate outside test fixtures, and the path and the cdhash are taken off the one guest object the validity call vouched for (R3-F4 closed with it). The R3-F1 attack, replayed by the ported tests, now yields `Unmeasured` rather than a chosen identity, for in-place overwrite and for rename-over alike. The "not tamper-evidence" scoping above is accurate and was independently reproduced (see R4 §"page tampering, confirmed"). Read the row together with the residual in R4-F1: the chain a measured ancestor contributes is *reconstructible* by anyone who can exec the same binaries from the same paths, so this measure fences honest tool trees and nothing else. |
+| Nothing about the measurement is cached | `lease.rs::{SysProcessTable,measure_running_image}` (no cache type exists) | Behavioural, by construction: the `FileStamp` cache and `measure_executable` are deleted, so every gated command re-measures every ancestor. This closes R3-F2 by removing what it exploited (every stamp field was owner-settable, so a same-length in-place rewrite plus `utimensat` was served the pre-rewrite identity for the daemon's lifetime) rather than by adding `ctime` to the stamp. Cost of having no cache, measured (release, M-series): 6.3ms for a real 6-deep chain per gated command, against 40-90ms for spawning `op --version` alone. |
+| The four identity measures cannot collide in a grant key | `lease.rs::grant_key` (length-prefixed `IdentityMeasure::tag`: `cdhash`, `adhoc`, `bytes`, `none`) | `lease.rs::the_measures_are_domain_separated_in_the_grant_key` (all six pairs, same 32 bytes), `a_cdhash_measurement_is_stable_and_distinguishing` (an ad-hoc cdhash and a signed one share a digest and must not share a key), `an_unmeasured_ancestor_is_keyed_to_one_process_instance`. **Reviewer verdict (round 4): PROVEN, and the ad-hoc call is the right one.** Keeping an ad-hoc binary's guest cdhash under its own tag, rather than falling back to a hash of the file's bytes, is what stops R3-F1 being reinstated across the Homebrew/cargo/npm majority of a dev machine: a byte hash is a statement about a file, and re-opens the write-the-path attack the guest measurement exists to close. `IdentityMeasure::Content` is now unreachable in production and is correctly documented as a test/hypothetical-platform arm. |
+| An ancestor the daemon could not measure is keyed to one process INSTANCE, never to code | `lease.rs::{CodeIdentity::unmeasured,ProcessStart,start_time}` (`BLAKE2b(domain ++ pid ++ start_sec ++ start_usec)`, both kernel-supplied) | `lease.rs::{an_unmeasured_ancestor_is_keyed_to_one_process_instance,swapping_the_file_under_a_running_process_does_not_change_what_it_measures_as}` (a swapped image drops to exactly this identity and to no other), `daemon.rs::an_unmeasured_ancestor_still_opens_and_rides_a_window`. **Scope of the claim (implementer's statement, not a verdict):** this branch is the weakest of the four and is accepted on product grounds. It asserts continuity of one process, not identity of code, so a window under it keeps serving while that process lives whatever it goes on to run. It is not attacker-reachable as a collision: to derive a victim's key an attacker must actually be a descendant of the victim's ancestors at that pid and that microsecond, which is the honest chain, and spawning under honest ancestors is the pre-existing dominant residual either way. The start time is what stops a recycled pid inheriting a window. R3-F5's overstatement is gone: the digest never claimed to "coalesce with nothing". **Reviewer verdict (round 4, independent, 2026-08-07): ACCEPTED as a bounded, documented weakening; no impersonation opening found.** Attacks run against it and their outcomes are listed under R3-F5 in the round-4 section: pid recycling is closed by a kernel-supplied microsecond start time neither half of which is caller-supplied; deliberately forcing an ancestor into this branch MOVES the grant key and so destroys a window rather than joining one; the digest is invariant across `exec`, which is exactly the "continuity of a process, not identity of code" the row already states, and reaching it needs code execution inside the ancestor, i.e. the pre-existing dominant residual. Worth recording alongside: this is the ONLY one of the four measures an attacker cannot reconstruct (see R4-F1), so on the reconstruction axis it is stronger than the measured branches, not weaker. |
+| A caller the daemon could not put a single process behind gets no lease | `lease.rs::Caller::may_lease`, `daemon.rs::fulfill` (`may_lease` gates both `token_for` and the grant) | `lease.rs::{an_unmeasured_ancestor_is_keyed_to_one_process_instance,a_pid_that_names_no_process_yields_no_identity_at_all}`, `daemon.rs::a_caller_with_no_identity_at_all_gets_no_window`. The shape this refuses is an empty chain, where every unidentifiable caller would derive ONE grant key. Such a request is still gated, still runs, and is still shown to the human; only the auto-release is withheld. |
+| An unmeasurable ancestor is never silent | `lease.rs::{note_unmeasured,unmeasured_notes,UnmeasuredNote}` (logged once per process instance, bounded registry), `daemon.rs::{unmeasured_ancestor_row,doctor_report}` | `daemon.rs::the_doctor_explains_an_unmeasurable_ancestor_and_stays_quiet_otherwise`, `lease.rs::swapping_the_file_under_a_running_process_does_not_change_what_it_measures_as` (asserts the note is recorded with its reason). Informational, not a failure row: leases still work, and the usual cause is a tool that updated itself. Contents are non-secret by construction (pid, start time, executable path, fixed reason) and never leave the machine. |
 
 ## 8. Fail closed, leases bounded (invariants #7, #8)
 
@@ -139,7 +185,11 @@ Residuals for the security-reviewer to weigh:
 | Every failure path denies (deny, timeout, dead phone, decrypt failure) | `daemon.rs::fulfill` (`fail_closed` on each branch), `remote.rs::round_trip` (`?`/`None` → Deny) | `daemon.rs::denied_request_fails_closed_and_delivers_no_secret`, `remote_softphone_denial_fails_closed_with_no_secret`, `approve.rs::local_timeout_fails_closed` |
 | Leases are RAM-only, triple-scoped (grant key + account + scope, where scope is the matched RULE's name), plus a source-material fingerprint when they cache values | `lease.rs::LeaseStore`, `Lease`, `LeaseBinding` | `lease.rs::lease_grant_lookup_and_scope_isolation`, `a_reseal_of_the_source_misses_the_cached_lease` |
 | A lease covers the whole matched rule for that caller chain (any argv, any cwd), and stops at the rule boundary | `daemon.rs::fulfill` (`lease_scope = action.rule`, `grant_key(&caller, ScopeKind::Command, "", &lease_scope)`) | `daemon.rs::a_lease_covers_any_command_the_same_rule_matches`, `a_lease_survives_a_change_of_directory`, `a_lease_on_one_rule_does_not_cover_another_rule`, `lease.rs::{one_rule_covers_any_command_it_matches,cwd_no_longer_splits_a_lease,different_rules_do_not_share_a_grant_key}` |
-| A lease never crosses caller chains: a different tool tree (or a tampered ancestor) is a different grant | `lease.rs::grant_key` (chain code identity) | `lease.rs::different_caller_chains_do_not_share_a_rule_lease` |
+| A lease never crosses caller chains: a different tool tree (or a tampered ancestor) is a different grant | `lease.rs::grant_key` (chain code identity) | `lease.rs::different_caller_chains_do_not_share_a_rule_lease`. **UNPROVEN against a deliberate imitator, by construction, not by a missing test (round 4, R4-F1):** the grant key binds only each ancestor's path, measure tag and digest plus the chain length, and nothing instance-specific whenever every ancestor measures, so an attacker who can exec the same binaries from the same paths in the same nesting derives the same key without touching the victim's processes at all. `ps` discloses the tree to imitate. The claim holds for *honest* trees, which is what it is for. **Implementer's addendum (fix round, 2026-08-07):** the stronger statement is now written at every place the claim is made rather than only here: `lease.rs` module docs, `lease.rs::grant_key`'s doc comment, the test comment on `different_caller_chains_do_not_share_a_rule_lease`, and both chain paragraphs of the design brief (which also no longer says malware must be *running under* those ancestors to ride a window). No behaviour changed and no user-facing string claimed the stronger property. **Reviewer verdict (round 5, independent, 2026-08-08): R4-F1 CLOSED.** Checked every place the claim is made. `lease.rs`'s module docs and `grant_key`'s doc comment both now state reconstructibility at full strength and name the unmeasured branch as the only measure an outsider cannot restage; the brief's two chain paragraphs say the same and no longer require malware to be "running under" the ancestors. Nothing left in the crate, the brief or `PROTOCOL.md` implies a different tool tree cannot ride a window. |
+| The **lease coverage label** shown on the consent surface is rendered by the daemon from the matched rule's own match conditions, never read from disk and never supplied by a peer | `config.rs::Match::coverage` (built from `command`/`subcommand`/`flag_present`/`flag_equals`/`argv_contains`/`arg_regex` only, never from argv), `config.rs::Config::resolve` (the sole writer: `with_covers(rule.match_.coverage())` on every match) | `config.rs::{coverage_renders_each_match_shape,resolve_stamps_the_coverage_label_only_on_a_leasable_rule,a_hand_edited_covers_on_disk_is_ignored_by_resolve}`, `daemon.rs::{a_granted_lease_reports_the_same_coverage_the_approver_consented_to,a_run_once_rule_emits_no_coverage_label_anywhere}`. A hand-edited `covers` on disk does deserialize but is unconditionally replaced at resolve time, and `Config::save` never persists one. There is no inbound path at all: `ApprovalResponse`/`InstallLease` carry no such field. |
+| The coverage label describes a window and can never define one: it is outside `LeaseBinding`, outside `grant_key`, and outside the lookup | `lease.rs::{Lease::covers,LeaseStore::grant,LeaseStore::token_for}` (the match compares `grant` + `binding` only; `covers` is written, never compared) | `lease.rs::coverage_is_carried_for_display_and_never_joins_the_lookup` (two labels, one window; a lookup that names no label still hits; a refresh re-stamps without forking) |
+| The coverage label is as protected in transit as the rest of the request: relay-invisible, signature-covered, single-use, and absent from the push doorbell | `request.rs::LeasePolicy::Leasable::covers` (a field of the sealed `ApprovalRequest`, no new transport), `sigil-relay/src/push.rs::DOORBELL_BODY` (a fixed constant) | `sigil-proto/tests/hostile_relay.rs::the_lease_coverage_label_rides_inside_the_seal` (not on the wire, undecryptable by a stranger, `BadSignature` on ciphertext tamper, `DuplicateRequest` on replay) |
+| The coverage label cannot deform the consent surface it rides on | `request.rs::sanitize_covers` (the single choke point: control characters and whitespace collapse, bounded to `COVERS_MAX_CHARS` = 72 counted in characters, single-character ellipsis), plus three independent renderer sanitisers: `apps/phone/src/lib/format.ts::coverageLabel`, `apps/mac/.../Domain.swift::Lease.coverage`, `cli.rs::lease_row` | `request.rs::covers_is_sanitized_bounded_and_never_set_on_run_once`, `config.rs::coverage_is_bounded_and_summarizes_a_busy_rule`, `apps/phone/src/lib/format.selftest.ts`. **UNPROVEN, and PARTIALLY FALSE as stated (round 4, R4-F4, demonstrated):** the choke point strips Unicode `Cc` and `White_Space` only. Bidi controls (`U+202A`-`U+202E`, `U+2066`-`U+2069`), zero-width and other `Cf` characters, and unbounded combining marks pass through it onto the phone's caption, where the label shares a paragraph with the fixed clause that states the breadth. The phone's regex does not close it either; the Swift mirror closes the `Cf` half only (`CharacterSet.controlCharacters` = Cc+Cf, verified) and the CLI re-sanitises nothing. See also R4-F5: the summary fallback can itself exceed the bound and be elided mid-clause. **Implementer's addendum (fix round, 2026-08-07, not a verdict):** the choke point is now `request.rs::sanitize_label`, an allowlist (printable ASCII, collapsed whitespace, `U+2026`; every other character becomes one `?` per run), called by `sanitize_covers` and re-run at the CLI render boundary by `cli.rs::cell` over `covers`, `scope` and `account`. `summarize` now bounds itself so the count clause survives (R4-F5). New tests: `request.rs::{covers_cannot_carry_a_character_that_reorders_or_hides_the_caption,sanitize_label_holds_its_bound_at_any_width}`, `cli.rs::a_lease_row_cannot_repaint_the_terminal_or_reorder_itself`, and the busy-rule case added to `config.rs::coverage_is_bounded_and_summarizes_a_busy_rule`. The phone and Mac mirrors are separate changes. Full record in the fix-round section at the end of this file; the UNPROVEN verdict above stands until an independent pass re-rates it. **Reviewer verdict (round 5, independent, 2026-08-08): R4-F4 CLOSED. This row is now PROVEN, and the allowlist is a stronger fix than the `Cc`/`Cf`/`Mn` blocklist this reviewer proposed.** Re-run against the original vectors and against four families a blocklist would have passed: `U+202E`/`U+200B` and 40 combining marks are gone; `U+3164 HANGUL FILLER` (Lo), `U+2800 BRAILLE PATTERN BLANK` (So), the `U+E0041` tag block, `U+2066` isolates and full-width homoglyphs (`\u{ff52}\u{ff45}\u{ff41}\u{ff44}`, which any letter-permitting filter renders as `read`) all reduce to `?`. The bound holds at exactly 72 for every pathological family, including the alternating rejected/space input that defeats run-collapsing. `Config::resolve` is still the only writer. One residual the collapse introduces is recorded as **R5-F1**: the marker is not injective, so two rules whose values differ only outside ASCII render the identical caption. |
 | A lease is **not** bound to a process, session, terminal, or user instance. The grant key excludes pids by design, so any *other* concurrently-running tree with the same ancestor executables (a second editor/agent session, another terminal, another project) shares the grant key and rides the window. Compounding it, every gated command arrives through a `~/.sigil/bin` symlink to the one `sigil` binary and macOS resolves symlinks, so the chain leaf is identical across commands: the chain discriminates tool trees, never commands | `lease.rs::grant_key` (pids excluded) | `lease.rs::grant_key_ignores_recycled_pids` (proves the property; the security consequence is reviewer finding **F2**). The load-bearing comment F2 called wrong is corrected at `daemon.rs::fulfill`, and the brief's "process tree key" phrasing with it |
 | A rule's *name* is the lease's scope, and rule names are user-mutable config, so a config reload REVOKES (and zeroizes) every lease whose rule did not survive it unchanged: rule removed, rule differing in any field by whole-struct comparison, or the source it injects from differing in any field. A rule rewritten mid-window cannot inherit the window | `daemon.rs::reload_config` -> `Core::invalidate_leases_for_config_change` -> `lease.rs::LeaseStore::revoke_scope`; each revocation is logged | `daemon.rs::a_rule_rewritten_mid_window_does_not_inherit_the_lease` (the reviewer's F3 scenario: a rule renamed to match `curl` mid-window), `config_reload_invalidates_exactly_the_leases_whose_rule_moved` (removed / match changed / policy changed / source changed / no-op), `lease.rs::revoke_scope_kills_every_lease_on_one_rule` |
 | What a lease holds depends on the rule. A plain gate (`op`, `env-file`, a degraded inline `env`) stores an empty presence marker and injects nothing on a leased run. A **sealed inline `env`** rule stores the values that approval unsealed, and leased runs inject them from RAM with no phone round trip: this is the one place a credential outlives a single request | `daemon.rs::fulfill` (the unseal runs BEFORE the grant, so a failed open leaves no lease; `sealed_plain` is what is stored, else `Zeroizing::new(Vec::new())`), `lease.rs::Lease::token` | `daemon.rs::a_sealed_env_lease_injects_from_ram_with_no_second_approval`, `leased_unsealed_inline_env_source_runs_as_a_plain_gate` (a plain gate still injects nothing) |
@@ -559,12 +609,18 @@ open recommendations.
 
 The inline `env` provider (provider id `env`) lets the user set secret VALUES
 directly (`KEY=VALUE`) instead of pointing at a plaintext env-file. It is the
-same direct-injection *shape* as §12's `env-file`, resolved values transit
-daemon RAM only as the child's spawn env, for the spawn instant, and it never
-leases, but unlike `env-file` the values are **sealed at rest under the DEK**,
+same direct-injection *shape* as §12's `env-file`, but unlike `env-file` the
+values are **sealed at rest under the DEK**,
 so the daemon-at-rest holds no plaintext value (invariant #1) even here. This
 section records behavior and residuals; the verdict is the independent
 reviewer's.
+
+> **WITHDRAWN IN PART, 2026-08-08.** This section previously stated that this
+> provider "never leases" and that resolved values never persist in daemon RAM
+> across a TTL, and the verdict below certified it. **That is false of the
+> shipped code**, and has been since the RAM-cache lease path landed. See the
+> withdrawal notice at the end of this section. The crypto/at-rest findings are
+> unaffected; the never-leases property is not.
 
 | Claim | Enforcing code | Proving test |
 |-------|----------------|--------------|
@@ -573,7 +629,7 @@ reviewer's.
 | `describe()` is **zero-knowledge**: it surfaces the KEY NAMES only (from config), never a value, and never reads the sealed blob (which it could not open pre-approval anyway) | `provider.rs::EnvProvider::describe` (maps `source.keys` to `SecretRef`s), `daemon.rs::fulfill` (builds `SourceView{keys}` before the decision) | `provider.rs::env_provider_flags_and_describe_shows_keys_not_values` |
 | The blob is **decrypted only after the grant**: the ciphertext is fetched before the approval wait (safe to hold), the DEK arrives with the phone approval (or is unwrapped from the keystore on a local approval, the same as `op`), is used for the one decrypt, and is dropped at once | `daemon.rs::fulfill` (`sealed_ct` fetched pre-decision; the `else if let Some(ct)=&sealed_ct` arm unwraps `outcome.dek`/keystore, `decrypt_token`, `drop(dek)`) | `daemon.rs::inline_env_command_runs_gated_and_injects_sealed_values` |
 | The decrypted pairs live in a `Zeroizing` map wiped at end of `run()`; the decode borrows out of the `Zeroizing` plaintext with `str::from_utf8` (no owned/un-zeroized value `String`) and fails closed on truncation or non-UTF-8 without panicking | `provider.rs::{decode_env_pairs,EnvProvider::run,spawn_with_env}`, `daemon.rs::fulfill` (`drop(sealed_env)`) | `provider.rs::{env_encode_decode_round_trips_including_awkward_values,env_decode_rejects_truncated_and_bad_utf8_without_panicking,env_provider_injects_decrypted_pairs_into_the_child}` |
-| **Never leases** (`needs_account()==false`, `needs_sealed_env()==true`): like `env-file`, resolved values must not persist in daemon RAM across a TTL, so it is gated on every run | `provider.rs::EnvProvider::{needs_account,needs_sealed_env}`, `daemon.rs::fulfill` (the sealed-env arm never calls `leases.grant`; the lease short-circuit is `if needs_account`) | `daemon.rs::inline_env_command_runs_gated_and_injects_sealed_values` (`leases.active()==0`) |
+| ~~**Never leases**: resolved values must not persist in daemon RAM across a TTL, so it is gated on every run~~ **WITHDRAWN 2026-08-08, THIS CLAIM IS FALSE.** A leasable inline-`env` rule caches the just-unsealed VALUES in the lease for the whole TTL and serves later matching runs from RAM with no phone contact. See the withdrawal notice below and §8's residuals. | Actual behaviour: `daemon.rs::fulfill` caches `sealed_plain` into `core.leases.grant(...)`; leasing is governed by the rule's `LeasePolicy` alone and is not keyed off the provider anywhere | `daemon.rs::a_sealed_env_lease_injects_from_ram_with_no_second_approval` proves the opposite of the withdrawn claim |
 | An **unset** source (no sealed blob) fails closed, never runs the child with a blank environment | `daemon.rs::fulfill` (`sealed_ct == None` → `fail_closed`) | `daemon.rs::inline_env_with_no_sealed_values_fails_closed` |
 | **Readout integrity (invariant #3):** the decoded blob's KEY set is reconciled against `action.env_keys` (the set the phone readout/audit was built from) *before* injection; any divergence fails closed. This closes the two ways names could drift from values without breaking crypto, a crash between the store save and config save in `seal_env_pairs`, and an import that kept a source NAME but changed its keys while a stale blob survived, so the approver can never consent to "will set FOO" and have the child receive a hidden BAR | `daemon.rs::fulfill` (the sealed-env arm's `BTreeSet` compare of decoded keys vs `action.env_keys` → `fail_closed`) | `daemon.rs::inline_env_blob_keys_must_match_the_approved_set_or_fail_closed` (blob has an extra key vs config → refused, nothing injected) |
 | Bulk `--stdin` parse errors report the **line NUMBER, never the line content**, so a mistakenly-piped secret line is not echoed to the terminal/logs | `cli.rs::read_env_pairs_stdin` (`"line {n}: no '=' found"`) | reviewed by inspection |
@@ -674,6 +730,55 @@ Net: the sealing, zeroization, fail-closed decoding, no-lease, and
 zero-knowledge-of-values properties all hold as claimed. The one substantive
 finding (P2-1) is a readout/injection reconciliation gap that should get an
 inject-time key-set check; the other two are hygiene. No P0/P1.
+
+### WITHDRAWAL NOTICE, 2026-08-08: the "never leases" certification
+
+Written by the security-reviewer that found it, which authored neither the
+inline `env` provider nor the lease path. Recorded as an entry rather than a
+silent edit, because a verdict that was wrong is itself a finding.
+
+**What was certified.** The verdict above certified this section as CONFIRMED
+SOUND while the section asserted, in three places (the intro, the "Never leases"
+claim row, and the module docs it cited), that a direct-injection provider never
+leases and that resolved values never persist in daemon RAM across a TTL.
+
+**Why it was wrong.** It was true when written and was falsified by a later
+change, the RAM-cache lease path, which nothing re-checked against this
+document. A leasable inline-`env` rule now caches the values that approval
+unsealed and injects them from RAM on later matching runs, for the whole TTL,
+with no phone round trip. `daemon.rs::fulfill` caches `sealed_plain` into
+`leases.grant`, and `a_sealed_env_lease_injects_from_ram_with_no_second_approval`
+proves it. Nothing keys leasing off the provider anywhere in the tree; the rule's
+`LeasePolicy` is the sole authority.
+
+**What is actually true**, and was already stated correctly at §8 of this
+document while §19 contradicted it: a sealed inline `env` lease is **the one
+place a credential outlives a single request**. It is RAM-only, triple-scoped,
+TTL-bound, and killed by expiry, revocation, daemon restart, or a config change
+touching the covering rule. That is a deliberate, documented trade, not an
+oversight in the code. The oversight was here.
+
+**Scope of the withdrawal.** The crypto and at-rest findings in the verdict above
+stand and were re-checked: values are ciphertext at rest, never in `config.json`,
+never on argv, decrypted only after the grant, reconciled against the approved
+key set before injection. **Only the never-leases property is withdrawn.** The
+verdict's remaining certification is narrowed accordingly and should be read as
+covering the seal/open core, not the memory-lifetime claim.
+
+**Two named tests in this section do not exist in the tree**
+(`inline_env_command_runs_gated_and_injects_sealed_values`,
+`inline_env_with_no_sealed_values_fails_closed`), so the rows citing them are
+**UNPROVEN** until re-pointed at the current tests. This section is also written
+throughout in v1 DEK vocabulary, which no longer exists; that is stale rather
+than false and is tracked separately.
+
+**Why this one mattered more than an ordinary stale comment.** It is the shape a
+future reviewer cites *instead of* reading the code. A claim table is read as
+settled, and a CONFIRMED SOUND verdict over it is read as settled twice. The
+generalisable lesson, which applies to every verdict in this document: a verdict
+is true of a commit, not of a codebase, and nothing re-validates it when the code
+moves underneath. Pin verdicts to commits, and re-check any claim a later change
+touches.
 
 ---
 
@@ -869,12 +974,18 @@ These are real and deliberately surfaced, not defects hidden.
    (both with no dev flag set). Severity: **Medium-High reduced to a documented
    dev-only mode that fails closed by default and is loudly labelled.**
 
-2. **Secure Enclave biometric unwrap and kernel peer/ancestry are unproven on
-   hardware.** `keystore_macos.rs::{ensure_dek,unwrap_dek}`, `lease.rs::peer_pid`,
-   and the code-signing `identity` all carry NEEDS-VERIFICATION and cannot be
-   exercised away from a Mac. Until verified, the biometric factor is inert
-   (returns `NeedsVerification`), so the effective shipping gate is either the
-   phone or residual #1.
+2. **Secure Enclave biometric unwrap and the kernel peer pid are unproven on
+   hardware.** `keystore_macos.rs::{ensure_dek,unwrap_dek}` and
+   `lease.rs::peer_pid` carry NEEDS-VERIFICATION and cannot be exercised away
+   from a Mac. Until verified, the biometric factor is inert (returns
+   `NeedsVerification`), so the effective shipping gate is either the phone or
+   residual #1. The third item that used to sit here, the ancestor code-signing
+   `identity`, is closed: it is now the platform's cdhash of the image each
+   ancestor is RUNNING, taken off a guest code object the platform vouched for
+   (ad-hoc signatures under their own tag, unmeasurable ancestors refused a
+   lease), and it is exercised headlessly (see §7). It is a measurement and not
+   tamper-evidence; its own residuals are stated in the `lease.rs` module docs
+   and §7 rather than here.
 
 3. **The SA token transits daemon RAM (unavoidable) and one copy is not
    zeroized.** The token is the injected credential, so it must reach the child
@@ -3569,3 +3680,1414 @@ House-rule check: the implementer's edits to this document add behavior rows to
 §10a only and contain no verdict language, and the round-2 verdict section above
 is untouched. Nothing further is outstanding from rounds 1 or 2; this reviewer has
 no objection to the landing.
+
+## Independent review verdict, round 3: caller code identity measured by cdhash (`6c71207`, merged `a032e6c`, 2026-08-07)
+
+Scope: the whole of `6c71207` -- `IdentityMeasure`/`CodeIdentity` and the measure
+tag in `grant_key`, the `FileStamp` measurement cache, `peercode.m::sigil_cdhash_for_path`
+and its Rust wrapper, and the doc changes in `lease.rs`, the brief, and §7 above.
+Reviewer wrote none of this code. Findings are numbered **R3-Fn** to avoid
+colliding with F1-F8, F9/F10 or R2-F1..F6. Gate re-measured on the merged tree:
+**561 tests pass, 0 failures; clippy `-D warnings` clean; `cargo fmt --check` clean.**
+
+**VERDICT: SOUND IN CONSTRUCTION, OVERSTATED IN CLAIM. Does not block the landing;
+does require the two doc corrections below and should not be described to anyone
+as tamper-evidence.** The domain separation is right, the ad-hoc call is right, and
+the kernel-enforcement reasoning is (independently verified) true of the image the
+kernel executed. What is not true is the sentence that connects them: because the
+measure is a *static read of the path* rather than a measurement of the *running
+image*, a same-UID caller chooses what it is measured as, and the kernel is not in
+that loop at all. One HIGH (R3-F1), one MEDIUM-HIGH regression against the code
+this replaced (R3-F2), and four smaller items.
+
+Nothing here changes the round-1 or round-2 verdicts, and nothing here weakens the
+rule-scoped-lease or RAM-cached-credential conclusions on their own terms: those
+rested on the caller chain telling *honest* tool trees apart, which is still what
+it does. They did not rest on the chain resisting an adversary, and after this
+change they still must not.
+
+### Rulings on the three flags the implementer raised
+
+**1. The exec-path measurement race, and the static-vs-dynamic trade: the trade is
+WRONG, and it is not the trade it was described as.** The dynamic answer is not
+the expensive one. Measured on this machine (M-series, macOS 26.3), per ancestor:
+
+| measurement | cost |
+|---|---|
+| `SecCodeCopyGuestWithAttributes` + `SecCodeCheckValidityWithErrors` + cdhash, warm (large ad-hoc binary, `node`) | **0.08 - 0.12 ms** |
+| same, cold / first call in a process | 1.5 - 7.6 ms |
+| current static path measure, cold (implementer's own figures) | 0.6 ms small, ~11 ms for the 40 MB `op` |
+| `SecStaticCodeCheckValidity` strict, the rejected option | ~200 ms |
+
+So the dynamic guest lookup costs *less* than the static cdhash it would replace,
+needs no measurement cache to be affordable, and closes the race instead of
+conceding it. It also detects both swap flavours: with the process still running,
+overwriting its path in place (`cp -f`) or renaming a new file over it both turn
+`SecCodeCheckValidityWithErrors(guest, NULL)` from `0` into `-67034`
+(`errSecCSStaticCodeChanged`), while the static read reports the substituted
+file's identity without complaint. This is the same machinery `peercode.m`
+already uses for the keystore gate, which is consequently *not* vulnerable to this
+(verified: after a swap, the guest requirement check refuses).
+
+`csops(pid, CS_OPS_CDHASH)` is not an option here: it returns `EPERM`
+cross-process and `EINVAL` for self on this OS version.
+
+**The cache stamp does not narrow the race, and it does give false confidence.**
+The before/after stamp comparison guards a *benign* concurrent replacement (it
+declines to file a torn measurement). It is not an adversarial check, and the
+stamp itself is forgeable -- see R3-F2.
+
+**2. Kernel enforcement: yes, the kernel is the real enforcement, and it is real
+and broader than the one binary tested.** Independently verified here:
+
+* A page-tampered copy of a *platform* binary (`/bin/ls`) is SIGKILLed at exec
+  (exit 137), as reported.
+* A page-tampered copy of a *non-platform, Developer-ID, hardened-runtime* binary
+  (`1Password.app/Contents/MacOS/1Password`) is also SIGKILLed (exit 137). The
+  generalisation past platform binaries holds on Apple Silicon.
+* Appending bytes past the signed limit does not move the cdhash, but the result
+  is also SIGKILLed at exec, so it collapses into the same story.
+* `csops(CS_OPS_STATUS)` on a plain ad-hoc linker-signed, non-platform process
+  here returns `CS_VALID|CS_KILL`, so the kill applies to the `Content` population
+  too, not only to signed code.
+
+What a signed binary whose signature the kernel does not enforce means in practice
+is therefore *not* mainly about weakly-signed binaries; on this platform that set
+is close to empty. It is about the three places enforcement does not reach: pages
+that are never faulted; code loaded into a process after exec where library
+validation and the hardened runtime are off (a cdhash names the executable, never
+what it later loaded or, for an interpreter, what script it is running); and, the
+one that matters, **the file being swapped after exec, which the kernel has no
+opinion about because it is not the image it validated.** The docs must say that
+the kernel vouches for the image it executed, not for the answer this code returns.
+
+**3. The ad-hoc fallback is CORRECT, and the domain separation is correctly
+implemented -- but it prevents confusion, not a chooser.** Treating an ad-hoc
+signature as no identity is the right call: it has no signer, so its cdhash
+asserts nothing a content hash does not, and tagging it `Signed` would be a lie
+told in a security-relevant field. The separation itself is sound: the tag is
+length-prefixed ahead of the digest in `grant_key` (`lease.rs:307-310`), exactly
+as `ScopeKind` is, and the three-way separation is tested.
+
+On the confusion attack specifically: **no, an attacker cannot use the tags to
+land on a victim's grant key, because the tags are not where the weakness is.** An
+attacker freely *chooses* which branch their file takes (ad-hoc sign it for
+`Content`; give it a non-ad-hoc signature blob for `Signed`), so the separation
+buys nothing against them; it buys correctness against accidental collision, which
+is worth having. Having chosen the branch they still need the victim's path and
+digest -- and R3-F1 hands them both. Worth recording: **`kSecCodeInfoUnique` is
+returned without any validity check, so the cdhash a file reports is whatever its
+CodeDirectory says, not a fact about its bytes.** Verified: a page-tampered copy
+of `/bin/ls` reports the pristine cdhash `4f35b316...`, and a tampered copy of the
+40 MB `op` reports the pristine `9c2bfc85...`. A file can therefore claim any
+identity its author cares to copy; only the kernel stops it *running*.
+
+### Findings
+
+**R3-F1 (HIGH). The grant key measures the file at the ancestor's path, not the
+code that is running there, so a caller who can write that path chooses its own
+code identity -- including a victim's exactly.** `lease.rs:692-699`
+(`SysProcessTable::identity` -> `exe(pid)` -> `measure_executable`),
+`lease.rs:620-648`, `peercode.m:113` (`SecStaticCodeCreateWithPath` on a path).
+
+Demonstrated end to end. A process is started from a path holding an ad-hoc binary
+(measured `Content`, digest of those bytes). While it is still running, the file at
+that path is replaced with `/bin/ls`. The static measure the daemon uses then
+reports `IdentityMeasure::Signed` with `/bin/ls`'s cdhash
+`4f35b3163233a684d47f496a1e050f518de37621` for a process that is running none of
+that code. The same result via `rename(2)` as via in-place overwrite. Meanwhile the
+dynamic guest check on that pid returns `-67034 errSecCSStaticCodeChanged`, i.e.
+the platform can tell and this code did not ask.
+
+Attack, concretely: the attacker wants an ancestor entry that hashes identically to
+a victim's. They copy the victim binary aside, put their own executable at the
+victim's path, exec it, restore the genuine file at that path, then run the gated
+command. Every ancestor field the grant key binds -- path, measure tag, digest --
+now matches the victim's, so `grant_key` collides with the live lease and the
+release happens with **no phone round trip**, including the sealed-`env` lease that
+holds unsealed credentials in daemon RAM. The paths this requires write access to
+are ordinary user-writable ones on this machine: everything under `/opt/homebrew`,
+`~/.local/bin`, cargo/npm shims, and `~/.sigil/bin/sigil` itself.
+
+*Invariant:* #6 (caller identity is daemon-verified). The daemon does derive the
+identity itself -- and the value it derives is attacker-selected. *Severity:* HIGH
+rather than a restatement of the conceded same-UID residual, because the module
+docs sell this measure as backed by kernel tamper-evidence
+(`lease.rs:31-38`: "anything that actually appears in a chain under this measure is
+code the kernel accepted as that cdhash"). That sentence is false as written, and
+it is the sentence a future reader will lean on.
+
+*Fix:* measure the running image. Resolve the ancestor to a guest code object
+(`SecCodeCopyGuestWithAttributes` with `kSecGuestAttributePid`), call
+`SecCodeCheckValidityWithErrors(code, kSecCSDefaultFlags, NULL, NULL)` and treat
+anything but `errSecSuccess` as `Unmeasured` (the swap shows up as `-67034`), then
+take `kSecCodeInfoUnique` from that object. Costs less than the current cold path
+(table above) and removes the need for the `FileStamp` cache entirely; if a cache
+is still wanted, key it on pid plus process start time, not on the file. Note the
+leaf could do better still: `peercode::peer_audit_token` already gives a
+recycle-proof identity for the socket peer, and only the ancestors need the pid
+form.
+
+*Failing test:* the reproduction harness is at
+`/private/tmp/claude-501/-Users-tom-Projects-op-remote/f5633d91-0072-489e-a1eb-664011533f87/scratchpad/`
+(`measure_probe.c`, `guest_req.c`); it is a two-process scenario, so it belongs in
+an ignored integration test rather than the unit suite.
+
+**R3-F2 (MEDIUM-HIGH, and a regression against the code this replaces). The
+measurement cache serves a stale identity for a stamp-preserving rewrite; every
+field of `FileStamp` is settable by the file's owner.** `lease.rs:559-586`
+(`FileStamp`), `lease.rs:620-648` (`measure_executable`).
+
+`path`, `dev`, `ino`, `size`, `mtime`, `mtime_nsec`: an in-place rewrite at the
+same length preserves the first four, and `utimensat` restores the last two to the
+nanosecond. `ctime` is the one field that moves, and it is not in the stamp. So a
+same-UID attacker patches an ancestor executable in place, pads to the original
+length, re-signs it ad-hoc so the kernel will still run it, restores mtime, and the
+daemon serves the *pre-patch* identity for the rest of its lifetime. The pre-change
+code re-read and re-hashed the file on every gated command and would have caught
+exactly this; the cache is what introduces it. The comment at `lease.rs:559-562`
+("a rebuild, a `brew upgrade`, or a swap of the binary invalidates the entry by
+missing it") is true of honest change only and should say so.
+
+Proven against the real code, not by inspection. Dropping this into
+`lease.rs`'s test module fails today:
+
+```rust
+#[test]
+fn a_stamp_preserving_rewrite_is_re_measured() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = scratch("cache-forge");
+    let f = dir.join("artifact");
+    std::fs::write(&f, vec![b'A'; 4096]).unwrap();
+    let first = measure_executable(&f).expect("measures");
+    let stamp = FileStamp::of(&f).unwrap();
+
+    std::fs::write(&f, vec![b'B'; 4096]).unwrap(); // same length, new bytes
+    let ts = libc::timespec { tv_sec: stamp.mtime, tv_nsec: stamp.mtime_nsec };
+    let times = [ts, ts];
+    let c = std::ffi::CString::new(f.as_os_str().as_bytes()).unwrap();
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(rc, 0, "the owner may always restore mtime");
+    assert_eq!(Some(&stamp), FileStamp::of(&f).as_ref(), "all five fields restored");
+
+    let second = measure_executable(&f).expect("measures");
+    assert_ne!(first.digest, second.digest,
+        "different bytes must not be served the old measurement");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+```
+
+Observed: `assertion left != right failed: different bytes must not be served the
+old measurement`, both sides `75dd7676...`. The existing
+`replacing_the_file_at_a_path_invalidates_the_cached_measurement` passes only
+because it moves the size as well as the content.
+
+*Fix:* add `ctime`/`ctime_nsec` to `FileStamp` (available on `MetadataExt`,
+un-forgeable by the owner) -- one line, and it kills the cheap version of this. The
+finding disappears outright under R3-F1's fix, which stops keying identity on a
+file at all.
+
+**R3-F3 (MEDIUM, doc-correctness). "A userspace re-check does not work" is half
+right, and the wrong half is the one written down.** `lease.rs:36-38`,
+`peercode.m:100-105`.
+
+Measured on a fresh, never-executed page-tampered copy of `/bin/ls`:
+`SecCodeCopySigningInformation` returns the pristine cdhash;
+`SecStaticCodeCheckValidity(code, kSecCSDefaultFlags, NULL)` returns `0 SUCCESS`
+(the implementer's result reproduces exactly); but
+`SecStaticCodeCheckValidity(code, kSecCSDefaultFlags | kSecCSCheckAllArchitectures | kSecCSStrictValidate, NULL)`
+returns `-67671`, a refusal (it decodes to a generic internal error rather than a
+named tamper verdict, but it is emphatically not success). `codesign -v` also
+catches the same file, on `/bin/ls` (exit 1)
+and on the tampered 40 MB `op` (exit 1). So the accurate statement is "a
+*default-flag* validity check passes a page-tampered Mach-O, and a strict one costs
+~200 ms", not "a userspace re-check still passes it". Keep the decision -- at
+~200 ms per ancestor it is the right call, and R3-F1's dynamic check is both
+cheaper and more relevant -- but fix the sentence in both files. The wrong version
+would justify skipping validation somewhere it is the only check available.
+
+**R3-F4 (LOW-MEDIUM). `Ancestor.exe` and `Ancestor.identity` are resolved by two
+independent `proc_pidpath` calls, so they can describe two different processes.**
+`lease.rs:238` (the trait takes a pid, not a path), `lease.rs:251-252` (walk
+resolves the path), `lease.rs:696` (`identity` resolves it again). A pid recycled
+between the two pairs one process's path with another's digest. This fails closed
+-- the mismatched pair derives a key nobody holds, so the caller takes a fresh
+approval -- and it is not a widening. It is worth removing anyway because it costs
+nothing: pass the already-resolved path into the measurement and the window is
+gone. R3-F1's fix should take the identity from the same guest object the walk
+resolved, for the same reason.
+
+**R3-F5 (LOW). `Unmeasured` does not "coalesce with nothing"; it coalesces with the
+same pid at the same path.** `lease.rs:138-141`, `lease.rs:188-193`. The digest is
+`BLAKE2b(pid)`, so two requests whose ancestor is unmeasurable at the same path and
+the same pid derive one grant key. That reintroduces, in the one branch where the
+measure failed, precisely the pid dependence the grant key excludes pids to avoid
+(and which `grant_key_ignores_recycled_pids` exists to pin). A caller can force the
+branch deliberately (make its own exec path unreadable after exec) and can choose
+its pid by spawning; the victim would have to be `Unmeasured` at the same path too,
+so this is a narrow equivalence rather than a widening, hence LOW. *Fix if touched:*
+derive the unmeasured digest from pid plus process start time, or -- the
+fail-closed reading -- decline to lease at all when any ancestor is `Unmeasured`.
+The comment at `lease.rs:138-141` and the test name
+`an_unmeasurable_ancestor_coalesces_with_nothing` both currently overstate.
+
+**R3-F6 (LOW, pre-existing). `std::fs::read` of an ancestor executable is
+unbounded.** `lease.rs:634`. A padded ad-hoc Mach-O of arbitrary size is read whole
+into daemon memory on the `Content` path -- which on this machine is most of a dev
+box (`cargo`, `node` and the `sigil` shim itself are all ad-hoc here, so the leaf of
+every chain takes this path). The old code did the same on every request, so this is
+not a regression, and the failure mode is fail-closed (daemon death takes the leases
+with it). Streaming into the hasher removes it.
+
+### Verified clean
+
+* **Domain separation of the three measures.** Length-prefixed tag ahead of the
+  digest, no shared namespace, tested three ways. No collision is constructible
+  through the tags.
+* **`caller_pid` is not client-supplied.** `sshagent.rs:324` reads it via
+  `lease::peer_pid` off the socket; the `Option<i32>` field is populated by the
+  daemon and is `None` in tests only. Invariant #6 holds on that axis.
+* **Secrets, logging, relay.** `CodeIdentity` is 33 bytes of non-secret
+  measurement, never persisted, never logged, never sent. Provenance to the phone
+  is still file names only, the grant hex is still echo-only, and no part of this
+  change touches the op child's stdout path, the envelope, or the relay.
+  Invariants #2 and #3 untouched.
+* **Fail-closed on every measurement error.** An unresolvable exe truncates the
+  walk (a shorter chain is a different key, never a superset), an unmeasurable one
+  becomes `Unmeasured` with a pid-derived digest, and a torn measurement is
+  returned but not cached. No error path falls through to a wider key. Invariant #7
+  holds.
+* **The keystore gate is not affected by R3-F1.** It uses the audit token and a
+  dynamic guest check, which refuse after a post-exec swap (verified). R2-F4's
+  closure stands.
+* **Ad-hoc classification.** `peercode.m:155` tests `kSecCodeSignatureAdhoc`
+  explicitly and returns "no identity"; `errSecCSUnsigned` returns the same. Both
+  land on `Content`. Correct, and correctly tested on both sides.
+
+### Behaviour change worth telling the human about
+
+Two, and the second is the one that is easy to get wrong:
+
+1. **Grant keys moved once.** Live leases from a pre-upgrade daemon do not match
+   afterwards. RAM-only, so the cost is one extra approval. Accurately stated by
+   the implementer.
+2. **A re-signature of unchanged code is now the same caller; a rebuild is not.**
+   The cdhash covers the CodeDirectory, so it moves whenever the code moves. What
+   no longer forces a fresh approval is a certificate renewal, a re-notarisation,
+   or any other re-sign of byte-identical code inside a live lease window -- and
+   under the old content hash that would have re-prompted, because the signature
+   bytes changed. This is the correct behaviour and the window is bounded by the
+   lease TTL, but "leases survive a rebuild of signed software" is the wrong way to
+   describe it and should not be written anywhere: they survive a re-*sign*.
+
+### Residuals restated, so this change is not read as narrowing them
+
+The caller-chain imitation class is **unchanged by this commit and remains the
+dominant limit**. An attacker who can run a process as this user does not need any
+of the above: they can spawn under the same ancestors and run the genuine gated
+command, and the chain matches by construction. The cdhash measure adds no defence
+there. Its value is telling *honest* tool trees apart, and R2's consent-caption
+reasoning ("a genuinely different tool tree does not ride the window") should
+continue to be read as a statement about honest trees only. Alongside it stand the
+already-recorded residuals this change does not touch: the shim symlink making the
+chain leaf identical for every gated command, lease-window imitation, approved-
+consumer misuse, and metadata at the relay.
+
+## Independent review verdict, round 4: guest-object measurement, the process-instance branch, and the lease coverage label (`4cfb017`, `e472e4c`, `e895c5d`, `c37c776`, `8f0e76b` + the phone/Mac renderers, tip `e895c5d`, 2026-08-07)
+
+Scope: **Part A**, the five R3 findings as fixed, plus the beyond-brief decision to
+keep an ad-hoc binary's guest cdhash instead of falling back to a byte hash.
+**Part B**, the daemon-rendered lease coverage label, which had had no security
+pass and no row in this document. Reviewer wrote none of this code and wrote the
+R3 verdict that drove most of it. Findings are numbered **R4-Fn**. Gate
+re-measured on the merged tree: **477 tests pass, 0 failures** (354 `sigil`, 79
+`sigil-proto`, 23 `pairing_mitm`, 21 `hostile_relay`); `cargo clippy --all-targets
+-- -D warnings` clean; `cargo fmt --check` clean.
+
+**VERDICT: LANDS. All five R3 findings are closed, and the two the implementer was
+least sure of (R3-F3's page-tampering wording, R3-F5's move off fail-closed) are
+both confirmed correct on independent evidence.** Part A is now the strongest form
+of this measurement available without leaving Security.framework. Part B is
+correctly built at the one place it should be and is provably display-only, with
+one real defect on the consent surface: **R4-F4 (MEDIUM)**, the choke point that
+the phone, the Mac and this document all describe as stripping control characters
+strips only Unicode `Cc`, so bidi overrides and combining marks reach the caption
+whose job is to state how wide the window is. That is a consent-surface integrity
+defect, not a privilege escalation, and it does not block the landing; it should
+be fixed before anything else is added to the label's vocabulary. Everything else
+below is LOW or doc-accuracy.
+
+### Part A: rulings on the R3 findings
+
+**R3-F1 (was HIGH) - CLOSED.** `sigil_cdhash_for_path` is gone from `peercode.m`;
+`grep` finds no `std::fs::read` of an ancestor executable anywhere outside test
+fixtures; `measure_guest` resolves the live guest by pid, calls
+`SecCodeCheckValidityWithErrors`, and only then reads both the cdhash and the
+executable path off that same object. The swap cases demonstrated in round 3 no
+longer move identity: the ported tests exercise rename-over and same-inode
+overwrite and both land on `Unmeasured`, keyed to the process instance rather than
+to anything the attacker chose. Nothing path-derived leaks back in: `proc_path` is
+called only on the branch where the platform has already refused to describe the
+image, and its answer is kernel-supplied. **R3-F4 closed with it** - one object,
+one resolution, so a recycled pid can no longer pair one process's path with
+another's measurement.
+
+**R3-F2 (was MEDIUM-HIGH) - CLOSED by deletion.** No cache type exists on this
+path: `FileStamp`, `measure_executable` and every memoization are gone, and the
+only `OnceLock` left in `lease.rs` is the non-secret unmeasured-note registry. The
+failing test is ported to the scheme that replaced the cache
+(`a_stamp_preserving_rewrite_is_never_served_the_old_identity`) and asserts the
+right thing: not that the forgery is detected, but that the pre-rewrite
+measurement is never served again.
+
+**R3-F3 (was MEDIUM, doc-correctness) - CLOSED, and independently reproduced.**
+Measured here on this machine, not taken on trust. An ad-hoc signed copy of
+`/bin/ls`, one byte flipped inside `__text`:
+
+* default-flag `SecStaticCodeCheckValidity` returns `0` - it **passes** the
+  page-tampered Mach-O, and `kSecCodeInfoUnique` still reports the unchanged
+  cdhash `948936696ebc1070006ba74cf7364d9d6c6907ec`;
+* `kSecCSCheckAllArchitectures | kSecCSStrictValidate` returns `-67671` - it
+  refuses;
+* the kernel `SIGKILL`s the image on exec (exit 137), so a page-tampered binary
+  cannot be a live guest at all.
+
+So the corrected wording is accurate, and the implementer's own finding - that the
+guest check catches SUBSTITUTION but not page tampering, because a patch under an
+intact CodeDirectory does not move the cdhash - is **confirmed**. The new "what
+this is NOT: tamper-evidence" section describes it correctly and should stay
+worded as it is. One calibration note on the cost figure: `codesign -v --strict`
+is ~10ms on `/bin/zsh` here and 1.66s on a 375MB binary, so "~200ms per binary" is
+representative of a large binary rather than of a typical ancestor. It does not
+change the conclusion, and the conclusion is in fact stronger than the cost
+argument makes it: strict validation is not a rejected trade-off, it is *moot*,
+because the thing it would catch cannot be running.
+
+**R3-F5 (was LOW; re-argued as a move off fail-closed) - ACCEPTED. No
+impersonation opening found.** Attacked on each of the four axes named:
+
+* *pid recycling against start-time granularity.* Both halves are kernel-supplied:
+  the pid off `LOCAL_PEERPID`, the start time from `proc_bsdinfo.pbi_start_tvsec/
+  tvusec`, which the kernel sets at fork and no process can set for itself.
+  Neither is ever read from the client. To collide with a victim's key an attacker
+  must present the same pid **and** the same microsecond, which is to say be that
+  process instance.
+* *inducing the branch deliberately.* An attacker who can write an ancestor's exec
+  path can push it to `Unmeasured` at will - but doing so **moves** the grant key,
+  destroying any window keyed to the old identity rather than joining one. The
+  gain is denial, in the fail-closed direction.
+* *"the window keeps serving whatever that process goes on to run".* The sharpest
+  form is that the digest is invariant across `exec` (macOS preserves a process's
+  start time through exec), so a process that is unmeasurable both before and
+  after an exec keeps its window across a total change of the code it runs.
+  Reaching that requires code execution inside the ancestor, which is the
+  pre-existing dominant residual; and it is precisely what the module docs already
+  say out loud. Documented, not hidden.
+* *the leaf.* Confirmed: the shim is a fresh process per gated command, so an
+  unmeasurable leaf gets a fresh instance digest every time and coalesces with
+  nothing. That is fail-closed, at the cost recorded in R4-F3.
+* *the empty chain.* Still refuses (`Caller::may_lease`), and both daemon tests
+  pin it - the run is still gated, still shown to the human, only the auto-release
+  is withheld.
+
+The product argument is also sound on its own terms: refusing to lease an
+unmeasurable chain turns a background auto-update into a silent return to one tap
+per command, which is the problem leases exist to solve, and the failure would be
+undiagnosable without exactly the logging and doctor row that were added. **And
+one thing worth stating positively rather than as a concession: this is the only
+one of the four measures an attacker cannot reconstruct** (see R4-F1). On the
+reconstruction axis the process-instance branch is *stronger* than the cdhash
+branches, not weaker. The honest summary is that it trades a property that never
+resisted a deliberate imitator for one that does, and loses a property that only
+ever held against an attacker who had already lost.
+
+**R3-F6 (was LOW) - CLOSED.** No executable is read on this path, so the
+`std::fs::read` concern has no target left.
+
+**Beyond brief: ad-hoc binaries keep their guest cdhash under an `AdHoc` tag
+rather than falling back to a byte hash - RULED CORRECT, and the important call in
+the change.** A byte hash is a statement about a *file*, so falling back to one
+would have reinstated R3-F1 across the branch covering most of a development
+machine (Homebrew, cargo and npm binaries are ad-hoc signed). Keeping the guest
+cdhash keeps the answer about the running image, and the separate tag stops it
+being read as a signing identity it does not have. Four tags, all six pairs tested
+for domain separation with identical 32 bytes. `IdentityMeasure::Content` is now
+unreachable in production; leaving it as a documented test/other-platform arm is
+right.
+
+### Part A findings
+
+**R4-F1 (LOW as a defect, MEDIUM as a claim correction). The caller chain is
+*reconstructible*, and this document understates the residual.** `grant_key`
+binds, per ancestor, only the executable path, the measure tag and the digest,
+plus the chain length, the empty project root, the kind tag and the rule name
+(`lease.rs:437-460`). Nothing instance-specific enters it whenever every ancestor
+measures. So an attacker does not need to spawn *under* the victim's ancestors, as
+the round-3 residual and the §7 row both say: they can build the chain from
+nothing by exec'ing the same binaries from the same paths in the same nesting -
+`/bin/zsh`, then the real `claude` at its real path, then the shim - and derive
+the identical key with no access to the victim's processes at all. `ps` discloses
+the tree to imitate. This is not a regression in this change; it has been true
+since the chain existed. It matters because it is the sentence the consent
+caption's "a genuinely different tool tree does not ride the window" reasoning
+leans on. Recorded on the §7 row as UNPROVEN-by-construction against a deliberate
+imitator. No fix is proposed: closing it would need a per-session secret the
+ancestors cannot both hold and be measured by.
+
+**R4-F2 (LOW, hardening; not a blocker and not exploitable today).** The cdhash is
+read by `SecCodeCopySigningInformation`, which - per this code's own measured
+comment at `peercode.m:96-101` - reads the file, gated by a *separate*
+`SecCodeCheckValidityWithErrors` call at `peercode.m:164`. Two file-touching
+operations at two moments; the guarantee that they observe the same bytes is an
+undocumented memoization detail of Security.framework, not something this code
+enforces. The kernel's own answer for the running image is available directly
+(`csops(pid, CS_OPS_CDHASH, ...)`), needs no validity call, cannot be moved by
+touching the file, and would be faster. This is *not* exploitable as things stand,
+for the reason in R4-F1: an attacker who can write an ancestor's binary can simply
+exec it honestly and skip the race entirely. Worth doing as hardening if this code
+is ever the last fence rather than an outer one.
+
+**R4-F3 (LOW, availability and observability).** `note_unmeasured`
+(`lease.rs:829-851`) dedups on the process instance, which is right for a
+long-lived ancestor and degenerate for the leaf: a fresh shim per gated command
+means one stderr line and one registry entry **per command**, and the 64-entry cap
+(`UNMEASURED_NOTES_MAX`, evicting oldest) then pushes out the long-lived note that
+`sigil doctor` exists to surface. The reachable trigger is a build where the shim
+is not validly signed - notably an x86_64 build, where an unsigned image returns
+`errSecCSUnsigned` and lands on `-5` for every process. On arm64 this stays
+theoretical, since everything is at least ad-hoc signed. Related and smaller:
+`GuestFailure::ImageNotVouched::explain()` (`lease.rs:127`) says only "its
+executable changed after it started", but `peercode.m:128-129` documents `-5` as
+covering unsigned and other refusals too, so on that build the daemon tells the
+human something false about why their leases stopped.
+
+### Part B: the lease coverage label
+
+**Choke point: sound in placement, and the "single writer" claim holds.**
+`Config::resolve` is the only caller of `with_covers` outside tests and the
+softphone fixture, and it stamps unconditionally on every match
+(`config.rs:732-736`), so a hand-edited `covers` on disk is genuinely re-derived
+and discarded - proven by `a_hand_edited_covers_on_disk_is_ignored_by_resolve`,
+and `Config::save` never persists one. There is no inbound path to test: neither
+`ApprovalResponse` nor `InstallLease` carries a coverage field, so the phone
+cannot return one. The daemon-to-phone direction is inside the existing seal and
+the hostile-relay suite proves the four properties that matter for it.
+
+**The label cannot touch matching or lease identity. Confirmed by reading, not
+only by the test.** `covers` sits on `Lease` beside `LeaseBinding` and outside it;
+`LeaseStore::grant` and `token_for` compare `grant` and `binding` only
+(`lease.rs:578` and `lease.rs:605`); `grant_key` never sees it. A refresh
+re-stamps the label without forking the window. `coverage_is_carried_for_display_
+and_never_joins_the_lookup` pins all three.
+
+**The consent claim this reviewer lifted its round-one block on is not weakened,
+with one exception.** The caption is deliberately broader than the grant on the
+process axis, which is the safe direction, and replacing an argv[0]-derived guess
+with the daemon's rendering of the actual rule strictly improves what the human is
+told. The exception is R4-F4.
+
+**Correction to the implementer's stated residual.** The residual is filed as "the
+label echoes user-authored match tokens including `flag_equals` values, which are
+already visible on the sheet inside `ApprovalRequest.command`". That is **wrong as
+stated**: the sheet does not render `request.command`. It renders
+`commandWord(request.command)`, the basename of argv[0] only, and says so at
+`approval-sheet.tsx:103-108`. The coverage label is therefore the **first** path
+by which user-authored config text (vault and account names, `argv_contains`
+needles, flag values) reaches the phone screen. That is a deliberate and correct
+product decision - the breadth cannot be stated without naming the conditions -
+but it must be filed as a new display path, not as an existing one. It is
+relay-blind (inside the seal, proven) and absent from the push doorbell, whose
+body is the fixed constant `sigil-relay/src/push.rs::DOORBELL_BODY`.
+
+### Part B findings
+
+**R4-F4 (MEDIUM). The choke point strips Unicode `Cc` only, so bidi controls and
+combining marks reach the consent caption. Demonstrated.** `sanitize_covers`
+(`sigil-proto/src/request.rs:115-139`) filters on `char::is_control()` (general
+category `Cc`) and `char::is_whitespace()` (the `White_Space` property). Neither
+covers category `Cf` or `Mn`. Run against the shipped code:
+
+```
+LeasePolicy::leasable(900).with_covers("op with --account \"\u{202e}terces-on\u{200b}\"")
+  .covers()  ==  "op with --account \"\u{202e}terces-on\u{200b}\""      // RLO and ZWSP survive
+LeasePolicy::leasable(900).with_covers("op read" + "\u{0301}" * 40)
+  .covers().chars().count() == 47                                        // 40 combining marks survive, under the bound
+```
+
+Why it matters on this surface specifically: the label and the fixed clause that
+states the breadth share one paragraph in the phone's caption - `Covers <label>:
+every command and secret that rule matches, from anywhere on this Mac`
+(`approval-sheet.tsx:282-296`). An unterminated `U+202E` inside a rule's flag
+value therefore reorders exactly the half of the sentence that says how wide the
+window is, and a combining-mark pile obscures it. The three renderers disagree
+about this and the least protected one is the one where consent is granted:
+
+| renderer | strips | passes |
+|---|---|---|
+| `sanitize_covers` (daemon, the choke point) | `Cc`, `White_Space` | `Cf`, `Mn` |
+| `format.ts::coverageLabel` (phone, consent surface) | `C0`/`C1`, `U+2028`/`U+2029`, `\s` | `Cf`, `Mn` |
+| `Domain.swift::Lease.coverage` (Mac) | `Cc` + `Cf` (`CharacterSet.controlCharacters`, verified) | `Mn` |
+| `cli.rs::lease_row` | nothing | everything |
+
+Reachability: anything that can author a rule. That includes a config writer, who
+could equally add an `allow` rule and skip the theatre - so this is **not** a
+privilege escalation - but it also includes the designed agent-operated config
+path (`docs/design/agent-operated-sigil.md`), where a rule is added on the human's
+behalf and the human's entire defence is reading this caption correctly. A broad
+rule whose caption cannot be read straight is the failure mode the caption exists
+to prevent. Fix direction, not implemented: filter categories `Cc`, `Cf` and `Mn`
+(or allowlist what a label may contain) at `sanitize_covers`, and widen the
+phone's regex to match; the Swift mirror then only needs `Mn`.
+
+**R4-F5 (LOW, display honesty). The summary fallback can exceed the bound it
+exists to respect, and be elided mid-clause.** `Match::coverage`'s `atoms >
+COVERS_MAX_ATOMS` branch returns `summarize(...)` with no length check
+(`config.rs:289-291`), and `summarize` can run to 81 characters: `head` is up to
+57 (two `COVERS_TOKEN_MAX`-elided tokens plus a space) and " with N match
+conditions" adds 24. `with_covers` then truncates the count clause itself.
+Demonstrated on the shipped code:
+
+```
+coverage() (81 chars) = "ccccccccccccccccccccccccccc… sssssssssssssssssssssssssss… with 4 match conditions"
+stamped    (71 chars) = "ccccccccccccccccccccccccccc… sssssssssssssssssssssssssss… with 4 match…"
+```
+
+`coverage_is_bounded_and_summarizes_a_busy_rule` asserts the bound on three
+shapes but not on this one (it never gives a long `command` and a long
+`subcommand` together with more than `COVERS_MAX_ATOMS` conditions). The fallback
+exists so a label never truncates into dishonesty; it can truncate itself. The
+breadth is not understated - the head is still the bare command - so this is
+degradation, not misrepresentation.
+
+**R4-F6 (LOW, hygiene asymmetry). `sigil lease list` re-sanitises nothing, and the
+rule name is sanitised nowhere.** `cli.rs::lease_row` (`cli.rs:816-838`) writes
+`l.covers` and `l.scope` straight to a terminal. It is the only one of the three
+renderers with no independent bound or filter, and it is the one writing to the
+surface where control bytes historically do the most damage; its own doc comment
+describes an empty-label fallback as "defensive", which is true of the empty case
+and not of the contents. Separately, `scope` (the rule *name*) is equally
+user-authored config and passes through no sanitiser on any surface - it does not
+reach the phone, so the exposure is `lease list` and the Mac's lease row only. Low
+because the daemon is the trusted party on that socket and does strip `Cc` from
+`covers`.
+
+### Doc corrections made by this reviewer
+
+Two rows in §7 cited tests that no longer exist - `a_pid_with_no_live_image_is_
+unmeasured_and_never_leases` and `an_unmeasured_ancestor_refuses_to_lease`, both
+names from the fail-closed cut that `e895c5d` replaced. A claim row citing a
+test that is not there reads as proven and is not, which is precisely the failure
+this table exists to prevent. Both are corrected to the tests that actually run.
+Part B had no rows at all; five are added above, one of them marked UNPROVEN.
+
+### Residuals, restated
+
+Unchanged and dominant: an attacker who can run code as this user, now stated in
+its stronger form (R4-F1) - they need not spawn under the victim's ancestors, they
+can reconstruct the chain. Also unchanged: the shim symlink making the chain leaf
+identical for every gated command, so the rule name is the whole
+command-discriminating boundary; lease-window imitation; approved-consumer misuse;
+metadata at the relay. New and recorded here: the coverage label is a display path
+for user-authored config text onto the phone screen (relay-blind, doorbell-free),
+and until R4-F4 is fixed that text is not fully normalised.
+
+## Round 4 fix round, daemon side (implementer's record, not a verdict)
+
+Written by the implementer of these changes. It states what the code now does and
+what remains open; whether R4-F4/F5/F6 are CLOSED is the independent reviewer's
+call, not made here.
+
+**R4-F4, the choke point (fixed).** `sanitize_covers` is now a thin call onto
+`sigil_proto::sanitize_label(raw, max_chars)`, which is an **allowlist**, not a
+wider blocklist. A label may contain printable ASCII (`U+0021`..=`U+007E`),
+whitespace runs collapsed to one space, and `U+2026` (the elision mark this code
+and `Match::coverage` emit, and the only non-ASCII character the daemon itself
+produces). Every other character becomes one `?` per RUN, so forty combining marks
+are one marker rather than forty, and the run collapse means a rejected pile
+cannot spend the bound either. Rejected rather than dropped on purpose: a label
+that had something in it must not read as though it never did.
+
+The allowlist was chosen over the fix direction the finding proposed (filter `Cc`,
+`Cf` and `Mn`) because that blocklist is incomplete in a way that is easy to
+demonstrate: `U+3164 HANGUL FILLER` is category `Lo` and `U+2800 BRAILLE PATTERN
+BLANK` is `So`, both render as nothing, and neither is `Cc`, `Cf` or `Mn`. An
+allowlist also fails in the correct direction for anything a future Unicode
+revision adds. The cost, stated rather than hidden: a legitimately non-ASCII rule
+token (a vault named `Ingénierie`) renders `Ing?nierie` on the consent surface.
+That is accepted for a string whose job is to state BREADTH; `sigil-config list`
+is where a rule is echoed verbatim.
+
+Tests, using the reviewer's own vectors:
+`request.rs::covers_cannot_carry_a_character_that_reorders_or_hides_the_caption`
+(the RLO-plus-ZWSP flag value, the 40-combining-mark case, the invisible-but-not-
+control families, the collapse of a 500-character rejected run, and four ordinary
+labels asserted unchanged) and
+`request.rs::sanitize_label_holds_its_bound_at_any_width`. The first test renders
+the phone's actual caption sentence around the label and asserts every character
+of the RESULT is printable ASCII, a space or the ellipsis, which is the property
+that makes reordering impossible rather than merely unlikely.
+
+`Config::resolve` remains the only writer of a coverage label; nothing about the
+choke point's placement changed.
+
+**R4-F5, the summary fallback (fixed).** `summarize` now bounds itself: the count
+clause is built first and the HEAD is elided to whatever `COVERS_MAX_CHARS`
+leaves, so `... with 4 match conditions` always survives intact and the breadth
+(the bare command) is still stated first. `token`'s elider was generalised to
+`elide(raw, max)` and is shared. `coverage_is_bounded_and_summarizes_a_busy_rule`
+gained the shape that escaped it: a long `command` AND a long `subcommand` AND
+more than `COVERS_MAX_ATOMS` conditions, asserted both before and after
+`with_covers`.
+
+**R4-F6, the CLI render boundary (fixed).** `cli.rs::lease_row` now draws every
+free-text cell through `cell()`, which is `sigil_proto::sanitize_label` at
+`COVERS_MAX_CHARS`: the coverage label, the rule NAME (`scope`), and the account.
+`LeaseCols::measure` measures the same filtered strings, so the columns stay
+aligned with what is drawn. Column WIDTH is still decided separately, so an
+over-long rule name steps out of its column rather than being cut to fit it. The
+doc comment no longer calls the label filter "defensive"; it says what it is,
+which is the terminal-facing filter for the one surface where a control byte
+repaints a screen. Test:
+`cli.rs::a_lease_row_cannot_repaint_the_terminal_or_reorder_itself` (an escape
+sequence in a rule name, an RLO in a label, a BEL in an account, and a 4000-
+character pair bounded without disturbing a healthy neighbouring row).
+
+**Still unfiltered, and NOT fixed here: `sigil-config` list output.** A rule name
+or match value carrying a control byte reaches the terminal raw from
+`config_rule_list` and its siblings (sources, env keys). This is the same class as
+R4-F6 and it matters for the same reason F4 does: `sigil-config rule list` is
+where a human audits what an agent-operated config path wrote on their behalf, so
+an escape sequence there can hide a rule from the audit. It is deliberately out of
+this fix's scope rather than half-done: the config CLI has many print sites, that
+surface's whole purpose is to echo config verbatim, and filtering it is a design
+question (what does "verbatim" mean once a byte cannot be drawn) rather than a
+one-line patch. Recorded for the reviewer to rate.
+
+**R4-F1, the caller chain (claim correction, no behaviour change).** The stronger
+statement, that a chain in which every ancestor measures is RECONSTRUCTIBLE from
+`ps` by anyone who can exec the same binaries from the same paths in the same
+nesting, is now written where the claim is made rather than only in this file:
+`lease.rs`'s module docs (the residual is restated at full strength, and the
+unmeasured branch is named as the only measure an outsider cannot restage),
+`lease.rs::grant_key`'s doc comment (which previously said "a different tool chain
+derives a different key" with nothing qualifying it), the test comment on
+`different_caller_chains_do_not_share_a_rule_lease` (which proves separation
+between honest trees and is now labelled as proving exactly that), and the design
+brief's two chain paragraphs. The brief also no longer says malware must be
+"running under those ancestors" to exercise a live lease; it can restage the chain
+itself. No user-facing string claimed the stronger property, so none needed to
+change.
+
+**R4-F2, the two file-touching operations (reordered; the security claim first
+written here was false and is corrected below).** `sigil_guest_measure` reads the
+signing information FIRST and runs `SecCodeCheckValidityWithErrors` SECOND, using
+nothing from the read until the check passes.
+
+~~The old order lost to ONE well-timed swap ... read-then-validate turns that same
+single swap into a refusal.~~ **Struck. Round 5 measured both orderings and both
+answer honestly** (evidence in the R4-F2 ruling of the round-5 section; recorded
+as R5-F3, and this entry is the second of the two places it names). One
+`SecCodeRef` pins ONE snapshot of its static code at the first file-touching use,
+and every later read and validity check on that object works from that snapshot,
+so whichever call touches the file first fixes the bytes and the other sees the
+same bytes. The two operations cannot disagree; there was no window between them
+to narrow, and the reorder is a security no-op. It is kept because it is harmless
+and puts both file-touching calls adjacent, not because it is safer.
+
+What is actually residual is the snapshot, not the ordering: memoization is
+undocumented Apple behaviour rather than a contract, and an OS that re-read the
+file per call would open exactly the window the struck text claimed was already
+closed - which no arrangement of these two calls would close. The containing
+answer depends on none of it, since the kernel's `csops(pid, CS_OPS_CDHASH)`
+touches no file at all and needs no validity call; it is SPI, so it is not taken,
+and the dependence is recorded as a residual rather than claimed closed.
+
+Unchanged, and both still true: this is not exploitable today, because an attacker
+who can write an ancestor's binary can exec it honestly and skip the question
+(R4-F1); and it is loud, because a measurement that lands on a decoy answers `-5`,
+drops that ancestor to `Unmeasured`, breaks the victim's leases, writes a daemon
+log line and raises a `sigil doctor` row (the R4-F3 machinery is the real defence
+here). All existing swap and rename-over tests pass on this ordering, including
+`swapping_the_file_under_a_running_process_does_not_change_what_it_measures_as`
+and `a_stamp_preserving_rewrite_is_never_served_the_old_identity`.
+
+The corresponding comment in `peercode.m` is rewritten to the same statement,
+including the measurement that contradicts the struck claim, so the file that
+implements the property does not assert a stronger one than it has.
+
+**R4-F3, note availability and observability (fixed).** `note_unmeasured` now
+dedups on the executable PATH plus the reason rather than on the process instance,
+so the degenerate leaf case (a fresh shim per gated command on a build whose shim
+will not measure) collapses to one log line and one registry entry instead of one
+per command. The surviving entry is REFRESHED to the newest instance, so the
+`sigil doctor` row keeps naming a process that is actually running rather than a
+first sighting that has since exited. Eviction at `UNMEASURED_NOTES_MAX` now
+prefers a note whose process is over (`doomed_index`), falling back to the oldest
+only when every note is live, so a churn of dead notes can no longer push out the
+long-lived one the report exists to carry. Separately,
+`GuestFailure::ImageNotVouched::explain()` no longer says only "its executable
+changed after it started": it now names the whole of what `-5` covers ("its
+executable is unsigned, was changed after it started, or was otherwise refused"),
+ending in a catch-all because `-5` is one. The unsigned case is what a build with
+unsigned binaries actually hits, and it was the case the old wording described
+falsely. This lengthens the `sigil doctor` row, which names up to three ancestors
+with a reason each on one unwrapped line; worth a design pass, not held for one.
+Tests:
+`lease.rs::{a_repeating_unmeasurable_executable_collapses_to_one_note,
+a_full_registry_evicts_a_finished_process_before_a_live_one}`.
+
+**What the other two renderers must mirror** (for the phone and Mac agents; their
+halves are not in this change): the daemon's filter is now an allowlist, so
+`format.ts::coverageLabel` and `Domain.swift::Lease.coverage` should keep only
+`U+0020`..`U+007E` plus `U+2026`, collapse whitespace runs to one space, and
+replace each run of anything else with a single `?`, bounded to 72 characters
+with `U+2026` as the last character when cut. Mirroring the daemon is what makes a
+label that arrives from an older daemon, or from a lease that outlived the config
+that named it, safe on the surface that renders it.
+
+## Independent review verdict, round 5: closure check on the R4 fixes (`a28dda1`, `39c4036`, `db2a77d`, tip `db2a77d`, 2026-08-08)
+
+Scope: the R4 fix round only. Reviewer wrote none of the fixes and wrote the R4
+findings they answer. Findings are numbered **R5-Fn**. Gate re-measured on the
+merged tree: **571 workspace tests pass, 0 failures**; `cargo clippy --all-targets
+-- -D warnings` clean; `cargo fmt --check` clean.
+
+**Everything below is pinned to `db2a77d`, and the tree moved during the review.**
+`c57404b` (Mac allowlist) landed mid-pass and closes R5-F4; further uncommitted
+work on `sanitize_label`, `Match::coverage` and the phone filter was in the tree
+at the time of writing and supersedes R5-F1. Neither is rated here. Measured
+outputs quoted below - including the `?` rejection marker - are what `db2a77d`
+produces; the in-flight work changes that glyph, which does not affect any ruling,
+because every ruling is about the filter's behaviour rather than its marker.
+A round-6 pass is needed once that work lands.
+
+**VERDICT: five of six CLOSED. R4-F2 is REOPENED, not because the fix is unsafe -
+it is a no-op - but because the premise it was built on is measurably false, and
+the code and this document now both assert that premise in detail.** That is the
+one item to act on, and it is a doc-accuracy action, not a code one. Everything
+else lands, and the R4-F4 fix is better than the fix this reviewer asked for.
+
+### Rulings
+
+**R4-F4 (was MEDIUM) - CLOSED, and the implementer was right to refuse the
+proposed fix.** This reviewer asked for a `Cc`/`Cf`/`Mn` blocklist. The
+implementer built an allowlist instead - printable ASCII, collapsed whitespace,
+`U+2026`, everything else one `?` per run - on the grounds that the blocklist
+still passes characters that render as nothing and fails open on future Unicode.
+Re-measured against the original vectors and against the families that argument
+turns on:
+
+```
+RLO   -> "op with --account \"?terces-on?\""      // U+202E, U+200B gone
+marks -> "op read?"                                // 40x U+0301 gone
+hangul filler  -> "op ? read"        // U+3164 is Lo: a Cc/Cf/Mn blocklist passes it
+braille blank  -> "op ? read"        // U+2800 is So: same
+tag block      -> "op ? read"        // U+E0041
+isolate        -> "op ?read?"        // U+2066/U+2069
+full-width     -> "op ?"             // U+FF52 U+FF45 U+FF41 U+FF44
+```
+
+The last line is the one that settles the design argument and it is worth stating
+plainly, because it was not in the finding: an allowlist closes **homoglyph
+spoofing of the label's own vocabulary**, and no category filter can. Full-width
+`\u{ff52}\u{ff45}\u{ff41}\u{ff44}` is four ordinary letters to any filter that
+permits letters, and it renders as `read` on a consent surface. Under the
+allowlist it is a `?`. A blocklist would have shipped that hole.
+
+The bound holds at exactly 72 characters for every pathological family tested,
+including the alternating rejected/space input specifically constructed to defeat
+run-collapsing (`"\u{e9} ".repeat(200)` -> 36 markers plus the ellipsis, 72
+characters). Run-collapsing cannot hide length or overflow the bound: it only
+ever shortens, and the bound is re-applied after it. The choke point is still
+single (`sanitize_covers` is a thin call onto `sanitize_label`) and
+`Config::resolve` is still the only writer of a label.
+
+**R4-F5 (was LOW) - CLOSED.** `summarize` now computes the tail first and elides
+the head into whatever budget the tail leaves, so the count clause survives whole.
+The exact shape from the finding:
+
+```
+coverage (72 chars) = "ccccccccccccccccccccccccccc… ssssssssssssssssss… with 4 match conditions"
+stamped  (72 chars) = "ccccccccccccccccccccccccccc… ssssssssssssssssss… with 4 match conditions"
+```
+
+The right half is what a reader needs and it is what survives. The busy-rule test
+gained the shape that escaped it.
+
+**R4-F6 (was LOW) - CLOSED for the lease row; the remainder is recorded as
+R5-F2.** `cli.rs::lease_row` draws `covers`, the rule name and the account through
+`cell()`, the same `sanitize_label`. Worth crediting a detail that was easy to
+miss: `LeaseCols::measure` was moved onto the **filtered** cell, so the columns
+measure the text that actually gets drawn. Measuring the raw field would have left
+every row with a `?` mis-aligned, which is how a hygiene fix becomes a display bug.
+
+**R4-F1 (claim correction) - CLOSED.** Verified at every site: `lease.rs` module
+docs, `grant_key`'s doc comment, the test comment, `PROTOCOL.md`, and both chain
+paragraphs of the brief - which also drops "running under those ancestors". No
+text left in the crate, the brief or the protocol doc implies a measured chain is
+a fence against a deliberate imitator.
+
+**R4-F3 (was LOW) - CLOSED.** Dedup on executable path plus reason, with the entry
+refreshed to the newest instance, is the right key: it collapses the degenerate
+per-command leaf case to one line while keeping the `sigil doctor` row pointed at
+a process that is actually running. `doomed_index` preferring a note whose process
+is over, and falling back to oldest only when all are live, is a better eviction
+rule than the finding asked for. `ImageNotVouched::explain()` now names the whole
+of what `-5` covers, including the unsigned case that was the falsely-described
+one.
+
+**R4-F2 - REOPENED. The race it posited does not exist, in either ordering, and
+the fix's stated premise is measurably false.** Measured on this machine (Darwin
+25.3) with a live ad-hoc signed process and a decoy of a different cdhash, driving
+the exact call sequence `sigil_guest_measure` uses:
+
+* **Old order** (`SecCodeCheckValidityWithErrors`, then swap the file to the
+  decoy, then `SecCodeCopySigningInformation`): the read returned the **honest**
+  cdhash `39fbcd64…`, byte-identical to a no-swap control, not the decoy's
+  `ff395a34…`. A second validity check also passed. The old order did **not** lose
+  to one well-timed swap.
+* **New order, attacked in its mirror image** (decoy pre-placed, so the read sees
+  it; honest file restored between the read and the check): the read returned the
+  decoy's cdhash and the validity check answered **`-67034`**, a refusal.
+
+The explanation is the one the original R4-F2 flagged as an unverified assumption
+and which is now verified: a `SecCodeRef` **memoizes its static code on first
+file-touching use**, and every later read and validity check on that same object
+works from that one snapshot. Whichever call touches the file first fixes the
+bytes; the other call then operates on the same bytes. So the two operations can
+never disagree, there was nothing to narrow, and the reorder is a security no-op.
+
+Disposition: **do not revert.** The reordering is harmless (memory management is
+correct on every path, and every swap and rename-over test still passes), and
+having both file-touching calls adjacent is arguably clearer. What must change is
+what is said about it. The code comment in `peercode.m` and the fix-round entry
+above both assert, confidently and at length, that the old order "loses to ONE
+well-timed swap" and that the new one "turns that same swap into a refusal".
+Neither is true. This is a worse defect than the finding it answers: R4-F2 said
+"this rests on an undocumented platform detail", which was accurate; the
+replacement says "this order is safe and the other was not", which measurement
+contradicts. Recorded as **R5-F3**.
+
+Two things in that entry are correct and should survive the rewrite: that
+`csops(pid, CS_OPS_CDHASH)` is the containing answer and is SPI, and that none of
+this is exploitable today because an attacker who can write an ancestor's binary
+can exec it honestly instead (R4-F1). To those, add the detection story neither
+round has stated: an attacker spinning a decoy in and out of an ancestor's path is
+**loud**, because every measurement that lands on the decoy answers `-5`, drops
+the ancestor to `Unmeasured`, breaks the victim's leases, writes a daemon log line
+and raises a `sigil doctor` row. The R4-F3 machinery is the real defence here.
+
+### Round-5 findings
+
+**R5-F1 (LOW; near-zero for this user, real at public release). The rejection
+marker is not injective, so two different rules can render one caption.** A run of
+rejected characters collapses to a single `?` that carries nothing about what it
+replaced, so distinct match values that differ only outside ASCII produce
+identical consent text. Demonstrated:
+
+```
+op with --vault "エンジニア"   ->  op with --vault "?"
+op with --vault "マーケティング" ->  op with --vault "?"
+identical captions: true
+```
+
+A consent surface exists to let a human tell one window from another, and this
+one can now collapse two windows to the same string. That is a sharper cost than
+"a non-ASCII vault renders as `Ing?nierie`", which is the way the trade has been
+described so far, and it is the part worth fixing. Practically inert for Tom's own
+ASCII config; it matters if Sigil ships publicly, which is the stated target.
+Smaller, same area: `sanitize_label`'s doc says "everything else becomes one
+`LABEL_REJECTED` per run", but a `Cc` character takes the whitespace branch and
+becomes a *space*, not a marker (`"a\u{1b}[31mb\u{7}"` -> `"a [31mb"`, as its own
+test asserts). Harmless - a control cannot draw - but the doc claims a uniformity
+the code does not have.
+
+> **Superseded in flight, and by a better fix than this finding proposed.** This
+> reviewer's suggestion was to make the marker injective (a count or a digest of
+> the rejected run). Work landed after the tip this section reviews takes the
+> opposite and correct route: `Match::coverage` now DETECTS that a token would not
+> survive the filter and degrades to the honest count form, so the caption never
+> quotes a value it cannot identify, reusing the existing "too many conditions"
+> path instead of inventing marker syntax. The same work moves the marker off `?`
+> because `?` is `is_ascii_graphic` and therefore forgeable **as content** - a rule
+> written `argv_contains ["?"]` rendered identically to a rejected run - which is a
+> sharper defect than the one filed here and which this reviewer did not spot.
+> Both are unrated: they are uncommitted at the time of writing, and rating a
+> moving tree is how a confident false statement gets written down (see R5-F3).
+> They need a round-6 pass once landed.
+
+**R5-F2 (LOW-MEDIUM). `sigil-config` list output is still unfiltered, and it is
+the more important of the two audit surfaces.** Recorded by the implementer rather
+than fixed, with the reasoning that filtering it is a design question rather than
+a patch. Agreed on the deferral and on the reasoning, and this reviewer rates it
+above the lease row that was fixed: `sigil-config rule list` is where a human
+audits what an agent-operated config path wrote on their behalf, so an escape
+sequence there can hide a rule from the audit that is supposed to catch it. The
+design question they raise - what "verbatim" means once a byte cannot be drawn -
+has an answer that follows from the surfaces' different jobs. A **consent** string
+must be unambiguous, so it filters. An **audit** string must show that the byte is
+there, so it should *escape* rather than filter: render `\x1b`, `\u{202e}`,
+`\u{0301}` visibly. Filtering an audit surface would hide exactly what the audit
+is for. That distinction should be written down before either surface is touched
+again.
+
+**R5-F3 (LOW as risk, MEDIUM as doc-accuracy). The `peercode.m` comment and the
+R4-F2 fix-round entry assert a security property that measurement contradicts.**
+See the R4-F2 ruling above for the evidence. Both should be rewritten to say what
+is true: one `SecCodeRef`, one snapshot pinned at first use, so the two
+file-touching operations cannot disagree and both orderings were and are safe; the
+residual is that the snapshot semantics are undocumented Apple behaviour a future
+OS could change, which is precisely why `csops(pid, CS_OPS_CDHASH)` - which
+touches no file at all - is the version that does not depend on it. A confident
+false statement about a security property in the file that implements it is how
+the next reviewer gets misled.
+
+**R5-F4 (INFO) - CLOSED by `c57404b`, which landed while this section was being
+written.** As of `db2a77d` the CLI applied the *allowlist* to the rule name while
+the Mac applied a *blocklist* to the same rule name, so one rule read
+`Ing<mark>nierie` in `sigil lease list` and `Ingénierie` in the Mac's lease row.
+`c57404b` ports the daemon's allowlist to the Mac, which resolves the
+disagreement. Noting for the record that it resolves it the opposite way to this
+reviewer's suggestion, which was to classify the FIELD rather than the surface -
+`covers` as a consent string (allowlist everywhere) and the rule *name* as an
+identifier that never rides the approval sheet (verbatim everywhere). Either
+resolution removes the defect and consistency is the property that mattered, so
+this is not a re-open; but if a rule name ever needs to be copied, matched on, or
+compared against `sigil-config` output, the field-based classification is the one
+that will be wanted, and R5-F2's consent-versus-audit distinction is the same
+argument in a different place.
+
+### On the trade the allowlist introduces (asked, and answered as an opinion)
+
+Keep it. For a **consent** string the direction of failure is the whole argument,
+and this reviewer's own proposed blocklist was the weaker instrument: measured
+above, `U+3164`, `U+2800` and full-width homoglyphs all sail through a `Cc`/`Cf`/
+`Mn` filter, and the homoglyph case is not a rendering nuisance but a spoof of the
+label's own vocabulary. Normalisation plus a narrower category filter is the wrong
+trade here for three reasons: it needs a Unicode table the fix deliberately
+avoided; it still has to decide about scripts the reader cannot read, which a
+consent surface cannot resolve; and confusables live entirely inside "legitimate
+letters", so it does not close the case that matters most.
+
+But the cost should be restated before it is accepted, because it has been
+described as an aesthetic one and it is not. The defect is R5-F1, ambiguity: not
+that an accented vault name looks wrong, but that two different rules can produce
+the same consent text. Fix the injectivity and keep the allowlist; that gets an
+unambiguous ASCII caption *and* distinguishable windows, which is the pair of
+properties a consent string actually needs. If a future release wants honest
+non-Latin labels, the place to spend that effort is a per-rule human-authored
+label the user writes and the daemon renders verbatim-if-ASCII, not a smarter
+filter on config tokens.
+
+## Implementer's record, R5 fix round: the marker, the degenerate label, and the config-list echo (2026-08-08, not a verdict)
+
+Behaviour and residuals only. R5-F1 and the `sigil-config list` echo noted at
+R4-F6's remainder are what this round answers; whether they are closed is for an
+independent round-6 pass.
+
+**1. The rejection marker is now `U+FFFD REPLACEMENT CHARACTER`
+(`request.rs::LABEL_REJECTED`), not `?`.** The defect was that `?` is
+`is_ascii_graphic`, so it was inside the very alphabet the marker had to stand
+outside of: `argv_contains ["?"]` rendered `op containing "?"` and a Japanese
+vault pin rendered `op with --vault "?"` - same glyph, same position, and no way
+for the reader to separate "a character was removed here" from "the rule contains
+a question mark". `U+FFFD` cannot survive the filter as content, so its presence
+in a label is unambiguous. Exactly one input puts it in a label without having
+been rejected - a config value that literally contains `U+FFFD`, which already
+asserts what the marker asserts. Category `So`, so it passes the phone's
+`\p{Cf}\p{Mn}` pass and the Mac's `nonspacingMark`/`controlCharacters` pass
+unchanged; present in SF Pro and SF Mono.
+
+**The permitted set is now: `is_ascii_graphic()` (`U+0021`..=`U+007E`), runs of
+whitespace collapsed to one `U+0020`, `U+2026` and `U+FFFD`** - printable ASCII
+plus exactly the two marks the daemon itself emits, neither forgeable from
+outside. Permitting `U+FFFD` is load-bearing, not cosmetic: `cli.rs::cell`
+re-runs `sanitize_label` over an already-sanitised label, so without it every
+marker would be re-marked on the CLI path. The function is now exactly idempotent
+(`sanitize_label(sanitize_label(x)) == sanitize_label(x)`), where before it was
+idempotent only by the accident of `?` being ASCII. Pinned by
+`request.rs::sanitize_label_is_idempotent` (four inputs x three bounds) and
+`cli.rs::a_lease_row_cannot_repaint_the_terminal_or_reorder_itself` (a lease row
+drawn from a label the choke point already filtered carries exactly the markers
+the choke point put there). Unforgeability is pinned by
+`request.rs::the_rejected_marker_cannot_be_spelled_by_a_label`.
+
+**2. The degenerate label (R5-F1's sharp edge) now declines to identify rather
+than misidentifying.** `config.rs::Match::coverage` checks every user-authored
+display token through `renders_anything` (the token, filtered, must retain at
+least one ASCII-graphic character) and falls back to the count form the
+"too many conditions" case already uses when any token fails. So a rule whose
+only distinguishing condition is a non-ASCII value renders
+`op read with 1 match condition`, not `op read with --vault "<mark>"`.
+Test: `config.rs::coverage_degrades_a_condition_it_cannot_render_to_the_count`.
+
+**Residual, stated plainly: this does NOT restore injectivity**, which is what the
+round-5 reviewer asked for. Two rules pinning two different Japanese vaults still
+render the identical string; the change is that the string no longer reads as
+though it named the condition. Partly-renderable values are unaffected
+(`Ingénierie` still renders as `Ing<mark>nierie`, marker in place). The count form
+also drops the flag NAME along with the value, so the reader loses "there is a
+vault pin" as well as the vault - coarser than the marker form, and chosen over it
+because a consent surface should not look precise while identifying nothing.
+
+**3. `sigil-config list` is no longer the unfiltered verbatim echo.** Both list
+views (`cli.rs::config_rule_list`, `config_source_list`) draw every free-text cell
+through `ListFilter::cell` - rule names, the target source, `describe_match`
+output, dead-flag names, source names, providers, `source_extra`, and plain env
+keys and values. It is filtered but deliberately NOT length-bounded: a cut here
+would hide a match condition on the view whose job is to show all of them. When
+the filter changes anything, the view prints one faint line naming the path that
+still shows it whole (`config.json` on disk, `sigil-config list --json`), so a
+non-ASCII config reads as filtered rather than as corrupt. Test:
+`cli.rs::a_config_list_cell_cannot_repaint_the_terminal_and_says_when_it_filtered`.
+
+The justification comment at `request.rs::sanitize_label` that leaned on this view
+("`sigil-config list` shows the rule verbatim, and it is the only place that
+claims to") is gone. It was wrong twice over: the human the caption exists for is
+holding a phone and cannot run a Mac CLI, so the marker has to carry the whole
+message unaided; and that view was itself recorded as unfiltered, making it the
+one path where a bidi override still reached a terminal. The replacement text
+states that every human-rendered surface filters and names the two verbatim paths.
+
+Residual: `--json` output is not itself filtered, by intent - it is the machine
+and record path. Anyone piping it to a terminal is piping unfiltered config to a
+terminal, which is true of `cat config.json` too.
+
+Residual, scoped out deliberately: the one-line confirmations (`rule <name>
+added`, `source <name> removed`, `nothing configured named <cmd>`) still echo
+their argument unfiltered. They differ from the list views in the way that
+matters here - they repeat a string the human typed in that same invocation,
+which their own shell already echoed, rather than rendering config written
+earlier or by a hand-edit. Worth closing if these lines ever start reporting a
+name the invocation did not supply.
+
+Gate on this change: **cargo test 575 passing / 0 failed** (571 at `db2a77d`, plus
+the four tests above), `cargo clippy
+--all-targets -- -D warnings` clean, `cargo fmt --check` clean. The phone and Mac
+mirrors of the marker are separate changes owned by those agents.
+
+## Independent review verdict, rounds 6-8: phone lease control, design contract to shipped surface (`5804080`..`072aa8d`, 2026-08-08)
+
+Scope: the phone's ability to list and revoke live lease windows, from the
+proposed wire contract (reviewed before implementation) through the shipped
+daemon and phone halves. Daemon: `5804080`, `a54adbf`, `58c5124`, `169408b`,
+`2ae4305`, `97d5f26`. Phone: `7e47597`, `5849633`, `34dd89c`, `703b1d0`,
+`1fb0039`, `041cca8`, `e8fd0fd`, `072aa8d`. Findings are numbered **R6-Fn**,
+**R7-Fn**, **R8-Fn**.
+
+Reviewer wrote none of the code under review. Reviewer wrote the findings it
+answers, the hostile-relay cases cited, and no implementation in this program.
+
+Gate re-measured on the tip: **603 workspace tests pass, 0 failures**; `cargo
+clippy --all-targets -- -D warnings` clean; `cargo fmt --check` clean.
+
+**The tree moved continuously during all three rounds.** R6 was written against a
+proposed contract that did not exist yet; R7 against `7e47597`, two commits of
+which were superseded before the ruling was read; R8 against `5849633`. Every
+ruling below is re-verified against `072aa8d` rather than against the commit the
+finding was written for.
+
+**VERDICT: SOUND. All eight R6 findings closed, all six R7 findings closed or
+withdrawn, both R8 findings closed.** Two of the reviewer's own findings were
+withdrawn on the implementer's argument and are recorded below with the reasoning,
+because a withdrawn finding tells the next reader as much as an upheld one. The
+containment story the brief cites for a rule-wide window is now real rather than
+badged: the phone can see live windows and end one, and every path that cannot
+confirm says so instead of implying success.
+
+### What this feature had to survive, and does
+
+A lease is a rule-wide auto-approve window. The brief cites phone-side visibility
+and revocation as its containment, and before this change the phone's control was
+a `planned` badge (the honest state after R4-F7 found that a revoke silently doing
+nothing is worse than no revoke at all). Making the control real means putting a
+security-bearing question and answer on a channel a hostile relay owns. The
+design pressure is therefore not confidentiality, which the seal already handles,
+but **whether a human can be made to believe a window closed when it did not**.
+
+### R6 rulings (design-level, before implementation)
+
+**R6-F1 and R6-F2 (both HIGH, blocking) - CLOSED, and the fix is better than the
+one asked for.** The proposed contract named a window by its grant key. A grant
+key is a hash of the caller's ancestor code identity plus the rule
+(`lease.rs::grant_key`) with nothing instance-specific, so it RECURS: naming only
+the key aims a revoke at every window that key will ever have, and a captured
+revoke becomes a stored weapon against a future window. Replay is bounded but not
+prevented (see the counter note below), so this was reachable.
+
+The reviewer asked for an opaque per-window id in addition to the key. The
+implementer removed the grant key from the wire entirely
+(`request.rs::LeaseRow::lease_id`, 16 bytes of CSPRNG, minted per window,
+preserved across a refresh, never reused), which is strictly better and closes a
+third objection the reviewer raised separately: a grant key on the phone is a
+stable correlator over the caller's code identity that outlives the window.
+Nothing of grant-key shape now reaches the app, and a phone-side selftest asserts
+it. `revoke_instance` -> `revoke_id` matches one id exactly, so a stale or
+mis-aimed revoke is a clean no-op.
+
+Two footguns died with it: `LeaseStore::revoke` is prefix-matched, so an empty
+string would have revoked everything, and one grant key can cover several windows
+under different bindings, so a per-key revoke would have killed siblings the human
+never saw. Neither is reachable from the phone now.
+
+**R6-F3 (HIGH, blocking) - CLOSED. This is the finding the feature turns on.**
+The proposed replies carried no correlation. The attack: a relay captures a
+genuine `LeaseRevokeReply{revoked:true}`, waits for the app to be killed (routine,
+and it resets the RAM-only replay guard), and when the human next taps revoke it
+suppresses the outgoing request and delivers the captured reply. Fresh guard,
+unseen id, valid signature, inside the freshness window, because the message
+genuinely is genuine. The human is told the window closed. It is open. That is
+strictly worse than the badge it replaced, because a badge never lies.
+
+The fix is `session/outstanding.ts`: a reply applies only if it names a request
+THIS process issued, of that exact kind, not yet answered, and claiming it
+consumes the entry. The map dies with the process, which is what makes the
+captured reply match nothing.
+
+**Worth recording precisely, because the implementer's first account of it was
+wrong and the correction matters:** this protection is NOT the envelope layer. The
+envelope guard is a freshness window plus a single-use id set held in RAM on both
+ends, empty again after a restart on either side, and the counter gates nothing
+(`replay.rs:81`, `let _ = counter;`). The application-layer correlation stands on
+its own and is load-bearing security, not belt-and-braces. The code and its
+comments now say so in those terms.
+
+**R6-F4 (MEDIUM) - CLOSED.** The contract's claim that both display fields were
+already sanitised was false for `scope`: the rule name is raw user config
+(`config.rs` validates only duplicates and emptiness), it was on no phone surface
+before this, and the CLI survived it only by filtering at its own render boundary.
+`LeaseRow::new` now filters all three display fields through the same allowlist as
+the approval caption, and the phone re-filters. A hostile-relay case pins that an
+unsanitised rule name cannot put a bidi override, zero-width character or
+combining mark into a row.
+
+**R6-F5 (MEDIUM) - CLOSED, then DOWNGRADED by the reviewer, then implemented
+anyway and correctly.** See the R8-F1 ruling: the list is gated, and it gets the
+same biometry-only policy as release.
+
+**R6-F6 (MEDIUM) - CLOSED.** Lease-control replies deposit with no push hint
+(`remote.rs::seal_to_phone`). Copying the resolution-broadcast pattern would have
+rung the APNs doorbell on every list refresh, handing the relay (which owns push)
+and Apple a signal correlated with lease-control use.
+
+**R6-F7 (MEDIUM) - CLOSED, with its limit pinned rather than papered over.** See
+R7-F6.
+
+**R6-F8 (LOW-MED) - CLOSED.** A list is rate-limited
+(`remote.rs::lease_list_allowed`, compare-and-set so a burst cannot pass twice); a
+revoke deliberately is NOT. That asymmetry is correct and matches invariant #4's
+logic: a deny must never be made heavier than an approve.
+
+### R7 rulings (shipped phone half)
+
+**R7-F1 (MEDIUM) - CLOSED.** Snapshot age was stamped at reply ARRIVAL, a number
+the adversary picks: a relay stalling a reply 19 seconds, just inside the reply
+timeout, handed the phone a 19-second-old answer reading as current. Age is now
+measured from when the query was SENT (`leases.ts::snapshotFresh`, from
+`askedAt`), bound to the specific outstanding entry rather than a loose
+last-asked time. Send time cannot be pushed later by anyone but this phone, so it
+is the correct upper bound on the answer's age.
+
+**The asymmetry is deliberate and must survive future tidying**, which is why the
+implementer wrote it out at length in two files and pinned the counterfactual in a
+selftest: `remainingMs` stays stamped at ARRIVAL, because that over-reports how
+long a window is open, which prompts a revoke; answer age is measured from SEND,
+because that over-reports staleness, which withholds the "no active leases" claim.
+Both err toward "assume more is open than you can see". A later reader
+"simplifying" them to one convention breaks one of the two.
+
+**R7-F2 (MEDIUM) - WITHDRAWN BY THE REVIEWER. The implementer's refusal was
+correct and the reasoning is worth keeping.** The finding asked to split a
+40-second freshness budget into a loose render tolerance and a tight assert
+tolerance for the definite "No active leases." claim. It was written against a
+POLLING surface, where rows refresh continuously and a loose render tolerance only
+costs flicker. The amendment replaced polling with a one-shot pull, and in a pull
+model the split is not merely unnecessary but wrong: a row list still rendering as
+live at 35 seconds would hide a window OPENED since the snapshot, which
+under-reports what is open. Render tolerance cannot honestly exceed assert
+tolerance here; they collapse into one number. The shipping budget is 10 seconds
+measured from send, tighter than both halves of what the finding proposed.
+
+The implementer's rejection of an even tighter 5 seconds is also upheld: measured
+from send, the budget spans the whole round trip, and 5 seconds over a relay
+long-poll could make the authoritative state unreachable. A human who can never
+obtain a definite answer cannot distinguish "nothing is open" from "this is
+broken", and a containment surface that can never make its claim is not a cautious
+surface, it is one that stops being read. **A control that fails to inform is a
+failure mode that looks like caution.**
+
+**R7-F3 (MEDIUM) - CLOSED.** Ciphertext length leaked the live-window count. See
+R7-F6 for what padding buys and what it does not.
+
+**R7-F4 (LOW) - CLOSED, and it changed shape.** The Mac fallback offered under a
+failed revoke printed a grant-key prefix, and the Mac's revoke is prefix-matched,
+so it could close more windows than the row it sat under. With grant keys off the
+phone entirely (R6-F2) the fallback now names `sigil lease list` on the Mac and
+carries the caveat that a prefix match may close other windows opened by the same
+caller under that rule. Killing more is the safe direction; the copy now says so.
+
+**R7-F5 (INFO) - the phone's inference is SOUND, and more firmly than its author
+believed.** A later snapshot omitting a window with a pending revoke is treated as
+confirmation the window closed. The author flagged this as an inference they were
+unsure of. It is airtight, and it rests on exactly one property: **a lease id goes
+live to dead and never back.** A genuine snapshot omitting an id therefore proves
+that id was dead when the snapshot was computed, and dead is permanent, whatever a
+relay does to ordering. The reviewer attempted to construct a false confirmation
+from a snapshot computed before the window existed and could not: seeing the
+window at all requires a later answer, which supersedes the single outstanding
+query.
+
+The risk was that nothing pinned the property the inference borrows. It is now
+pinned daemon-side (`2ae4305`) and named on both sides (`041cca8`, `97d5f26`), so
+a future change reusing a lease id across re-grants fails a test instead of
+silently making the phone lie. A later commit (`e8fd0fd`) correctly removed an
+ordering guard that implied the inference depended on send/receive ordering; it
+does not, and implying a dependency the reasoning does not have is its own hazard.
+
+**R7-F6 (MEDIUM as a claim, LOW as a leak) - CLOSED.** The padding test asserted a
+universal under the name `..._leaks_nothing` while proving only that no plaintext
+substring appeared on the wire. Padding to `LEASE_PAD_BUCKET` (1024) hides the
+live-window count only while a reply fits ONE bucket. Measured: the crossing is at
+8 rows with short labels, 6 typical, and **3 with maximum-length labels**, which
+is reachable rather than theoretical. The test is now
+`lease_control_is_one_ciphertext_length_within_a_bucket`, it documents the crossing
+points, and it does not pretend to close the leak. The claim and the test now say
+the same thing.
+
+### R8 rulings
+
+**R8-F1 (HIGH) - CLOSED. Independently verified by this reviewer, who wrote none
+of the fix.** Found while verifying an unrelated ruling, in the file the lease
+gate calls rather than in the lease feature itself.
+`apps/phone/src/lib/biometric.ts` set `disableDeviceFallback: false` directly
+beneath a comment reading "Never silently fall through to a device passcode for an
+approval", and under a module docstring reading "Approving REQUIRES a fresh
+biometric". `false` is not "no fallback": it is the library default and the value
+that ENABLES iOS's "Use Passcode" button after failed biometry.
+
+Impact was on the primary path, not an edge case. A threshold approve is gated by
+the Secure Enclave key-agreement and never reaches this flag, but a PLAIN GATE
+approve has `faceGate` as its only authorization, and every `op` rule on this
+machine is a plain gate. Anyone holding the phone and knowing its passcode could
+approve a gated command having never passed biometry. That is invariant #4 broken
+where it matters most.
+
+Verified at `072aa8d`:
+
+* The policy is a fixed, parameterless value in its own module
+  (`biometric-policy.ts::BIOMETRIC_ONLY`, `disableDeviceFallback: true`). The
+  implementer refused a per-caller option on the grounds that it would keep the
+  weak variant alive one forgotten argument away from the approve path. **Upheld:
+  for a property this load-bearing, divergence should be impossible rather than
+  discouraged.**
+* `faceGate` spreads the policy LAST (`biometric.ts:52-55`), so no caller argument
+  can override it. The prompt string remains per-caller, which is right: a human
+  trained to clear an identical prompt for a harmless read is being conditioned to
+  clear the one that releases a secret.
+* All three `faceGate` call sites take it: plain-gate approve
+  (`controller.ts:413`), lease list (`controller.ts:283`), and the pairing
+  ceremony (`app/pairing/keys.tsx:52`), which mints the device identity and pins
+  the daemon and which neither the finding nor the brief had named. Catching that
+  one was the implementer's, not the reviewer's.
+* **Correction to the implementer's own account:** there are three `faceGate`
+  callers, not four. The threshold approve is a fourth GATE but not a `faceGate`
+  caller; it is gated by the SE key's access control
+  (`SigilSeModule.swift::computePartial`), which this fix does not touch and does
+  not need to.
+
+**The lease list gets the strong policy too, and this does not reverse the earlier
+downgrade.** The reviewer downgraded "gate the list" from required to recommended
+on the grounds that an attacker who can pass biometry can simply approve, which
+dominates anything listing discloses. That argument was about whether to have a
+gate. The implementer's argument is about how strong the gate should be once it
+exists: the only thing gating the list still buys is denying an enumeration of
+live auto-approve windows to someone holding an unlocked phone who cannot pass
+biometry, and someone who unlocked it plausibly knows the passcode, so a fallback
+there hands back precisely the capability the gate exists to deny. Both hold. The
+narrow residual value is exactly what the strong policy preserves.
+
+**Fail direction and lockout - upheld.** With no passcode fallback, repeated
+biometric failure locks biometry out at OS level with no in-app recovery, and
+approvals stop until the device is unlocked by other means. That is the correct
+direction. A lockout surfacing as an ordinary `"failed"` is also correct: every way
+of not passing biometry has to mean the same thing to the gate, and distinguishing
+them would invite a "use your passcode instead" affordance, which is the hole that
+was just closed.
+
+**R8-F2 (LOW) - CLOSED.** A docstring in `leases.ts` still described the staleness
+decision as using elapsed time since arrival, which is what the code did before
+`34dd89c`. It pointed the next reader at precisely the regression the adjacent
+comment existed to prevent. Fixed at `1fb0039`.
+
+### What the reviewer got wrong
+
+Recorded because this document is a map a skeptical adopter reads, and a reviewer
+that only records other people's errors is not a reliable narrator.
+
+**The replay freshness window is 150 seconds, not 90.** `sigil-proto/src/lib.rs`
+and `apps/phone/src/protocol/replay.ts` both read `150_000`. The reviewer stated
+"90s window" throughout R6, R7 and R8 as verified fact, having inherited it from
+the brief without checking the constant. No ruling changes, but every
+replay-timing argument in those rounds was 60 seconds more permissive than
+described, and the docs carry the same error in several places. This is the exact
+defect class the reviewer had just finished naming.
+
+### Residuals (honest limits of this feature)
+
+1. **Traffic analysis is reduced, not eliminated.** The relay learns which
+   1024-byte band the live-window count falls in (crossing at 3 rows with
+   maximum-length labels), and it learns THAT lease control was used and when.
+   Padding cannot touch timing. The 15-second poll that would have made this a
+   periodic beacon is gone; the signal is now one exchange per deliberate human
+   tap, which is a cleaner signal of "the human is on this screen" but not a
+   repeating one.
+2. **The threshold path's passcode-proofness is UNPROVEN.** The SE key is created
+   with `[.privateKeyUsage, .biometryCurrentSet]`
+   (`modules/sigil-se/ios/SigilSeModule.swift:96`), which by Apple's documentation
+   admits biometry only. That has never been exercised on hardware here. Until it
+   is, no string, comment or document may claim the threshold path is
+   passcode-proof. The NEEDS-VERIFICATION note in `biometric.ts` is correctly
+   framed as what the source says rather than what was observed, and it tells the
+   next reader not to delete it because the code above it looks correct. **Keep
+   it.** Related, and a mild instance of the R8-F1 pattern: the comment at
+   `SigilSeModule.swift:138-140` places "Passcode fallback is disabled so key
+   release is strictly biometric" directly above
+   `context.localizedFallbackTitle = ""`, which hides a button. The enforcement is
+   real but lives in the access control 40 lines earlier; the comment credits a
+   cosmetic line with it.
+3. **The biometric selftest guards the value, not the wiring.** It asserts
+   `BIOMETRIC_ONLY.disableDeviceFallback === true` and that the policy grew no
+   knobs, which is a genuine guard verified by reintroducing the bug. It cannot
+   assert that `faceGate` still spreads the policy, or that no future call site
+   calls `authenticateAsync` directly, because `biometric.ts` imports native code
+   and will not load headlessly. A cheap closure exists if wanted: export a pure
+   function that builds the options object and assert on its output.
+4. **A revoke whose reply arrives after the 20-second timeout is dropped**, so a
+   genuine `revoked: true` can leave a standing warning over a window that did
+   close. Over-warning is the right direction, and the TTL retirement now ends the
+   warning when the window's own remaining time elapses (with any approval, or any
+   request another device resolved, in the interim keeping it standing, because
+   either could have been a renewal this phone was not told about).
+5. **The relay can still deny the answer entirely.** Every path that cannot
+   confirm says so; none of them can be made to say the opposite. That is the
+   whole claim, and it is the right one.
+
+### Claims added by this work
+
+| Claim | Enforcing code | Proving test |
+|---|---|---|
+| A revoke names one window, so a captured revoke cannot kill a future window sharing a caller and rule | `lease.rs::LeaseStore::revoke_id`, `request.rs::LeaseRevoke::target` | `revoke_by_id_is_exact_and_refuses_anything_prefix_shaped`, `a_captured_lease_revoke_cannot_be_replayed_or_backdated` |
+| A lease id is never reused, so absence from a snapshot proves the window is dead | `lease.rs` (mint on new window, preserve on refresh) | `a_lease_id_names_one_window_and_survives_a_refresh`, `a_live_window_keeps_its_id_and_a_dead_one_never_lends_it_out` (`2ae4305`) |
+| One grant key can hold several windows, and ids still separate them | `lease.rs::LeaseStore` | `one_grant_key_can_hold_several_windows_and_ids_still_separate_them` |
+| The lease-control handle can only list and revoke by id | `remote.rs` lease-control seam | `the_lease_control_handle_can_only_list_and_revoke_by_id` |
+| A reply applies only to a request this process issued, once | `apps/phone/src/session/outstanding.ts::claim` | `apps/phone/src/domain/leases.selftest.ts` (replays the captured-reply scenario) |
+| The grant key never reaches the phone | `request.rs::LeaseRow` (no grant field) | `leases.selftest.ts` asserts no grant-key-width string on any lease surface |
+| Lease-control display fields are allowlist-filtered daemon-side | `request.rs::LeaseRow::new` -> `sanitize_label` | `a_lease_query_cannot_be_forged_and_a_list_reply_reveals_no_plaintext` |
+| Lease-control envelopes are one ciphertext length within a bucket | `request.rs::LeaseControlMessage::padded` | `lease_control_is_one_ciphertext_length_within_a_bucket` |
+| Snapshot age is measured from the query, not the answer | `leases.ts::snapshotFresh` (`askedAt`) | `leases.selftest.ts`, incl. the arrival-stamp counterfactual |
+| No gate in the phone app accepts a device passcode | `biometric-policy.ts::BIOMETRIC_ONLY`, spread last in `biometric.ts::faceGate` | `biometric.selftest.ts` (value + no-knobs); **UNPROVEN** that the wiring still consumes it (see residual 3) |
+| A plain-gate approve is authorized by biometry alone, with no key release | `controller.ts::liveApprove` -> `faceGate` | **UNPROVEN**: no automated test covers the call-site wiring |
+
+The last two rows close a structural gap this review found: before it, the sole
+authorization for every plain-gate approve on this machine had **no row anywhere
+in this document**.

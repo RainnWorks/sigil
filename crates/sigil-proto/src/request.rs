@@ -68,23 +68,209 @@ use serde::{Deserialize, Serialize};
 ///
 /// One tap approves on the phone regardless of policy; policy governs only
 /// whether that tap may *also* open a lease window, never the friction of the tap.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum LeasePolicy {
     /// Fresh approval every invocation; no lease is ever offered or granted. The
     /// default: a rule leases only when explicitly made leasable.
     #[default]
     RunOnce,
-    /// The approver may grant a session lease up to `max_secs` seconds. The field
-    /// is renamed explicitly (the enum-level `rename_all` renames only the variant
-    /// tags, not struct-variant fields) so the wire spelling is `maxSecs`.
+    /// The approver may grant a session lease up to `max_secs` seconds. The fields
+    /// are renamed explicitly (the enum-level `rename_all` renames only the variant
+    /// tags, not struct-variant fields) so the wire spelling is `maxSecs`/`covers`.
     Leasable {
         #[serde(rename = "maxSecs")]
         max_secs: u32,
+        /// **The coverage label**: a short, DISPLAY-ONLY sentence fragment naming
+        /// how wide the window this tap may open is, e.g. `op read` or
+        /// `op with --account "rowmhq.1password.eu"`.
+        ///
+        /// Rendered **by the daemon** from the matched rule's user-authored match
+        /// conditions (rule name and match conditions are user config, not
+        /// provider semantics, so this does not dent the approver's
+        /// provider-blindness). It is never an argv, never a secret reference, and
+        /// never a value the approver should parse or act on: it exists so the
+        /// consent surface can state the breadth of the window exactly instead of
+        /// hedging.
+        ///
+        /// Bounded to [`COVERS_MAX_CHARS`] characters and reduced to the
+        /// printable-ASCII allowlist by [`LeasePolicy::with_covers`] (see
+        /// [`sanitize_label`]), the only constructor the daemon uses. **Empty
+        /// means "no label available"** (it is then omitted from the wire): a
+        /// renderer must show no coverage clause rather than invent one.
+        #[serde(rename = "covers", default, skip_serializing_if = "String::is_empty")]
+        covers: String,
     },
 }
 
+/// The maximum length, in characters, of a [`LeasePolicy::Leasable`] coverage
+/// label. It rides on a consent surface with a fixed caption line, so both the
+/// renderer (daemon) and every reader (phone, Mac, CLI) hold to one bound.
+pub const COVERS_MAX_CHARS: usize = 72;
+
+/// The single character a label may carry from outside printable ASCII: the
+/// elision mark the bound below and `Match::coverage`'s token elider both emit.
+/// Permitting it is what lets an already-bounded label pass the filter unchanged.
+pub const LABEL_ELLIPSIS: char = '\u{2026}';
+
+/// What one run of rejected characters becomes. A visible marker, never a silent
+/// drop: a label that had something in it must not read as though it never did,
+/// and the human comparing the caption against their own rule should see that the
+/// daemon would not render part of it.
+///
+/// **`U+FFFD REPLACEMENT CHARACTER`, because the marker has to be unforgeable.**
+/// A marker drawn from the permitted alphabet cannot carry that message: an ASCII
+/// `?` is `is_ascii_graphic`, so it passes the filter as ordinary content, and a
+/// rule written as `argv_contains ["?"]` renders `op containing "?"` while a rule
+/// pinning a Japanese vault renders `op with --vault "?"` — same glyph, same
+/// position, and no way for the reader to tell "a character was removed here"
+/// from "the rule really does contain a question mark". `U+FFFD` is outside
+/// `is_ascii_graphic`, so it can never survive the filter as content; it is the
+/// standard, self-describing mark for exactly this ("something was here that I
+/// cannot show you"); and it is present in SF Pro and SF Mono, the faces every
+/// surface that renders a label uses.
+///
+/// Stated exactly: the only input that can put this character in a label without
+/// having been rejected is the character itself (it is permitted, so the filter
+/// stays idempotent), and a config value that literally contains `U+FFFD` already
+/// asserts what the marker asserts. Every other input either survives as ASCII or
+/// becomes this mark, so a reader never has to decide which of the two happened.
+pub const LABEL_REJECTED: char = '\u{fffd}';
+
+/// Sanitize a display label for a consent surface, bounded to `max_chars`
+/// characters (elided with a single-character ellipsis, not three dots, so the
+/// bound is exact).
+///
+/// **An allowlist, deliberately, not a list of known-bad characters.** A label
+/// may contain printable ASCII (`U+0021`..=`U+007E`), runs of whitespace
+/// collapsed to one space, and exactly the two non-ASCII marks the daemon itself
+/// emits: [`LABEL_ELLIPSIS`] and [`LABEL_REJECTED`]. Everything else becomes one
+/// [`LABEL_REJECTED`] per run.
+///
+/// Permitting the daemon's own two marks is what makes this function **exactly
+/// idempotent**: `sanitize_label(sanitize_label(x))` is `sanitize_label(x)`. That
+/// is load-bearing rather than tidy, because an already-sanitized label really is
+/// re-filtered at a second boundary (`sigil lease list` re-runs it over a label
+/// the daemon already produced). Without the marker in the permitted set, every
+/// marker would be re-marked on that path; neither mark can be forged into a
+/// label from outside, so permitting them lets nothing new through.
+///
+/// The blocklist this replaces filtered `char::is_control` (general category
+/// `Cc`) and `char::is_whitespace`, which let two families through onto the
+/// phone's consent caption, where the label shares a sentence with the fixed
+/// clause stating how wide the window is:
+///
+/// * **Category `Cf`.** An unterminated `U+202E RIGHT-TO-LEFT OVERRIDE` inside a
+///   rule's flag value reorders the caption, including the half that states the
+///   breadth. Zero-width characters (`U+200B`, `U+2060`, the `U+E0020` tag block)
+///   hide text or split a word invisibly.
+/// * **Combining marks (`Mn`/`Me`).** A pile of them on one base character
+///   obscures the line it lands on while counting as one character each against
+///   any length bound.
+///
+/// An allowlist closes both, and closes what a `Cc`/`Cf`/`Mn` blocklist would
+/// still miss: characters that are neither control nor mark yet render as
+/// nothing (`U+3164 HANGUL FILLER` is a letter, `U+2800 BRAILLE PATTERN BLANK`
+/// is a symbol), plus whatever a future Unicode revision adds. Unknown input is
+/// rejected rather than passed, which is the direction a consent surface has to
+/// fail in.
+///
+/// The cost, stated plainly: a legitimately non-ASCII rule token (a 1Password
+/// vault named `Ingénierie`) renders as `Ing\u{fffd}nierie` here, and a token
+/// with no ASCII in it at all renders as one bare marker. That is accepted: this
+/// string is a statement of BREADTH on a consent surface, not a faithful echo of
+/// config, and the marker states where the gap is instead of leaving a hole.
+///
+/// It is accepted **without** pointing at another surface as the faithful one.
+/// The human this filter exists for is holding a phone and cannot run a Mac CLI
+/// to see what the caption elided, so the marker has to carry the whole message
+/// unaided — which is exactly why it must be unforgeable. Every human-rendered
+/// surface filters, `sigil-config list` included (it is a terminal, the one place
+/// where an unfiltered escape does real damage). `config.json` on disk and
+/// `sigil-config list --json` are the verbatim record, and `list` says so on the
+/// spot whenever the filter had to change a line it drew.
+pub fn sanitize_label(raw: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out = String::with_capacity(raw.len().min(max_chars));
+    let mut pending_space = false;
+    let mut prev_rejected = false;
+    for ch in raw.chars() {
+        if ch.is_control() || ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        // The daemon's own two marks are permitted so a second pass over an
+        // already-filtered label is a no-op (see the idempotence note above).
+        let permitted = ch.is_ascii_graphic() || ch == LABEL_ELLIPSIS || ch == LABEL_REJECTED;
+        // A run of rejected characters collapses to one marker, the same way a
+        // run of whitespace collapses to one space: forty combining marks are one
+        // piece of information ("something here would not render"), and repeating
+        // the marker forty times would itself deform the line.
+        if !permitted && prev_rejected && !pending_space {
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(if permitted { ch } else { LABEL_REJECTED });
+        prev_rejected = !permitted;
+    }
+    if out.chars().count() > max_chars {
+        out = out
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        out.push(LABEL_ELLIPSIS);
+    }
+    out
+}
+
+/// [`sanitize_label`] at the coverage label's own bound. The single choke point
+/// every coverage label passes through: [`LeasePolicy::with_covers`] is the only
+/// constructor that sets one, and the daemon's `Config::resolve` is the only
+/// caller of that.
+fn sanitize_covers(raw: &str) -> String {
+    sanitize_label(raw, COVERS_MAX_CHARS)
+}
+
 impl LeasePolicy {
+    /// A leasable policy capped at `max_secs`, with no coverage label yet. The
+    /// label is attached by the daemon at resolve time via
+    /// [`with_covers`](Self::with_covers); config on disk stores none.
+    pub fn leasable(max_secs: u32) -> Self {
+        LeasePolicy::Leasable {
+            max_secs,
+            covers: String::new(),
+        }
+    }
+
+    /// Attach (or replace) the daemon-rendered coverage label, sanitized and
+    /// bounded. A no-op on [`RunOnce`](Self::RunOnce): a run-once request opens no
+    /// window, so it must carry no coverage label at all.
+    pub fn with_covers(self, label: impl AsRef<str>) -> Self {
+        match self {
+            LeasePolicy::RunOnce => LeasePolicy::RunOnce,
+            LeasePolicy::Leasable { max_secs, .. } => LeasePolicy::Leasable {
+                max_secs,
+                covers: sanitize_covers(label.as_ref()),
+            },
+        }
+    }
+
+    /// The coverage label, or `""` when there is none (run-once, or a peer that
+    /// omitted it). Display only.
+    pub fn covers(&self) -> &str {
+        match self {
+            LeasePolicy::Leasable { covers, .. } => covers,
+            LeasePolicy::RunOnce => "",
+        }
+    }
+
     /// Whether this policy permits any lease at all.
     pub fn is_leasable(&self) -> bool {
         matches!(self, LeasePolicy::Leasable { .. })
@@ -99,7 +285,7 @@ impl LeasePolicy {
     /// The per-rule cap in seconds if leasable, else `None` (run-once).
     pub fn max_secs(&self) -> Option<u32> {
         match self {
-            LeasePolicy::Leasable { max_secs } => Some(*max_secs),
+            LeasePolicy::Leasable { max_secs, .. } => Some(*max_secs),
             LeasePolicy::RunOnce => None,
         }
     }
@@ -251,10 +437,12 @@ pub struct ApprovalRequest {
     pub ssh: Option<SshChallenge>,
     pub provenance: Provenance,
     /// The rule's lease policy: whether this tap may also open an auto-approve
-    /// window and its cap. Rides inside the seal so it is part of what the
-    /// approver consents to; the phone offers "approve for N minutes" only when
-    /// this is [`LeasePolicy::Leasable`]. Defaults to [`LeasePolicy::RunOnce`]
-    /// when absent, so an older/omitting peer fails safe to run-once.
+    /// window, its cap, and (on a leasable rule) the daemon-rendered
+    /// [`covers`](LeasePolicy::covers) label describing how wide that window is.
+    /// Rides inside the seal so it is part of what the approver consents to; the
+    /// phone offers "approve for N minutes" only when this is
+    /// [`LeasePolicy::Leasable`]. Defaults to [`LeasePolicy::RunOnce`] when
+    /// absent, so an older/omitting peer fails safe to run-once.
     #[serde(default)]
     pub lease_policy: LeasePolicy,
     /// One optional reason line the approver renders under the command.
@@ -552,17 +740,444 @@ impl ResolutionBroadcast {
     }
 }
 
+// --- Phone lease control: list and revoke live windows from the approver ------
+//
+// Four messages let the paired approver see and close the auto-approve windows
+// its own taps opened. They are the second controller over a store whose first
+// controller is `sigil lease revoke <prefix>` on the Mac, which is unchanged.
+//
+// Three properties of the surrounding system drive every design choice here, and
+// none of them is obvious:
+//
+// 1. **The envelope counter is not a replay gate.** It was retired (see
+//    [`crate::replay`]) because an in-memory counter reset on either side and
+//    dropped genuine approvals. It still rides inside the signed bytes and gates
+//    nothing. What protects replay is the Ed25519 signature, a
+//    [`REPLAY_WINDOW_MS`](crate::REPLAY_WINDOW_MS) freshness window, and a
+//    single-use uuidv7 set -- the last two in a RAM-only guard on BOTH ends, so
+//    both are empty again after any restart on either side.
+// 2. **A grant key is deterministic AND non-unique.** It is a hash of the
+//    caller's ancestor code-identity chain plus the rule, so it recurs tomorrow;
+//    and several windows with different `LeaseBinding`s share one. It is
+//    therefore useless as a wire identifier in both directions at once, and it
+//    never appears here.
+// 3. **A reply that cannot be tied to its request is an affirmative lie waiting
+//    to happen.** A relay that captured a genuine `revoked: true` can, after the
+//    phone's RAM guard is gone, suppress a fresh revoke and deliver the capture
+//    instead. So every reply names the envelope that asked for it.
+
+/// The exact character width of a lease id rendered as lowercase hex (16 bytes).
+pub const LEASE_ID_CHARS: usize = 32;
+
+/// The bound every human-readable field of a [`LeaseRow`] is sanitized to. The
+/// same bound as [`COVERS_MAX_CHARS`], because these strings render on the same
+/// consent surface as the coverage label and must hold to one rule.
+pub const LEASE_LABEL_MAX_CHARS: usize = COVERS_MAX_CHARS;
+
+/// The fixed length bucket every lease-control plaintext is padded up to, in
+/// bytes of serialized JSON.
+///
+/// Without it, ciphertext length is a function of how many windows are live and
+/// of the exact rule names in them, all of which an attacker who has seen the
+/// config can fingerprint; and a revoke is trivially shorter than any list. With
+/// it, zero rows, one row and five rows are one length, and a revoke is
+/// indistinguishable from a list.
+///
+/// **1024, not the 512 the review specified**, because 512 does not buy the
+/// property the review asked for. Measured on this wire: a row is 115 bytes with
+/// short labels, 169 with realistic ones (`op with --account "rowmhq.1password.eu"`),
+/// and 318 with all three labels at the 72-character bound. So a 512-byte bucket
+/// holds two realistic rows and rolls to a second bucket at three, which would
+/// leak the row count in exactly the range that matters. 1024 holds five.
+///
+/// **What it does not hide, stated plainly:** the relay still learns THAT lease
+/// control was used and when (a 1024-byte-bucket envelope is not an approval),
+/// and a list long enough to overflow the bucket reveals that it did -- six
+/// realistic rows, or four with maximal labels. Widening the bucket only moves
+/// that boundary; it cannot remove it.
+pub const LEASE_PAD_BUCKET: usize = 1024;
+
+/// The filler character [`LeaseControlMessage::padded`] uses. Printable ASCII
+/// that never escapes in JSON, so the padded length is exactly predictable.
+const LEASE_PAD_FILL: char = '.';
+
+/// Normalize an ASCII-hex field of exactly `chars` characters to lowercase, or
+/// `None` if it is not exactly that.
+///
+/// The exact-width check is load-bearing, not tidiness. The store's OTHER revoke
+/// entry point is prefix-matched for the CLI, and `"".starts_with(p)` holds for
+/// every string, so a short or empty identifier reaching a prefix API would be a
+/// silent global lease wipe reported as a success. Nothing from this module can
+/// reach that API (see [`LeaseRevoke`]), and this is the second lock on the same
+/// door.
+fn hex_field(raw: &str, chars: usize) -> Option<String> {
+    if raw.len() != chars || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(raw.to_ascii_lowercase())
+}
+
+/// The four lease-control payloads, which all pad to [`LEASE_PAD_BUCKET`].
+///
+/// The `pad` field is meaningless filler and a receiver MUST ignore it: never
+/// display it, never sanitize it, never let its size decide anything. It exists
+/// only so the ciphertext length carries no information.
+///
+/// Padding is a **sender** obligation and is deliberately not verified on
+/// receipt. Rejecting an unpadded message would make a version skew between the
+/// two halves fail silently and closed, and a revoke that vanishes is the exact
+/// failure this whole feature exists to end. The residual is stated where it
+/// belongs: a peer that does not pad leaks its own lengths, nobody else's.
+pub trait LeaseControlMessage: Serialize + Sized {
+    /// Overwrite the padding field.
+    fn set_pad(&mut self, pad: String);
+
+    /// Return this message with `pad` sized so the serialized JSON is exactly a
+    /// multiple of [`LEASE_PAD_BUCKET`] bytes.
+    ///
+    /// Exact because `pad` always serializes (never skipped when empty), so the
+    /// zero-padding measurement already includes the field's own overhead and the
+    /// filler never escapes.
+    fn padded(mut self) -> Self {
+        self.set_pad(String::new());
+        let len = serde_json::to_vec(&self).map(|v| v.len()).unwrap_or(0);
+        let target = len.div_ceil(LEASE_PAD_BUCKET) * LEASE_PAD_BUCKET;
+        self.set_pad(std::iter::repeat_n(LEASE_PAD_FILL, target - len).collect());
+        self
+    }
+}
+
+/// A phone -> daemon request to enumerate the daemon's live lease windows.
+///
+/// **Wire contract (locked, shared with `apps/phone`).**
+/// `{"type":"leaseList","pad":"…"}`. It carries no body: the daemon lists
+/// everything it holds, exactly as `sigil lease list` does, because the phone is
+/// the same single human. Correlation is the ENVELOPE's uuidv7 request id, which
+/// the daemon echoes as [`LeaseListReply::in_reply_to`]; there is no
+/// application-level id, so there is one fewer peer-chosen string to validate and
+/// echo.
+///
+/// It rides the established session box with the same seal, signature, and
+/// [`ReplayGuard`](crate::ReplayGuard) as an [`ApprovalResponse`]. It grants
+/// nothing and releases nothing: a (cryptographically impossible) forged one
+/// would at most make the daemon seal a list to the pinned phone that asked.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseQuery {
+    /// The wire discriminator. Always [`LeaseQuery::TYPE`] on a conforming
+    /// message; validated by [`ToDaemonMessage::from_value`] before dispatch.
+    #[serde(rename = "type")]
+    pub message_type: String,
+    /// Length-hiding filler. Ignore it; see [`LeaseControlMessage`].
+    #[serde(default)]
+    pub pad: String,
+}
+
+impl LeaseQuery {
+    /// The locked `type` discriminator value.
+    pub const TYPE: &'static str = "leaseList";
+
+    /// Build a padded query.
+    pub fn new() -> Self {
+        Self {
+            message_type: Self::TYPE.to_string(),
+            pad: String::new(),
+        }
+        .padded()
+    }
+}
+
+impl LeaseControlMessage for LeaseQuery {
+    fn set_pad(&mut self, pad: String) {
+        self.pad = pad;
+    }
+}
+
+/// A phone -> daemon request to kill ONE live lease window.
+///
+/// **Wire contract (locked, shared with `apps/phone`).**
+/// `{"type":"leaseRevoke","leaseId":"<32 hex>","pad":"…"}`.
+///
+/// # Why the target is an opaque lease id and never a grant key
+///
+/// The obvious identifier is the grant key, and it is wrong on three counts, each
+/// of which alone would sink it:
+///
+/// * **It is not unique.** Several live windows can share one grant key with
+///   different bindings, so revoking "the row I tapped" would kill unseen
+///   siblings, and the reply would describe a wider action than the human
+///   consented to.
+/// * **It reaches a prefix-matched API.** The store's CLI revoke is prefix
+///   matched, and every string starts with `""`. A truncated or empty grant key
+///   arriving from the network would be a silent global lease wipe reported as a
+///   success.
+/// * **It is a durable correlator.** A hash of the caller's ancestor
+///   code-identity chain plus the rule outlives the window it describes and would
+///   sit in phone storage across re-pairs, describing the shape of the human's
+///   machine.
+///
+/// So the wire carries a [`LeaseRow::lease_id`]: 128 opaque bits minted from the
+/// platform CSPRNG when a window opens, RAM-only, dying with the window. It
+/// names ONE window and asserts nothing about any other. A captured revoke
+/// re-flown after a daemon restart -- authentic, in-window, and against a fresh
+/// empty guard -- names an id that no longer exists and is inert.
+///
+/// **This message never gains a duration field.** It exists to take a window
+/// away. A revoke that could also set a TTL would be a grant path reachable from
+/// the network, and the daemon is structurally prevented from reaching one from
+/// here (its handle exposes list and revoke only).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseRevoke {
+    /// The wire discriminator. Always [`LeaseRevoke::TYPE`] on a conforming
+    /// message; validated by [`ToDaemonMessage::from_value`] before dispatch.
+    #[serde(rename = "type")]
+    pub message_type: String,
+    /// The window to close, lowercase hex, exactly [`LEASE_ID_CHARS`]. Taken
+    /// verbatim from a [`LeaseRow`].
+    pub lease_id: String,
+    /// Length-hiding filler. Ignore it; see [`LeaseControlMessage`].
+    #[serde(default)]
+    pub pad: String,
+}
+
+impl LeaseRevoke {
+    /// The locked `type` discriminator value.
+    pub const TYPE: &'static str = "leaseRevoke";
+
+    /// Build a padded revoke for one listed window.
+    pub fn new(lease_id: impl Into<String>) -> Self {
+        Self {
+            message_type: Self::TYPE.to_string(),
+            lease_id: lease_id.into(),
+            pad: String::new(),
+        }
+        .padded()
+    }
+
+    /// The lease id this names, validated and normalized, or `None`.
+    ///
+    /// Fail closed as ONE decision: a message whose target the daemon cannot parse
+    /// is dropped whole, with no reply. Replying to a malformed target would echo
+    /// peer-chosen bytes back onto a screen, and there is nothing useful to say --
+    /// a phone that sends an id it did not read off a [`LeaseRow`] has a bug, not
+    /// a window.
+    pub fn target(&self) -> Option<String> {
+        hex_field(&self.lease_id, LEASE_ID_CHARS)
+    }
+}
+
+impl LeaseControlMessage for LeaseRevoke {
+    fn set_pad(&mut self, pad: String) {
+        self.pad = pad;
+    }
+}
+
+/// One live lease window, as the daemon describes it to the approver.
+///
+/// **Everything here is display-safe by construction.** The three human-readable
+/// fields go through [`sanitize_label`] at [`LEASE_LABEL_MAX_CHARS`] in
+/// [`LeaseRow::new`], the only constructor the daemon uses. That is not
+/// belt-and-braces: `covers` is rendered by the daemon and already filtered, but
+/// `scope` is the RAW rule name out of `config.json` and `account` is the raw
+/// source label, and config validation only rejects duplicates and empty matches.
+/// Without this they would be the first unfiltered config text on a
+/// consent-adjacent phone surface -- the exact class the coverage-label allowlist
+/// was written for.
+///
+/// None of them is ever a raw argv, a secret reference, or a secret value:
+/// `scope` is the matched RULE's name and `covers` is the coverage label, both
+/// already on the consent surface the human said yes to.
+///
+/// A renderer must still re-filter (the phone ports this same allowlist): this
+/// type describes what the daemon promises to send, not what a screen may assume
+/// it received.
+///
+/// **No age.** A refresh extends a window without re-stamping when it was first
+/// granted, so an age would read "an hour" beside a full remaining for a window
+/// re-approved thirty seconds ago. A number that misleads on the common path is
+/// worse than no number; `remaining_ms` against [`LeaseListReply::as_of_ms`] is
+/// what a countdown actually needs.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseRow {
+    /// This window's opaque id, lowercase hex, [`LEASE_ID_CHARS`] wide. 128 bits
+    /// from the platform CSPRNG, minted when the window opens, preserved when a
+    /// later approval REFRESHES it (a refresh extends one window, it does not
+    /// start another), never reused, and gone when the window is. It is the row's
+    /// whole identity and the only thing a [`LeaseRevoke`] may name.
+    pub lease_id: String,
+    /// The matched rule's name. Display must make the breadth plain: the window
+    /// covers anything that rule matches for that caller chain, not the one
+    /// command that opened it.
+    pub scope: String,
+    /// The daemon-rendered coverage label for that rule (`op read`, `op with
+    /// --account "…"`). **Empty means no label was rendered**: show no coverage
+    /// clause rather than inventing one, and never read empty as "narrow".
+    pub covers: String,
+    /// The source/account label the window injects from. Empty for a plain gate,
+    /// which injects nothing.
+    pub account: String,
+    /// Milliseconds left before the window lapses on its own, as measured at
+    /// [`LeaseListReply::as_of_ms`].
+    pub remaining_ms: u64,
+}
+
+impl LeaseRow {
+    /// Build a row, sanitizing every display field and validating the id. `None`
+    /// when `lease_id` is not exactly-width ASCII hex, so a row the phone could
+    /// not act on is never sent at all.
+    pub fn new(
+        lease_id: &str,
+        scope: &str,
+        covers: &str,
+        account: &str,
+        remaining_ms: u64,
+    ) -> Option<Self> {
+        Some(Self {
+            lease_id: hex_field(lease_id, LEASE_ID_CHARS)?,
+            scope: sanitize_label(scope, LEASE_LABEL_MAX_CHARS),
+            covers: sanitize_label(covers, LEASE_LABEL_MAX_CHARS),
+            account: sanitize_label(account, LEASE_LABEL_MAX_CHARS),
+            remaining_ms,
+        })
+    }
+}
+
+/// The daemon's answer to a [`LeaseQuery`]: every live window, newest first.
+///
+/// **Wire contract (locked, shared with `apps/phone`).**
+/// `{"type":"leaseListReply","inReplyTo":"<uuid>","asOfMs":int,"leases":[LeaseRow,…],"pad":"…"}`.
+/// `leases` is always present and may be empty (no live windows).
+///
+/// See [`LeaseRevokeReply::in_reply_to`] for why the correlation is mandatory
+/// and what the phone must do with it. `as_of_ms` is when the daemon measured
+/// the window clocks: a renderer counts down from it and, once it is old enough
+/// to distrust, must show the list as stale rather than as current.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseListReply {
+    /// The wire discriminator. Always [`LeaseListReply::TYPE`].
+    #[serde(rename = "type")]
+    pub message_type: String,
+    /// The uuidv7 request id of the envelope that asked. See
+    /// [`LeaseRevokeReply::in_reply_to`].
+    pub in_reply_to: String,
+    /// Daemon wall clock, unix ms, when these windows were measured.
+    pub as_of_ms: u64,
+    /// The live windows. Empty is a complete, meaningful answer: no windows.
+    pub leases: Vec<LeaseRow>,
+    /// Length-hiding filler. Ignore it; see [`LeaseControlMessage`].
+    #[serde(default)]
+    pub pad: String,
+}
+
+impl LeaseListReply {
+    /// The locked `type` discriminator value.
+    pub const TYPE: &'static str = "leaseListReply";
+
+    /// Build a padded reply to the envelope `in_reply_to`, measured at `as_of_ms`.
+    pub fn new(in_reply_to: impl Into<String>, as_of_ms: u64, leases: Vec<LeaseRow>) -> Self {
+        Self {
+            message_type: Self::TYPE.to_string(),
+            in_reply_to: in_reply_to.into(),
+            as_of_ms,
+            leases,
+            pad: String::new(),
+        }
+        .padded()
+    }
+}
+
+impl LeaseControlMessage for LeaseListReply {
+    fn set_pad(&mut self, pad: String) {
+        self.pad = pad;
+    }
+}
+
+/// The daemon's answer to a [`LeaseRevoke`].
+///
+/// **Wire contract (locked, shared with `apps/phone`).**
+/// `{"type":"leaseRevokeReply","inReplyTo":"<uuid>","leaseId":"<echoed>","revoked":bool,"pad":"…"}`.
+///
+/// `revoked` is `true` **only** when a live window with that exact id was found
+/// and zeroized. It is `false` -- never an error, never a distinguishable failure
+/// -- for every other case: the window already lapsed, it was already revoked
+/// (from here or from `sigil lease revoke`), or the id names nothing. The three
+/// are deliberately indistinguishable, so a `false` is not an oracle for what
+/// this daemon holds.
+///
+/// A revoke is therefore **idempotent**: sending it twice is `true` then `false`,
+/// and both are successful outcomes.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseRevokeReply {
+    /// The wire discriminator. Always [`LeaseRevokeReply::TYPE`].
+    #[serde(rename = "type")]
+    pub message_type: String,
+    /// **The uuidv7 request id of the envelope that asked for this.**
+    ///
+    /// Without it, a suppressed revoke becomes an affirmative lie. The attack is
+    /// routine, not exotic: a relay captures a genuine `revoked: true`; the phone
+    /// is later killed or backgrounded, which empties its RAM replay guard; the
+    /// human reopens the app and taps revoke; the relay swallows that request and
+    /// delivers the capture instead. Genuine signature, unseen id, inside the
+    /// freshness window -- and the human is told the window closed while it is
+    /// open.
+    ///
+    /// The phone MUST therefore accept a reply only when it names a request the
+    /// phone has **outstanding right now**, and must retire that request the
+    /// moment it does (single-use at the application layer). That check survives
+    /// what the replay guard does not: after a restart nothing is outstanding, so
+    /// every captured reply is dropped. A revoke with no matching reply is
+    /// **unconfirmed** -- never rendered as success, never as failure -- and the
+    /// recovery is to re-list.
+    pub in_reply_to: String,
+    /// Echoes the revoke's normalized `leaseId`, so a phone tracking several rows
+    /// attributes the answer to the right one.
+    pub lease_id: String,
+    /// Whether a live window with that exact id was found and killed.
+    pub revoked: bool,
+    /// Length-hiding filler. Ignore it; see [`LeaseControlMessage`].
+    #[serde(default)]
+    pub pad: String,
+}
+
+impl LeaseRevokeReply {
+    /// The locked `type` discriminator value.
+    pub const TYPE: &'static str = "leaseRevokeReply";
+
+    /// Build a padded reply to the envelope `in_reply_to`.
+    pub fn new(in_reply_to: impl Into<String>, lease_id: impl Into<String>, revoked: bool) -> Self {
+        Self {
+            message_type: Self::TYPE.to_string(),
+            in_reply_to: in_reply_to.into(),
+            lease_id: lease_id.into(),
+            revoked,
+            pad: String::new(),
+        }
+        .padded()
+    }
+}
+
+impl LeaseControlMessage for LeaseRevokeReply {
+    fn set_pad(&mut self, pad: String) {
+        self.pad = pad;
+    }
+}
+
 /// A daemon -> phone message on an established session's `ToPhone` channel.
 ///
-/// Two shapes share this channel: the (untagged, legacy) [`ApprovalRequest`] and
-/// the tagged [`ResolutionBroadcast`]. This mirrors [`ToDaemonMessage`] on the
-/// return path: the daemon's demux there tells a response from a tagged
-/// registration/receipt; the phone's demux here tells a request from a tagged
-/// resolution. The discriminator is the `type` field: `"resolution"` selects
-/// [`ResolutionBroadcast`]; its absence is an [`ApprovalRequest`]. A hand-rolled
-/// peek is used deliberately instead of a `#[serde(untagged)]` enum so
-/// [`ApprovalRequest`]'s wire shape stays byte-for-byte unchanged (the pinned
-/// vectors and the pairing transcript must not shift).
+/// Four shapes share this channel: the (untagged, legacy) [`ApprovalRequest`] and
+/// the tagged [`ResolutionBroadcast`], [`LeaseListReply`], and
+/// [`LeaseRevokeReply`]. This mirrors [`ToDaemonMessage`] on the return path: the
+/// daemon's demux there tells a response from a tagged
+/// registration/receipt/lease-control message; the phone's demux here tells a
+/// request from a tagged resolution or lease reply. The discriminator is the
+/// `type` field; its absence is an [`ApprovalRequest`]. A hand-rolled peek is used
+/// deliberately instead of a `#[serde(untagged)]` enum so [`ApprovalRequest`]'s
+/// wire shape stays byte-for-byte unchanged (the pinned vectors and the pairing
+/// transcript must not shift).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ToPhoneMessage {
     /// A fresh approval request to display.
@@ -570,6 +1185,10 @@ pub enum ToPhoneMessage {
     /// A resolution of an already-shown request: dismiss it. Never a decision and
     /// never a release; display only.
     Resolution(ResolutionBroadcast),
+    /// The live lease windows this daemon holds. Display only.
+    LeaseList(LeaseListReply),
+    /// The outcome of one revoke. Reports what happened; changes nothing itself.
+    LeaseRevoke(LeaseRevokeReply),
 }
 
 impl ToPhoneMessage {
@@ -582,6 +1201,8 @@ impl ToPhoneMessage {
         let tag = value.get("type").and_then(serde_json::Value::as_str);
         match tag {
             Some(ResolutionBroadcast::TYPE) => Ok(Self::Resolution(serde_json::from_value(value)?)),
+            Some(LeaseListReply::TYPE) => Ok(Self::LeaseList(serde_json::from_value(value)?)),
+            Some(LeaseRevokeReply::TYPE) => Ok(Self::LeaseRevoke(serde_json::from_value(value)?)),
             _ => Ok(Self::Request(Box::new(serde_json::from_value(value)?))),
         }
     }
@@ -589,14 +1210,20 @@ impl ToPhoneMessage {
 
 /// A phone -> daemon message on an established session's `ToDaemon` channel.
 ///
-/// Three shapes share this channel: the (untagged, legacy) [`ApprovalResponse`],
-/// the tagged [`PushRegister`], and the tagged [`DeliveryReceipt`]. This is the
-/// single place the daemon decides which one an opened payload is. The
-/// discriminator is the `type` field: `"pushRegister"` selects [`PushRegister`],
-/// `"delivered"` selects [`DeliveryReceipt`]; anything else (in practice, its
-/// absence) is an [`ApprovalResponse`]. A hand-rolled peek is used deliberately
-/// instead of a `#[serde(untagged)]` enum so [`ApprovalResponse`]'s wire shape
-/// stays byte-for-byte unchanged (the v2 pairing transcript must not shift).
+/// Five shapes share this channel: the (untagged, legacy) [`ApprovalResponse`],
+/// and the tagged [`PushRegister`], [`DeliveryReceipt`], [`LeaseQuery`], and
+/// [`LeaseRevoke`]. This is the single place the daemon decides which one an
+/// opened payload is. The discriminator is the `type` field: `"pushRegister"`,
+/// `"delivered"`, `"leaseList"`, and `"leaseRevoke"` select their tagged types;
+/// anything else (in practice, its absence) is an [`ApprovalResponse`]. A
+/// hand-rolled peek is used deliberately instead of a `#[serde(untagged)]` enum so
+/// [`ApprovalResponse`]'s wire shape stays byte-for-byte unchanged (the v2 pairing
+/// transcript must not shift).
+///
+/// **None of the tagged shapes can be mistaken for a decision.** An
+/// [`ApprovalResponse`] is the one payload with no `type` at all, so a lease
+/// message can never be routed to a waiting approval, and a lease message that
+/// fails to parse is an error the caller drops rather than a half-built one.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ToDaemonMessage {
     /// A decision on a pending approval.
@@ -606,6 +1233,12 @@ pub enum ToDaemonMessage {
     /// A receipt acknowledging the phone opened a request. Display only: it never
     /// releases a secret and never gates a decision.
     Delivered(DeliveryReceipt),
+    /// A request to enumerate the daemon's live lease windows. Reads state; grants
+    /// nothing.
+    LeaseList(LeaseQuery),
+    /// A request to kill ONE live lease window, named by grant key AND instance.
+    /// It can only ever narrow what is authorized, never widen it.
+    LeaseRevoke(LeaseRevoke),
 }
 
 impl ToDaemonMessage {
@@ -620,6 +1253,8 @@ impl ToDaemonMessage {
         match tag {
             Some(PushRegister::TYPE) => Ok(Self::Push(serde_json::from_value(value)?)),
             Some(DeliveryReceipt::TYPE) => Ok(Self::Delivered(serde_json::from_value(value)?)),
+            Some(LeaseQuery::TYPE) => Ok(Self::LeaseList(serde_json::from_value(value)?)),
+            Some(LeaseRevoke::TYPE) => Ok(Self::LeaseRevoke(serde_json::from_value(value)?)),
             _ => Ok(Self::Response(serde_json::from_value(value)?)),
         }
     }
@@ -712,7 +1347,7 @@ mod tests {
         // Run-once refuses any lease, whatever the request asks for.
         assert_eq!(LeasePolicy::RunOnce.clamp_secs(60), None);
 
-        let leasable = LeasePolicy::Leasable { max_secs: 900 };
+        let leasable = LeasePolicy::leasable(900);
         assert!(leasable.is_leasable());
         assert_eq!(leasable.max_secs(), Some(900));
         // Under the cap passes through; over the cap clamps down.
@@ -728,10 +1363,223 @@ mod tests {
         assert_eq!(j1, "{\"kind\":\"runOnce\"}");
         assert_eq!(serde_json::from_str::<LeasePolicy>(&j1).unwrap(), once);
 
-        let leas = LeasePolicy::Leasable { max_secs: 900 };
+        // No coverage label: `covers` is omitted entirely, so the wire shape is
+        // byte-identical to the pre-coverage protocol.
+        let leas = LeasePolicy::leasable(900);
         let j2 = serde_json::to_string(&leas).unwrap();
         assert_eq!(j2, "{\"kind\":\"leasable\",\"maxSecs\":900}");
         assert_eq!(serde_json::from_str::<LeasePolicy>(&j2).unwrap(), leas);
+
+        // With a label it rides alongside the cap, and an omitting peer decodes
+        // to the empty label (fails safe to "no coverage clause", never invented).
+        let covered = LeasePolicy::leasable(900).with_covers("op read");
+        let j3 = serde_json::to_string(&covered).unwrap();
+        assert_eq!(
+            j3,
+            "{\"kind\":\"leasable\",\"maxSecs\":900,\"covers\":\"op read\"}"
+        );
+        assert_eq!(serde_json::from_str::<LeasePolicy>(&j3).unwrap(), covered);
+        assert_eq!(covered.covers(), "op read");
+        assert_eq!(
+            serde_json::from_str::<LeasePolicy>("{\"kind\":\"leasable\",\"maxSecs\":900}")
+                .unwrap()
+                .covers(),
+            ""
+        );
+    }
+
+    #[test]
+    fn covers_is_sanitized_bounded_and_never_set_on_run_once() {
+        // A run-once policy opens no window, so it can carry no coverage label.
+        assert_eq!(
+            LeasePolicy::RunOnce.with_covers("op read"),
+            LeasePolicy::RunOnce
+        );
+        assert_eq!(LeasePolicy::RunOnce.covers(), "");
+
+        // Control characters and whitespace runs cannot deform the consent
+        // surface: they collapse to single spaces and the ends are trimmed.
+        let messy = LeasePolicy::leasable(60).with_covers("  op\n\tread   with\r\n--vault  ");
+        assert_eq!(messy.covers(), "op read with --vault");
+
+        // The bound is exact, counted in characters, and marked with an ellipsis.
+        let long = LeasePolicy::leasable(60).with_covers("x".repeat(500));
+        assert_eq!(long.covers().chars().count(), COVERS_MAX_CHARS);
+        assert!(long.covers().ends_with('\u{2026}'));
+
+        // Multi-byte characters are truncated on a char boundary, not a byte one.
+        // The ellipsis is the one non-ASCII character the allowlist admits, so it
+        // is what proves the truncation is counted and cut in characters.
+        let wide = LeasePolicy::leasable(60).with_covers("\u{2026}".repeat(500));
+        assert_eq!(wide.covers().chars().count(), COVERS_MAX_CHARS);
+
+        // A label exactly at the bound is left alone.
+        let exact = "y".repeat(COVERS_MAX_CHARS);
+        assert_eq!(
+            LeasePolicy::leasable(60).with_covers(&exact).covers(),
+            exact
+        );
+    }
+
+    /// R4-F4, the reviewer's own vectors. The choke point used to filter general
+    /// category `Cc` plus whitespace, so bidi controls, zero-width characters and
+    /// combining marks reached the phone's consent caption, where the label and
+    /// the fixed clause stating how wide the window is share one sentence.
+    #[test]
+    fn covers_cannot_carry_a_character_that_reorders_or_hides_the_caption() {
+        // The caption the label rides in. If the label cannot introduce a
+        // direction override, a zero-width character or a combining mark, the
+        // rendered sentence cannot be reordered or obscured either.
+        let caption = |p: &LeasePolicy| {
+            format!(
+                "Covers {}: every command and secret that rule matches, from anywhere on this Mac.",
+                p.covers()
+            )
+        };
+
+        // Vector 1: RIGHT-TO-LEFT OVERRIDE and ZERO WIDTH SPACE inside a rule's
+        // flag value. Both are category Cf, which `char::is_control` does not
+        // report, and the RLO is unterminated: it reordered everything after it.
+        let rlo = LeasePolicy::leasable(900)
+            .with_covers("op with --account \"\u{202e}terces-on\u{200b}\"");
+        assert_eq!(
+            rlo.covers(),
+            "op with --account \"\u{fffd}terces-on\u{fffd}\""
+        );
+
+        // Vector 2: forty combining acute accents, which survived the old filter
+        // whole and sat under the bound.
+        let marks =
+            LeasePolicy::leasable(900).with_covers(format!("op read{}", "\u{301}".repeat(40)));
+        assert_eq!(marks.covers(), "op read\u{fffd}");
+
+        // Nothing that can move text direction, join or split a word invisibly,
+        // or stack on a neighbour survives, on either vector or in the sentence
+        // they render into.
+        for p in [&rlo, &marks] {
+            let rendered = caption(p);
+            for ch in rendered.chars() {
+                assert!(
+                    ch.is_ascii_graphic()
+                        || ch == ' '
+                        || ch == LABEL_ELLIPSIS
+                        || ch == LABEL_REJECTED,
+                    "{ch:?} reached the consent caption: {rendered}"
+                );
+            }
+        }
+
+        // The rest of the families an allowlist closes and a Cc/Cf/Mn blocklist
+        // would not: characters that are neither control nor mark and still
+        // render as nothing, and the tag block used to smuggle whole sentences.
+        let invisible = LeasePolicy::leasable(900).with_covers(
+            "op\u{3164}read\u{2800}\u{e0041}\u{e0042}", // HANGUL FILLER, BRAILLE BLANK, tags
+        );
+        assert_eq!(invisible.covers(), "op\u{fffd}read\u{fffd}");
+
+        // A run collapses to one marker, so a rejected pile cannot spend the
+        // whole bound either.
+        let pile = LeasePolicy::leasable(900).with_covers("\u{202e}".repeat(500));
+        assert_eq!(pile.covers(), "\u{fffd}");
+
+        // Ordinary labels are untouched, including the quoting and the elision
+        // mark `Match::coverage` emits.
+        for plain in [
+            "op read",
+            "op with --account \"rowmhq.1password.eu\"",
+            "op with --vault \"Shared Eng\" and --account \"a\u{2026}\"",
+            "op containing \"prod\", matching a pattern",
+        ] {
+            assert_eq!(
+                LeasePolicy::leasable(900).with_covers(plain).covers(),
+                plain
+            );
+        }
+    }
+
+    /// The exported filter is what the CLI re-runs at its own render boundary
+    /// (R4-F6), so it has to hold at any bound, not just the coverage one.
+    #[test]
+    fn sanitize_label_holds_its_bound_at_any_width() {
+        assert_eq!(sanitize_label("", 40), "");
+        assert_eq!(sanitize_label("anything", 0), "");
+        assert_eq!(sanitize_label("  op   read  ", 40), "op read");
+        // Bounded exactly, in characters, with the elision mark inside the bound.
+        let cut = sanitize_label(&"z".repeat(99), 10);
+        assert_eq!(cut.chars().count(), 10);
+        assert!(cut.ends_with(LABEL_ELLIPSIS));
+        // A trailing space is trimmed before the mark, never elided into "x …".
+        assert_eq!(sanitize_label("abcde fghij", 7), "abcde\u{2026}");
+        // Control bytes never reach a terminal through it.
+        assert_eq!(sanitize_label("a\u{1b}[31mb\u{7}", 40), "a [31mb");
+    }
+
+    /// The marker must mean one thing and only one thing: "the daemon would not
+    /// render what was here". A marker drawn from the permitted alphabet cannot,
+    /// because content could spell it. This pins the property that makes the
+    /// message unambiguous — a marker in the output was PUT there by the filter.
+    #[test]
+    fn the_rejected_marker_cannot_be_spelled_by_a_label() {
+        // It is outside the permitted set by construction, so nothing that goes
+        // in as content can come out looking like the filter's own mark.
+        assert!(!LABEL_REJECTED.is_ascii_graphic());
+
+        // The old marker (`?`) is ordinary content and stays ordinary content: a
+        // rule that really matches on a question mark is distinguishable, in the
+        // same position, from a rule whose value would not render.
+        let literal = sanitize_label("op containing \"?\"", COVERS_MAX_CHARS);
+        let elided = sanitize_label("op with --vault \"\u{65e5}\u{672c}\"", COVERS_MAX_CHARS);
+        assert_eq!(literal, "op containing \"?\"");
+        assert_eq!(elided, "op with --vault \"\u{fffd}\"");
+        assert!(!literal.contains(LABEL_REJECTED));
+        assert!(elided.contains(LABEL_REJECTED));
+
+        // The mark appears in the output exactly when the input held something the
+        // filter would not render, so its presence is never ambiguous. The one
+        // input that puts the mark there without being rejected is the mark
+        // itself, which already means what the filter means by it.
+        for (raw, marked) in [
+            ("?", false),
+            ("op read", false),
+            ("op with --account \"a-b.c\"", false),
+            ("\u{fe0f}", true),
+            ("\u{202e}", true),
+            ("a\u{300}b", true),
+            ("\u{fffd}", true),
+        ] {
+            assert_eq!(
+                sanitize_label(raw, COVERS_MAX_CHARS).contains(LABEL_REJECTED),
+                marked,
+                "marker presence is wrong for {raw:?}"
+            );
+        }
+    }
+
+    /// Exactly idempotent, because `sigil lease list` re-filters a label the
+    /// daemon already filtered (R4-F6). Today that holds by construction: the two
+    /// marks the filter emits are the two non-ASCII characters it permits. It used
+    /// to hold only by the accident of the marker being ASCII.
+    #[test]
+    fn sanitize_label_is_idempotent() {
+        for raw in [
+            "",
+            "op read",
+            "op with --account \"\u{202e}terces-on\u{200b}\"",
+            "op with --vault \"Ing\u{e9}nierie\"",
+            &"\u{301}".repeat(40),
+            &format!("op {}", "z".repeat(200)),
+            "\u{fffd}\u{2026}",
+            "op containing \"?\"",
+        ] {
+            for bound in [7, 40, COVERS_MAX_CHARS] {
+                let once = sanitize_label(raw, bound);
+                assert_eq!(
+                    sanitize_label(&once, bound),
+                    once,
+                    "not idempotent at {bound} for {raw:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -962,6 +1810,317 @@ mod tests {
         // real pending prompt.
         let bogus = serde_json::json!({ "type": "resolution" });
         assert!(ToPhoneMessage::from_value(bogus).is_err());
+    }
+
+    // --- phone lease control -------------------------------------------------
+
+    const LEASE_ID: &str = "fedcba9876543210fedcba9876543210";
+    const REQ_ID: &str = "01920000-0000-7000-8000-00000000c0de";
+
+    /// The JSON key set of a serialized value, for pinning what is and is not on
+    /// the wire.
+    fn keys<T: Serialize>(v: &T) -> Vec<String> {
+        let value = serde_json::to_value(v).unwrap();
+        let mut k: Vec<String> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect();
+        k.sort();
+        k
+    }
+
+    #[test]
+    fn the_phone_to_daemon_messages_serialize_the_locked_wire_contract() {
+        let q = LeaseQuery::new();
+        assert_eq!(keys(&q), vec!["pad", "type"]);
+        let json = serde_json::to_string(&q).unwrap();
+        assert!(json.starts_with("{\"type\":\"leaseList\""));
+        assert_eq!(serde_json::from_str::<LeaseQuery>(&json).unwrap(), q);
+
+        let r = LeaseRevoke::new(LEASE_ID);
+        assert_eq!(keys(&r), vec!["leaseId", "pad", "type"]);
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"type\":\"leaseRevoke\""));
+        assert!(json.contains(&format!("\"leaseId\":\"{LEASE_ID}\"")));
+        assert_eq!(serde_json::from_str::<LeaseRevoke>(&json).unwrap(), r);
+        assert_eq!(r.target(), Some(LEASE_ID.to_string()));
+    }
+
+    /// F2/F9: a grant key must not appear anywhere on this wire, and a revoke
+    /// must never gain a way to CREATE or extend a window. Both are pinned by
+    /// key set rather than by review, so a future field has to break a test.
+    #[test]
+    fn no_lease_control_message_carries_a_grant_key_or_a_duration() {
+        let row = LeaseRow::new(LEASE_ID, "op", "op read", "rowm", 60_000).unwrap();
+        let payloads = [
+            serde_json::to_value(LeaseQuery::new()).unwrap(),
+            serde_json::to_value(LeaseRevoke::new(LEASE_ID)).unwrap(),
+            serde_json::to_value(LeaseListReply::new(REQ_ID, 1, vec![row])).unwrap(),
+            serde_json::to_value(LeaseRevokeReply::new(REQ_ID, LEASE_ID, true)).unwrap(),
+        ];
+        for p in &payloads {
+            let text = serde_json::to_string(p).unwrap();
+            for forbidden in [
+                "grant",
+                "grantHex",
+                "ttl",
+                "ttlMs",
+                "duration",
+                "durationMs",
+                "secs",
+                "maxSecs",
+                "prefix",
+                "expires",
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "{forbidden} must not appear in {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_revoke_target_must_be_an_exactly_wide_hex_lease_id() {
+        // The width check is what keeps a truncated or empty identifier away from
+        // the store's prefix-matched CLI revoke, where "" matches everything.
+        for bad in [
+            "",
+            &LEASE_ID[..31],
+            &format!("{LEASE_ID}0"),
+            &LEASE_ID.replace('0', "z"),
+            &"0".repeat(64), // a grant-key-width string is not a lease id
+        ] {
+            assert!(
+                LeaseRevoke::new(bad).target().is_none(),
+                "{bad:?} must not parse as a target"
+            );
+        }
+        // Either hex case normalizes to lowercase.
+        assert_eq!(
+            LeaseRevoke::new(LEASE_ID.to_uppercase()).target(),
+            Some(LEASE_ID.to_string())
+        );
+    }
+
+    /// F4: `scope` is the RAW rule name out of config and `account` the raw
+    /// source label, so both must pass the same allowlist `covers` already does.
+    #[test]
+    fn a_lease_row_sanitizes_every_display_field_and_validates_the_id() {
+        let row = LeaseRow::new(
+            LEASE_ID,
+            "op\u{202e}prod",
+            "  op   read  ",
+            "rowm\u{200b}hq",
+            60_000,
+        )
+        .expect("a well-formed id");
+        assert_eq!(row.scope, "op\u{fffd}prod");
+        assert_eq!(row.covers, "op read");
+        assert_eq!(row.account, "rowm\u{fffd}hq");
+        for field in [&row.scope, &row.covers, &row.account] {
+            for ch in field.chars() {
+                assert!(
+                    ch.is_ascii_graphic()
+                        || ch == ' '
+                        || ch == LABEL_ELLIPSIS
+                        || ch == LABEL_REJECTED,
+                    "{ch:?} reached the lease list"
+                );
+            }
+            assert!(field.chars().count() <= LEASE_LABEL_MAX_CHARS);
+        }
+
+        // Every field is bounded, so no single row can spend an unbounded screen.
+        let long = LeaseRow::new(
+            LEASE_ID,
+            &"s".repeat(500),
+            &"c".repeat(500),
+            &"a".repeat(500),
+            1,
+        )
+        .expect("a well-formed id");
+        for field in [&long.scope, &long.covers, &long.account] {
+            assert_eq!(field.chars().count(), LEASE_LABEL_MAX_CHARS);
+            assert!(field.ends_with(LABEL_ELLIPSIS));
+        }
+
+        // A row the phone could not act on is never built at all.
+        assert!(LeaseRow::new("nope", "s", "c", "a", 1).is_none());
+    }
+
+    #[test]
+    fn lease_replies_serialize_the_locked_wire_contract() {
+        let row = LeaseRow::new(LEASE_ID, "op", "op read", "rowm", 60_000).unwrap();
+        assert_eq!(
+            keys(&row),
+            vec!["account", "covers", "leaseId", "remainingMs", "scope"],
+            "no grantHex and no ageMs"
+        );
+
+        let list = LeaseListReply::new(REQ_ID, 1_720_000_000_000, vec![row]);
+        assert_eq!(
+            keys(&list),
+            vec!["asOfMs", "inReplyTo", "leases", "pad", "type"]
+        );
+        let json = serde_json::to_string(&list).unwrap();
+        assert!(json.contains("\"type\":\"leaseListReply\""));
+        assert!(json.contains(&format!("\"inReplyTo\":\"{REQ_ID}\"")));
+        assert!(json.contains("\"asOfMs\":1720000000000"));
+        assert!(json.contains("\"remainingMs\":60000"));
+        assert_eq!(serde_json::from_str::<LeaseListReply>(&json).unwrap(), list);
+
+        // An empty list is a complete answer, not a missing one.
+        assert!(
+            serde_json::to_string(&LeaseListReply::new(REQ_ID, 1, Vec::new()))
+                .unwrap()
+                .contains("\"leases\":[]")
+        );
+
+        let rev = LeaseRevokeReply::new(REQ_ID, LEASE_ID, true);
+        assert_eq!(
+            keys(&rev),
+            vec!["inReplyTo", "leaseId", "pad", "revoked", "type"]
+        );
+        let json = serde_json::to_string(&rev).unwrap();
+        assert!(json.contains("\"type\":\"leaseRevokeReply\""));
+        assert!(json.contains("\"revoked\":true"));
+        assert_eq!(
+            serde_json::from_str::<LeaseRevokeReply>(&json).unwrap(),
+            rev
+        );
+    }
+
+    /// F7: every lease-control plaintext pads to a bucket boundary, so within a
+    /// bucket the length carries neither the row count nor which message it is.
+    /// The bounded half (what happens when a list outgrows its bucket) is asserted
+    /// at the end, and proved at the ciphertext layer by the hostile-relay suite's
+    /// `lease_control_is_one_ciphertext_length_within_a_bucket`.
+    #[test]
+    fn lease_control_plaintexts_pad_to_a_bucket_boundary() {
+        let row = |n: usize| LeaseRow::new(LEASE_ID, &"s".repeat(n), "op read", "rowm", 60_000);
+        let len = |v: &serde_json::Value| serde_json::to_vec(v).unwrap().len();
+
+        // Zero, one and five REALISTIC rows are one length. Realistic is the
+        // measurement the bucket was sized against: a rule name and a coverage
+        // label of the shape `op with --account "rowmhq.1password.eu"`.
+        let lists: Vec<serde_json::Value> = [0usize, 1, 3, 5]
+            .iter()
+            .map(|&n| {
+                let rows = (0..n)
+                    .map(|_| {
+                        LeaseRow::new(
+                            LEASE_ID,
+                            "op-account-rowmhq",
+                            "op with --account \"rowmhq.1password.eu\"",
+                            "Rowm work",
+                            60_000,
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                serde_json::to_value(LeaseListReply::new(REQ_ID, 1, rows)).unwrap()
+            })
+            .collect();
+        let sizes: Vec<usize> = lists.iter().map(len).collect();
+        assert_eq!(
+            sizes,
+            vec![LEASE_PAD_BUCKET; 4],
+            "row count must not move the length"
+        );
+
+        // And a revoke is indistinguishable from a list, in both directions.
+        for v in [
+            serde_json::to_value(LeaseQuery::new()).unwrap(),
+            serde_json::to_value(LeaseRevoke::new(LEASE_ID)).unwrap(),
+            serde_json::to_value(LeaseRevokeReply::new(REQ_ID, LEASE_ID, true)).unwrap(),
+            serde_json::to_value(LeaseRevokeReply::new(REQ_ID, LEASE_ID, false)).unwrap(),
+        ] {
+            assert_eq!(len(&v), LEASE_PAD_BUCKET, "{v}");
+        }
+
+        // A list too long for one bucket rolls to the next WHOLE bucket, never to
+        // an arbitrary length. This is the stated residual, pinned: overflow is
+        // visible, but only as a bucket count, never as a row count.
+        let big: Vec<LeaseRow> = (0..40).map(|_| row(60).unwrap()).collect();
+        let overflow = serde_json::to_value(LeaseListReply::new(REQ_ID, 1, big)).unwrap();
+        assert!(len(&overflow) > LEASE_PAD_BUCKET);
+        assert_eq!(len(&overflow) % LEASE_PAD_BUCKET, 0);
+
+        // The filler is inert: it never escapes, so the padded length is exact.
+        let padded = LeaseQuery::new();
+        assert!(padded.pad.chars().all(|c| c == '.'));
+
+        // Padding is IDEMPOTENT, which matters for more than tidiness: a message
+        // padded twice must not grow, or a resend would be a different size from
+        // the original and the relay could spot it as a resend. It holds because
+        // `padded` clears the field before measuring.
+        for once in [
+            serde_json::to_value(LeaseQuery::new().padded()).unwrap(),
+            serde_json::to_value(LeaseRevoke::new(LEASE_ID).padded()).unwrap(),
+            serde_json::to_value(LeaseRevokeReply::new(REQ_ID, LEASE_ID, true).padded()).unwrap(),
+            serde_json::to_value(LeaseListReply::new(REQ_ID, 1, vec![row(20).unwrap()]).padded())
+                .unwrap(),
+        ] {
+            assert_eq!(len(&once), LEASE_PAD_BUCKET, "re-padding must not grow it");
+        }
+    }
+
+    #[test]
+    fn lease_control_messages_classify_and_never_shadow_a_decision() {
+        // Phone -> daemon: both tags select their type.
+        let q = LeaseQuery::new();
+        assert_eq!(
+            ToDaemonMessage::from_value(serde_json::to_value(&q).unwrap()).unwrap(),
+            ToDaemonMessage::LeaseList(q)
+        );
+        let r = LeaseRevoke::new(LEASE_ID);
+        assert_eq!(
+            ToDaemonMessage::from_value(serde_json::to_value(&r).unwrap()).unwrap(),
+            ToDaemonMessage::LeaseRevoke(r)
+        );
+        // An ApprovalResponse is the only untagged payload, so a lease message can
+        // never be routed to a waiting approval.
+        let resp = ApprovalResponse::approve_gate("req-1", 1);
+        assert!(matches!(
+            ToDaemonMessage::from_value(serde_json::to_value(&resp).unwrap()).unwrap(),
+            ToDaemonMessage::Response(_)
+        ));
+
+        // Daemon -> phone: both reply tags select their type.
+        let list = LeaseListReply::new(REQ_ID, 1, Vec::new());
+        assert_eq!(
+            ToPhoneMessage::from_value(serde_json::to_value(&list).unwrap()).unwrap(),
+            ToPhoneMessage::LeaseList(list)
+        );
+        let rev = LeaseRevokeReply::new(REQ_ID, LEASE_ID, false);
+        assert_eq!(
+            ToPhoneMessage::from_value(serde_json::to_value(&rev).unwrap()).unwrap(),
+            ToPhoneMessage::LeaseRevoke(rev)
+        );
+    }
+
+    #[test]
+    fn half_built_lease_control_messages_fail_closed() {
+        // A tag with missing required fields is an error the caller drops, never a
+        // half-built message that could reach the lease store or a screen. `pad` is
+        // the one optional field: an older peer that omits it still decodes.
+        for bogus in [
+            serde_json::json!({ "type": "leaseRevoke" }),
+            serde_json::json!({ "type": "leaseRevoke", "pad": "" }),
+        ] {
+            assert!(ToDaemonMessage::from_value(bogus).is_err());
+        }
+        assert!(ToDaemonMessage::from_value(serde_json::json!({ "type": "leaseList" })).is_ok());
+        for bogus in [
+            serde_json::json!({ "type": "leaseListReply" }),
+            serde_json::json!({ "type": "leaseListReply", "inReplyTo": "r" }),
+            serde_json::json!({ "type": "leaseRevokeReply", "inReplyTo": "r" }),
+        ] {
+            assert!(ToPhoneMessage::from_value(bogus).is_err());
+        }
     }
 
     #[test]

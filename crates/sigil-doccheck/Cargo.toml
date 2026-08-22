@@ -1,0 +1,16 @@
+[package]
+name = "sigil-doccheck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# No dependencies, deliberately. This crate is a repo gate, not a product
+# surface: it reads two things off disk (docs/security-claims.md and the source
+# tree) and compares them. Everything it needs is in std, and keeping it
+# dependency-free means it cannot be the reason `cargo test` gets slower or the
+# lockfile churns.
+
+[[bin]]
+name = "sigil-doccheck"
+path = "src/main.rs"

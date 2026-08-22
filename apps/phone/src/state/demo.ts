@@ -5,10 +5,12 @@
  * directly for pure-UI iteration.
  */
 import { type ApprovalRequest } from "@/src/protocol";
+import { emptyLeaseView } from "@/src/domain/leases";
 import {
+  type ActiveLease,
   type AppState,
   type HistoryEntry,
-  type Lease,
+  type LeaseView,
   type RelayOrigin,
 } from "@/src/domain/types";
 
@@ -56,8 +58,11 @@ export function demoRoutineRequest(): ApprovalRequest {
     ],
     reason: undefined,
     // Leasable grant: the sheet offers approve-once vs keep-approved-for-a-window
-    // (task #57). Run-once demos omit this and show approve-once only.
-    leasePolicy: { kind: "leasable", maxSecs: 900 },
+    // (task #57). Run-once demos omit this and show approve-once only. `covers`
+    // is the daemon's own description of the matched rule, which the caption
+    // states verbatim; real ones range from a bare "op" to a full phrase like
+    // "op read with --vault, containing \"prod\"", so exercise a middle shape.
+    leasePolicy: { kind: "leasable", maxSecs: 900, covers: "op read with --vault" },
     provenance: {
       processChain: ["zsh", "claude", "op read"],
       cwd: "~/Projects/rowm",
@@ -157,17 +162,30 @@ export function demoUnboundSshRequest(): ApprovalRequest {
  */
 export const demoRelayOrigin: RelayOrigin = { ip: "203.0.113.7", atMs: now };
 
-export const demoLeases: Lease[] = [
+/**
+ * Sample lease rows for a DEMO build only, in the same shape a real answer
+ * arrives in. The identifiers are made up: they name no real window, so the
+ * revoke control in a demo build has no daemon to answer it and lands in the
+ * unconfirmed state, which is itself worth being able to look at. The screen labels these as
+ * samples wherever they appear; they never reach a Release build.
+ */
+export const demoLeases: ActiveLease[] = [
   {
-    id: "l1",
-    caller: "rowm launcher",
+    leaseId: "d3m0".repeat(8),
     // A rule name, not a secret path: the lease covers every command that rule
     // matches for this caller until it lapses.
     scope: "op-eu",
-    grantedAt: now - 19 * 60_000,
+    covers: 'op with --account "rowmhq.1password.eu"',
+    account: "rowmhq.1password.eu",
     expiresAt: now + 41 * 60_000,
+    windowMs: 41 * 60_000,
   },
 ];
+
+/** A demo lease view: a snapshot taken a moment ago, so the samples read fresh. */
+export function demoLeaseView(): LeaseView {
+  return { ...emptyLeaseView(), rows: demoLeases, askedAt: now, asOfMs: now, arrivedAt: now };
+}
 
 export const demoHistory: HistoryEntry[] = [
   {
@@ -241,7 +259,7 @@ export function emptyInitialState(): AppState {
     pairedAt: 0,
     pending: [],
     history: [],
-    leases: [],
+    leases: emptyLeaseView(),
     settings: defaultSettings(),
     pairingWords: null,
     ownFingerprint: null,
@@ -256,7 +274,7 @@ export function demoInitialState(): AppState {
     pairedAt: now - 6 * 86_400_000,
     pending: [],
     history: demoHistory,
-    leases: demoLeases,
+    leases: demoLeaseView(),
     settings: defaultSettings(),
     pairingWords: null,
     ownFingerprint: "tide brass anchor harbor reef mast",

@@ -290,7 +290,13 @@ pub struct Core {
     /// once at arm time. A record here is opened by the two-party combine (the
     /// phone's partial `Z_F` plus the Mac share `m`), never a key at rest.
     threshold: Mutex<crate::threshold::ThresholdStore>,
-    leases: LeaseStore,
+    /// The live lease windows. `Arc` rather than a plain field because it has two
+    /// controllers now: this core (the control socket's `lease_list`/`lease_revoke`,
+    /// the config-reload invalidation, the shutdown wipe) and each paired phone,
+    /// which reaches it through the [`RemoteApprover`] it is attached to. Both act
+    /// on the SAME store, so a window revoked from a phone is gone from
+    /// `sigil lease list` and vice versa.
+    leases: Arc<LeaseStore>,
     gate: ApprovalGate,
     pending: Arc<PendingRegistry>,
     /// The remote approvers, one per paired phone (#36 multi-device), when the
@@ -588,7 +594,7 @@ impl Core {
         let core = Self {
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(threshold),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate,
             pending,
             remote: remote_listeners.clone(),
@@ -607,6 +613,18 @@ impl Core {
             provisioned: AtomicBool::new(false),
             unwrap_requests: UnwrapRequests::default(),
         };
+        // Hand every paired device a lease-control handle, so the phone's lease
+        // screen lists and revokes the same windows the CLI does. The approvers
+        // are built before the core exists (inside `build_gate`), which is why
+        // this is a post-construction attach rather than a constructor argument.
+        //
+        // The handle is the narrow `LeaseControl` trait, never the store: a paired
+        // phone may see which windows are open and close one, and is structurally
+        // unable to open one, extend one, or read what one holds.
+        for approver in &remote_listeners {
+            let control: Arc<dyn lease::LeaseControl> = core.leases.clone();
+            approver.attach_leases(control);
+        }
         Ok((core, remote_listeners, direct_acceptors))
     }
 
@@ -638,6 +656,17 @@ impl Core {
     /// alarm, not a routine condition.
     fn doctor_report(&self) -> Vec<crate::json::CheckJson> {
         let mut checks = crate::report::doctor(true);
+        if let Some(row) = unmeasured_ancestor_row(&lease::live_unmeasured_notes()) {
+            // Before the ssh-agent row, which the renderer treats as the trailing
+            // informational one. This row is informational too, but only one can
+            // be last, and the ssh-agent row carries its text in the hint while
+            // this one carries it in the label.
+            let at = checks
+                .iter()
+                .position(|c| c.label == "ssh-agent socket")
+                .unwrap_or(checks.len());
+            checks.insert(at, row);
+        }
         let (ok, hint) = self.sealed_store_drift();
         checks.push(crate::json::CheckJson {
             label: "sealed store matches the armed daemon".to_string(),
@@ -1269,12 +1298,27 @@ async fn serve(
     let listener_handles: Vec<std::thread::JoinHandle<()>> = remote_listeners
         .into_iter()
         .enumerate()
-        .map(|(i, approver)| {
+        .flat_map(|(i, approver)| {
             let stop = listener_shutdown.clone();
-            std::thread::Builder::new()
-                .name(format!("sigil-todaemon-owner-{i}"))
-                .spawn(move || approver.run_todaemon_owner(&stop))
-                .expect("spawning the ToDaemon owner")
+            let owner = {
+                let approver = approver.clone();
+                std::thread::Builder::new()
+                    .name(format!("sigil-todaemon-owner-{i}"))
+                    .spawn(move || approver.run_todaemon_owner(&stop))
+                    .expect("spawning the ToDaemon owner")
+            };
+            // The lease-control reply pump for the same device, on its own thread.
+            // It exists so a reply deposit can never park the owner above, which is
+            // the sole reader of the channel an approval RESPONSE arrives on: a
+            // human's approval must never wait behind a lease list. It shares the
+            // shutdown flag and returns immediately when the device has no
+            // lease-control handle attached.
+            let stop = listener_shutdown.clone();
+            let pump = std::thread::Builder::new()
+                .name(format!("sigil-lease-replies-{i}"))
+                .spawn(move || approver.run_lease_reply_pump(&stop))
+                .expect("spawning the lease reply pump");
+            [owner, pump]
         })
         .collect();
 
@@ -2026,6 +2070,7 @@ fn leases_json(core: &Core) -> Vec<crate::json::LeaseJson> {
             caller: String::new(),
             account: l.account,
             scope: l.scope,
+            covers: l.covers,
             granted_ms: now.saturating_sub(l.age.as_millis() as u64),
             expires_ms: now + l.remaining.as_millis() as u64,
         })
@@ -2075,6 +2120,7 @@ fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
                 },
                 leasable: ctx.lease.is_leasable(),
                 max_lease_secs: ctx.lease.max_secs(),
+                lease_covers: covers_or_none(&ctx.lease),
                 reason: None,
                 expires_ms: s.queued_at_ms + s.timeout_ms,
                 timeout_ms: s.timeout_ms,
@@ -2115,6 +2161,15 @@ fn pending_json(core: &Core) -> Vec<crate::json::PendingJson> {
     rows
 }
 
+/// The lease coverage label as the DTO carries it: `None` rather than an empty
+/// string when there is none (run-once, or a policy the daemon never labeled), so
+/// a renderer shows no coverage clause instead of an empty one.
+fn covers_or_none(lease: &LeasePolicy) -> Option<String> {
+    Some(lease.covers())
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+}
+
 /// Map one in-flight remote approval to the `pending` DTO. The request is a
 /// plaintext snapshot (names/provenance only, never a secret); `delivered` /
 /// `delivered_at_ms` reflect the phone's receipt (task #41), display only.
@@ -2146,6 +2201,7 @@ fn remote_pending_json(p: crate::remote::RemotePending) -> crate::json::PendingJ
         },
         leasable: req.lease_policy.is_leasable(),
         max_lease_secs: req.lease_policy.max_secs(),
+        lease_covers: covers_or_none(&req.lease_policy),
         reason: req.reason,
         expires_ms: req.expires_at,
         timeout_ms: req.timeout_ms,
@@ -2265,9 +2321,11 @@ fn split_shadowed_plain(
 /// The command's config selects the provider; the provider decides the injection
 /// shape. `op` is a plain gated command: Sigil injects no credential and op does
 /// its own auth. An inline-`env` rule opens its threshold-sealed values with the
-/// phone's partial and injects them, gated on every run (no leasing, so resolved
-/// values never sit in RAM across a TTL). An *unconfigured* command is refused
-/// with a pointer to `sigil-config add`, never run ungated.
+/// phone's partial and injects them; whether that run also opens a lease is the
+/// matched rule's `LeasePolicy` alone, and a leasable one caches the values it
+/// just opened so later matching runs inject them from RAM until the window
+/// lapses. An *unconfigured* command is refused with a pointer to
+/// `sigil-config add`, never run ungated.
 #[allow(clippy::too_many_arguments)]
 fn fulfill(
     core: &Core,
@@ -2458,6 +2516,17 @@ fn fulfill(
     // ride one decision.
     let coalesce_key = lease::grant_key(&caller, lease::ScopeKind::Command, cwd, &scope);
 
+    // Whether this caller may touch a LEASE at all, which is a stricter question
+    // than whether it may be gated. A lease releases a later request with no
+    // human in the loop, so it needs an identity the daemon established itself.
+    // The disqualifier is having none at all: an empty chain (no peer pid, or a
+    // pid resolving to nothing) would put every unidentifiable caller on ONE
+    // grant key. Such a run is still gated and still shown to the human; only the
+    // window is withheld. An ancestor that could not be measured is keyed to its
+    // process instance instead, which is weaker than code identity and is logged
+    // and reported (see `lease::note_unmeasured` and the doctor row).
+    let may_lease = caller.may_lease();
+
     // For the inline `env` provider, fetch its threshold-sealed record now. The
     // record is public (ciphertext plus the base point E), safe to hold across the
     // approval wait; it is opened only AFTER the grant, by combining the phone's
@@ -2526,7 +2595,10 @@ fn fulfill(
     // the rule now consents to, is refused as a cache hit: the lease is dropped
     // and the run falls through to a fresh approval rather than injecting anything
     // the human did not agree to.
-    if let Some(cached) = core.leases.token_for(&gk, &binding) {
+    if let Some(cached) = may_lease
+        .then(|| core.leases.token_for(&gk, &binding))
+        .flatten()
+    {
         match leased_env(&cached, needs_sealed_env, &action.env_keys) {
             Ok(leased) => {
                 let refs = provider.describe(argv, &view);
@@ -2596,7 +2668,9 @@ fn fulfill(
         command: argv.to_vec(),
         secret_refs: provider.describe(argv, &view),
         kind: provider.kind(argv),
-        lease: action.lease,
+        // Carries the coverage label `resolve` rendered from the matched rule, so
+        // the phone's consent surface can state the window's breadth exactly.
+        lease: action.lease.clone(),
         ssh: None,
         threshold,
     };
@@ -2694,6 +2768,7 @@ fn fulfill(
     // `Zeroizing` token and dies with the lease.
     let lease_ttl = decision
         .lease_ttl()
+        .filter(|_| may_lease)
         .and_then(|ttl| {
             action
                 .lease
@@ -2702,7 +2777,12 @@ fn fulfill(
         .map(|s| Duration::from_secs(u64::from(s)));
     if let Some(ttl) = lease_ttl {
         let cached = sealed_plain.unwrap_or_else(|| zeroize::Zeroizing::new(Vec::new()));
-        core.leases.grant(gk, &binding, cached, ttl);
+        // The window is stamped with the same coverage label the approver was
+        // shown, so `sigil lease list` and the Mac describe what is open in the
+        // words the human agreed to. Display only; the binding above is what
+        // actually decides which runs this window serves.
+        core.leases
+            .grant(gk, &binding, action.lease.covers(), cached, ttl);
     }
 
     core.record_audit(
@@ -2863,6 +2943,44 @@ fn log_ssh_sign_request(label: &str, host: &str, data_fingerprint: &str, peer: O
 }
 
 /// Log request metadata: argv (item names, not secret values), cwd, peer pid.
+/// The doctor row for ancestors the platform would not describe, or `None` when
+/// there are none (the normal case, and no row is better than a row saying
+/// nothing happened).
+///
+/// It answers one question a human would otherwise have no way to ask: why did
+/// approvals come back for a session that had been running on one? Informational
+/// rather than a failure, because the usual cause is a tool that updated itself
+/// and deleted the binary it was running from, and because leases still work
+/// under it; what changed is what the window is keyed to. The whole sentence
+/// lives in the label, since the doctor renderer only prints a hint for the
+/// trailing row.
+fn unmeasured_ancestor_row(notes: &[lease::UnmeasuredNote]) -> Option<crate::json::CheckJson> {
+    if notes.is_empty() {
+        return None;
+    }
+    // Name the first few; a long tail is a count, not a wall of text.
+    const NAMED: usize = 3;
+    let mut named: Vec<String> = notes
+        .iter()
+        .take(NAMED)
+        .map(|n| format!("{} ({})", n.name(), n.reason.explain()))
+        .collect();
+    if notes.len() > NAMED {
+        named.push(format!("and {} more", notes.len() - NAMED));
+    }
+    let count = notes.len();
+    let plural = if count == 1 { "" } else { "s" };
+    Some(crate::json::CheckJson {
+        label: format!(
+            "{count} caller ancestor{plural} could not be measured: {}; \
+             leases under them are keyed to the process, not to its code",
+            named.join(", ")
+        ),
+        ok: true,
+        hint: String::new(),
+    })
+}
+
 fn log_request(argv: &[String], cwd: &str, peer: Option<i32>) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2886,19 +3004,26 @@ mod tests {
     use std::os::fd::{FromRawFd, RawFd};
     use std::path::PathBuf;
 
-    /// A process table that resolves nothing, so the ancestry walk returns an
-    /// empty chain instantly (the real table would hash every ancestor's
-    /// executable, which is slow and irrelevant to what these tests assert).
-    struct EmptyTable;
-    impl ProcessTable for EmptyTable {
+    /// The peer pid these tests hand `fulfill`. It has to be a plausible pid
+    /// (the walk stops at 1) and it has to RESOLVE, because a caller the daemon
+    /// could not measure is refused a lease by design; passing `None` here would
+    /// silently test the unmeasured path in every lease assertion.
+    const TEST_PEER: Option<i32> = Some(4242);
+
+    /// A synthetic process table: one measured leaf, no parents, so the ancestry
+    /// walk returns a one-node chain instantly. The real table asks the platform
+    /// about every ancestor of the test runner, which is slow and irrelevant to
+    /// what these tests assert.
+    struct StubTable;
+    impl ProcessTable for StubTable {
         fn parent(&self, _pid: i32) -> Option<i32> {
             None
         }
-        fn exe(&self, _pid: i32) -> Option<PathBuf> {
-            None
-        }
-        fn identity(&self, _pid: i32) -> [u8; 32] {
-            [0u8; 32]
+        fn resolve(&self, _pid: i32) -> Option<(PathBuf, lease::CodeIdentity)> {
+            Some((
+                PathBuf::from("/test/caller"),
+                lease::CodeIdentity::content([0u8; 32]),
+            ))
         }
     }
 
@@ -3017,7 +3142,7 @@ mod tests {
                 // per-rule run-once/clamp enforcement has its own focused tests.
                 mode: RuleMode::Gate,
                 source: "op".into(),
-                lease: LeasePolicy::Leasable { max_secs: 900 },
+                lease: LeasePolicy::leasable(900),
                 timeout_sec: None,
             },
         })
@@ -3088,6 +3213,28 @@ mod tests {
         timeout: Duration,
         config: Config,
     ) -> (Arc<Core>, Arc<PendingRegistry>) {
+        test_core_with_table(
+            dir,
+            token,
+            secret,
+            dev,
+            timeout,
+            config,
+            Box::new(StubTable),
+        )
+    }
+
+    /// [`test_core_with_config`] but with an explicit process table, so a test
+    /// can put a caller the platform could not measure in front of the gate.
+    fn test_core_with_table(
+        dir: &Path,
+        token: &str,
+        secret: &str,
+        dev: DevMode,
+        timeout: Duration,
+        config: Config,
+        proc_table: Box<dyn ProcessTable + Send + Sync>,
+    ) -> (Arc<Core>, Arc<PendingRegistry>) {
         let keystore: Arc<dyn Keystore> = Arc::new(MemoryKeystore::new());
         let _ = (token, secret);
 
@@ -3102,10 +3249,10 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending: pending.clone(),
-            proc_table: Box::new(EmptyTable),
+            proc_table,
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
             ))]),
@@ -3202,7 +3349,7 @@ mod tests {
             "op://Engineering/.env/password".into(),
         ];
         // Empty cwd: the fake op runs in the test's own directory (a real path).
-        let code = fulfill(&core, &argv, "", None, 0, None, Some(write_end), None);
+        let code = fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(write_end), None);
         assert_eq!(code, 0);
         assert_eq!(read_all(read_end), "known-secret-42");
         // No lease was requested, so none is held.
@@ -3227,10 +3374,10 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(&dir, "tok", "secret-1"),
             ))]),
@@ -3252,7 +3399,7 @@ mod tests {
         ];
         // Empty cwd: the fake op runs in the test's own directory (a real path).
         assert_eq!(
-            fulfill(&core, &argv, "", None, 0, None, Some(write_end), None),
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(write_end), None),
             0
         );
         assert_eq!(read_all(read_end), "secret-1");
@@ -3391,7 +3538,7 @@ mod tests {
         let (_r, w) = pipe();
         let worker = std::thread::spawn(move || {
             let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
-            fulfill(&park_core, &argv, "", None, 0, None, Some(w), None)
+            fulfill(&park_core, &argv, "", TEST_PEER, 0, None, Some(w), None)
         });
 
         // A subsequent event carries the parked request.
@@ -3483,13 +3630,13 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(Arc::new(MemoryKeystore::new())),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(CountingApprover::new(
                 calls.clone(),
                 Duration::from_secs(60),
             ))),
             pending: Arc::new(PendingRegistry::new()),
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, "tok-abc", "secret-A"),
             ))]),
@@ -3530,7 +3677,7 @@ mod tests {
                 action: Action {
                     mode: RuleMode::Gate,
                     source: "op".into(),
-                    lease: LeasePolicy::Leasable { max_secs: 900 },
+                    lease: LeasePolicy::leasable(900),
                     timeout_sec: None,
                 },
             })
@@ -3550,7 +3697,10 @@ mod tests {
 
         let (r1, w1) = pipe();
         let first = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
-        assert_eq!(fulfill(&core, &first, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &first, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the first run is approved");
         assert_eq!(core.leases.active(), 1);
@@ -3558,7 +3708,7 @@ mod tests {
         let (r2, w2) = pipe();
         let second = vec!["op".into(), "item".into(), "get".into(), "Deploy".into()];
         assert_eq!(
-            fulfill(&core, &second, "", None, 0, None, Some(w2), None),
+            fulfill(&core, &second, "", TEST_PEER, 0, None, Some(w2), None),
             0
         );
         assert_eq!(read_all(r2), "secret-A");
@@ -3585,13 +3735,19 @@ mod tests {
 
         let (r1, w1) = pipe();
         let a = one.to_str().unwrap();
-        assert_eq!(fulfill(&core, &argv, a, None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, a, TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let (r2, w2) = pipe();
         let b = two.to_str().unwrap();
-        assert_eq!(fulfill(&core, &argv, b, None, 0, None, Some(w2), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, b, TEST_PEER, 0, None, Some(w2), None),
+            0
+        );
         assert_eq!(read_all(r2), "secret-A");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -3610,13 +3766,19 @@ mod tests {
 
         let (r1, w1) = pipe();
         let read = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
-        assert_eq!(fulfill(&core, &read, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &read, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let (r2, w2) = pipe();
         let item = vec!["op".into(), "item".into(), "get".into(), "Deploy".into()];
-        assert_eq!(fulfill(&core, &item, "", None, 0, None, Some(w2), None), 0);
+        assert_eq!(
+            fulfill(&core, &item, "", TEST_PEER, 0, None, Some(w2), None),
+            0
+        );
         assert_eq!(read_all(r2), "secret-A");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -3647,13 +3809,16 @@ mod tests {
 
         let (r1, w1) = pipe();
         let first = vec!["op".into(), "read".into(), "op://Engineering/first".into()];
-        assert_eq!(fulfill(&core, &first, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &first, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
 
         let (r2, w2) = pipe();
         let second = vec!["op".into(), "read".into(), "op://Engineering/second".into()];
         assert_eq!(
-            fulfill(&core, &second, "", None, 0, None, Some(w2), None),
+            fulfill(&core, &second, "", TEST_PEER, 0, None, Some(w2), None),
             0
         );
         assert_eq!(read_all(r2), "secret-A");
@@ -3699,16 +3864,178 @@ mod tests {
         let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
         // First request approves and leases.
         let (r1, w1) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
         assert_eq!(core.leases.active(), 1);
 
         // With a live lease the second identical request must be served from the
         // lease, not a fresh approval.
         let (r2, w2) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w2), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w2), None),
+            0
+        );
         assert_eq!(read_all(r2), "secret-A");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A caller the platform would not describe: one ancestor, unmeasured, keyed
+    /// to a process instance. What a self-updating tool that deleted its own
+    /// binary mid-session looks like to the daemon.
+    struct UnmeasuredTable;
+    impl ProcessTable for UnmeasuredTable {
+        fn parent(&self, _pid: i32) -> Option<i32> {
+            None
+        }
+        fn resolve(&self, pid: i32) -> Option<(PathBuf, lease::CodeIdentity)> {
+            Some((
+                PathBuf::from("/test/vanished"),
+                lease::CodeIdentity::unmeasured(
+                    pid,
+                    lease::ProcessStart {
+                        sec: 1_770_000_000,
+                        usec: 7,
+                    },
+                ),
+            ))
+        }
+    }
+
+    #[test]
+    fn an_unmeasured_ancestor_still_opens_and_rides_a_window() {
+        // The product half of the caller-identity work. An ancestor the platform
+        // will not describe (its binary was deleted under it, the common case
+        // being a tool that updated itself) must NOT silently revert the session
+        // to a phone tap per command: it is keyed to that process instance and
+        // leases normally. The security half is that the key is an instance
+        // nobody else can present, which `lease.rs` pins.
+        let dir = tmpdir("unmeasured-lease");
+        let (core, _) = test_core_with_table(
+            &dir,
+            "tok-abc",
+            "secret-A",
+            DevMode::Lease(Duration::from_secs(60)),
+            Duration::from_millis(50),
+            op_config(),
+            Box::new(UnmeasuredTable),
+        );
+
+        let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
+        let (r1, w1) = pipe();
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
+        assert_eq!(read_all(r1), "secret-A");
+        assert_eq!(
+            core.leases.active(),
+            1,
+            "an unmeasurable ancestor must not cost the session its window"
+        );
+
+        let (r2, w2) = pipe();
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w2), None),
+            0
+        );
+        assert_eq!(read_all(r2), "secret-A", "and the window is ridden");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_caller_with_no_identity_at_all_gets_no_window() {
+        // The one shape that is refused a lease: a chain the daemon could not
+        // put a single process in. Every such caller derives one grant key, so a
+        // window would be shared by callers with nothing in common. The request
+        // still runs and still reaches the human; only the auto-release is gone.
+        struct NothingTable;
+        impl ProcessTable for NothingTable {
+            fn parent(&self, _pid: i32) -> Option<i32> {
+                None
+            }
+            fn resolve(&self, _pid: i32) -> Option<(PathBuf, lease::CodeIdentity)> {
+                None
+            }
+        }
+        let dir = tmpdir("no-identity");
+        let (core, _) = test_core_with_table(
+            &dir,
+            "tok-abc",
+            "secret-A",
+            DevMode::Lease(Duration::from_secs(60)),
+            Duration::from_millis(50),
+            op_config(),
+            Box::new(NothingTable),
+        );
+
+        let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
+        let (r1, w1) = pipe();
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w1), None),
+            0,
+            "the run is gated and served as normal"
+        );
+        assert_eq!(read_all(r1), "secret-A");
+        assert_eq!(
+            core.leases.active(),
+            0,
+            "but an unidentifiable caller opens no window"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_doctor_explains_an_unmeasurable_ancestor_and_stays_quiet_otherwise() {
+        // The question this row exists to answer: why did approvals come back?
+        assert!(
+            unmeasured_ancestor_row(&[]).is_none(),
+            "no row at all in the normal case"
+        );
+
+        let note = |name: &str, reason| lease::UnmeasuredNote {
+            pid: 4242,
+            started: lease::ProcessStart {
+                sec: 1_770_000_000,
+                usec: 7,
+            },
+            exe: PathBuf::from(format!("/opt/tools/{name}")),
+            reason,
+        };
+        let row = unmeasured_ancestor_row(&[
+            note("claude", crate::peercode::GuestFailure::NoLiveImage),
+            note("node", crate::peercode::GuestFailure::ImageNotVouched),
+        ])
+        .expect("a row once something could not be measured");
+        assert!(
+            row.ok,
+            "informational: leases still work, keyed differently"
+        );
+        assert!(row.label.contains("claude"), "it names the ancestor");
+        assert!(row.label.contains("node"));
+        assert!(
+            row.label
+                .contains("its executable is gone or it has exited"),
+            "and why: {}",
+            row.label
+        );
+        assert!(
+            row.label.contains("keyed to the process, not to its code"),
+            "and what it cost: {}",
+            row.label
+        );
+
+        // The row is inserted ahead of the ssh-agent row, which the doctor
+        // renderer treats as the trailing informational one; if that label ever
+        // moves, the insertion silently appends and the ssh row loses its hint.
+        assert!(
+            crate::report::doctor(true)
+                .iter()
+                .any(|c| c.label == "ssh-agent socket"),
+            "the insertion anchor still exists"
+        );
     }
 
     #[test]
@@ -3728,7 +4055,10 @@ mod tests {
         );
         let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
         let (r1, w1) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
         assert_eq!(
             core.leases.active(),
@@ -3749,11 +4079,14 @@ mod tests {
             "secret-A",
             DevMode::Lease(Duration::from_secs(60)),
             Duration::from_millis(50),
-            op_config_with_lease(LeasePolicy::Leasable { max_secs: 5 }),
+            op_config_with_lease(LeasePolicy::leasable(5)),
         );
         let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
         let (r1, w1) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
         assert_eq!(core.leases.active(), 1, "a leasable rule grants the lease");
         let leases = core.leases.list();
@@ -3764,6 +4097,96 @@ mod tests {
             leases[0].remaining
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_granted_lease_reports_the_same_coverage_the_approver_consented_to() {
+        // The daemon renders the coverage label once, from the matched rule, and
+        // it must reach BOTH the sealed request (what the phone consents to) and
+        // `lease list` (what the CLI and the Mac later show), identically. Anything
+        // less and one surface describes the open window in words the human never
+        // agreed to.
+        use crate::config::{Action, Match, Rule, RuleMode, Source};
+        let dir = tmpdir("covers");
+        let mut cfg = Config::default();
+        cfg.add_source(Source {
+            name: "op".into(),
+            provider: OpProvider::ID.into(),
+            account: None,
+            path: None,
+            keys: Vec::new(),
+            plain: Default::default(),
+        })
+        .unwrap();
+        cfg.add_rule(Rule {
+            name: "op-read".into(),
+            match_: Match {
+                command: Some("op".into()),
+                subcommand: Some("read".into()),
+                ..Match::default()
+            },
+            action: Action {
+                mode: RuleMode::Gate,
+                source: "op".into(),
+                lease: LeasePolicy::leasable(900),
+                timeout_sec: None,
+            },
+        })
+        .unwrap();
+
+        let (core, _) = test_core_with_config(
+            &dir,
+            "tok-abc",
+            "secret-A",
+            DevMode::Lease(Duration::from_secs(60)),
+            Duration::from_millis(50),
+            cfg,
+        );
+        let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
+
+        // What the sealed request would carry to the phone: the resolved policy.
+        let resolved = match core.config.snapshot().resolve(&argv) {
+            Some(crate::config::Resolution::Gate(a)) => a,
+            other => panic!("expected a gate resolution, got {other:?}"),
+        };
+        assert_eq!(resolved.lease.covers(), "op read");
+
+        let (r1, w1) = pipe();
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
+        assert_eq!(read_all(r1), "secret-A");
+
+        // What `sigil lease list` renders, over the same control-socket DTO.
+        let rows = leases_json(&core);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].scope, "op-read", "the lease names its rule");
+        assert_eq!(
+            rows[0].covers,
+            resolved.lease.covers(),
+            "the CLI row and the wire must describe one window the same way"
+        );
+        // And it is a rendering of the RULE, never of the argv that tripped it.
+        assert!(!rows[0].covers.contains("op://"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_run_once_rule_emits_no_coverage_label_anywhere() {
+        // A run-once request opens no window, so there is nothing to describe: the
+        // policy carries no label and the pending DTO omits it entirely.
+        let cfg = op_config_with_lease(LeasePolicy::RunOnce);
+        let resolved = match cfg.resolve(&["op".to_string(), "read".to_string()]) {
+            Some(crate::config::Resolution::Gate(a)) => a,
+            other => panic!("expected a gate resolution, got {other:?}"),
+        };
+        assert_eq!(resolved.lease, LeasePolicy::RunOnce);
+        assert_eq!(resolved.lease.covers(), "");
+        assert_eq!(covers_or_none(&resolved.lease), None);
+
+        let json = serde_json::to_string(&sigil_proto::LeasePolicy::RunOnce).unwrap();
+        assert!(!json.contains("covers"));
     }
 
     #[test]
@@ -3803,7 +4226,7 @@ mod tests {
             &core,
             &["true".to_string()],
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -3839,7 +4262,7 @@ mod tests {
             &core,
             &argv,
             "/p",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -3870,7 +4293,7 @@ mod tests {
             &core,
             &argv,
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -3915,10 +4338,10 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
             lease_ttl: Duration::from_secs(60),
@@ -3943,7 +4366,7 @@ mod tests {
             &core,
             &["faketool".into()],
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -3956,8 +4379,9 @@ mod tests {
 
         assert_eq!(code, 0);
         assert_eq!(read_all(read_end), "tok=abc123 region=eu");
-        // A direct-injection provider is never leased (no credential to hold in
-        // RAM across a TTL), even though the decision would allow it.
+        // The rule is `RunOnce`, so no lease opens even though the decision would
+        // allow one. The provider does not enter into it: under a leasable rule
+        // this same sealed source would cache its opened values for the window.
         assert_eq!(core.leases.active(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4024,10 +4448,10 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: env_inline_config("faketool", &["TOKEN"]).into(),
             lease_ttl: Duration::from_secs(60),
@@ -4053,7 +4477,7 @@ mod tests {
             &core,
             &["faketool".into()],
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -4111,10 +4535,10 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: cfg.into(),
             lease_ttl: Duration::from_secs(60),
@@ -4139,7 +4563,7 @@ mod tests {
             &core,
             &["faketool".into()],
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -4230,12 +4654,12 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(store),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(
                 CountingApprover::new(calls.clone(), lease_ttl).with_partial(zf),
             )),
             pending: Arc::new(PendingRegistry::new()),
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
             lease_ttl,
@@ -4280,7 +4704,7 @@ mod tests {
         let mut argv = vec!["faketool".to_string()];
         argv.extend(args.iter().map(|a| (*a).to_string()));
         let (r, w) = pipe();
-        let code = fulfill(core, &argv, "", None, 0, None, Some(w), None);
+        let code = fulfill(core, &argv, "", TEST_PEER, 0, None, Some(w), None);
         (code, read_all(r))
     }
 
@@ -4630,7 +5054,7 @@ mod tests {
         let (core, calls) = sealed_env_core(
             "faketool",
             &[("TOKEN", "sealed-value-42")],
-            LeasePolicy::Leasable { max_secs: 900 },
+            LeasePolicy::leasable(900),
             Duration::from_secs(60),
         );
 
@@ -4703,7 +5127,7 @@ mod tests {
         let (core, calls) = sealed_env_core(
             "faketool",
             &[("TOKEN", "sealed-value-42")],
-            LeasePolicy::Leasable { max_secs: 900 },
+            LeasePolicy::leasable(900),
             Duration::from_secs(1),
         );
 
@@ -4739,7 +5163,7 @@ mod tests {
         let (core, calls) = sealed_env_core(
             "faketool",
             &[("TOKEN", "sealed-value-42")],
-            LeasePolicy::Leasable { max_secs: 900 },
+            LeasePolicy::leasable(900),
             Duration::from_secs(60),
         );
 
@@ -4838,7 +5262,7 @@ mod tests {
         let (core, calls) = sealed_env_core(
             "faketool",
             &[("TOKEN", "sealed-value-42")],
-            LeasePolicy::Leasable { max_secs: 900 },
+            LeasePolicy::leasable(900),
             Duration::from_secs(60),
         );
         let (_, out1) = run_sealed(&core, &[]);
@@ -4867,7 +5291,7 @@ mod tests {
                 action: Action {
                     mode: RuleMode::Gate,
                     source: "faketool".into(),
-                    lease: LeasePolicy::Leasable { max_secs: 900 },
+                    lease: LeasePolicy::leasable(900),
                     timeout_sec: None,
                 },
             })
@@ -4887,7 +5311,7 @@ mod tests {
             &core,
             &["curl".into(), "https://example.invalid".into()],
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(w),
@@ -4919,7 +5343,10 @@ mod tests {
 
         // A run under generation 0 opens a window.
         let (r1, w1) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w1), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w1), None),
+            0
+        );
         assert_eq!(read_all(r1), "secret-A");
         assert_eq!(core.leases.active(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -4936,7 +5363,10 @@ mod tests {
         );
 
         let (r2, w2) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w2), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w2), None),
+            0
+        );
         assert_eq!(read_all(r2), "secret-A");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -4977,7 +5407,7 @@ mod tests {
                 action: Action {
                     mode: RuleMode::Gate,
                     source: "other".into(),
-                    lease: LeasePolicy::Leasable { max_secs: 900 },
+                    lease: LeasePolicy::leasable(900),
                     timeout_sec: None,
                 },
             })
@@ -4990,6 +5420,7 @@ mod tests {
                 core.leases.grant(
                     [i as u8; 32],
                     &lease::LeaseBinding::cached("src", rule, "E1", 0),
+                    rule,
                     zeroize::Zeroizing::new(b"TOKEN=v".to_vec()),
                     Duration::from_secs(60),
                 );
@@ -5016,7 +5447,7 @@ mod tests {
         // 3. Only the lease policy changed. Still a change; the window dies.
         seed(&core);
         let mut relaxed = base.clone();
-        relaxed.rules[0].action.lease = LeasePolicy::Leasable { max_secs: 30 };
+        relaxed.rules[0].action.lease = LeasePolicy::leasable(30);
         core.invalidate_leases_for_config_change(&base, &relaxed);
         assert_eq!(core.leases.active(), 1);
 
@@ -5085,7 +5516,7 @@ mod tests {
                 action: Action {
                     mode: RuleMode::Gate,
                     source: "faketool".into(),
-                    lease: LeasePolicy::Leasable { max_secs: 900 },
+                    lease: LeasePolicy::leasable(900),
                     timeout_sec: None,
                 },
             })
@@ -5101,13 +5532,13 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(CountingApprover::new(
                 calls.clone(),
                 Duration::from_secs(60),
             ))),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
             lease_ttl: Duration::from_secs(60),
@@ -5133,7 +5564,7 @@ mod tests {
             &core,
             &["faketool".into()],
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(w1),
@@ -5154,7 +5585,7 @@ mod tests {
             &core,
             &["faketool".into(), "--other".into()],
             elsewhere.to_str().unwrap(),
-            None,
+            TEST_PEER,
             0,
             None,
             Some(w2),
@@ -5212,10 +5643,10 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
             lease_ttl: Duration::from_secs(60),
@@ -5295,10 +5726,10 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: env_file_config("faketool", env_path.to_str().unwrap()).into(),
             lease_ttl: Duration::from_secs(60),
@@ -5385,10 +5816,10 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: op_config().into(),
             lease_ttl: Duration::from_secs(60),
@@ -5570,11 +6001,11 @@ mod tests {
         let core = Arc::new(Core {
             keystore: KeystoreCell::new(Arc::new(MemoryKeystore::new())), // no DEK at rest
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver.clone())),
             remote: vec![approver.clone()],
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
             ))]),
@@ -5725,7 +6156,7 @@ mod tests {
             &core,
             &argv,
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -6018,7 +6449,7 @@ mod tests {
             "read".into(),
             "op://Engineering/.env/password".into(),
         ];
-        let code = fulfill(&core, &argv, "", None, 0, None, Some(write_end), None);
+        let code = fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(write_end), None);
 
         assert_eq!(code, 0, "the loop must complete after a relay bounce");
         assert_eq!(read_all(read_end), "bounce-secret-55");
@@ -6043,10 +6474,10 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate,
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::new(vec![Box::new(OpProvider::with_binary(
                 write_fake_op(dir, token, secret),
             ))]),
@@ -6105,7 +6536,16 @@ mod tests {
         let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
         let (out_r, out_w) = pipe();
         let (err_r, err_w) = pipe();
-        let code = fulfill(&core, &argv, "", None, 0, None, Some(out_w), Some(err_w));
+        let code = fulfill(
+            &core,
+            &argv,
+            "",
+            TEST_PEER,
+            0,
+            None,
+            Some(out_w),
+            Some(err_w),
+        );
         assert_eq!(code, 1, "a sealed daemon fails closed");
         assert_eq!(read_all(out_r), "", "and delivers no secret");
 
@@ -6140,7 +6580,10 @@ mod tests {
         );
         let argv = vec!["op".into(), "read".into(), "op://Engineering/.env".into()];
         let (r, w) = pipe();
-        assert_eq!(fulfill(&core, &argv, "", None, 0, None, Some(w), None), 0);
+        assert_eq!(
+            fulfill(&core, &argv, "", TEST_PEER, 0, None, Some(w), None),
+            0
+        );
         assert_eq!(
             read_all(r),
             "should-never-appear",
@@ -6150,7 +6593,16 @@ mod tests {
         let down = sealed_core(&dir, crate::keystore_seal::SealState::Downgraded, true);
         let (out_r, out_w) = pipe();
         let (err_r, err_w) = pipe();
-        let code = fulfill(&down, &argv, "", None, 0, None, Some(out_w), Some(err_w));
+        let code = fulfill(
+            &down,
+            &argv,
+            "",
+            TEST_PEER,
+            0,
+            None,
+            Some(out_w),
+            Some(err_w),
+        );
         assert_eq!(code, 1, "a downgraded keystore serves nothing");
         assert_eq!(read_all(out_r), "");
         assert!(read_all(err_r).contains("downgraded"));
@@ -6411,7 +6863,7 @@ mod tests {
             &core,
             &argv,
             "/p",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -6977,7 +7429,7 @@ mod tests {
         // derive a different grant key, so the approval gate can never let one
         // challenge ride another challenge's approval. Same caller, same key
         // label, different data fingerprints -> different scope -> different gk.
-        let caller = lease::walk_ancestry(&EmptyTable, -1);
+        let caller = lease::walk_ancestry(&StubTable, TEST_PEER.unwrap_or(-1));
         let fp_a = crate::sshagent::sha256_fingerprint(b"challenge-A");
         let fp_b = crate::sshagent::sha256_fingerprint(b"challenge-B");
         assert_ne!(fp_a, fp_b);
@@ -7034,10 +7486,10 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: config.into(),
             lease_ttl: Duration::from_secs(60),
@@ -7062,7 +7514,7 @@ mod tests {
             &core,
             &["faketool".into()],
             "",
-            None,
+            TEST_PEER,
             0,
             None,
             Some(write_end),
@@ -7078,7 +7530,7 @@ mod tests {
         assert_eq!(
             core.leases.active(),
             0,
-            "env-file must never lease, even on a lease decision"
+            "a RunOnce rule must not lease, even on a lease decision"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -7113,10 +7565,10 @@ mod tests {
             remote: Vec::new(),
             keystore: KeystoreCell::new(keystore),
             threshold: Mutex::new(Default::default()),
-            leases: LeaseStore::new(),
+            leases: Arc::new(LeaseStore::new()),
             gate: ApprovalGate::new(Box::new(approver)),
             pending,
-            proc_table: Box::new(EmptyTable),
+            proc_table: Box::new(StubTable),
             providers: ProviderRegistry::with_defaults(),
             config: op_config().into(),
             lease_ttl: Duration::from_secs(60),

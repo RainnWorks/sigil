@@ -27,7 +27,11 @@
 //  refuses a process whose code signature carries no keychain-access-group
 //  entitlement, and an unsigned binary asking for a data-protection keychain item
 //  is killed by amfid rather than merely refused. Compilation proves the API
-//  usage type-checks; only a signed, installed .app proves the runtime path.
+//  usage type-checks; only a signed, installed .app proves the runtime path. The
+//  same is true of the Touch ID prompt at the bottom of this file: which LAPolicy
+//  it picks is a pure function of the error `canEvaluatePolicy` returns and can be
+//  read and reasoned about here, but whether a real sensor produces that error is
+//  a question only a physical Mac answers.
 
 import CryptoKit
 import Foundation
@@ -267,22 +271,100 @@ struct UnavailableWrapKey: KeystoreWrapKey {
 /// The one place in this feature that asks for a human. De-adoption downgrades
 /// the file back to plaintext, so it takes a live Touch ID even though wrapping
 /// and unwrapping never do.
+///
+/// Because this is the path that LOWERS protection, the login password is not a
+/// general substitute for the finger. It is allowed in exactly one situation: a
+/// Mac with no usable biometry hardware, where the password is not a weaker
+/// alternative to Touch ID but the entirety of what "the device owner" can mean
+/// there. Everywhere else, an unusable sensor refuses. The distinction matters
+/// because some of the ways biometry becomes unavailable are things an attacker
+/// can cause on purpose: failing Touch ID five times locks it out, and a Magic
+/// Keyboard can be unpaired. Selecting the policy on `canEvaluatePolicy` alone
+/// would turn each of those into a way to unwrap the keystore with a stolen
+/// password. The daemon's own presence check (crates/sigil/src/presence.m) is
+/// biometry or nothing; this is the same rule with the one hardware exception
+/// spelled out.
 enum LocalPresence {
-    /// Ask for Touch ID (falling back to the login password only where no
-    /// biometry is enrolled, so this is never a dead end on a Mac without a
-    /// sensor). Returns nil on success, or a calm reason on refusal or failure.
+    /// What to do when the biometrics-only policy reports itself unavailable.
+    enum BiometryUnavailable: Equatable {
+        /// This Mac cannot do biometry at all. Fall back to the login password:
+        /// refusing here would make de-adoption permanently impossible on a Mac
+        /// with no sensor, and there is no stronger check to hold out for.
+        case fallBackToPassword
+        /// Biometry exists on this Mac and is not usable right now. Refuse, with
+        /// a reason that says how to make it usable again. The cost is real and
+        /// deliberate: a locked-out user cannot de-adopt until they unlock the
+        /// Mac elsewhere, which is the correct direction on a path whose whole
+        /// purpose is to remove protection.
+        case refuse(String)
+    }
+
+    /// Ask for Touch ID. Returns nil on success, or a calm reason on refusal,
+    /// failure, or a sensor this Mac cannot use.
     static func confirm(reason: String) async -> String? {
         let context = LAContext()
+        // No "Enter Password" button on the biometric sheet. Under the biometrics
+        // policy that button authenticates nothing (it returns `userFallback`),
+        // so all it can do is advertise a way through that does not exist here.
+        // Matches presence.m, which sets the same empty title.
+        context.localizedFallbackTitle = ""
+
         var policyError: NSError?
-        let policy: LAPolicy = context.canEvaluatePolicy(
-            .deviceOwnerAuthenticationWithBiometrics, error: &policyError)
-            ? .deviceOwnerAuthenticationWithBiometrics
-            : .deviceOwnerAuthentication
+        let policy: LAPolicy
+        if context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &policyError) {
+            policy = .deviceOwnerAuthenticationWithBiometrics
+        } else {
+            switch fallback(for: policyError) {
+            case .fallBackToPassword: policy = .deviceOwnerAuthentication
+            case .refuse(let why): return why
+            }
+        }
+
         do {
             let ok = try await context.evaluatePolicy(policy, localizedReason: reason)
             return ok ? nil : "not confirmed"
         } catch {
             return (error as? LAError).map(describe) ?? error.localizedDescription
+        }
+    }
+
+    /// Read the error `canEvaluatePolicy` left behind and decide whether the
+    /// login password may stand in. Pure and separated from `LAContext` on
+    /// purpose: it is the security decision on this path, and it should be
+    /// readable and checkable without a Touch ID sensor in the room.
+    ///
+    /// Anything unrecognized, including a false with no error at all, refuses.
+    /// A reason we cannot name is not a reason to accept less.
+    static func fallback(for error: NSError?) -> BiometryUnavailable {
+        guard let error, error.domain == LAErrorDomain else {
+            return .refuse("Touch ID is unavailable and this Mac gave no reason")
+        }
+        switch LAError.Code(rawValue: error.code) {
+        case .biometryNotAvailable?:
+            // No sensor, or one this Mac will never offer us. The password is all
+            // there is.
+            return .fallBackToPassword
+        case .biometryNotEnrolled?:
+            // A sensor with no finger on file, which is an ordinary way to own a
+            // Mac and not something the app should turn into a dead end. Stated
+            // rather than hidden: removing an enrollment in System Settings takes
+            // the login password, so someone who already has the password can
+            // reach this branch on purpose. That is a strictly smaller step than
+            // what the password alone opens on such a Mac, and it is the reason
+            // the LOCKOUT branch below, which needs no password at all, refuses.
+            return .fallBackToPassword
+        case .biometryLockout?:
+            return .refuse(
+                "Touch ID is locked out; unlock this Mac with your password to re-enable it, then try again")
+        case .biometryNotPaired?, .biometryDisconnected?:
+            // A Touch ID keyboard the Mac knows about but cannot reach. Unlike a
+            // Mac with no sensor, this one has a fix the person can perform, and
+            // unplugging a keyboard must not be a way around the finger.
+            return .refuse("the Touch ID keyboard is not connected; reconnect it, then try again")
+        case .passcodeNotSet?:
+            return .refuse("this Mac has no login password set, so there is nothing to confirm with")
+        default:
+            return .refuse("Touch ID is unavailable: \(error.localizedDescription)")
         }
     }
 
@@ -292,7 +374,10 @@ enum LocalPresence {
         case .userFallback: return "cancelled"
         case .biometryNotEnrolled: return "no Touch ID enrolled on this Mac"
         case .biometryNotAvailable: return "no Touch ID on this Mac"
-        case .biometryLockout: return "Touch ID is locked out; unlock with your password first"
+        case .biometryLockout:
+            // Reachable here as well as from the policy choice above: a sensor
+            // that was usable when we asked can lock out during the prompt.
+            return "Touch ID is locked out; unlock this Mac with your password to re-enable it, then try again"
         default: return "not confirmed"
         }
     }

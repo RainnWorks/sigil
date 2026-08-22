@@ -13,7 +13,7 @@ use crate::json::{self, ControlResult};
 use crate::keystore;
 use crate::local::{self, Frame, Reply};
 use crate::paths;
-use crate::settings::{self, Settings};
+use crate::settings::Settings;
 use crate::style::Style;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -78,7 +78,7 @@ pub fn run_gating() -> i32 {
 
 /// Dispatch the `sigil-config` binary: all configuration management. Its verbs
 /// are the config engine (`source`/`rule`/`list`/`export`/`import`) plus
-/// `account`, `settings`, `mac-approvals`, and `wipe`. It never gates a command;
+/// `account`, `settings`, and `wipe`. It never gates a command;
 /// an unknown verb is an error, not a `sigil <cmd>` invocation.
 pub fn run_config() -> i32 {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -94,7 +94,6 @@ pub fn run_config() -> i32 {
         "remove" | "rm" => config_remove(args.get(1).map(String::as_str), json),
         "proxy" => cmd_proxy(&args[1..], json),
         "settings" => cmd_settings(&args[1..], json),
-        "mac-approvals" => cmd_mac_approvals(&args[1..], json),
         "wipe" => cmd_wipe(&args[1..], json),
         "version" | "--version" | "-V" => {
             println!("sigil-config {VERSION}");
@@ -114,7 +113,7 @@ pub fn run_config() -> i32 {
 
 /// Whether `cmd` is a reserved verb in the lean `sigil` binary (handled by
 /// [`run_gating`]) and therefore takes precedence over the `sigil <cmd>`
-/// primitive. The management verbs (config/account/settings/mac-approvals/wipe)
+/// primitive. The management verbs (config/account/settings/wipe)
 /// are deliberately NOT reserved here — they moved to `sigil-config`, which frees
 /// those names to be gated. The escape hatch for a tool named like a residual
 /// reserved verb is `sigil run -- <cmd>`.
@@ -295,13 +294,12 @@ usage: sigil-config <cmd> [args...]   author rules/sources, manage accounts
                     also: proxy remove <cmd> [--purge] | list | status |
                     doctor [<cmd>] | env [--shell zsh|bash|fish|nu]
   settings get|set  read or change preferences (timeouts, relay, retention)
-  mac-approvals --enable|--phone-only  toggle the Mac local-approval factor
   wipe [--force]    remove pairing, accounts, keys, config, and settings
   version           print version
   help              print this message
 
 --json is for the CLI-only mutation commands the Mac app shells out for
-(source/rule/list/export/import, account, settings, wipe, mac-approvals).
+(source/rule/list/export/import, account, settings, wipe).
 A running daemon picks up config, sealed values, and SSH keys on its own."
     );
 }
@@ -715,13 +713,13 @@ fn cmd_lease(args: &[String]) -> i32 {
                 return 0;
             }
             let now = sigil_proto::now_ms();
-            // The account column only earns its width when some lease names one
-            // (a plain gate carries none), so it never renders as a blank gutter.
-            let with_account = leases.iter().any(|l| !l.account.is_empty());
+            let cols = LeaseCols::measure(&leases, now);
             println!("{}", s.cobalt("leases"));
             println!();
+            println!("  {}", s.faint(LEASE_BREADTH));
+            println!();
             for l in &leases {
-                println!("{}", lease_row(s, l, now, with_account));
+                println!("{}", lease_row(s, l, now, cols));
             }
             0
         }
@@ -741,26 +739,123 @@ fn cmd_lease(args: &[String]) -> i32 {
     }
 }
 
-/// One `sigil lease list` row: grant-key prefix (what `lease revoke` takes), the
-/// account when there is one, the RULE the lease covers, and the countdown.
+/// The breadth of every lease in the list, stated ONCE above the rows.
 ///
-/// A lease is rule-wide: it auto-approves anything that rule matches for the
-/// caller chain that opened it, not only the command that did. The row says so
-/// outright rather than leaving the rule name to be read as a command.
-fn lease_row(s: Style, l: &json::LeaseJson, now: u64, with_account: bool) -> String {
-    let left = l.expires_ms.saturating_sub(now) / 1000;
-    let account = if with_account {
-        format!("{}  ", pad(&l.account, 14))
-    } else {
+/// A lease is rule-wide: it auto-approves anything its rule matches for the
+/// caller chain that opened it, not only the command that did. The scope column
+/// names that RULE, and a rule name reads like a command (`op-read`), so without
+/// this line a row invites exactly the misreading "the one command I approved".
+/// It sits at list level rather than on each row so a row can spend its width on
+/// aligned columns instead of repeating a constant.
+const LEASE_BREADTH: &str =
+    "A lease covers everything its rule matches, from anywhere on this Mac.";
+
+/// Above this the rule column stops widening for one outlier: a single very long
+/// rule name should step out of its own column rather than tax every other row
+/// with a gutter it does not use.
+const LEASE_SCOPE_MAX: usize = 36;
+
+/// The fixed-width column widths for one `sigil lease list`, measured from the
+/// rows about to be printed rather than guessed.
+///
+/// Guessed widths are how a table goes ragged: the account column used to be a
+/// flat 14, and a perfectly ordinary account name (`rowmhq.1password.eu`, 19)
+/// overflowed it and shoved every column after it out of line. Measuring means a
+/// column is exactly as wide as its widest value, so nothing overflows and
+/// nothing pays for a gutter it does not use.
+#[derive(Clone, Copy)]
+struct LeaseCols {
+    /// Zero when no lease names an account (a plain gate carries none), which is
+    /// how the column disappears instead of rendering as a blank gutter.
+    account: usize,
+    scope: usize,
+    left: usize,
+}
+
+impl LeaseCols {
+    fn measure(leases: &[json::LeaseJson], now: u64) -> Self {
+        let widest =
+            |f: &dyn Fn(&json::LeaseJson) -> usize| leases.iter().map(f).max().unwrap_or(0);
+        // Characters, not bytes, and for the same reason `pad` counts characters:
+        // the two must agree or the padding a column asks for is not the padding
+        // it gets. Measured on the FILTERED cell, never the raw field, for the
+        // same reason: `lease_row` draws the filtered one, and a column measured
+        // against text that is not what gets drawn is a column out of alignment.
+        Self {
+            account: widest(&|l| cell(&l.account).chars().count()),
+            scope: widest(&|l| cell(&l.scope).chars().count()).min(LEASE_SCOPE_MAX),
+            left: widest(&|l| countdown(l, now).chars().count()),
+        }
+    }
+}
+
+/// One free-text cell of a lease row, filtered and bounded for a terminal.
+///
+/// The bound is the coverage label's own, which is generous for a rule name and
+/// an account: it is not a display preference, it is the ceiling that stops a
+/// single absurd value from flooding the line. Column WIDTH is decided
+/// separately, by [`LeaseCols`], which is why an over-long rule name still steps
+/// out of its column rather than being cut to fit it.
+fn cell(raw: &str) -> String {
+    sigil_proto::sanitize_label(raw, sigil_proto::COVERS_MAX_CHARS)
+}
+
+/// The countdown cell, as text, so its column can be measured before it is drawn.
+fn countdown(l: &json::LeaseJson, now: u64) -> String {
+    format!("{}s left", l.expires_ms.saturating_sub(now) / 1000)
+}
+
+/// One `sigil lease list` row: grant-key prefix (what `lease revoke` takes), the
+/// account when there is one, the RULE the lease covers, the countdown, and then
+/// what that rule covers.
+///
+/// Every fixed-width column is emitted BEFORE the one free-text column, so a
+/// coverage label of any length or shape can only ragged-edge the end of the
+/// line; it can never push the countdown out of alignment with the row above it.
+///
+/// That trailing column is the daemon's own **coverage label** (`op read`,
+/// `op with --account "rowmhq.1password.eu"`) — the same string the approver was
+/// shown when they opened the window, rendered once in `Match::coverage` and
+/// carried here. The breadth that keeps the rule name from being misread as a
+/// single approved command is stated once for the whole list in
+/// [`LEASE_BREADTH`], not repeated on every row.
+///
+/// `Match::coverage` never returns empty and `Config::resolve` stamps a label on
+/// every lease policy, so the EMPTY-label branch below is unreachable from this
+/// daemon. It is kept for a lease minted by a daemon older than the field: still
+/// true, never a guess at what the rule matches.
+///
+/// The free text is re-filtered here, at the render boundary, through the same
+/// [`sigil_proto::sanitize_label`] the coverage choke point uses (R4-F6). That is
+/// not distrust of this daemon's own label; it is that this row is the one
+/// surface where a control byte does real damage (an escape sequence on a
+/// terminal), and it is the surface with the widest inputs: the RULE NAME arrives
+/// here unfiltered by any other stage, and a lease can outlive the config that
+/// named it. Filtering costs a `?` in a non-ASCII rule name and buys a row that
+/// cannot repaint the screen. `Config::resolve` remains the only WRITER of a
+/// coverage label; this only decides how one is drawn.
+fn lease_row(s: Style, l: &json::LeaseJson, now: u64, cols: LeaseCols) -> String {
+    let account = if cols.account == 0 {
         String::new()
+    } else {
+        format!("{}  ", pad(&cell(&l.account), cols.account))
+    };
+    let drawn = cell(&l.covers);
+    let covers = if drawn.is_empty() {
+        "any matching command"
+    } else {
+        &drawn
     };
     format!(
         "  {}  {}{}  {}  {}",
         s.dim(&l.grant_hex[..12.min(l.grant_hex.len())]),
         account,
-        pad(&l.scope, 30),
-        s.faint("\u{b7} any matching command"),
-        s.faint(&format!("{left}s left"))
+        pad(&cell(&l.scope), cols.scope),
+        // Right-aligned, alone among the columns: a countdown is a number, and
+        // right-aligning it lines up both the digits and the "s left" unit as the
+        // window drains from three digits to one.
+        s.faint(&format!("{:>w$}", countdown(l, now), w = cols.left)),
+        s.faint(&format!("\u{b7} {covers}")),
     )
 }
 
@@ -2671,6 +2766,52 @@ fn config_source_add(args: &[String], json: bool) -> i32 {
     )
 }
 
+/// The terminal filter for the `sigil-config list` views, which remembers whether
+/// it ever had to change a line so the view can point at the verbatim path once,
+/// and only when that applies.
+///
+/// These lines are the one config surface drawn into a TERMINAL, where an
+/// unfiltered escape sequence repaints the screen and an unterminated
+/// `U+202E RIGHT-TO-LEFT OVERRIDE` reorders a rule into reading as a rule the
+/// human does not have. Everything on them is user-authored config (rule names,
+/// match values, source names, plain env values), so filtering here is the same
+/// call [`lease_row`] makes at its own render boundary.
+///
+/// It cost something to make it: this view used to be the faithful echo, and the
+/// coverage label's own documentation leaned on that. It is not any more, so the
+/// verbatim record is `config.json` on disk and `sigil-config list --json`, and
+/// [`note`](Self::note) says so on the spot rather than leaving the human to
+/// wonder whether their config or their terminal is wrong.
+#[derive(Default)]
+struct ListFilter {
+    touched: bool,
+}
+
+impl ListFilter {
+    /// One free-text cell: filtered, and deliberately NOT bounded. A length cut
+    /// here would hide a match condition on the view whose whole job is to show
+    /// every one of them; the bound belongs to the consent label, not to this.
+    fn cell(&mut self, raw: &str) -> String {
+        let out = sigil_proto::sanitize_label(raw, usize::MAX);
+        self.touched |= out != raw;
+        out
+    }
+
+    /// Printed after the list, only when the filter changed something, naming the
+    /// path that still shows it whole.
+    fn note(&self, s: Style, what: &str) {
+        if self.touched {
+            println!(
+                "  {}",
+                s.faint(&format!(
+                    "\u{fffd} marks characters in {what} this view cannot render; \
+                     sigil-config list --json shows them verbatim"
+                ))
+            );
+        }
+    }
+}
+
 fn config_source_list(json: bool) -> i32 {
     let cfg = match sources_for_display() {
         Some(c) => c,
@@ -2690,19 +2831,23 @@ fn config_source_list(json: bool) -> i32 {
     }
     println!("{}", s.cobalt("sources"));
     println!();
+    let mut f = ListFilter::default();
     for src in &cfg.sources {
+        let name = f.cell(&src.name);
+        let provider = f.cell(&src.provider);
+        let extra = source_extra(&mut f, src);
         println!(
             "  {}  {}{}",
-            pad(&src.name, 16),
-            s.dim(&src.provider),
-            s.dim(&source_extra(src))
+            pad(&name, 16),
+            s.dim(&provider),
+            s.dim(&extra)
         );
         // Plain vars show their VALUES, on their own lines, labelled `plain`. The
         // distinction from a sealed key (name only, above) has to survive a
         // glance: it is the difference between what Sigil is protecting and what
         // it is merely setting.
         for (k, v) in &src.plain {
-            let line = format!("plain {k}={v}");
+            let line = format!("plain {}={}", f.cell(k), f.cell(v));
             if src.keys.contains(k) {
                 // Listed, but inert: the sealed value of the same name is what the
                 // child will get. Saying so here is the difference between config
@@ -2717,6 +2862,7 @@ fn config_source_list(json: bool) -> i32 {
             }
         }
     }
+    f.note(s, "source names and values");
     0
 }
 
@@ -2746,17 +2892,28 @@ fn sources_for_display() -> Option<crate::config::Config> {
 /// [`sources_for_display`] has already reconciled, so a name reaching the
 /// `sealed` label has a record behind it. For others, the account label or the
 /// env-file path.
-fn source_extra(src: &crate::config::Source) -> String {
+/// The user-authored halves are filtered individually rather than the composed
+/// string being filtered by the caller: this descriptor's own punctuation
+/// includes `U+00B7`, which the label allowlist would mark as unrenderable and
+/// which no user typed.
+fn source_extra(f: &mut ListFilter, src: &crate::config::Source) -> String {
     if src.provider != crate::provider::EnvProvider::ID {
         return src
             .account
             .as_deref()
             .or(src.path.as_deref())
-            .map(|x| format!(" \u{b7} {x}"))
+            .map(|x| format!(" \u{b7} {}", f.cell(x)))
             .unwrap_or_default();
     }
     match (src.keys.is_empty(), src.plain.is_empty()) {
-        (false, _) => format!(" \u{b7} sealed {}", src.keys.join(", ")),
+        (false, _) => format!(
+            " \u{b7} sealed {}",
+            src.keys
+                .iter()
+                .map(|k| f.cell(k))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         // Not dead config: a gate that injects only non-secret vars, which are
         // listed underneath.
         (true, false) => " \u{b7} no sealed values".to_string(),
@@ -3352,7 +3509,9 @@ fn lease_flag(args: &[String]) -> Result<sigil_proto::LeasePolicy, i32> {
         },
         None => DEFAULT_LEASE_MAX_SECS,
     };
-    Ok(sigil_proto::LeasePolicy::Leasable { max_secs })
+    // No coverage label here: it is rendered by the daemon from the rule's match
+    // at resolve time, never authored or stored CLI-side.
+    Ok(sigil_proto::LeasePolicy::leasable(max_secs))
 }
 
 /// Normalize a rule-matcher flag name to the form it must have to ever match.
@@ -3530,6 +3689,7 @@ fn config_rule_list(json: bool) -> i32 {
     }
     println!("{}", s.cobalt("rules"));
     println!();
+    let mut f = ListFilter::default();
     for r in &cfg.rules {
         // An allow rule is a passthrough (no source, no lease); a gate rule shows
         // its target source and lease policy.
@@ -3537,20 +3697,23 @@ fn config_rule_list(json: bool) -> i32 {
             ("-> allow (passthrough)".to_string(), "allow".to_string())
         } else {
             (
-                format!("-> {}", r.action.source),
-                crate::config::lease_str(r.action.lease),
+                format!("-> {}", f.cell(&r.action.source)),
+                crate::config::lease_str(&r.action.lease),
             )
         };
+        let name = f.cell(&r.name);
+        let conditions = f.cell(&describe_match(&r.match_));
         println!(
             "  {}  {}  {}",
-            pad(&r.name, 16),
+            pad(&name, 16),
             pad(&target, 22),
-            s.dim(&format!("{} \u{b7} {}", policy, describe_match(&r.match_)))
+            s.dim(&format!("{policy} \u{b7} {conditions}"))
         );
         // A rule authored before flag normalization can hold a flag with no
         // leading dash, which never matches. It reads as a working rule on the
         // line above, so say plainly that it is not one.
         for dead in r.match_.dead_flags() {
+            let dead = f.cell(dead);
             println!(
                 "  {}",
                 s.brass(&format!(
@@ -3560,6 +3723,7 @@ fn config_rule_list(json: bool) -> i32 {
             );
         }
     }
+    f.note(s, "rule names and match values");
     0
 }
 
@@ -3810,7 +3974,7 @@ fn config_add(args: &[String], json: bool) -> i32 {
         action: crate::config::Action {
             mode: crate::config::RuleMode::Gate,
             source: cmd.clone(),
-            lease,
+            lease: lease.clone(),
             timeout_sec: None,
         },
     };
@@ -3833,7 +3997,7 @@ fn config_add(args: &[String], json: bool) -> i32 {
     println!(
         "  {}     {}",
         s.dim("lease"),
-        s.dim(&crate::config::lease_str(lease))
+        s.dim(&crate::config::lease_str(&lease))
     );
     println!(
         "  {}",
@@ -3901,82 +4065,6 @@ fn config_remove(cmd: Option<&str>, json: bool) -> i32 {
     print_config_result(&result, json)
 }
 
-/// `sigil mac-approvals --enable | --phone-only`: toggle the Mac local-approval
-/// factor / hardened mode. `--phone-only` persists the hardened intent (every
-/// approval degrades to the phone). `--enable` needs the Mac Secure Enclave DEK
-/// envelope, whose minting is not yet verified on hardware (task #17): it
-/// succeeds on the dev keystores and honestly reports "needs verification" on a
-/// real enclave rather than pretending.
-fn cmd_mac_approvals(args: &[String], json: bool) -> i32 {
-    let s = Style::stdout();
-    let enable = has_flag(args, "--enable");
-    let phone_only = has_flag(args, "--phone-only");
-    if enable == phone_only {
-        eprintln!("usage: sigil mac-approvals --enable | --phone-only");
-        return 2;
-    }
-
-    let mut settings = match Settings::load() {
-        Ok(st) => st,
-        Err(e) => {
-            eprintln!("sigil: loading settings: {e}");
-            return 1;
-        }
-    };
-
-    if phone_only {
-        // Hardened: the phone is strictly required. We persist the intent; the
-        // Secure Enclave envelope teardown itself defers to task #17.
-        settings.mac_approvals = settings::MAC_APPROVALS_PHONE_ONLY.to_string();
-        if let Err(e) = settings.save() {
-            eprintln!("sigil: saving settings: {e}");
-            return 1;
-        }
-        if json {
-            println!("{}", json::to_line(&json::MacApprovalsJson { ok: true }));
-        } else {
-            println!(
-                "{} mac approvals hardened (phone required)",
-                s.ok("\u{2713}")
-            );
-        }
-        return 0;
-    }
-
-    // --enable: provision the Mac threshold share and confirm the keystore is
-    // usable. The phone is always the approving factor now (there is no local
-    // Touch-ID approve path); this only readies the Mac side. On a dev keystore
-    // this always succeeds; a real keystore failure is surfaced honestly.
-    let ks = keystore::for_host();
-    match crate::threshold::load_or_create_mac_share(ks.as_ref()) {
-        Ok(_) => {
-            settings.mac_approvals = settings::MAC_APPROVALS_ENABLED.to_string();
-            if let Err(e) = settings.save() {
-                eprintln!("sigil: saving settings: {e}");
-                return 1;
-            }
-            if json {
-                println!("{}", json::to_line(&json::MacApprovalsJson { ok: true }));
-            } else {
-                println!(
-                    "{} Mac side readied (the phone remains the approving factor)",
-                    s.ok("\u{2713}")
-                );
-            }
-            0
-        }
-        Err(e) => {
-            eprintln!(
-                "sigil: cannot ready the Mac side: {e}. The phone remains the approving factor."
-            );
-            if json {
-                println!("{}", json::to_line(&json::MacApprovalsJson { ok: false }));
-            }
-            1
-        }
-    }
-}
-
 /// `sigil settings get|set`: read or change preferences. `set` takes either a
 /// `<key> <value>` pair or, with `--json`, a JSON object patch on stdin (the
 /// form the Mac app uses); a patch is *merged*, so unlisted keys are untouched.
@@ -4026,11 +4114,6 @@ fn settings_get(json: bool) -> i32 {
         "  {}  {}",
         pad("reduce_motion", 22),
         s.dim(&settings.reduce_motion.to_string())
-    );
-    println!(
-        "  {}  {}",
-        pad("mac_approvals", 22),
-        s.dim(&settings.mac_approvals)
     );
     0
 }
@@ -4144,13 +4227,21 @@ fn cmd_wipe(args: &[String], json: bool) -> i32 {
     0
 }
 
-/// Left-pad-to-width a plain (unstyled) label so columns line up. Styling is
+/// Pad a plain (unstyled) label out to `width` so columns line up. Styling is
 /// applied to the glyph separately, so widths here are real display widths.
+///
+/// Counted in CHARACTERS, not bytes: an account or rule name with any non-ASCII
+/// in it would otherwise be measured as wider than it draws and misalign the
+/// very table this exists to align. Characters are not true display width either
+/// (a CJK glyph draws two columns, a combining mark none), but closing that gap
+/// needs a unicode-width dependency, and these are command, flag, and account
+/// names. Whatever counts here must also count in [`LeaseCols::measure`].
 fn pad(s: &str, width: usize) -> String {
-    if s.len() >= width {
+    let len = s.chars().count();
+    if len >= width {
         s.to_string()
     } else {
-        format!("{s}{}", " ".repeat(width - s.len()))
+        format!("{s}{}", " ".repeat(width - len))
     }
 }
 
@@ -4183,7 +4274,7 @@ mod tests {
         // values (Sigil is only setting them).
         let sealed = env_source(&["OP_SERVICE_ACCOUNT_TOKEN"], &[]);
         assert_eq!(
-            source_extra(&sealed),
+            source_extra(&mut ListFilter::default(), &sealed),
             " \u{b7} sealed OP_SERVICE_ACCOUNT_TOKEN"
         );
     }
@@ -4230,6 +4321,7 @@ mod tests {
         let shown = sources_for_display().expect("the display config loads");
         let extra = |name: &str| {
             source_extra(
+                &mut ListFilter::default(),
                 shown
                     .sources
                     .iter()
@@ -4266,8 +4358,16 @@ mod tests {
         // Requirement of the degrade path: gate plus plain env injection is a
         // legitimate configuration, so `list` must not render it as dead config.
         let plain_only = env_source(&[], &[("OP_BIOMETRIC_UNLOCK_ENABLED", "false")]);
-        assert_eq!(source_extra(&plain_only), " \u{b7} no sealed values");
-        assert_eq!(source_extra(&env_source(&[], &[])), " \u{b7} (nothing set)");
+        let mut f = ListFilter::default();
+        assert_eq!(
+            source_extra(&mut f, &plain_only),
+            " \u{b7} no sealed values"
+        );
+        assert_eq!(
+            source_extra(&mut f, &env_source(&[], &[])),
+            " \u{b7} (nothing set)"
+        );
+        assert!(!f.touched, "an ordinary source must not raise the note");
     }
 
     #[test]
@@ -4402,33 +4502,237 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_lease_row_names_its_rule_and_says_how_wide_it_is() {
-        // Display honesty: the middle column is a RULE, and the row must not let
-        // it read as "the one command that was approved".
-        let s = Style::with_color(false);
-        let l = json::LeaseJson {
+    /// A `lease list` row as the daemon would hand it over. `scope` is the rule
+    /// name; `covers` is the daemon's coverage label for that rule.
+    fn lease_json(rule: &str, covers: &str) -> json::LeaseJson {
+        json::LeaseJson {
             grant_hex: "a1b2c3d4e5f60718293a4b5c6d7e8f90".into(),
             caller: String::new(),
             account: String::new(),
-            scope: "op-account-rowmhq-1password-eu".into(),
+            scope: rule.into(),
+            covers: covers.into(),
             granted_ms: 1_000,
             expires_ms: 121_000,
-        };
-        let row = lease_row(s, &l, 1_000, false);
+        }
+    }
+
+    #[test]
+    fn a_lease_row_names_its_rule_and_says_how_wide_it_is() {
+        // Display honesty: the middle column is a RULE, and the list must not let
+        // it read as "the one command that was approved". The breadth is stated
+        // once above the rows, so it is the list, not the row, that carries it.
+        assert!(LEASE_BREADTH.contains("everything its rule matches"));
+        assert!(LEASE_BREADTH.contains("from anywhere on this Mac"));
+
+        let s = Style::with_color(false);
+        let l = lease_json("op-account-rowmhq-1password-eu", "");
+        let one = [l.clone()];
+        let row = lease_row(s, &l, 1_000, LeaseCols::measure(&one, 1_000));
         // Revoke prefix first, then the rule: with no account anywhere, the row
         // spends no width on an empty column.
         assert!(
             row.starts_with("  a1b2c3d4e5f6  op-account-rowmhq-1password-eu"),
             "{row}"
         );
-        assert!(row.contains("\u{b7} any matching command"), "{row}");
-        assert!(row.ends_with("120s left"), "{row}");
+        // With no label rendered, the row still states the breadth generically
+        // rather than implying none.
+        assert!(row.ends_with("\u{b7} any matching command"), "{row}");
+        assert!(row.contains("120s left"), "{row}");
 
         // An account, when there is one, keeps its own aligned column.
         let mut with = l.clone();
         with.account = "Rowm".into();
-        assert!(lease_row(s, &with, 1_000, true).contains("Rowm"));
+        let two = [with.clone()];
+        assert!(lease_row(s, &with, 1_000, LeaseCols::measure(&two, 1_000)).contains("Rowm"));
+    }
+
+    #[test]
+    fn a_lease_row_states_the_coverage_label_when_the_daemon_rendered_one() {
+        // The whole point of the label: the row stops gesturing at the breadth
+        // ("any matching command") and states it in the same words the approver
+        // consented to. It is the LAST column, being the only free-text one.
+        let s = Style::with_color(false);
+        let l = lease_json("op-eu", "op with --account \"rowmhq.1password.eu\"");
+        let one = [l.clone()];
+        let row = lease_row(s, &l, 1_000, LeaseCols::measure(&one, 1_000));
+        assert!(row.contains("op-eu"), "{row}");
+        assert!(
+            row.ends_with("\u{b7} op with --account \"rowmhq.1password.eu\""),
+            "{row}"
+        );
+        assert!(!row.contains("any matching command"), "{row}");
+        assert!(row.contains("120s left"), "{row}");
+    }
+
+    /// R4-F6: this row is the one lease surface that writes free text straight to
+    /// a terminal, and the rule name reaches it having passed no other filter.
+    #[test]
+    fn a_lease_row_cannot_repaint_the_terminal_or_reorder_itself() {
+        let s = Style::with_color(false);
+        // A rule name carrying an escape sequence and a direction override, and a
+        // coverage label from a daemon that did not filter one (the label is
+        // filtered at its choke point, but a lease outlives the daemon that
+        // minted it and this row must not depend on that).
+        let mut l = lease_json(
+            "op\u{1b}[2Kread\u{202e}",
+            "op with --account \"\u{202e}terces-on\u{200b}\"",
+        );
+        l.account = "Rowm\u{7}".into();
+        let one = [l.clone()];
+        let row = lease_row(s, &l, 1_000, LeaseCols::measure(&one, 1_000));
+
+        for ch in row.chars() {
+            assert!(
+                ch.is_ascii_graphic()
+                    || ch == ' '
+                    || ch == '\u{b7}'
+                    || ch == '\u{2026}'
+                    || ch == sigil_proto::LABEL_REJECTED,
+                "{ch:?} reached the terminal: {row:?}"
+            );
+        }
+        assert!(row.contains("op [2Kread\u{fffd}"), "{row}");
+        assert!(
+            row.ends_with("\u{b7} op with --account \"\u{fffd}terces-on\u{fffd}\""),
+            "{row}"
+        );
+        assert!(row.contains("120s left"), "{row}");
+
+        // The row is drawn from an ALREADY-filtered label on the daemon's own
+        // path, so the second pass this row makes has to be a no-op: a marker the
+        // choke point emitted must not be re-marked here (the marker is inside the
+        // permitted set, which is what makes the filter idempotent).
+        let stamped = sigil_proto::LeasePolicy::leasable(60)
+            .with_covers("op with --account \"\u{202e}terces-on\u{200b}\"");
+        let twice = lease_json("op-read", stamped.covers());
+        let cols = LeaseCols::measure(std::slice::from_ref(&twice), 1_000);
+        let drawn = lease_row(s, &twice, 1_000, cols);
+        assert!(drawn.ends_with(stamped.covers()), "{drawn}");
+        assert_eq!(
+            drawn.matches(sigil_proto::LABEL_REJECTED).count(),
+            2,
+            "a second pass added markers: {drawn}"
+        );
+
+        // A pathological value is bounded rather than flooding the line, and a
+        // neighbouring row with nothing wrong with it renders exactly as it would
+        // have alone: the outlier steps out of its own column (LEASE_SCOPE_MAX)
+        // instead of taxing the list.
+        let mut huge = lease_json(&"n".repeat(4_000), &"c".repeat(4_000));
+        huge.account = "Rowm".into();
+        let mut plain = lease_json("op-read", "op read");
+        plain.account = "Rowm".into();
+        let rows = lease_rows(&[huge, plain.clone()], 1_000);
+        assert!(
+            rows[0].chars().count() <= 2 * sigil_proto::COVERS_MAX_CHARS + 64,
+            "an unbounded cell flooded the line: {}",
+            rows[0]
+        );
+        assert!(rows[1].ends_with("\u{b7} op read"), "{}", rows[1]);
+        assert!(rows[1].contains("  Rowm  op-read"), "{}", rows[1]);
+    }
+
+    /// `sigil-config list` is a terminal too, and it draws the widest
+    /// user-authored text of any surface: rule names and match values that reach
+    /// it having passed no other filter. It used to be documented as the verbatim
+    /// echo, which made it the one path where an escape or a direction override
+    /// still reached a screen.
+    #[test]
+    fn a_config_list_cell_cannot_repaint_the_terminal_and_says_when_it_filtered() {
+        let mut f = ListFilter::default();
+        assert_eq!(f.cell("op-read"), "op-read");
+        assert!(!f.touched, "an ASCII line must not raise the note");
+
+        // No length bound: this view's job is to show every condition, so a long
+        // match description is drawn whole rather than cut like a consent label.
+        let long = format!("cmd={}", "x".repeat(400));
+        assert_eq!(f.cell(&long), long);
+        assert!(!f.touched);
+
+        assert_eq!(
+            f.cell("op\u{1b}[2Kread\u{202e}"),
+            format!("op [2Kread{}", sigil_proto::LABEL_REJECTED)
+        );
+        assert!(f.touched, "a filtered line must raise the note");
+    }
+
+    /// Render a whole list the way `sigil lease list` does, with the columns
+    /// measured across all of its rows.
+    fn lease_rows(leases: &[json::LeaseJson], now: u64) -> Vec<String> {
+        let s = Style::with_color(false);
+        let cols = LeaseCols::measure(leases, now);
+        leases.iter().map(|l| lease_row(s, l, now, cols)).collect()
+    }
+
+    #[test]
+    fn a_lease_list_aligns_every_column_before_the_free_text_one() {
+        // The alignment invariant, and the reason the coverage label was moved to
+        // the end: rules of wildly different shapes, an account name far wider
+        // than the old fixed 14 (which it used to overflow, shoving every later
+        // column out of line), and countdowns of different digit counts must all
+        // still put "s left" and the label at one offset.
+        let mut long_account = lease_json("op-eu", "op with --account \"rowmhq.1password.eu\"");
+        long_account.account = "rowmhq.1password.eu".into();
+        let mut short_account = lease_json("op-read", "op read");
+        short_account.account = "Rowm".into();
+        let mut nearly_done = lease_json(
+            "op-shared",
+            "op read with --vault \"Shared Eng\", containing \"prod\"",
+        );
+        nearly_done.account = "Rowm".into();
+        nearly_done.expires_ms = 10_000;
+        // A non-ASCII name is measured in characters, not the bytes it encodes
+        // to, or it claims more width than it draws and drags the row left.
+        let mut accented = lease_json("op-café", "op read");
+        accented.account = "Rowmé".into();
+
+        let rows = lease_rows(&[long_account, short_account, nearly_done, accented], 1_000);
+        // Offsets in CHARACTERS: a byte offset would differ across these rows for
+        // reasons that have nothing to do with where the column is drawn.
+        let at = |needle: &str, row: &str| {
+            let byte = row.find(needle).unwrap_or_else(|| panic!("{row}"));
+            row[..byte].chars().count()
+        };
+        let left: Vec<usize> = rows.iter().map(|r| at("s left", r)).collect();
+        let label: Vec<usize> = rows.iter().map(|r| at("\u{b7}", r)).collect();
+        assert!(
+            left.windows(2).all(|w| w[0] == w[1]),
+            "countdown column moved:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            label.windows(2).all(|w| w[0] == w[1]),
+            "label column moved:\n{}",
+            rows.join("\n")
+        );
+        // The measured account column is exactly as wide as its widest value, so
+        // the rule that follows it is not pushed right by one long account.
+        assert_eq!(
+            LeaseCols::measure(&[lease_json("r", "c")], 1_000).account,
+            0,
+            "an account column with nothing in it must not be drawn"
+        );
+
+        // INTENDED, not a bug to be "fixed" by truncating: a rule name past
+        // LEASE_SCOPE_MAX steps out of its own column and pushes that row's
+        // countdown right, rather than every other row paying a gutter for one
+        // outlier. `pad` does not truncate, because a rule name is what
+        // `lease revoke` and the config are keyed on and half of one is worse
+        // than a long one.
+        let outlier = "op-".to_string() + &"x".repeat(LEASE_SCOPE_MAX);
+        let stepped = lease_rows(
+            &[
+                lease_json(&outlier, "op read"),
+                lease_json("op-read", "op read"),
+            ],
+            1_000,
+        );
+        assert!(stepped[0].contains(&outlier), "the rule name is never cut");
+        assert!(
+            at("s left", &stepped[0]) > at("s left", &stepped[1]),
+            "an over-long rule must step out of its column, not be truncated:\n{}",
+            stepped.join("\n")
+        );
     }
 
     #[test]
@@ -4443,15 +4747,7 @@ mod tests {
         // Management verbs moved to sigil-config, so they are NOT reserved in the
         // lean binary — which frees those names to be gated as `sigil <name>`.
         for c in [
-            "op",
-            "gcloud",
-            "bw",
-            "kubectl",
-            "mytool",
-            "config",
-            "settings",
-            "wipe",
-            "mac-approvals",
+            "op", "gcloud", "bw", "kubectl", "mytool", "config", "settings", "wipe",
         ] {
             assert!(!is_reserved_verb(c), "{c} must dispatch as a command");
         }

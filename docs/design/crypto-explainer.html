@@ -402,7 +402,7 @@
     <div>
       <span class="lbl">Where we are going</span>
       <h2>From padlocks to a split key</h2>
-      <p>We start with what a key even is, build up to a lock that needs two halves to open, and finish with the one honest limit that no design can remove.</p>
+      <p>We start with what a key even is, build up to a lock that needs two halves to open, and finish with the honest limits no design can remove.</p>
     </div>
   </div>
 
@@ -598,6 +598,7 @@
     <h2>One lock that needs two half-keys</h2>
     <div class="prose">
       <p class="lead">Here is the move that makes a compromised Mac safe. The lock on your secret is not opened by a single key. It is opened only when two separate half-keys are brought together.</p>
+      <p class="aside"><strong>First, what this chapter is and is not about.</strong> Sigil does two different jobs and only one of them involves a lock. Some tools fetch their own secrets and have their own way of proving who they are; the <code>op</code> command is the everyday example. For those, Sigil holds nothing at all. It stands in front of the command and decides whether it runs, and if you approve, the tool goes and does exactly what it always did. There is no half-key in that story because there is nothing of yours to unlock. The split key below is about the other job: the values you hand to Sigil to keep, which it encrypts and later puts into an approved command's environment. Keep the two apart as you read, because the guarantees are not the same.</p>
       <p>One half is held by your <strong>Mac</strong>. The other half lives <strong>only inside a special security chip in your phone</strong>, called the Secure Enclave. Think of that chip as a sealed vault with no door: things can be computed inside it, but the half-key it guards can never come out. Not to an app, not to you, not to anyone who steals the phone.</p>
       <p>Neither half opens anything on its own. The Mac's half alone is useless. The phone's half alone is useless. Only combined do they form the key that unscrambles the secret. This is why a Mac riddled with malware still cannot unlock a secret by itself: it is holding half of a key, and half a key opens nothing.</p>
       <p>Compare it to the older, simpler approach, where a single whole key does the unlocking. Steal that one key once and you can open every secret, forever, with no one the wiser. Splitting the key removes that single point of failure entirely. Use the toggle to see the difference.</p>
@@ -692,8 +693,10 @@
     <div class="prose">
       <p class="lead">There is no master key sitting anywhere waiting to be used. Each time a tool needs a secret, the unlock is created from scratch, and your face is what creates it.</p>
       <p>When a tool asks for a secret, your Mac computes its own half and then asks your phone for the other half. Your phone shows you exactly what is being requested. When you approve with <strong>Face ID</strong>, and only then, the sealed chip computes its half <em>for that one request</em>. That half travels back, the Mac combines the two halves into the key, unscrambles the secret for that single command, and then immediately wipes it from memory.</p>
-      <p>Nothing lingers. The two halves for this request cannot be reused for the next one. The next request starts the whole dance over: a new ask, a new glance, a new tap of your face, a new half computed fresh in the chip. Approving is not flipping a permission switch. Your face is literally supplying a missing piece of the math, once, for this exact command.</p>
-      <p>Step through it below.</p>
+      <p>Nothing lingers. The two halves for this request cannot be reused for the next one. By default the next request starts the whole dance over: a new ask, a new glance, a new tap of your face, a new half computed fresh in the chip. Your face is not flipping a permission switch, it is supplying a missing piece of the math for this exact command.</p>
+      <p><strong>Unless you deliberately open a window, which you can, and which you should understand before you use it.</strong> Answering thirty prompts in an hour is the kind of friction that makes people turn a safety feature off, so Sigil offers a bounded alternative called a <em>lease</em>. A rule has to permit it in advance; the default is that it does not. When a rule does permit it, the approval screen offers "approve for the next N minutes" alongside the ordinary one-command approve, and if you choose it, anything that rule matches runs inside that window without asking again. Not just the command you were looking at: anything the same rule covers, started by the same chain of programs. For a value Sigil keeps, the window also holds that value unscrambled in memory the whole time, which is the price of not doing the unlock dance again.</p>
+      <p>That is a real widening of the boundary, and the design does not pretend otherwise. What keeps it bounded: you choose it, and never by accident. The Mac clamps the length down to the ceiling the rule sets, whatever the phone asks for. <code>sigil lease list</code> shows every open window, its countdown, and what it covers, in the same words the approval screen used. <code>sigil lease revoke</code> closes one immediately. Expiry, a restart of the daemon, or an edit to the rule closes it too. And nothing about a window is ever written to disk, so it cannot outlive the process that holds it.</p>
+      <p>Step through the default, one-command path below.</p>
     </div>
 
     <figure class="plate reveal">
@@ -795,7 +798,9 @@
     <div class="prose">
       <p class="lead">When you are away from home, your Mac and phone are not on the same network. Their messages have to travel through a middleman server called a relay. The trick is to need no trust in that middleman at all.</p>
       <p>Every message between the two is a <strong>sealed envelope</strong>. It is locked with the recipient's padlock, so only the true recipient can open it, and it carries a tamper-proof <strong>wax seal</strong>, a signature that proves it genuinely came from the other device and was not altered. The relay carries these envelopes back and forth and that is all it can do.</p>
-      <p>It cannot read what is inside, because it lacks the key. It cannot forge a message, because it cannot fake the seal. It cannot secretly resend an old envelope to trick a device, because each one is stamped for single use within a short time window. The relay is a postman who ferries locked mail he can neither open nor counterfeit. This is exactly what lets Sigil work from anywhere without you having to trust the server in the middle.</p>
+      <p>It cannot read what is inside, because it lacks the key. It cannot forge a message, because it cannot fake the seal. Resending an old envelope to trick a device is caught by two checks: every envelope carries the time it was written, and one older than 150 seconds is refused outright; and inside that window each envelope's serial number may be accepted exactly once.</p>
+      <p>Be precise about that second check, because it is the one with a limit. Both the clock check and the list of serial numbers already used live in each device's memory, not on its disk. Restart the daemon, or let the phone rebuild its session, and the list starts empty again. So a captured envelope replayed across a restart, and still inside its 150 seconds, would clear both checks. What stops it there is simpler than cryptography: every reply says which question it is answering, and after a restart nobody is waiting on that question any more, so the reply is thrown away. Your Mac only accepts an answer it is still holding the door open for. That is the honest shape of it. The relay is a postman who ferries locked mail he can neither open nor counterfeit, and the household only opens the door for a reply it is expecting.</p>
+      <p>One thing that is <em>not</em> doing this job, in case you read it somewhere: each envelope is also locked with a throwaway key, but that buys something different and worth having. It means that if someone steals a device's long-term key next year, the messages they recorded this year stay unreadable. It does not stop a replay, because a recorded message carries its own throwaway key along with it and opens perfectly well.</p>
     </div>
 
     <figure class="plate reveal">
@@ -832,7 +837,7 @@
           </g>
         </svg>
       </div>
-      <figcaption>The relay sees only <b>opaque sealed envelopes</b>. It cannot read them (no key), cannot forge them (no seal), and cannot replay them (each is single-use). No trust in the middleman is required.</figcaption>
+      <figcaption>The relay sees only <b>opaque sealed envelopes</b>. It cannot read them (no key) or forge them (no seal), and a resend is caught by the 150-second stamp and the single-use serial, then by the fact that a reply nobody is waiting for is discarded. No trust in the middleman is required.</figcaption>
     </figure>
   </section>
 
@@ -854,7 +859,7 @@
       </div>
       <div class="card good">
         <svg class="ico"><use href="#i-check"/></svg>
-        <div><h4>A hijacked Mac cannot help itself</h4><p>Malware on the Mac holds only half a key. It cannot produce a secret on its own; it can only ask your phone, which needs your face for every single answer.</p></div>
+        <div><h4>A hijacked Mac cannot help itself</h4><p>Malware on the Mac holds only half a key. It cannot produce a secret on its own; it can only ask your phone, and every answer needs your face. The exception you chose yourself is a lease: while a window you opened is still running, a matching request inside it is answered without asking. Close it with <code>sigil lease revoke</code>, or restart the daemon, and asking resumes.</p></div>
       </div>
       <div class="card good">
         <svg class="ico"><use href="#i-check"/></svg>
@@ -868,12 +873,20 @@
     <div class="ch-head"><span class="ch-num">09</span><p class="eyebrow">Told straight</p></div>
     <h2>The honest limits, not hidden</h2>
     <div class="prose">
-      <p class="lead">No design is magic, and pretending otherwise would be the real security flaw. Here are the two limits Sigil does not remove, explained plainly.</p>
+      <p class="lead">No design is magic, and pretending otherwise would be the real security flaw. Here are the four limits Sigil does not remove, explained plainly.</p>
     </div>
     <div class="cards reveal">
       <div class="card limit">
         <svg class="ico"><use href="#i-alert"/></svg>
         <div><h4>One brief moment in the open</h4><p>When a tool finally runs, it genuinely needs the secret to do its job, so for that instant the secret exists unscrambled on the Mac. This is unavoidable: a secret nobody can ever read is a secret nobody can ever use. Sigil keeps that window as short as physically possible and wipes it immediately after.</p></div>
+      </div>
+      <div class="card limit">
+        <svg class="ico"><use href="#i-alert"/></svg>
+        <div><h4>A window you open stays open until it closes</h4><p>A lease trades some of the per-command guarantee for far less friction, and it is a trade, not a free lunch. While it runs, anything the same rule covers is approved without asking, and a kept value sits unscrambled in memory for the duration. It is opt-in per rule, you choose the length within a ceiling the rule sets, <code>sigil lease list</code> shows every open one, and <code>sigil lease revoke</code>, an expiry, a restart, or a rule edit ends it. None of it touches the disk.</p></div>
+      </div>
+      <div class="card limit">
+        <svg class="ico"><use href="#i-alert"/></svg>
+        <div><h4>Not every approval uses the chip</h4><p>The split key and the sealed chip protect the values Sigil keeps for you. Gating a tool that fetches its own secrets, which is what happens with <code>op</code>, has no key to split, so that approval is authorised by the biometric on your phone alone. The biometric is genuine and there is no passcode fallback behind it, but the honest statement is that someone who can pass your face or thumb on your unlocked phone can approve a gated command. Losing the phone is a real event, not a shrug.</p></div>
       </div>
       <div class="card limit">
         <svg class="ico"><use href="#i-alert"/></svg>
@@ -891,7 +904,7 @@
   <section class="closing reveal">
     <p class="eyebrow">The shape of it</p>
     <h2>Cryptography doing the work, not a promise</h2>
-    <p>Notice what Sigil never asks you to trust: not the network, not the relay server, not even the Mac by itself. The safety does not rest on a company keeping a promise or a server behaving. It rests on the plain fact that half a key opens nothing, and that the phone's half is created fresh, by your face, only for the request in front of you.</p>
+    <p>Notice what Sigil never asks you to trust: not the network, not the relay server, not even the Mac by itself. The safety does not rest on a company keeping a promise or a server behaving. It rests on the plain fact that half a key opens nothing, and that the phone's half is created fresh, by your face, for the request in front of you or for a window you deliberately chose to open.</p>
 
     <dl class="glossary">
       <dt>Public key (padlock)</dt>

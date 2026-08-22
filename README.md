@@ -15,14 +15,23 @@ use, on your phone."
 
 ## How it works
 
-- **The daemon at rest is inert.** Stored tokens are ciphertext. The key that
-  decrypts them is never sitting on disk in the clear; it is reconstructed per
-  approval from two shares, one held by your Mac's Secure Enclave and one by
-  your phone's Secure Enclave (a threshold split). Approving is the act of
-  contributing the phone's share, behind a hardware biometric.
-- **Secret bytes never enter the daemon's memory.** The provider's own process
-  (for example `op`) writes the secret straight to the calling program's file
-  descriptor. Sigil gates and injects; it does not read.
+- **Gating and holding are two different jobs.** For a command that fetches its
+  own secret, `op` above all, Sigil holds no credential: it gates the command
+  and runs the real binary, and `op` does its own auth. Sigil only stores values
+  you seal into it yourself (`sigil-config source env set`), which it injects
+  into the gated command's environment after approval.
+- **The values Sigil does hold are inert at rest.** Sealed env values are
+  ciphertext. The key that decrypts them is never on disk in the clear; it is
+  reconstructed per approval from two shares, one held by your Mac and one that
+  never leaves your phone's Secure Enclave (a threshold split). Approving is the
+  act of contributing the phone's share, behind a hardware biometric. The Mac's
+  share decrypts nothing on its own, so the default store for it is a 0600 file
+  at `~/.sigil/keystore.json`; the signed Sigil Mac app can additionally wrap
+  that file under a key held in the Mac's Secure Enclave, which is opt-in and
+  needs the app installed.
+- **Secret bytes never enter the daemon's memory.** The gated program's own
+  process (for example `op`) writes the secret straight to the calling program's
+  file descriptor. Sigil gates and injects; it does not read.
 - **The relay is blind.** Your Mac and phone meet on a relay that moves sealed
   envelopes it cannot open, addressed by key-hashes it cannot reverse. It has no
   accounts, stores nothing at rest, and cannot read a secret, forge an approval,

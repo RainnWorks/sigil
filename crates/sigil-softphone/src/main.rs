@@ -192,8 +192,9 @@ fn cmd_demo(args: &[String]) -> anyhow::Result<()> {
             machine: "demo-mac".into(),
             requested_at: now,
         },
-        // The demo request is leasable so the `--policy lease` path is coherent.
-        lease_policy: LeasePolicy::Leasable { max_secs: 15 * 60 },
+        // The demo request is leasable so the `--policy lease` path is coherent,
+        // and carries a coverage label so the caption path is exercised too.
+        lease_policy: LeasePolicy::leasable(15 * 60).with_covers("op read"),
         reason: None,
         threshold: None,
         expires_at: now + 90_000,

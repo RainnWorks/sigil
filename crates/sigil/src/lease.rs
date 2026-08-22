@@ -6,12 +6,118 @@
 //!
 //! 1. Read the true peer pid off the unix socket (`LOCAL_PEERPID`).
 //! 2. Walk the ancestor chain kernel-side (sysctl `KERN_PROC` on macOS), pid by
-//!    pid, resolving each to an executable path and a content hash.
+//!    pid, resolving each to an executable path and a code-identity measurement
+//!    ([`CodeIdentity`]) in ONE lookup of the running process, so the path and
+//!    the measurement can never describe two different processes.
 //! 3. The grant key is `BLAKE2b(chain ++ project_root ++ kind ++ scope)`. Raw
 //!    pids are excluded from the hash because they recycle; only the stable code
-//!    identity (path + hash) of each ancestor is bound in. `kind` is the
-//!    request-kind tag ([`ScopeKind`]), so a command scope and an SSH scope live
-//!    in separate namespaces and cannot collide however they are spelled.
+//!    identity (path + measure tag + digest) of each ancestor is bound in.
+//!    `kind` is the request-kind tag ([`ScopeKind`]), so a command scope and an
+//!    SSH scope live in separate namespaces and cannot collide however they are
+//!    spelled.
+//!
+//! # What the ancestor measurement does and does not buy
+//!
+//! It does **not** authenticate the caller. Any same-UID process can put itself
+//! in the chain, name itself anything, and ask; the measurement only decides
+//! *which* grant key that chain derives, and therefore which earlier approval it
+//! can coalesce with. The authorizing step is always the human on the phone.
+//!
+//! What it is: **the platform's answer to "what is that pid running", asked of
+//! the live process**. Each ancestor is resolved to its guest code object by pid
+//! (`SecCodeCopyGuestWithAttributes`), the platform is asked whether it still
+//! vouches for that image (`SecCodeCheckValidityWithErrors`), and only then are
+//! the cdhash and the executable path taken off that same object
+//! ([`crate::peercode::measure_guest`]). Properties that follow:
+//!
+//! * The measure names the RUNNING image, not a file. Rewriting the file at an
+//!   ancestor's path after exec does not hand the caller the identity it put
+//!   there: the platform answers `-67034 errSecCSStaticCodeChanged` for that
+//!   process (verified here for in-place overwrite and for rename-over) and the
+//!   ancestor drops to [`IdentityMeasure::Unmeasured`], keyed to its own process
+//!   instance. That is a refusal to measure, not detection of a live tamper.
+//! * It is stable across a re-sign of unchanged code (a renewed certificate does
+//!   not move the cdhash) and it moves the moment the code moves.
+//! * An ad-hoc signature has no signer, so its cdhash asserts nothing a hash of
+//!   the bytes would not. It gets its own measure ([`IdentityMeasure::AdHoc`]),
+//!   never [`IdentityMeasure::Signed`]. All measures are domain-separated in the
+//!   grant key, so a binary that gains a real signature reads as a DIFFERENT
+//!   caller (a fresh approval) rather than silently the same one.
+//!
+//! What it is NOT, and must not be described as: **tamper-evidence.** Three
+//! things it does not cover, none of them fixable here:
+//!
+//! * A cdhash names an executable, never what that process later loaded, and for
+//!   an interpreter never the script it is running. `zsh` measures as `zsh`
+//!   whatever it is executing.
+//! * No page hashes are checked, by us or by the validity call. Measured here:
+//!   patching bytes in the file under an INTACT CodeDirectory leaves the cdhash
+//!   where it was, so the guest check still succeeds and the ancestor still
+//!   measures the same. That is not staleness (the identity genuinely did not
+//!   move, and the running process is still running the pages it mapped); it is
+//!   the boundary of what a cdhash is. What the validity check catches is
+//!   SUBSTITUTION, an image whose identity differs from the one the kernel
+//!   executed, which is the attack on this grant key. Page enforcement is the
+//!   kernel's: it refuses to run a page-tampered image at all. A userspace
+//!   re-check would not help either -- a default-flag `SecStaticCodeCheckValidity`
+//!   passes a page-tampered Mach-O, and the strict flags that refuse one
+//!   (`kSecCSCheckAllArchitectures | kSecCSStrictValidate`) cost ~200ms per
+//!   binary (`codesign -v` catches it too, at similar cost).
+//! * The dominant residual is untouched by any of this: an attacker who can run
+//!   a process as this user does not need to imitate an ancestor, because they
+//!   can spawn UNDER the honest ones and run the genuine gated command, and the
+//!   chain then matches by construction.
+//!
+//! State the last one at its full strength, because a weaker version of it has
+//! been written here before. **A chain of measured ancestors is
+//! RECONSTRUCTIBLE, not just joinable.** [`grant_key`] binds each ancestor's
+//! executable path, measure tag and digest, plus the chain length and the rule
+//! name, and NOTHING instance-specific whenever every ancestor measures. So an
+//! attacker who can run code as this user need not touch the victim's processes
+//! at all: they can exec the same binaries from the same paths in the same
+//! nesting and derive the identical key, and `ps` discloses the tree to imitate.
+//! Closing that would need a per-session secret the ancestors cannot both hold
+//! and be measured by, so it is not closed. The measure's value is telling
+//! HONEST tool trees apart, which is what it is for; it is not a fence against a
+//! deliberate imitator, and no text here or on a consent surface may imply it is.
+//! (The one measure an attacker cannot reconstruct is the unmeasured branch
+//! below, which keys to a live process instance.)
+//!
+//! # When the platform will not describe an ancestor
+//!
+//! Sometimes it will not answer at all. The overwhelmingly common cause is
+//! benign and is not an attack: a tool that updates itself deletes the binary it
+//! is running from, and from that moment the platform has no image to describe
+//! for a process that is still perfectly healthy. The swap case above lands here
+//! too.
+//!
+//! Such an ancestor is [`IdentityMeasure::Unmeasured`], and its digest is the
+//! **process instance**: the pid plus the kernel's start time for it
+//! ([`CodeIdentity::unmeasured`]). It keeps its own measure tag, so it can never
+//! be confused with a measured one, and the chain still leases.
+//!
+//! This branch is weaker than the measured ones and it is accepted deliberately:
+//!
+//! * **What it asserts** is continuity of one process, not identity of code. It
+//!   says "the same live process that was here before", and nothing about what
+//!   that process is running. A window under it therefore keeps serving while
+//!   that process lives, whatever it went on to do.
+//! * **What it costs an attacker** is nothing they did not already have. To
+//!   collide with a victim's key they would have to BE a descendant of the
+//!   victim's ancestors at that pid and that microsecond, which is the honest
+//!   chain; and spawning under the honest ancestors was always the dominant
+//!   residual above. Neither half is caller-supplied: the daemon reads the pid
+//!   off the socket and the start time from the kernel.
+//! * **Why not fail closed instead.** Refusing to lease an unmeasured chain was
+//!   the first cut and it is the wrong trade for this product. It turns a
+//!   background auto-update into a silent return to one phone tap per command,
+//!   with a cause no user could diagnose, and per-command approval is the exact
+//!   problem leases exist to solve. The narrower rule is what remains: a caller
+//!   the daemon could not put a single process behind gets no window at all
+//!   ([`Caller::may_lease`]), because every such caller would share one key.
+//! * **It is never silent.** The daemon logs each unmeasurable ancestor once per
+//!   executable and reason, naming it and why, and `sigil doctor` carries a row
+//!   for as long as any are outstanding ([`unmeasured_notes`]).
 //!
 //! Honest limit on the chain: every gated command reaches the daemon through a
 //! `~/.sigil/bin` symlink to the ONE `sigil` binary, and macOS `proc_pidpath`
@@ -53,12 +159,23 @@
 //! Client-supplied ancestry is never consulted; the whole chain is measured
 //! here.
 //!
-//! NEEDS-VERIFICATION: the ancestor "code identity" here is a BLAKE2b hash of
-//! the executable's bytes. The design calls for the platform code-signing
-//! identity (Developer ID / Authenticode) so a re-signed-but-identical binary
-//! and a tampered one are told apart. Confirm the macOS path with:
-//!   codesign -dvvv --verbose=4 "$(command -v op)"   # team identifier / cdhash
-//! and fold the cdhash into `identity_of` in a follow-up.
+//! macOS ancestors are measured through the live guest code object, the same
+//! machinery [`crate::peercode`] uses for the keystore gate, with the validity
+//! check gating the answer. Nothing is measured from a path, and nothing is
+//! cached: a stale or forgeable cache key is a way to be told an ancestor is
+//! code it is no longer running, so every request measures afresh (a few
+//! fractions of a millisecond per ancestor, well under the cost of the `op` child
+//! the request goes on to spawn).
+//!
+//! Residuals that remain (for the reviewer, not a verdict): the caller-chain
+//! imitation class above; the process-instance branch, which asserts continuity
+//! of a process rather than identity of code and is stated in full in its own
+//! section; the measure is macOS-only, so a future Linux/Windows process table
+//! has to fill the seam or every ancestor there is unmeasured; and the walk
+//! resolves ancestors by pid, so a pid recycled between the parent lookup and
+//! the measurement pairs one process's chain position with another's identity.
+//! That last one fails closed (the mismatched pair derives a key nobody holds,
+//! so the run takes a fresh approval) and cannot widen a grant.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -72,16 +189,140 @@ use crate::secrets::Token;
 type Blake2b256 = Blake2b<U32>;
 
 const GRANT_DOMAIN: &[u8] = b"sigil.grant.v1";
+/// Domain for folding a variable-width cdhash down to the 32 bytes the chain
+/// carries. Separate from [`GRANT_DOMAIN`] so the two hashes are unrelated.
+const CDHASH_DOMAIN: &[u8] = b"sigil.cdhash.v1";
+/// Domain for the process-instance digest an unmeasurable ancestor gets. Its own
+/// string so it can never coincide with a cdhash fold.
+const UNMEASURED_DOMAIN: &[u8] = b"sigil.unmeasured.v1";
 /// Cap the ancestry walk so a pathological or looping process table cannot spin.
 const MAX_ANCESTRY_DEPTH: usize = 64;
 
+/// How an ancestor's 32 bytes of code identity were arrived at. Hashed into the
+/// grant key alongside the digest, exactly as [`ScopeKind`] is, so the measures
+/// never share a namespace: a signed binary and an unsigned one cannot collide,
+/// and a binary that gains a signature derives a new key (a fresh approval)
+/// rather than inheriting the old one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityMeasure {
+    /// The platform's own answer about a running image whose signature has a
+    /// signer: its cdhash, taken off a guest code object the platform vouched
+    /// for.
+    Signed,
+    /// The same measurement of a running image whose signature is ad-hoc. An
+    /// ad-hoc signature has no signer, so its cdhash is a digest of the binary
+    /// and nothing more; it is separated from [`IdentityMeasure::Signed`] so it
+    /// is never read as a signing identity. Most of a dev box lands here
+    /// (Homebrew, cargo and npm binaries are ad-hoc signed).
+    AdHoc,
+    /// A hash of the executable's bytes. Nothing on macOS produces this: it is
+    /// what a platform with no code-identity machinery would fall back to, and
+    /// what the synthetic process tables in tests use.
+    Content,
+    /// No measurement was obtainable: the pid does not resolve to a live guest,
+    /// or the platform declined to vouch for the image (which is what a
+    /// post-exec swap of the executable looks like).
+    ///
+    /// This is the one measure that names a PROCESS rather than code: the digest
+    /// is derived from the pid and the kernel's start time for it, so it holds
+    /// for the life of that one process instance and no other. It is weaker than
+    /// the measures above and deliberately so; see the module docs for what it
+    /// buys and what it costs.
+    Unmeasured,
+}
+
+impl IdentityMeasure {
+    /// The tag hashed into the grant key. Short and fixed; never displayed.
+    fn tag(self) -> &'static [u8] {
+        match self {
+            IdentityMeasure::Signed => b"cdhash",
+            IdentityMeasure::AdHoc => b"adhoc",
+            IdentityMeasure::Content => b"bytes",
+            IdentityMeasure::Unmeasured => b"none",
+        }
+    }
+}
+
+/// The kernel's start time for a process: seconds and microseconds since the
+/// epoch, as `proc_pidinfo` reports them. Together with a pid it names one
+/// process instance, which is the strongest thing available about a process
+/// whose code the platform will not describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessStart {
+    pub sec: u64,
+    pub usec: u32,
+}
+
+/// A 32-byte code-identity measurement of one executable, plus how it was
+/// measured. Both halves bind into the grant key; the digest alone is not an
+/// identity, because two measures can produce the same 32 bytes only by
+/// coincidence and must still be told apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeIdentity {
+    pub measure: IdentityMeasure,
+    pub digest: [u8; 32],
+}
+
+impl CodeIdentity {
+    /// A cdhash off a running image, folded to 32 bytes under its own domain
+    /// string (a cdhash is 20 bytes today and the width is not ours to fix).
+    /// `adhoc` decides the measure, never the digest: a signature with no signer
+    /// is a different KIND of claim, not a different hash.
+    pub fn from_cdhash(cdhash: &[u8], adhoc: bool) -> Self {
+        let mut h = Blake2b256::new();
+        h.update(CDHASH_DOMAIN);
+        h.update((cdhash.len() as u64).to_le_bytes());
+        h.update(cdhash);
+        Self {
+            measure: if adhoc {
+                IdentityMeasure::AdHoc
+            } else {
+                IdentityMeasure::Signed
+            },
+            digest: h.finalize().into(),
+        }
+    }
+
+    /// A measurement of the executable's bytes, for a platform with no
+    /// code-identity machinery to ask.
+    pub fn content(digest: [u8; 32]) -> Self {
+        Self {
+            measure: IdentityMeasure::Content,
+            digest,
+        }
+    }
+
+    /// The nothing-to-measure case, keyed to one process INSTANCE: the pid plus
+    /// the kernel's start time for it.
+    ///
+    /// Both halves are load-bearing. The pid alone recycles, and a recycled pid
+    /// inheriting the previous process's window would be a real widening; the
+    /// start time (microsecond resolution, kernel-supplied, not settable by the
+    /// process) is what makes a new process a new identity. Neither is
+    /// caller-supplied: the daemon reads the pid off the socket and walks the
+    /// ancestry itself, so a caller cannot present a victim's pid and start time
+    /// without actually being that process's descendant, which is the honest
+    /// chain anyway.
+    pub fn unmeasured(pid: i32, started: ProcessStart) -> Self {
+        let mut h = Blake2b256::new();
+        h.update(UNMEASURED_DOMAIN);
+        h.update(pid.to_le_bytes());
+        h.update(started.sec.to_le_bytes());
+        h.update(started.usec.to_le_bytes());
+        Self {
+            measure: IdentityMeasure::Unmeasured,
+            digest: h.finalize().into(),
+        }
+    }
+}
+
 /// One resolved ancestor: its pid (for display only, never hashed), executable
-/// path, and a 32-byte code-identity measurement of that executable.
+/// path, and the code-identity measurement of that executable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ancestor {
     pub pid: i32,
     pub exe: PathBuf,
-    pub identity: [u8; 32],
+    pub identity: CodeIdentity,
 }
 
 /// The daemon's own measurement of who is calling: the leaf process and its
@@ -105,6 +346,34 @@ impl Caller {
             .collect::<Vec<_>>()
             .join(" \u{2192} ")
     }
+
+    /// Whether this caller may touch a lease at all.
+    ///
+    /// The one disqualifier is having no identity whatsoever: an empty chain
+    /// means the daemon could not name a single process behind the request (no
+    /// peer pid, or a pid that resolves to nothing), and every such caller would
+    /// derive the SAME grant key. That is the one shape where a window could be
+    /// shared by callers with nothing in common, so it gets no window. Such a
+    /// request is still gated and still shown to the human; only the auto-release
+    /// is withheld.
+    ///
+    /// An ancestor that could not be MEASURED does not disqualify the chain; it
+    /// is keyed to that process instance instead ([`CodeIdentity::unmeasured`]).
+    /// See [`Caller::unmeasured`] for what that is worth.
+    pub fn may_lease(&self) -> bool {
+        !self.chain.is_empty()
+    }
+
+    /// The ancestors the platform would not describe, if any. Empty in the
+    /// normal case; non-empty means this caller's window is keyed partly to a
+    /// process instance rather than wholly to code, which the daemon logs and
+    /// `sigil doctor` reports so the state is visible rather than mysterious.
+    pub fn unmeasured(&self) -> Vec<&Ancestor> {
+        self.chain
+            .iter()
+            .filter(|a| a.identity.measure == IdentityMeasure::Unmeasured)
+            .collect()
+    }
 }
 
 /// The kernel's view of the process table, abstracted so the ancestry walk can
@@ -112,11 +381,12 @@ impl Caller {
 pub trait ProcessTable {
     /// The parent pid of `pid`, or `None` at the root / for an unknown pid.
     fn parent(&self, pid: i32) -> Option<i32>;
-    /// The executable path backing `pid`.
-    fn exe(&self, pid: i32) -> Option<PathBuf>;
-    /// A stable 32-byte code identity for `pid`'s executable. The real fill
-    /// hashes the file contents; the synthetic table returns an injected value.
-    fn identity(&self, pid: i32) -> [u8; 32];
+    /// The executable path backing `pid` and the code identity of the image it
+    /// is running, as ONE resolution: the two are read off the same object so a
+    /// recycled pid cannot pair one process's path with another's measurement.
+    /// `None` means the pid does not name a process at all, which truncates the
+    /// walk.
+    fn resolve(&self, pid: i32) -> Option<(PathBuf, CodeIdentity)>;
 }
 
 /// Walk from `start` up to the root, resolving each process. Returns the chain
@@ -129,8 +399,9 @@ pub fn walk_ancestry(table: &dyn ProcessTable, start: i32) -> Caller {
         if pid <= 1 || !seen.insert(pid) {
             break;
         }
-        let Some(exe) = table.exe(pid) else { break };
-        let identity = table.identity(pid);
+        let Some((exe, identity)) = table.resolve(pid) else {
+            break;
+        };
         chain.push(Ancestor { pid, exe, identity });
         match table.parent(pid) {
             Some(ppid) if ppid != pid => pid = ppid,
@@ -174,7 +445,17 @@ impl ScopeKind {
 /// happened to run in.
 ///
 /// Every field is length-prefixed, so no two different inputs can serialize to
-/// the same byte string.
+/// the same byte string. Each ancestor contributes its path, the tag naming HOW
+/// its identity was measured ([`IdentityMeasure`]), and the digest, so two
+/// measures can never derive one key even if their 32 bytes coincided.
+///
+/// Read "a different tool chain derives a different key" as the honest-tree
+/// statement it is, never as unforgeability. Every input above is a property of
+/// code on disk plus the shape of the tree, all of it readable with `ps`, so a
+/// chain in which every ancestor MEASURES can be reconstructed from scratch by
+/// anyone able to exec those same binaries from those same paths. The unmeasured
+/// branch is the only one that binds something an outsider cannot restage (a
+/// live process instance). See the module docs.
 pub fn grant_key(caller: &Caller, kind: ScopeKind, project_root: &str, scope: &str) -> [u8; 32] {
     let mut h = Blake2b256::new();
     h.update(GRANT_DOMAIN);
@@ -183,7 +464,10 @@ pub fn grant_key(caller: &Caller, kind: ScopeKind, project_root: &str, scope: &s
         let exe = a.exe.as_os_str().as_encoded_bytes();
         h.update((exe.len() as u64).to_le_bytes());
         h.update(exe);
-        h.update(a.identity);
+        let measure = a.identity.measure.tag();
+        h.update((measure.len() as u64).to_le_bytes());
+        h.update(measure);
+        h.update(a.identity.digest);
     }
     let root = project_root.as_bytes();
     h.update((root.len() as u64).to_le_bytes());
@@ -252,7 +536,40 @@ impl LeaseBinding {
 /// removal path drops the `Zeroizing` token and wipes it.
 struct Lease {
     grant: [u8; 32],
+    /// This window's opaque id: 128 bits of OS randomness, minted when the window
+    /// OPENS and preserved for its whole life (a refresh extends one window, it
+    /// does not start another). RAM-only, and it dies with the window.
+    ///
+    /// It exists because **the grant key cannot do this job**, on three counts:
+    ///
+    /// * It is DETERMINISTIC. The same caller chain running the same rule derives
+    ///   the same key tomorrow, so a key names a *lease shape*, not a *lease*. A
+    ///   revoke that named only the key would be aimed at every window that shape
+    ///   will ever have -- fine for a human typing `sigil lease revoke <prefix>`
+    ///   at a terminal, not fine for a message that crossed a hostile relay and
+    ///   could be handed back to a later daemon.
+    /// * It is NOT UNIQUE. Several live windows share one key with different
+    ///   [`LeaseBinding`]s, so revoking "the row I tapped" by key would kill
+    ///   unseen siblings.
+    /// * It is a DURABLE CORRELATOR: a hash of the caller's ancestor
+    ///   code-identity chain plus the rule, describing the shape of the machine,
+    ///   outliving the window and surviving in phone storage across re-pairs.
+    ///
+    /// So the remote path names this instead, exactly
+    /// ([`LeaseStore::revoke_id`]), and the grant key never leaves the Mac.
+    ///
+    /// Random rather than a granted-at timestamp: two windows granted in the same
+    /// millisecond would share a timestamp, a clock is a thing that moves, and
+    /// [`LeaseStore::grant`] does not re-stamp `granted` on a refresh, so a
+    /// re-approved window would carry the original instant and a stale revoke
+    /// would still land on it.
+    id: [u8; 16],
     binding: LeaseBinding,
+    /// The daemon-rendered coverage label for the rule this window covers, e.g.
+    /// `op read`. Display only, and deliberately NOT part of [`LeaseBinding`]:
+    /// the binding is the lookup key, and a description of a window must never be
+    /// able to widen, narrow, or split it. Empty when none was rendered.
+    covers: String,
     token: Token,
     granted: Instant,
     expires: Instant,
@@ -262,12 +579,57 @@ struct Lease {
 #[derive(Debug, Clone)]
 pub struct LeaseInfo {
     pub grant_hex: String,
+    /// This window's opaque id as lowercase hex (32 chars). Unlike
+    /// [`Self::grant_hex`] it names ONE window, is unique across windows, and is
+    /// derived from nothing, so it is the only identifier safe to hand to a remote
+    /// controller. See [`Lease::id`].
+    pub lease_id: String,
     pub account: String,
     /// The rule name the lease covers. Display must make the breadth plain: the
     /// lease covers any command that rule matches, not the one that opened it.
     pub scope: String,
+    /// What that rule matches, in the daemon's own words (`op read`,
+    /// `op with --account "rowmhq.1password.eu"`, …): the same string the approver
+    /// consented to, so the CLI states the breadth instead of gesturing at it.
+    /// Empty when the daemon rendered none.
+    pub covers: String,
     pub remaining: Duration,
     pub age: Duration,
+}
+
+/// The character width of a lease id in hex. Mirrors
+/// [`sigil_proto::LEASE_ID_CHARS`]; asserted equal in the tests below so the two
+/// crates can never drift into disagreeing about what an id is.
+const LEASE_ID_HEX_CHARS: usize = 32;
+
+/// The only capabilities the remote (phone) lease-control path is given.
+///
+/// This trait exists to make a class of bug **structurally impossible** rather
+/// than merely absent. The daemon's remote approver holds one of these, not a
+/// [`LeaseStore`], so no code reachable from an inbound network message can call
+/// [`LeaseStore::grant`], [`LeaseStore::revoke`] (the prefix-matched CLI path),
+/// [`LeaseStore::token_for`] (which hands out cached credential values), or
+/// anything else the store can do. A future edit that wanted to would have to
+/// widen this trait, which is a visible, reviewable act.
+///
+/// Read the two methods as the whole authority granted to a paired phone: it may
+/// see which windows are open, and it may close one. It may never open one,
+/// extend one, or read what one holds.
+pub trait LeaseControl: Send + Sync {
+    /// Active windows, newest first, for display on the approver.
+    fn list(&self) -> Vec<LeaseInfo>;
+    /// Close exactly the window named by this opaque id; see
+    /// [`LeaseStore::revoke_id`].
+    fn revoke_id(&self, lease_id: &str) -> bool;
+}
+
+impl LeaseControl for LeaseStore {
+    fn list(&self) -> Vec<LeaseInfo> {
+        LeaseStore::list(self)
+    }
+    fn revoke_id(&self, lease_id: &str) -> bool {
+        LeaseStore::revoke_id(self, lease_id)
+    }
 }
 
 /// All active leases. The tokens live only here, in RAM; every removal path
@@ -285,7 +647,19 @@ impl LeaseStore {
     /// Grant (or refresh) a lease for `grant` + `binding` with `ttl`. Refreshing
     /// replaces the cached token, so the newest approval's values are the ones
     /// served (the old ones are dropped, and so zeroized).
-    pub fn grant(&self, grant: [u8; 32], binding: &LeaseBinding, token: Token, ttl: Duration) {
+    ///
+    /// `covers` is the display-only coverage label for the rule the binding names
+    /// (see [`Lease::covers`]). It never participates in the match, so it cannot
+    /// change which runs a window serves; a refresh re-stamps it so the readout
+    /// follows the latest approval rather than the first one.
+    pub fn grant(
+        &self,
+        grant: [u8; 32],
+        binding: &LeaseBinding,
+        covers: &str,
+        token: Token,
+        ttl: Duration,
+    ) {
         let now = Instant::now();
         let mut leases = self.inner.lock().expect("lease store poisoned");
         leases.retain(|l| l.expires > now);
@@ -294,12 +668,20 @@ impl LeaseStore {
             .find(|l| l.grant == grant && &l.binding == binding)
         {
             l.token = token;
+            l.covers = covers.to_string();
             l.expires = now + ttl;
+            // The id is deliberately NOT re-minted. A refresh extends the one
+            // window the human is already looking at, so a revoke they aimed at it
+            // before the refresh must still land. A new id is minted only when a
+            // window genuinely ended and a fresh approval opened another, which is
+            // exactly the case a stale revoke must not reach.
             return;
         }
         leases.push(Lease {
             grant,
+            id: new_lease_id(),
             binding: binding.clone(),
+            covers: covers.to_string(),
             token,
             granted: now,
             expires: now + ttl,
@@ -329,8 +711,10 @@ impl LeaseStore {
             .iter()
             .map(|l| LeaseInfo {
                 grant_hex: hex32(&l.grant),
+                lease_id: hex16(&l.id),
                 account: l.binding.account.clone(),
                 scope: l.binding.scope.clone(),
+                covers: l.covers.clone(),
                 remaining: l.expires.saturating_duration_since(now),
                 age: now.saturating_duration_since(l.granted),
             })
@@ -346,6 +730,44 @@ impl LeaseStore {
         let before = leases.len();
         leases.retain(|l| !hex32(&l.grant).starts_with(prefix));
         before - leases.len()
+    }
+
+    /// Revoke the ONE live lease whose opaque id is exactly `lease_id`. Returns
+    /// whether one was found and zeroized.
+    ///
+    /// This is the remote (phone) revoke path, and it is deliberately unlike
+    /// [`revoke`](Self::revoke) in every respect that matters:
+    ///
+    /// * **Exact, not prefix.** A prefix is a convenience for a human typing at a
+    ///   terminal who can see what they are aiming at. A message off the network
+    ///   gets no such latitude, and the reason is concrete: `"".starts_with(p)`
+    ///   holds for every string, so a truncated or empty identifier reaching the
+    ///   prefix API would be a silent global lease wipe reported as a success.
+    ///   The width is re-checked here rather than trusted from the caller.
+    /// * **Keyed on the opaque id, never the grant key.** A grant key is
+    ///   deterministic and shared across windows; the id names exactly one window
+    ///   and nothing that will exist later ([`Lease::id`]). That is what makes a
+    ///   captured revoke, re-flown after a restart against an empty replay guard,
+    ///   inert rather than dangerous.
+    ///
+    /// Expired leases are purged (and zeroized) first, so a window that lapsed on
+    /// its own reports `false` exactly like one that was never held. The caller
+    /// must not distinguish the reasons for `false`; see
+    /// [`LeaseRevokeReply`](sigil_proto::LeaseRevokeReply).
+    pub fn revoke_id(&self, lease_id: &str) -> bool {
+        // An id that is not exactly-width lowercase hex cannot name a window this
+        // store minted, so refuse before touching anything. Belt to the proto's
+        // braces: neither layer relies on the other having checked.
+        if lease_id.len() != LEASE_ID_HEX_CHARS || !lease_id.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return false;
+        }
+        let now = Instant::now();
+        let mut leases = self.inner.lock().expect("lease store poisoned");
+        leases.retain(|l| l.expires > now);
+        let before = leases.len();
+        leases.retain(|l| hex16(&l.id) != lease_id);
+        before != leases.len()
     }
 
     /// Revoke every lease whose scope is exactly `scope`. The config-change path:
@@ -378,11 +800,29 @@ impl LeaseStore {
 
 /// Lowercase hex of a 32-byte key.
 pub fn hex32(bytes: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
+    hex(bytes)
+}
+
+/// Lowercase hex of a 16-byte lease instance id.
+pub fn hex16(bytes: &[u8; 16]) -> String {
+    hex(bytes)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// A fresh opaque lease id from the OS CSPRNG. See [`Lease::id`] for why this is
+/// random rather than a timestamp or a counter.
+fn new_lease_id() -> [u8; 16] {
+    use rand_core::RngCore;
+    let mut id = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut id);
+    id
 }
 
 /// The peer process id on the far end of a unix socket, verified by the kernel.
@@ -432,56 +872,244 @@ pub fn peer_pid(_fd: std::os::fd::RawFd) -> Option<i32> {
     None
 }
 
-/// The real process table: sysctl for ancestry, `proc_pidpath` for the exe, a
-/// BLAKE2b of the executable bytes for the code identity (interim stand-in for
-/// the code-signing identity; see the module NEEDS-VERIFICATION note).
+/// The real process table: `proc_pidinfo` for ancestry, and the platform's own
+/// code identity of the RUNNING image for both the path and the measurement.
+///
+/// Nothing is measured from a path and nothing is memoized. A cache would have
+/// to be keyed on something, and every candidate key is either forgeable by the
+/// file's owner (any stat field) or a claim about a file rather than about a
+/// running process; being told an ancestor is code it is no longer running is
+/// exactly the failure this measurement exists to avoid. Measuring afresh costs
+/// fractions of a millisecond per ancestor (see [`measure_running_image`]),
+/// which is noise beside the `op` child the request goes on to spawn.
 pub struct SysProcessTable;
+
+/// Measure the image running as `pid`: its executable path and its code
+/// identity, both off the one guest code object the platform vouched for.
+///
+/// `Err` when the platform will not answer for that pid at all (it exited, its
+/// image is gone) or will not vouch for the image (the file at its path was
+/// replaced after exec, `-67034 errSecCSStaticCodeChanged`). The caller keeps
+/// the process in the chain, under [`IdentityMeasure::Unmeasured`] and keyed to
+/// the process instance, and says so out loud.
+///
+/// Cost, measured on an M-series Mac (release build, no cache anywhere): 0.15ms
+/// for an ad-hoc Homebrew binary, 0.47ms for `/bin/zsh`, 1.2-2.1ms for a large
+/// Developer-ID binary, and **6.3ms for a whole real 6-deep chain** (login, zsh,
+/// claude, zsh, cargo, leaf) on every gated command. That is an order of
+/// magnitude below the `op` child the command goes on to spawn (40-90ms for
+/// `op --version` alone, more for a real read) and two below the 236ms the
+/// original unconditional content hash cost on the same chain.
+#[cfg(target_os = "macos")]
+fn measure_running_image(
+    pid: i32,
+) -> Result<(PathBuf, CodeIdentity), crate::peercode::GuestFailure> {
+    let m = crate::peercode::measure_guest(pid)?;
+    Ok((m.exe, CodeIdentity::from_cdhash(&m.cdhash, m.adhoc)))
+}
+
+/// One ancestor the platform would not describe, remembered so a human can find
+/// out why their approvals came back.
+///
+/// Non-secret by construction: a pid, a start time, an executable path and a
+/// fixed reason string. It never leaves the machine (`sigil doctor` reads it
+/// over the local control socket) and it holds nothing about the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmeasuredNote {
+    pub pid: i32,
+    pub started: ProcessStart,
+    pub exe: PathBuf,
+    pub reason: crate::peercode::GuestFailure,
+}
+
+impl UnmeasuredNote {
+    /// The ancestor's short name, for a one-line report.
+    pub fn name(&self) -> String {
+        self.exe
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.pid.to_string())
+    }
+}
+
+/// Cap on remembered notes. A handful of ancestors go unmeasurable in a long
+/// session; this exists only so a process churning through unmeasurable
+/// executables cannot grow the daemon. The oldest is evicted, which at worst
+/// costs a repeated log line later.
+const UNMEASURED_NOTES_MAX: usize = 64;
+
+fn unmeasured_registry() -> &'static Mutex<Vec<UnmeasuredNote>> {
+    static NOTES: std::sync::OnceLock<Mutex<Vec<UnmeasuredNote>>> = std::sync::OnceLock::new();
+    NOTES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Every ancestor this daemon has failed to measure, oldest first.
+pub fn unmeasured_notes() -> Vec<UnmeasuredNote> {
+    unmeasured_registry()
+        .lock()
+        .expect("unmeasured registry poisoned")
+        .clone()
+}
+
+/// The unmeasurable ancestors that are still running, for a report about the
+/// state a human is in RIGHT NOW rather than about everything that ever
+/// happened. The process instance is checked, not just the pid: a recycled pid
+/// is a different process and its predecessor's note is history, not news.
+pub fn live_unmeasured_notes() -> Vec<UnmeasuredNote> {
+    unmeasured_notes()
+        .into_iter()
+        .filter(still_running)
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn still_running(note: &UnmeasuredNote) -> bool {
+    start_time(note.pid) == Some(note.started)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn still_running(_note: &UnmeasuredNote) -> bool {
+    false
+}
+
+/// Record an unmeasurable ancestor and log it ONCE per executable and reason.
+///
+/// Once, not once per command: a gated command walks the same chain every time,
+/// and an ancestor that will not measure now will not measure for the rest of its
+/// life, so per-command logging would bury the daemon log in a repetition that
+/// says nothing new.
+///
+/// The dedup key is the PATH plus the reason, not the process instance, which is
+/// R4-F3. An instance key is right for a long-lived ancestor and degenerate for
+/// the leaf: the shim is a fresh process per gated command, so a build whose shim
+/// will not measure (an unsigned x86_64 one, where every process answers `-5`)
+/// used to emit a line and consume a registry slot per command, and the 64-slot
+/// cap then evicted the long-lived note `sigil doctor` exists to surface. Keyed
+/// by path, that whole class collapses to one entry and one line, and the entry
+/// is REFRESHED to the newest instance so the row keeps naming a process that is
+/// actually running. Nothing is lost: the actionable content of the line is the
+/// path and the reason, and the pid is only there to find it with.
+fn note_unmeasured(note: UnmeasuredNote) {
+    let mut notes = unmeasured_registry()
+        .lock()
+        .expect("unmeasured registry poisoned");
+    if let Some(seen) = notes
+        .iter_mut()
+        .find(|n| n.exe == note.exe && n.reason == note.reason)
+    {
+        // Same problem, newer process: keep the row current and stay quiet.
+        *seen = note;
+        return;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    eprintln!(
+        "sigil daemon: [{ts}] caller ancestor not measurable \u{b7} {} \u{b7} pid {} \u{b7} {} \u{b7} \
+         leases under it are keyed to this process, not to its code",
+        note.exe.display(),
+        note.pid,
+        note.reason.explain(),
+    );
+    if notes.len() >= UNMEASURED_NOTES_MAX {
+        let doomed = doomed_index(&notes, still_running);
+        notes.remove(doomed);
+    }
+    notes.push(note);
+}
+
+/// Which note the registry drops when it is full: the first whose process is
+/// over, and only if every note is still live, the oldest.
+///
+/// Eviction order matters because the registry's whole job is answering "what is
+/// the human in RIGHT NOW" (`sigil doctor` reads only the live notes). A note
+/// about a process that has exited is history and costs nothing to drop; dropping
+/// a live one loses the row that was going to explain why approvals came back.
+fn doomed_index(notes: &[UnmeasuredNote], live: impl Fn(&UnmeasuredNote) -> bool) -> usize {
+    notes.iter().position(|n| !live(n)).unwrap_or_default()
+}
+
+/// The kernel's BSD info for `pid`: parent, start time, and the rest.
+#[cfg(target_os = "macos")]
+fn bsdinfo(pid: i32) -> Option<libc::proc_bsdinfo> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info` and returns
+    // the count written, or <= 0 on failure.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    (n >= size).then_some(info)
+}
+
+/// The executable path `proc_pidpath` reports for `pid`. Used only where the
+/// platform would not describe the image: the measured path always comes off the
+/// guest object instead.
+#[cfg(target_os = "macos")]
+fn proc_path(pid: i32) -> Option<PathBuf> {
+    let mut buf = [0u8; 4096];
+    // SAFETY: proc_pidpath writes at most buf.len() bytes and returns the
+    // length written, or <= 0 on failure.
+    let n =
+        unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    let s = std::str::from_utf8(&buf[..n as usize]).ok()?;
+    Some(PathBuf::from(s))
+}
 
 #[cfg(target_os = "macos")]
 impl ProcessTable for SysProcessTable {
     fn parent(&self, pid: i32) -> Option<i32> {
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        // SAFETY: proc_pidinfo writes at most `size` bytes into `info` and
-        // returns the count written, or <= 0 on failure.
-        let n = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                &mut info as *mut _ as *mut libc::c_void,
-                size,
-            )
-        };
-        if n < size {
-            return None;
-        }
-        let ppid = info.pbi_ppid as i32;
+        let ppid = bsdinfo(pid)?.pbi_ppid as i32;
         (ppid > 0).then_some(ppid)
     }
 
-    fn exe(&self, pid: i32) -> Option<PathBuf> {
-        let mut buf = [0u8; 4096];
-        // SAFETY: proc_pidpath writes at most buf.len() bytes and returns the
-        // length written, or <= 0 on failure.
-        let n = unsafe {
-            libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32)
+    fn resolve(&self, pid: i32) -> Option<(PathBuf, CodeIdentity)> {
+        let failure = match measure_running_image(pid) {
+            Ok(resolved) => return Some(resolved),
+            Err(failure) => failure,
         };
-        if n <= 0 {
-            return None;
-        }
-        let s = std::str::from_utf8(&buf[..n as usize]).ok()?;
-        Some(PathBuf::from(s))
+        // The platform would not describe this process's image. It still gets a
+        // name in the chain, because the human on the phone should see the whole
+        // tree that reached the daemon, and it still gets an identity, because a
+        // self-updating tool that deletes its own binary mid-session is the
+        // common cause and must not silently cost the session its leases. That
+        // identity is the process INSTANCE (pid plus kernel start time), so it
+        // holds while this process lives and no new process can inherit it.
+        //
+        // Both halves have to come from the kernel. Without a start time there is
+        // no instance to key on, so the walk truncates here rather than keying on
+        // a pid that recycles; a shorter chain is a different grant key, never a
+        // wider one.
+        let started = start_time(pid)?;
+        let exe = proc_path(pid)?;
+        note_unmeasured(UnmeasuredNote {
+            pid,
+            started,
+            exe: exe.clone(),
+            reason: failure,
+        });
+        Some((exe, CodeIdentity::unmeasured(pid, started)))
     }
+}
 
-    fn identity(&self, pid: i32) -> [u8; 32] {
-        match self.exe(pid).and_then(|p| std::fs::read(p).ok()) {
-            Some(bytes) => Blake2b256::digest(&bytes).into(),
-            // Unreadable exe: bind the pid's path string so the chain is still
-            // distinct rather than colliding on a zero identity.
-            None => Blake2b256::digest(pid.to_le_bytes()).into(),
-        }
-    }
+/// The kernel's start time for `pid`.
+#[cfg(target_os = "macos")]
+fn start_time(pid: i32) -> Option<ProcessStart> {
+    let info = bsdinfo(pid)?;
+    Some(ProcessStart {
+        sec: info.pbi_start_tvsec,
+        usec: info.pbi_start_tvusec as u32,
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -489,11 +1117,8 @@ impl ProcessTable for SysProcessTable {
     fn parent(&self, _pid: i32) -> Option<i32> {
         None
     }
-    fn exe(&self, _pid: i32) -> Option<PathBuf> {
+    fn resolve(&self, _pid: i32) -> Option<(PathBuf, CodeIdentity)> {
         None
-    }
-    fn identity(&self, pid: i32) -> [u8; 32] {
-        Blake2b256::digest(pid.to_le_bytes()).into()
     }
 }
 
@@ -501,20 +1126,21 @@ impl ProcessTable for SysProcessTable {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use zeroize::Zeroizing;
 
     /// Synthetic process tree for exercising the ancestry walk deterministically.
     struct MapTable {
         parent: HashMap<i32, i32>,
         exe: HashMap<i32, PathBuf>,
-        ident: HashMap<i32, [u8; 32]>,
+        ident: HashMap<i32, CodeIdentity>,
     }
 
     impl MapTable {
         fn node(&mut self, pid: i32, ppid: i32, exe: &str, id: u8) {
             self.parent.insert(pid, ppid);
             self.exe.insert(pid, PathBuf::from(exe));
-            self.ident.insert(pid, [id; 32]);
+            self.ident.insert(pid, CodeIdentity::content([id; 32]));
         }
     }
 
@@ -522,11 +1148,14 @@ mod tests {
         fn parent(&self, pid: i32) -> Option<i32> {
             self.parent.get(&pid).copied()
         }
-        fn exe(&self, pid: i32) -> Option<PathBuf> {
-            self.exe.get(&pid).cloned()
-        }
-        fn identity(&self, pid: i32) -> [u8; 32] {
-            self.ident.get(&pid).copied().unwrap_or([0u8; 32])
+        fn resolve(&self, pid: i32) -> Option<(PathBuf, CodeIdentity)> {
+            let exe = self.exe.get(&pid).cloned()?;
+            let identity = self
+                .ident
+                .get(&pid)
+                .copied()
+                .unwrap_or_else(|| CodeIdentity::content([0u8; 32]));
+            Some((exe, identity))
         }
     }
 
@@ -666,6 +1295,11 @@ mod tests {
     fn different_caller_chains_do_not_share_a_rule_lease() {
         // Same rule, different tool tree: the lease must not carry across. This
         // is the whole security boundary now that argv and cwd are out of the key.
+        //
+        // What it proves is separation between HONEST trees, and only that. It is
+        // not a claim that a tree cannot be imitated: every input to the key is
+        // reconstructible by anyone who can exec the same binaries from the same
+        // paths in the same nesting (see the module docs, R4-F1).
         let mine = walk_ancestry(&tree(), 300);
         let mut other = tree();
         other.node(300, 200, "/opt/homebrew/bin/op", 3);
@@ -678,7 +1312,9 @@ mod tests {
 
         // And a tampered ancestor (same paths, different code identity) too.
         let mut tampered = tree();
-        tampered.ident.insert(200, [0x42; 32]);
+        tampered
+            .ident
+            .insert(200, CodeIdentity::content([0x42; 32]));
         assert_ne!(
             rule_key(&mine, "op"),
             rule_key(&walk_ancestry(&tampered, 300), "op"),
@@ -695,12 +1331,538 @@ mod tests {
 
         // A different ancestor identity (e.g. a tampered claude) must move it.
         let mut t = tree();
-        t.ident.insert(200, [0x42; 32]);
+        t.ident.insert(200, CodeIdentity::content([0x42; 32]));
         assert_ne!(
             base,
             grant_key(&walk_ancestry(&t, 300), CMD, "/p", "s"),
             "ancestor code identity must matter"
         );
+    }
+
+    // ---- Ancestor code identity: the platform measure and its fallback ----
+
+    /// A scratch dir for the measurement tests, unique per test and per process.
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("sigil-measure-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("scratch dir");
+        d
+    }
+
+    #[test]
+    fn the_measures_are_domain_separated_in_the_grant_key() {
+        // The core of the change: identical 32 bytes under different measures
+        // must not derive one key. This is what makes a binary that gains a real
+        // signature a DIFFERENT caller rather than silently the same one, and
+        // what stops an ad-hoc cdhash from ever reading as a signing identity.
+        let digest = [0x5a; 32];
+        let mk = |identity: CodeIdentity| Caller {
+            chain: vec![Ancestor {
+                pid: 42,
+                exe: PathBuf::from("/opt/homebrew/bin/op"),
+                identity,
+            }],
+        };
+        let with = |measure| CodeIdentity { measure, digest };
+        let key = |i: CodeIdentity| grant_key(&mk(i), CMD, "", "op");
+        let measures = [
+            IdentityMeasure::Signed,
+            IdentityMeasure::AdHoc,
+            IdentityMeasure::Content,
+            IdentityMeasure::Unmeasured,
+        ];
+        for (i, a) in measures.iter().enumerate() {
+            for b in &measures[i + 1..] {
+                assert_ne!(
+                    key(with(*a)),
+                    key(with(*b)),
+                    "{a:?} and {b:?} share 32 bytes but must not share a key"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_cdhash_measurement_is_stable_and_distinguishing() {
+        // The fold from a 20-byte cdhash to the 32 the chain carries must be a
+        // function of the cdhash and nothing else, and must separate cdhashes.
+        let a = CodeIdentity::from_cdhash(&[1u8; 20], false);
+        assert_eq!(a, CodeIdentity::from_cdhash(&[1u8; 20], false));
+        assert_eq!(a.measure, IdentityMeasure::Signed);
+        assert_ne!(
+            a.digest,
+            CodeIdentity::from_cdhash(&[2u8; 20], false).digest
+        );
+        // Length is bound in, so a short cdhash cannot be a prefix of a long one.
+        assert_ne!(
+            a.digest,
+            CodeIdentity::from_cdhash(&[1u8; 21], false).digest
+        );
+        // Ad-hoc is a different KIND of claim about the same bytes: same digest,
+        // different measure, and the grant key separates them.
+        let adhoc = CodeIdentity::from_cdhash(&[1u8; 20], true);
+        assert_eq!(adhoc.digest, a.digest);
+        assert_eq!(adhoc.measure, IdentityMeasure::AdHoc);
+    }
+
+    #[test]
+    fn an_unmeasured_ancestor_is_keyed_to_one_process_instance() {
+        // The weaker branch, and exactly how weak. An ancestor the platform will
+        // not describe is keyed to the process instance: the same live process
+        // keeps its window (the point -- a tool that deleted its own binary
+        // mid-session must not silently cost the session its leases), while a
+        // recycled pid must NOT inherit it, which is what the start time is for.
+        let start = ProcessStart {
+            sec: 1_770_000_000,
+            usec: 123_456,
+        };
+        let later = ProcessStart {
+            usec: start.usec + 1,
+            ..start
+        };
+        assert_eq!(
+            CodeIdentity::unmeasured(100, start).digest,
+            CodeIdentity::unmeasured(100, start).digest,
+            "one process instance keeps one identity while it lives"
+        );
+        assert_ne!(
+            CodeIdentity::unmeasured(100, start).digest,
+            CodeIdentity::unmeasured(100, later).digest,
+            "a recycled pid must not inherit the previous process's window"
+        );
+        assert_ne!(
+            CodeIdentity::unmeasured(100, start).digest,
+            CodeIdentity::unmeasured(101, start).digest,
+            "and a different pid is a different instance"
+        );
+        assert_eq!(
+            CodeIdentity::unmeasured(100, start).measure,
+            IdentityMeasure::Unmeasured,
+            "it keeps its own measure tag, never Signed and never AdHoc"
+        );
+
+        // Such a chain may still lease. The only caller that may not is one with
+        // no identity at all, because every one of those derives the same key.
+        let ancestor = |identity| Ancestor {
+            pid: 7,
+            exe: PathBuf::from("/bin/zsh"),
+            identity,
+        };
+        let measured = Caller {
+            chain: vec![
+                ancestor(CodeIdentity::from_cdhash(&[9u8; 20], false)),
+                ancestor(CodeIdentity::from_cdhash(&[8u8; 20], true)),
+            ],
+        };
+        assert!(measured.may_lease());
+        assert!(measured.unmeasured().is_empty());
+
+        let mut mixed = measured.clone();
+        mixed
+            .chain
+            .push(ancestor(CodeIdentity::unmeasured(7, start)));
+        assert!(mixed.may_lease(), "an unmeasured ancestor still leases");
+        assert_eq!(
+            mixed.unmeasured().len(),
+            1,
+            "but it is reported, so the state is visible rather than mysterious"
+        );
+        assert!(
+            !Caller { chain: vec![] }.may_lease(),
+            "a caller with no identity at all gets no window"
+        );
+    }
+
+    /// A live child to measure, killed when the guard drops.
+    #[cfg(target_os = "macos")]
+    struct Running(std::process::Child);
+
+    /// The long-lived process the swap test needs, spawned from a COPY of a
+    /// binary it may then overwrite. It has to be ad-hoc signed to run from an
+    /// arbitrary path at all (a copy of a platform binary is arm64e and the
+    /// kernel refuses to exec it outside the trust cache), and the one ad-hoc
+    /// binary a unit test can always find is itself. So the test binary is
+    /// copied and re-run pointed at this one ignored "test", which just sleeps.
+    /// Ignored, and inert unless the env var is set, so a plain `cargo test` and
+    /// even `cargo test -- --ignored` skip past it in microseconds.
+    #[cfg(target_os = "macos")]
+    const SLEEPER: &str = "lease::tests::a_sleeper_helper_for_the_swap_test";
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "helper process for the swap test, not a test"]
+    fn a_sleeper_helper_for_the_swap_test() {
+        if std::env::var_os("SIGIL_TEST_SLEEPER").is_some() {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Running {
+        /// A copy of this test binary, running the sleeper helper above.
+        fn sleeper_at(path: &std::path::Path) -> Self {
+            std::fs::copy(std::env::current_exe().expect("current exe"), path)
+                .expect("copy an ad-hoc signed binary to the victim path");
+            let child = std::process::Command::new(path)
+                .args(["--exact", SLEEPER, "--ignored", "--test-threads=1"])
+                .env("SIGIL_TEST_SLEEPER", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Self(child)
+        }
+
+        fn spawn(exe: &std::path::Path) -> Self {
+            let child = std::process::Command::new(exe)
+                .arg("30")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn");
+            // Give the child time to exec; before that it is still a fork of the
+            // test binary and would measure as the test binary.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Self(child)
+        }
+        fn pid(&self) -> i32 {
+            self.0.id() as i32
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_running_signed_binary_measures_as_the_platform_identity() {
+        // /bin/sleep is signed by the platform, so the measurement must come
+        // from the code signature of the RUNNING image, and the path must come
+        // off that same object rather than from a second lookup.
+        let sleeper = Running::spawn(std::path::Path::new("/bin/sleep"));
+        let (exe, id) =
+            measure_running_image(sleeper.pid()).expect("a live system binary measures");
+        assert_eq!(exe, std::path::Path::new("/bin/sleep"));
+        assert_eq!(
+            id.measure,
+            IdentityMeasure::Signed,
+            "a platform binary has a signer"
+        );
+        let content: [u8; 32] = Blake2b256::digest(std::fs::read("/bin/sleep").unwrap()).into();
+        assert_ne!(id.digest, content, "it is the cdhash, not the bytes");
+
+        // Stability is the whole point (an unstable measure means a fresh
+        // approval per command), and two binaries must never land on one
+        // identity.
+        assert_eq!(
+            measure_running_image(sleeper.pid()).map(|(_, i)| i),
+            Ok(id),
+            "the same process measures the same way twice"
+        );
+        let other = Running::spawn(std::path::Path::new("/usr/bin/yes"));
+        let (_, id2) = measure_running_image(other.pid()).expect("also signed");
+        assert_ne!(id.digest, id2.digest, "two binaries, two identities");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_ad_hoc_process_measures_under_its_own_tag() {
+        // This test binary is linker/ad-hoc signed: a signature with no signer,
+        // whose cdhash asserts nothing a hash of the bytes does not. Reporting
+        // it as a platform identity would overstate it.
+        let (exe, id) =
+            measure_running_image(std::process::id() as i32).expect("this process measures");
+        assert_eq!(exe, std::env::current_exe().expect("current exe"));
+        assert_eq!(
+            id.measure,
+            IdentityMeasure::AdHoc,
+            "an ad-hoc signature is not a signing identity"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_pid_that_names_no_process_yields_no_identity_at_all() {
+        // A pid that names nothing is not "unmeasured", it is nothing: there is
+        // no process instance to key on, so the walk truncates rather than
+        // inventing an identity, and a caller with an empty chain gets no window.
+        assert_eq!(
+            measure_running_image(0),
+            Err(crate::peercode::GuestFailure::NoLiveImage)
+        );
+        assert_eq!(SysProcessTable.resolve(0), None);
+        assert!(
+            !walk_ancestry(&SysProcessTable, 0).may_lease(),
+            "a caller with no identity at all gets no window"
+        );
+
+        // The daemon's own chain, on the other hand, measures end to end: this is
+        // the shape a real gated command arrives in, and it is what keeps the
+        // unmeasured branch rare rather than routine.
+        let me = walk_ancestry(&SysProcessTable, std::process::id() as i32);
+        assert!(!me.chain.is_empty(), "this process has ancestors");
+        assert!(me.may_lease());
+        assert!(
+            me.unmeasured().is_empty(),
+            "a normal live chain measures end to end: {}",
+            me.provenance()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn swapping_the_file_under_a_running_process_does_not_change_what_it_measures_as() {
+        // The regression this measurement exists to prevent, end to end and with
+        // a real second process. A caller who can write an ancestor's executable
+        // path used to be able to choose that ancestor's identity, victim's
+        // cdhash included, by replacing the file after exec: the static read
+        // reported the SUBSTITUTED binary. Measured on the live image instead,
+        // the platform refuses (-67034 errSecCSStaticCodeChanged) and the
+        // ancestor drops to an identity of its own process instance, which is
+        // nobody else's and is nothing the attacker chose.
+        let dir = scratch("swap");
+        let victim = dir.join("victim");
+        let running = Running::sleeper_at(&victim);
+        // The platform answers a fully resolved path (the scratch dir lives under
+        // the /var -> /private/var symlink), so compare against the same form.
+        let victim = victim.canonicalize().expect("canonical victim path");
+
+        let (exe, before) = measure_running_image(running.pid()).expect("measures while honest");
+        assert_eq!(exe, victim);
+        assert_eq!(
+            before.measure,
+            IdentityMeasure::AdHoc,
+            "a copy of this ad-hoc signed test binary measures as ad-hoc"
+        );
+
+        // The attack: put a different binary at that path while the process runs.
+        // This is what used to hand the caller `/bin/ls`'s identity for a process
+        // running none of that code. Rename-over rather than overwrite-in-place:
+        // both flavours are refused by the platform, but this one leaves the
+        // victim running, so the daemon's view of a live swapped ancestor is what
+        // gets asserted below.
+        let decoy = dir.join("decoy");
+        std::fs::copy("/bin/ls", &decoy).expect("stage the substitute");
+        std::fs::rename(&decoy, &victim).expect("rename the substitute over the exec path");
+
+        assert_eq!(
+            measure_running_image(running.pid()),
+            Err(crate::peercode::GuestFailure::ImageNotVouched),
+            "the platform must refuse to vouch for a swapped image"
+        );
+        let (path, id) = SysProcessTable
+            .resolve(running.pid())
+            .expect("the process is still named for the human");
+        assert_eq!(path, victim);
+        assert_eq!(
+            id.measure,
+            IdentityMeasure::Unmeasured,
+            "a swapped image measures as nothing, never as the substituted binary"
+        );
+        assert_ne!(
+            id.digest, before.digest,
+            "so a window opened before the swap does not survive it"
+        );
+        // What it drops to is this process instance and nothing else: the
+        // attacker gets an identity nobody holds, not the victim's.
+        let started = start_time(running.pid()).expect("a live process has a start time");
+        assert_eq!(id, CodeIdentity::unmeasured(running.pid(), started));
+        assert_ne!(
+            id.digest,
+            CodeIdentity::unmeasured(
+                running.pid(),
+                ProcessStart {
+                    usec: started.usec.wrapping_add(1),
+                    ..started
+                }
+            )
+            .digest,
+            "and it is the instance, not the pid, that fixes it"
+        );
+
+        // The daemon says so out loud rather than degrading silently, and while
+        // the process lives it is reported as the state the human is in now.
+        let note = live_unmeasured_notes()
+            .into_iter()
+            .find(|n| n.pid == running.pid())
+            .expect("the unmeasurable ancestor is recorded for `sigil doctor`");
+        assert_eq!(note.reason, crate::peercode::GuestFailure::ImageNotVouched);
+        assert_eq!(note.exe, victim);
+        assert_eq!(note.started, started);
+
+        // A note about a process that has since exited is history, not news.
+        let stale = UnmeasuredNote {
+            pid: running.pid(),
+            started: ProcessStart {
+                usec: started.usec.wrapping_add(1),
+                ..started
+            },
+            ..note
+        };
+        assert!(
+            !still_running(&stale),
+            "a recycled pid must not keep its predecessor's note alive"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R4-F3. The leaf of every chain is a fresh shim process per gated command,
+    /// so a build whose shim will not measure hits this once per command. Keyed
+    /// by process instance that was one log line and one registry slot each, and
+    /// the cap then evicted the long-lived note the report exists to carry.
+    #[test]
+    fn a_repeating_unmeasurable_executable_collapses_to_one_note() {
+        // A path no other test uses: the registry is process-wide.
+        let exe = PathBuf::from("/nonexistent/sigil-r4f3/shim");
+        for pid in 9_000..9_064 {
+            note_unmeasured(UnmeasuredNote {
+                pid,
+                started: ProcessStart {
+                    sec: 1_770_000_000 + u64::try_from(pid).unwrap_or(0),
+                    usec: 1,
+                },
+                exe: exe.clone(),
+                reason: crate::peercode::GuestFailure::ImageNotVouched,
+            });
+        }
+        let mine: Vec<UnmeasuredNote> = unmeasured_notes()
+            .into_iter()
+            .filter(|n| n.exe == exe)
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "64 runs of one unmeasurable executable must be one note, not 64"
+        );
+        // And the surviving note names the process that is running NOW, so the
+        // doctor row is about a live problem rather than a dead first sighting.
+        assert_eq!(mine[0].pid, 9_063);
+
+        // A second reason for the same path is a different problem and does speak
+        // up: the dedup is per path AND reason, not per path.
+        note_unmeasured(UnmeasuredNote {
+            pid: 9_100,
+            started: ProcessStart {
+                sec: 1_770_000_001,
+                usec: 2,
+            },
+            exe: exe.clone(),
+            reason: crate::peercode::GuestFailure::NoLiveImage,
+        });
+        assert_eq!(
+            unmeasured_notes().iter().filter(|n| n.exe == exe).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_full_registry_evicts_a_finished_process_before_a_live_one() {
+        let note = |pid| UnmeasuredNote {
+            pid,
+            started: ProcessStart {
+                sec: 1_770_000_000,
+                usec: 0,
+            },
+            exe: PathBuf::from(format!("/opt/tools/t{pid}")),
+            reason: crate::peercode::GuestFailure::NoIdentity,
+        };
+        let notes: Vec<UnmeasuredNote> = (1..=4).map(note).collect();
+
+        // The oldest is still running and the third has exited: the third goes,
+        // so the report keeps the state the human is actually in.
+        assert_eq!(doomed_index(&notes, |n| n.pid != 3), 2);
+        // Every note live: the cap still has to give, and it gives up the oldest.
+        assert_eq!(doomed_index(&notes, |_| true), 0);
+        assert_eq!(doomed_index(&[], |_| true), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stamp_preserving_rewrite_is_never_served_the_old_identity() {
+        // The R3-F2 regression, ported to the scheme that replaced the cache it
+        // was about. The old measurement cache was keyed on (path, dev, ino,
+        // size, mtime, mtime_nsec) -- every field settable by the file's owner,
+        // since ctime is the only one an in-place rewrite moves and it was not in
+        // the key. So a same-length patch plus `utimensat` was served the
+        // pre-patch identity for the daemon's lifetime. Here the same forgery is
+        // performed against a RUNNING process, and the measurement must not come
+        // back equal to the one taken before it.
+        use std::io::{Seek, Write};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = scratch("stamp-forge");
+        let victim = dir.join("victim");
+        let running = Running::sleeper_at(&victim);
+        let (_, before) = measure_running_image(running.pid()).expect("measures while honest");
+        let stamp = std::fs::metadata(&victim).expect("stat");
+
+        // Rewrite in place at exactly the same length with a DIFFERENT code
+        // identity (`/bin/ls`, zero-padded up to the victim's size), then restore
+        // mtime to the nanosecond. Same inode, same size, same mtime: the stamp
+        // is identical, and the identity at that path is now one the attacker
+        // chose. Note the weaker forgery is not enough here and should not be
+        // confused with this one: patching bytes UNDER an intact CodeDirectory
+        // does not move the cdhash at all, so it changes no identity, and running
+        // the patched pages is what the kernel refuses.
+        {
+            let mut substitute = std::fs::read("/bin/ls").expect("read a different binary");
+            assert!(substitute.len() < stamp.size() as usize);
+            substitute.resize(stamp.size() as usize, 0);
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&victim)
+                .expect("open the victim for writing");
+            f.seek(std::io::SeekFrom::Start(0)).expect("seek");
+            f.write_all(&substitute).expect("rewrite in place");
+        }
+        let ts = libc::timespec {
+            tv_sec: stamp.mtime(),
+            tv_nsec: stamp.mtime_nsec(),
+        };
+        let times = [ts, ts];
+        let c = std::ffi::CString::new(victim.as_os_str().as_bytes()).unwrap();
+        // SAFETY: utimensat reads the NUL-terminated path and the two-element
+        // timespec array, both of which outlive the call.
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(rc, 0, "the owner may always restore mtime");
+        let after_stamp = std::fs::metadata(&victim).expect("stat");
+        assert_eq!(
+            (
+                stamp.dev(),
+                stamp.ino(),
+                stamp.size(),
+                stamp.mtime(),
+                stamp.mtime_nsec()
+            ),
+            (
+                after_stamp.dev(),
+                after_stamp.ino(),
+                after_stamp.size(),
+                after_stamp.mtime(),
+                after_stamp.mtime_nsec()
+            ),
+            "every field the old cache keyed on is restored: this is the forgery"
+        );
+
+        // Either the platform refuses to vouch for the rewritten image, or the
+        // process is already gone; both leave the ancestor unmeasured. What must
+        // never happen is being handed the pre-rewrite identity again.
+        let served_old = match measure_running_image(running.pid()) {
+            Ok((_, id)) => id.digest == before.digest,
+            Err(_) => false,
+        };
+        assert!(
+            !served_old,
+            "different bytes must not be served the old measurement"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn token(s: &str) -> Token {
@@ -711,6 +1873,10 @@ mod tests {
     /// not matter here, only that grant and lookup agree (the daemon-level tests
     /// cover a generation actually moving).
     const GEN: u64 = 0;
+
+    /// The display-only coverage label a grant is stamped with. It is not part of
+    /// the binding, so every lookup below must succeed without naming it.
+    const COVERS: &str = "op read";
 
     /// A presence binding (what a plain gate stores).
     fn gate(account: &str, scope: &str) -> LeaseBinding {
@@ -723,7 +1889,7 @@ mod tests {
         let store = LeaseStore::new();
         let gk = rule_key(&walk_ancestry(&tree(), 300), "op");
         let b = gate("Rowm", "op");
-        store.grant(gk, &b, token("tok"), Duration::from_secs(60));
+        store.grant(gk, &b, COVERS, token("tok"), Duration::from_secs(60));
 
         assert_eq!(store.active(), 1);
         let t = store.token_for(&gk, &b).unwrap();
@@ -747,6 +1913,7 @@ mod tests {
         store.grant(
             gk,
             &sealed_then,
+            COVERS,
             token("TOKEN=old"),
             Duration::from_secs(60),
         );
@@ -761,11 +1928,38 @@ mod tests {
     }
 
     #[test]
+    fn coverage_is_carried_for_display_and_never_joins_the_lookup() {
+        // The label describes the window; the binding decides it. Two leases whose
+        // labels differ but whose bindings match are ONE lease, and a lookup that
+        // knows nothing about labels still hits: a description can never widen,
+        // narrow, or split a grant.
+        let store = LeaseStore::new();
+        let gk = rule_key(&walk_ancestry(&tree(), 300), "op");
+        let b = gate("Rowm", "op");
+        store.grant(gk, &b, COVERS, token("tok"), Duration::from_secs(60));
+        assert_eq!(store.list()[0].covers, COVERS);
+        assert_eq!(store.list()[0].scope, "op", "scope stays the rule name");
+        assert!(store.token_for(&gk, &b).is_some());
+
+        // A refresh under a re-rendered label (the rule was edited) re-stamps the
+        // readout without forking the window.
+        store.grant(
+            gk,
+            &b,
+            "op with --account rowm",
+            token("tok2"),
+            Duration::from_secs(60),
+        );
+        assert_eq!(store.active(), 1);
+        assert_eq!(store.list()[0].covers, "op with --account rowm");
+    }
+
+    #[test]
     fn lease_expires_and_is_purged() {
         let store = LeaseStore::new();
         let gk = [7u8; 32];
         let b = gate("Rowm", "s");
-        store.grant(gk, &b, token("tok"), Duration::from_millis(15));
+        store.grant(gk, &b, COVERS, token("tok"), Duration::from_millis(15));
         assert!(store.token_for(&gk, &b).is_some());
         std::thread::sleep(Duration::from_millis(30));
         assert!(store.token_for(&gk, &b).is_none());
@@ -780,11 +1974,279 @@ mod tests {
         let store = LeaseStore::new();
         let gk = [9u8; 32];
         let b = LeaseBinding::cached("prod-env", "deploy", "E1", GEN);
-        store.grant(gk, &b, token("TOKEN=live"), Duration::from_millis(15));
+        store.grant(
+            gk,
+            &b,
+            COVERS,
+            token("TOKEN=live"),
+            Duration::from_millis(15),
+        );
         assert_eq!(&store.token_for(&gk, &b).unwrap()[..], b"TOKEN=live");
         std::thread::sleep(Duration::from_millis(30));
         assert!(store.token_for(&gk, &b).is_none(), "the window lapsed");
         assert_eq!(store.active(), 0, "and the values were purged with it");
+    }
+
+    /// The opaque id is what lets a remote controller name ONE window rather than
+    /// a shape of window. Three properties make it worth having, and all three are
+    /// load-bearing for the phone's revoke path.
+    #[test]
+    fn a_lease_id_names_one_window_and_survives_a_refresh() {
+        // The two crates must agree on what an id is, or the daemon would reject
+        // ids the proto happily produced.
+        assert_eq!(LEASE_ID_HEX_CHARS, sigil_proto::LEASE_ID_CHARS);
+
+        let store = LeaseStore::new();
+        let gk = [0xa1; 32];
+        let b = gate("Rowm", "op");
+
+        // 1. Minted when the window opens, and opaque: 128 bits of lowercase hex
+        //    derived from nothing.
+        store.grant(gk, &b, COVERS, token("t"), Duration::from_secs(60));
+        let first = store.list()[0].lease_id.clone();
+        assert_eq!(first.len(), LEASE_ID_HEX_CHARS);
+        assert!(first
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+
+        // 2. Preserved across a REFRESH. A later approval under the same key
+        //    extends the window the human is already looking at; a revoke they
+        //    aimed at it before the refresh must still land.
+        store.grant(gk, &b, COVERS, token("t2"), Duration::from_secs(600));
+        assert_eq!(store.active(), 1, "a refresh does not open a second window");
+        assert_eq!(store.list()[0].lease_id, first, "same window, same id");
+
+        // 3. A genuinely NEW window gets a new id, even though the grant key is
+        //    deterministic and recurs. This is the whole point: the key cannot
+        //    distinguish yesterday's window from today's, and the id can.
+        assert!(store.revoke_id(&first));
+        store.grant(gk, &b, COVERS, token("t3"), Duration::from_secs(60));
+        assert_eq!(store.list()[0].grant_hex, hex32(&gk), "the key recurs");
+        assert_ne!(store.list()[0].lease_id, first, "the id does not");
+    }
+
+    /// **R7-F5: lease id PERMANENCE, which a remote controller reasons from.**
+    ///
+    /// The phone infers "a window absent from a later list has closed". That
+    /// inference is only sound if a live window's id never moves, so this pins the
+    /// property from the consumer's side rather than from the implementation's:
+    ///
+    /// * A live window appears in every snapshot under the SAME id, no matter what
+    ///   happens to other windows around it (grants, revokes, expiries, repeated
+    ///   listing). If an id could be re-minted for a continuing window, the phone
+    ///   would report a still-open window as closed, which is the dangerous
+    ///   direction.
+    /// * An id is never handed to a second window. If one could be reused, the
+    ///   phone could carry stale row state onto a window it never saw approved.
+    ///
+    /// There is exactly ONE assignment of `Lease::id` in this file (the insert in
+    /// `grant`), and nothing ever reassigns it; that is what makes the property
+    /// hold.
+    ///
+    /// **Who breaks if this changes:** `leaseListReceived` in
+    /// `apps/phone/src/state/store.ts`, which settles a pending revoke when a
+    /// later snapshot omits the window. Its comment names this test, and this one
+    /// names it back, because the coupling is invisible from either side alone: a
+    /// reader here would not guess that a phone is reasoning from it, and a reader
+    /// there cannot see what pins it. If a future change adds continuity by
+    /// reusing an id across re-grants, this test fails FIRST and that code starts
+    /// lying second. The two must be revisited together.
+    #[test]
+    fn a_live_window_keeps_its_id_and_a_dead_one_never_lends_it_out() {
+        let store = LeaseStore::new();
+        let gk = [0xf1; 32];
+        let b = gate("Rowm", "op");
+        store.grant(gk, &b, COVERS, token("t"), Duration::from_secs(60));
+        let watched = store.list()[0].lease_id.clone();
+
+        // Churn everything AROUND the watched window: other windows opened, other
+        // windows revoked by both paths, an unrelated window left to lapse, and a
+        // config-driven scope revoke. The watched id must not move once.
+        let id_of = |scope: &str| {
+            store
+                .list()
+                .into_iter()
+                .find(|l| l.scope == scope)
+                .map(|l| l.lease_id)
+        };
+        store.grant(
+            [0xf2; 32],
+            &gate("A", "other"),
+            COVERS,
+            token("a"),
+            Duration::from_secs(60),
+        );
+        store.grant(
+            [0xf3; 32],
+            &gate("B", "doomed"),
+            COVERS,
+            token("b"),
+            Duration::from_millis(10),
+        );
+        let other = id_of("other").expect("filed");
+        assert!(store.revoke_id(&other));
+        store.revoke_scope("nothing-matches-this");
+        std::thread::sleep(Duration::from_millis(30)); // the doomed one lapses
+        for _ in 0..5 {
+            assert_eq!(
+                id_of("op").as_deref(),
+                Some(watched.as_str()),
+                "a live window must appear under one unchanging id"
+            );
+        }
+        // A refresh is the case most likely to re-mint by accident.
+        store.grant(gk, &b, COVERS, token("t2"), Duration::from_secs(600));
+        assert_eq!(id_of("op").as_deref(), Some(watched.as_str()));
+
+        // And the converse the phone relies on: once the window is gone, its id is
+        // gone from every later snapshot, so an omission really does mean closed.
+        assert!(store.revoke_id(&watched));
+        assert_eq!(id_of("op"), None);
+
+        // No id is ever handed out twice, across many open/close cycles under the
+        // SAME grant key and binding (the shape that would recur in real use).
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(watched);
+        seen.insert(other);
+        for _ in 0..200 {
+            store.grant(gk, &b, COVERS, token("t"), Duration::from_secs(60));
+            let id = store.list()[0].lease_id.clone();
+            assert!(store.revoke_id(&id));
+            assert!(seen.insert(id), "a lease id was reused for a later window");
+        }
+    }
+
+    /// Two live windows can share ONE grant key with different bindings. That is
+    /// exactly why the grant key cannot be the remote revoke target: killing "the
+    /// row I tapped" by key would take unseen siblings with it. The id does not
+    /// have this problem, and this pins the difference.
+    #[test]
+    fn one_grant_key_can_hold_several_windows_and_ids_still_separate_them() {
+        let store = LeaseStore::new();
+        let gk = [0xd1; 32];
+        store.grant(
+            gk,
+            &LeaseBinding::cached("A", "rule", "src-1", GEN),
+            COVERS,
+            token("a"),
+            Duration::from_secs(60),
+        );
+        store.grant(
+            gk,
+            &LeaseBinding::cached("B", "rule", "src-2", GEN),
+            COVERS,
+            token("b"),
+            Duration::from_secs(60),
+        );
+        let rows = store.list();
+        assert_eq!(rows.len(), 2, "one key, two windows");
+        assert_eq!(rows[0].grant_hex, rows[1].grant_hex, "sharing the key");
+        assert_ne!(rows[0].lease_id, rows[1].lease_id, "but not the id");
+
+        // Revoking one by id leaves its sibling alone. A key-targeted revoke could
+        // not have made that distinction.
+        let doomed = rows[0].lease_id.clone();
+        let spared = rows[1].lease_id.clone();
+        assert!(store.revoke_id(&doomed));
+        let left = store.list();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].lease_id, spared);
+    }
+
+    /// The remote revoke path is exact and silent about misses, so a stale or
+    /// mis-aimed revoke can never take down a window it was not aimed at, and
+    /// never reveals what this daemon holds.
+    #[test]
+    fn revoke_by_id_is_exact_and_refuses_anything_prefix_shaped() {
+        let store = LeaseStore::new();
+        store.grant(
+            [0xb1; 32],
+            &gate("A", "rule-a"),
+            COVERS,
+            token("a"),
+            Duration::from_secs(60),
+        );
+        store.grant(
+            [0xb2; 32],
+            &gate("B", "rule-b"),
+            COVERS,
+            token("b"),
+            Duration::from_secs(60),
+        );
+        let rows = store.list();
+        let one = rows.iter().find(|l| l.scope == "rule-a").unwrap().clone();
+        let two = rows.iter().find(|l| l.scope == "rule-b").unwrap().clone();
+
+        // THE one that matters: an empty id must revoke NOTHING. The store's other
+        // revoke entry point is prefix-matched, and "" is a prefix of every string,
+        // so an empty identifier reaching that path would wipe every window and
+        // report success. This path refuses on width before it looks at anything.
+        assert!(!store.revoke_id(""));
+        assert_eq!(store.active(), 2, "an empty id is not a wildcard");
+
+        // Every other near miss is equally inert.
+        assert!(
+            !store.revoke_id(&one.lease_id[..8]),
+            "a prefix is not an id"
+        );
+        assert!(!store.revoke_id(&one.grant_hex), "a grant key is not an id");
+        assert!(!store.revoke_id(&format!("{}0", one.lease_id)), "too long");
+        assert!(!store.revoke_id(&"z".repeat(32)), "not hex");
+        assert!(!store.revoke_id(&"f".repeat(32)), "an id nobody minted");
+        assert_eq!(store.active(), 2, "no near miss killed anything");
+
+        // The exact id kills exactly one window, and only once.
+        assert!(store.revoke_id(&one.lease_id));
+        assert_eq!(store.active(), 1);
+        assert!(
+            !store.revoke_id(&one.lease_id),
+            "idempotent: revoking a dead window is a clean false, never an error"
+        );
+        assert_eq!(store.list()[0].lease_id, two.lease_id, "the other survives");
+    }
+
+    #[test]
+    fn revoke_by_id_reports_false_for_a_window_that_already_lapsed() {
+        // An expired window and a window that never existed must be
+        // indistinguishable, so the reply is not an oracle for what this daemon
+        // holds. Both are a bare `false`.
+        let store = LeaseStore::new();
+        store.grant(
+            [0xc1; 32],
+            &gate("Rowm", "op"),
+            COVERS,
+            token("t"),
+            Duration::from_millis(15),
+        );
+        let row = store.list()[0].clone();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!store.revoke_id(&row.lease_id));
+        assert!(!store.revoke_id(&"e".repeat(32)));
+    }
+
+    /// F9: the remote path's handle exposes exactly two capabilities. This is a
+    /// compile-time property, so the test is that the narrow handle type is what
+    /// the daemon actually passes -- a `dyn LeaseControl` cannot reach `grant`,
+    /// `token_for`, or the prefix-matched `revoke` at all.
+    #[test]
+    fn the_lease_control_handle_can_only_list_and_revoke_by_id() {
+        let store = Arc::new(LeaseStore::new());
+        store.grant(
+            [0xe1; 32],
+            &gate("Rowm", "op"),
+            COVERS,
+            token("t"),
+            Duration::from_secs(60),
+        );
+        let control: Arc<dyn LeaseControl> = store.clone();
+        assert_eq!(control.list().len(), 1);
+        let id = control.list()[0].lease_id.clone();
+        assert!(control.revoke_id(&id));
+        assert_eq!(control.list().len(), 0);
+        // `control.grant(..)`, `control.token_for(..)` and `control.revoke(..)` do
+        // not compile: the trait has two methods and neither creates or reads a
+        // window. The store itself still has them, for the CLI and the gate.
+        assert_eq!(store.active(), 0);
     }
 
     #[test]
@@ -793,12 +2255,14 @@ mod tests {
         store.grant(
             [1u8; 32],
             &gate("A", "s"),
+            COVERS,
             token("a"),
             Duration::from_secs(60),
         );
         store.grant(
             [2u8; 32],
             &gate("B", "s"),
+            COVERS,
             token("b"),
             Duration::from_secs(60),
         );
@@ -812,7 +2276,7 @@ mod tests {
         let store = LeaseStore::new();
         let gk = [0xabu8; 32];
         let b = gate("A", "s");
-        store.grant(gk, &b, token("a"), Duration::from_secs(60));
+        store.grant(gk, &b, COVERS, token("a"), Duration::from_secs(60));
         let prefix = &hex32(&gk)[..8];
         assert_eq!(store.revoke(prefix), 1);
         assert_eq!(store.active(), 0);
@@ -831,18 +2295,21 @@ mod tests {
         store.grant(
             [1u8; 32],
             &doomed,
+            COVERS,
             token("TOKEN=a"),
             Duration::from_secs(60),
         );
         store.grant(
             [2u8; 32],
             &doomed,
+            COVERS,
             token("TOKEN=b"),
             Duration::from_secs(60),
         );
         store.grant(
             [3u8; 32],
             &gate("", "op"),
+            COVERS,
             token(""),
             Duration::from_secs(60),
         );
@@ -858,8 +2325,8 @@ mod tests {
         let store = LeaseStore::new();
         let gk = [3u8; 32];
         let b = gate("A", "s");
-        store.grant(gk, &b, token("a"), Duration::from_secs(1));
-        store.grant(gk, &b, token("b"), Duration::from_secs(60));
+        store.grant(gk, &b, COVERS, token("a"), Duration::from_secs(1));
+        store.grant(gk, &b, COVERS, token("b"), Duration::from_secs(60));
         assert_eq!(store.active(), 1);
         assert_eq!(&store.token_for(&gk, &b).unwrap()[..], b"b");
     }

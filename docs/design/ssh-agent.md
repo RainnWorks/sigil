@@ -215,9 +215,27 @@ should say so.
 ## 4. Security notes for the security-reviewer
 
 - **Signatures are approval-gated identically to secrets.** A `SIGN_REQUEST` is an
-  authentication event and rides the same sealed/signed envelope + single-use
-  request id + monotonic counter + 90s window as an `op` release. Fail closed:
-  no approval, no signature.
+  authentication event and rides the same sealed and signed envelope as an `op`
+  release, behind the same two replay gates: a **150s freshness window**
+  (`REPLAY_WINDOW_MS`) on the sender timestamp, and a single-use request-id set
+  that accepts each uuidv7 once. The per-pairing counter is still on the wire and
+  still covered by the signature, but it **gates nothing**
+  (`replay.rs::check_and_record` does `let _ = counter`); it was retired because a
+  daemon restart or a phone session recreation reset it and it began rejecting
+  genuine, human-approved envelopes. Do not reintroduce it as a gate, and do not
+  cite it as one.
+  The residual, which matters more for a signature than for a read: **both
+  surviving gates are RAM-only on each end**, so a restart empties the seen-id
+  set. A captured `SIGN_RESPONSE` replayed inside its 150s window across a restart
+  clears both. What still stands behind them is **correlation**: the response
+  names the request it answered, and a response with no registered waiter is
+  dropped as stale (`remote.rs`). Do not credit the per-envelope ephemeral key
+  here. It is forward secrecy against sender-key compromise, not replay
+  resistance: a crypto_box ciphertext opens from the recipient's static key and
+  the ephemeral carried in the envelope, so nothing about it binds a captured
+  response to a request context. Any new message type whose safety depends on
+  matching an outstanding request needs its own correlation, not the envelope's.
+  Fail closed: no approval, no signature.
 - **Show a fingerprint, not raw bytes.** The `data` to sign is opaque and useless to
   a human. The phone screen must show a stable **hash of the data** (e.g. the same
   Blake2 fingerprint style already used), plus the derived destination (§3). Never

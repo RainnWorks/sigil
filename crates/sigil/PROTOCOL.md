@@ -21,8 +21,7 @@ operations so a compromised daemon cannot perform them. Therefore:
   (+ live subscription), history, approve/deny.
 - **CLI-only mutations (the Mac app shells out to `sigil … --json`):** account
   add/rotate/remove, **command config** (`config add|list|remove`), settings
-  get/set, wipe `--force`, mac-approvals `--enable|--phone-only`, shim
-  install/add, and **pairing** (`sigil pair --relay <url> --json`, an NDJSON
+  get/set, wipe `--force`, shim install/add, and **pairing** (`sigil pair --relay <url> --json`, an NDJSON
   ceremony stream). These write the keystore / `~/.sigil` and so are deliberately
   not daemon capabilities. Their `--json` shapes are in `JSON.md`.
 
@@ -101,10 +100,13 @@ the runtime facts (live leases, the pending set, the audit log).
 (`ssh-agent socket`) is informational (always `ok`).
 
 `LeaseJson`: `{ "grant_hex": str, "caller": str, "account": str, "scope": str,
-"granted_ms": int, "expires_ms": int }`. `scope` is the matched RULE's name: the
-lease covers any command that rule matches for the caller chain that opened it,
-not just the command line that did. Renderers must show that breadth (the CLI
-prints `<rule> · any matching command`).
+"covers": str, "granted_ms": int, "expires_ms": int }`. `scope` is the matched
+RULE's name: the lease covers any command that rule matches for the caller chain
+that opened it, not just the command line that did. `covers` is the daemon's
+coverage label (below) naming exactly what that rule matches, so renderers can
+state the breadth instead of gesturing at it; the CLI prints
+`<rule> · <covers>`, falling back to `<rule> · any matching command` when the
+daemon rendered no label.
 
 `PendingJson`:
 ```json
@@ -112,9 +114,54 @@ prints `<rule> · any matching command`).
   "secrets": [ { "provider": str, "segments": [str], "label": str } ],
   "ssh": { "key_label": str, "host": str, "fingerprint": str }?,
   "provenance": { "process_chain": [str], "cwd": str, "machine": str, "requested_ms": int },
-  "leasable": bool, "max_lease_secs": int?, "reason": str?,
+  "leasable": bool, "max_lease_secs": int?, "lease_covers": str?, "reason": str?,
   "expires_ms": int, "timeout_ms": int, "coalesced": int }
 ```
+
+### The lease coverage label (`covers`)
+
+A leasable request must tell the human **how wide the window is** before they
+open it. The daemon therefore renders one short string, the **coverage label**,
+and every surface shows that same string: the phone's approval sheet, the Mac,
+and `sigil lease list`. No renderer derives its own description of the breadth.
+
+- **Provenance.** Rendered by the daemon (`Match::coverage` in
+  `crates/sigil/src/config.rs`) from the **matched rule's own match conditions**
+  (`command`, `subcommand`, `argv_contains`, `flag_present`, `flag_equals`,
+  `arg_regex`) at resolve time. Those conditions are **user-authored config**, not
+  provider semantics, so carrying them does not dent the approver's
+  provider-blindness. It is never read from disk (a hand-edited `covers` in
+  `config.json` is ignored and overwritten), never taken from a client, and never
+  built from the argv that happened to trip the rule. A raw argv and a secret
+  reference can therefore never appear in it.
+- **Register.** `op read` (subcommand), `op with --account "rowmhq.1password.eu"`
+  (flag equality), `op with --vault` (flag presence), `op containing "prod"`
+  (substring), plain `op` when nothing beyond the command is constrained. The
+  label never implies a rule is narrower than it is: a command-only rule renders
+  the bare command.
+- **Bound.** At most `sigil_proto::COVERS_MAX_CHARS` (72) characters, reduced by
+  `LeasePolicy::with_covers` to an allowlist: printable ASCII, whitespace runs
+  collapsed to one space, and `…`. Every other character (bidi controls,
+  zero-width and other format characters, combining marks, and anything else that
+  renders as nothing) becomes one `?` per run, so a label cannot reorder, hide
+  inside, or stack on the caption it is rendered into. Renderers mirror this
+  filter rather than trusting it.
+  A rule with more than three conditions, or one whose list would exceed the
+  bound, degrades to an honest count (`op read with 5 match conditions`) rather
+  than a truncated list that would read as if the dropped conditions did not
+  exist. A single over-long user token is elided with `…`.
+- **Run-once carries none.** A run-once request opens no window, so it has
+  nothing to describe: `lease_covers` is omitted (and the proto's `covers` is
+  absent from the sealed policy).
+- **Display only.** Renderers must treat it as text to show, never as something
+  to parse, match on, or act on. The daemon remains the sole lease authority: the
+  label describes the window, it does not define it. When it is absent or empty a
+  renderer shows **no coverage clause** rather than inventing one.
+
+**On the wire to the phone**, the same string rides *inside the sealed envelope*
+as a field of the request's lease policy (proto `LeasePolicy::Leasable`):
+`{"kind":"leasable","maxSecs":900,"covers":"op read"}`, omitted when empty. It
+uses no new transport and is not visible to the relay.
 
 `HistoryJson`: `{ "id": str, "kind": str, "label": str, "account": str,
 "process": str, "cwd": str, "decision": "approved|denied|expired", "note": str?,
@@ -190,6 +237,226 @@ cannot read the Mac share to seal with. `len == 0` removes the record. The calle
 is `sigil-config`, an unsigned CLI, so there is no code identity to demand; the
 boundary is the 0600 socket, the same one every other CLI verb has.
 
+## Phone lease control (sealed relay messages, NOT this socket)
+
+Everything above rides the local unix control socket. This section is different:
+it defines four messages that ride the **sealed envelope between the daemon and a
+paired phone**, on the same `ToDaemon` / `ToPhone` channels as approvals. It lives
+here because it is the second controller over the same lease store the
+`lease_list` / `lease_revoke` frames above drive, and the two must be read
+together. Rust definitions: `crates/sigil-proto/src/request.rs`; daemon side:
+`RemoteApprover::answer_lease_list` / `answer_lease_revoke` in
+`crates/sigil/src/remote.rs`.
+
+`sigil lease revoke <prefix>` is unchanged. This **adds** a controller.
+
+### Why it exists
+
+The brief cites phone-side visibility and revocation as the containment for a
+rule-wide lease window. Until now the phone's lease list and revoke control were
+demo state, which is worse than an absent control: a revoke button that silently
+does nothing teaches the human that a window is closed when it is open.
+
+### Three facts that drive every choice below
+
+Read these first; most of the design is downstream of them and looks arbitrary
+without them.
+
+1. **The envelope counter is not a replay gate.** It was retired
+   (`crates/sigil-proto/src/replay.rs`) because an in-memory counter reset on
+   either side and dropped genuine approvals as false replays. It still rides
+   inside the signed bytes and gates nothing. Replay protection is: the Ed25519
+   signature, a `REPLAY_WINDOW_MS` freshness window, and a single-use uuidv7 set.
+   **The window is 150s, not 90s** — `REPLAY_WINDOW_MS` was widened so a legit
+   approval that takes the full 120s timeout is not rejected as stale. Every
+   attack window below is 150s wide.
+2. **Both replay guards are RAM-only.** The daemon's is per-process
+   (`RemoteApprover::classify`); the phone's is per app session. A daemon restart
+   or an app kill — both routine — empties one, and everything captured inside the
+   freshness window then opens against it. No protection here may assume a guard
+   survives.
+3. **A grant key is deterministic AND non-unique.** It is a hash of the caller's
+   ancestor code-identity chain plus the rule, so it recurs tomorrow; and several
+   live windows share one with different `LeaseBinding`s. It is therefore unusable
+   as a wire identifier, and it never leaves the Mac.
+
+### The four messages
+
+All four are **tagged by a `type` field** and demultiplexed alongside the existing
+traffic on their channel. `ApprovalResponse` and `ApprovalRequest` remain the only
+untagged payloads, so no lease message can be routed to a waiting approval.
+
+**Phone → daemon** (`ToDaemon`, same seal, signature, and guard as an approval):
+
+```jsonc
+{ "type": "leaseList",   "pad": "…" }
+{ "type": "leaseRevoke", "leaseId": "<32 lowercase hex>", "pad": "…" }
+```
+
+**Daemon → phone** (`ToPhone`, same seal as a request):
+
+```jsonc
+{ "type": "leaseListReply", "inReplyTo": "<uuidv7>", "asOfMs": int,
+  "leases": [ { "leaseId": str, "scope": str, "covers": str,
+                "account": str, "remainingMs": int } ], "pad": "…" }
+{ "type": "leaseRevokeReply", "inReplyTo": "<uuidv7>",
+  "leaseId": "<echoed>", "revoked": bool, "pad": "…" }
+```
+
+| Field | Meaning |
+|-------|---------|
+| `leaseId` | **The only identifier on this wire.** 128 opaque bits from the platform CSPRNG, lowercase hex, exactly 32 chars. Minted when a window opens, preserved across a refresh, never reused, RAM-only, dies with the window. |
+| `inReplyTo` | The **uuidv7 request id of the envelope that asked**. Not an application-level id: the phone generated that envelope, so it can check the reply against what it has outstanding. |
+| `asOfMs` | Daemon wall clock, unix ms, when the window clocks were read. Count down from it; once it is old enough to distrust, show the list as stale. |
+| `scope` | The matched rule's name. Display must state the breadth: the window covers anything that rule matches, not the one command that opened it. |
+| `covers` | The daemon-rendered coverage label (`op read`). **Empty means none was rendered** — show no coverage clause rather than inventing one, and never read empty as "narrow". |
+| `account` | The source label the window injects from. Empty for a plain gate. |
+| `remainingMs` | Milliseconds until the window lapses, as measured at `asOfMs`. |
+| `revoked` | `true` only when a live window with that exact id was found and zeroized. |
+| `pad` | Meaningless filler. **Ignore it**: never display it, never sanitize it, never let its size decide anything. |
+
+`leases` is always present; empty means "no live windows". `covers` and `account`
+are always present; empty is their "none" value.
+
+**No `grantHex` and no `ageMs`, deliberately.** The grant key is excluded for the
+three reasons in "Three facts" above, plus one more: it is a durable correlator
+describing the shape of the human's machine that would sit in phone storage across
+re-pairs. The age is excluded because a refresh does not re-stamp when a window was
+first granted, so a window re-approved thirty seconds ago would display as an hour
+old beside a full `remainingMs`. A number that misleads on the common path is
+worse than no number.
+
+### Replay and suppression: what is bound, and what is left over
+
+Three separate attacks, three separate answers. None of them is the envelope
+counter (fact 1).
+
+**1. A replayed revoke killing a future window.** A grant key recurs, so a revoke
+that named one would be a stored weapon against every window that key will ever
+have. The signature stops forgery; freshness and the single-use id stop replay
+against a live daemon. The gap is fact 2: a daemon restarted inside the 150s
+window has an empty guard, and the sequence `restart → human re-approves → relay
+re-flies the capture` would kill a window opened seconds earlier, with no visible
+cause. **Bound by the opaque `leaseId`**, which is fresh per window, so a replayed
+revoke names a window that has ended and is a clean no-op. Preserved across a
+refresh (that extends one window, it does not start another); re-minted only when
+a window genuinely ended.
+
+**2. A suppressed revoke reported as success.** A relay captures a genuine
+`revoked: true`; the phone is later killed, emptying its guard; the human reopens
+and taps revoke; the relay swallows the request and delivers the capture. Genuine
+signature, unseen id, in window — and the human is told a window closed while it is
+open. **Bound by `inReplyTo`.** The phone MUST accept a reply only when it names a
+request it has **outstanding right now**, and MUST retire that request the moment
+it does (single-use at the application layer, independent of guard state). After a
+restart nothing is outstanding, so every captured reply is dropped. A revoke with
+no matching reply is **unconfirmed** — never rendered as success, never as failure
+— and the recovery is to re-list.
+
+**3. Reading the wire by length.** Ciphertext length would otherwise carry the row
+count and the rule names, and a revoke would be trivially shorter than a list.
+**Bound by padding** every lease-control plaintext to a multiple of 1024 bytes with
+inert `.` filler.
+
+Left over, stated plainly:
+
+1. **A censoring relay.** It cannot forge, alter, or replay any of the four, but it
+   can **drop** one. A dropped revoke leaves the window alive until its TTL,
+   `sigil lease revoke` on the Mac, or a daemon restart. Phone-side revocation is
+   best-effort by construction: the TTL and the Mac are the backstops, not the
+   phone. The relay can withhold a revocation; it can never cause a release.
+2. **Padding is a sender obligation, not verified on receipt.** Rejecting an
+   unpadded message would make a version skew between the two halves fail silently
+   and closed, and a revoke that vanishes is exactly what this feature exists to
+   end. A peer that does not pad leaks its own lengths.
+3. **Padding hides the window count only within a bucket.** This is the residual
+   with the most careful wording, because the test that proves it is cited as the
+   proof, and an earlier version of both claimed a universal property.
+
+   The bucket is 1024, not the 512 first specified, because 512 does not buy the
+   property: measured on this wire a row is 115 bytes with short labels, 169 with
+   realistic ones (`op with --account "rowmhq.1password.eu"`), and 318 with all
+   three labels at the 72-character bound, so 512 rolls at three realistic rows.
+   At 1024 the first crossing is **8 rows with short labels, 6 with realistic
+   ones, and 3 when every label is at the bound** — the last of which is reachable,
+   not theoretical, for a verbose rule set.
+
+   So: **the relay learns which band the open-window count falls in, and nothing
+   about which rules.** Never the count itself, never a label, never an identifier.
+   Closing it would mean padding every list to a fixed maximum, paying real bytes
+   on every exchange to hide a band, and it is deliberately not done.
+
+   Timing is a separate, inherent residual: a lease-control exchange is visible as
+   an exchange, so the relay learns that lease control was used and when. It is
+   *narrower* than a polling design would make it — the phone issues at most one
+   `leaseList` per deliberate human action, not one every 15 seconds — so the
+   signal is "the human opened the lease screen", not a periodic beacon announcing
+   that it is still open.
+4. **A compromised phone can revoke at will.** It holds the signing key. Revocation
+   only ever narrows what is authorized, so this is a denial of convenience, never
+   a release.
+5. **Multi-device: any paired device sees every window.** Under ring-all, a device
+   lists and can revoke windows that a *different* device's approval opened. So
+   "the phone sees only what it approved" is not true of this surface. Accepted for
+   a single-user product where every paired device is Tom's, and stated here rather
+   than left implicit.
+
+### What is never on the wire
+
+`scope`, `covers`, and `account` are the only human-readable fields, and all three
+pass through `sanitize_label` at 72 characters — the same allowlist that protects
+the approval sheet's coverage caption. That is load-bearing, not defensive:
+`covers` is daemon-rendered and already clean, but **`scope` is the raw rule name
+out of `config.json`** and `account` the raw source label, and config validation
+only rejects duplicates and empty matches. Without the filter they would be the
+first unfiltered config text on a consent-adjacent phone surface. Renderers
+re-filter rather than trusting this.
+
+There is no argv, no secret reference, and no secret value in any of the four.
+
+### Rate limiting
+
+A per-pairing token bucket: sustained one lease-control message per second, with a
+burst of four. Over-budget messages are dropped silently.
+
+A bucket rather than a flat interval **because a flat 1/s would drop the second of
+two revokes a human taps in quick succession**, which is the silent failure this
+feature exists to end. Four tokens cover any burst a person can produce while
+reading, and still bound a looping client to 1/s.
+
+### Never in the way of an approval
+
+A lease reply is sealed on the ToDaemon owner thread but **queued, not deposited
+there** — that thread is the sole reader of the channel an approval *response*
+arrives on, and a synchronous deposit would park it for a network round trip (and
+spend the transport's retry budget) while a human's approval sat in the mailbox. A
+separate pump thread drains a bounded queue of 8; when it is full, replies are
+**dropped**. A lost list costs a re-ask; a lost revoke reply leaves the phone
+showing "unconfirmed", which is exactly true.
+
+No push hint is forwarded on a lease reply. It answers a screen the human is
+already looking at, and ringing the APNs doorbell would correlate lease-control use
+to the relay and to Apple for no benefit.
+
+### Fail-closed rules the daemon holds to
+
+- No lease-control handle attached, or a `leaseId` that is not exactly-width hex:
+  the message is dropped **whole, with no reply**. Peer-chosen bytes are never
+  echoed back onto a screen.
+- **An empty or truncated id revokes nothing.** The store's other revoke entry
+  point is prefix-matched and `"".starts_with(p)` holds for every string, so an
+  empty identifier reaching it would be a silent global lease wipe reported as
+  success. This path refuses on width, at two layers, before it looks at anything.
+- A revoke that matches nothing is a **successful no-op** reporting
+  `revoked: false`, never an error. The three ways to reach `false` (already
+  lapsed, already revoked, id names nothing) are indistinguishable, so the reply is
+  not an oracle for what this daemon holds.
+- **Structurally unable to grant.** The approver holds a `lease::LeaseControl` — a
+  two-method trait, list and revoke-by-id — not a `LeaseStore`. No code reachable
+  from an inbound envelope can call `grant`, `token_for`, or the prefix-matched
+  `revoke`. Widening that is a visible, reviewable act. `LeaseRevoke` carries no
+  duration field and never will; a test pins the key set of all four messages.
+
 ### The run path (not part of the control surface)
 
 `{"kind":"run","argv":[str],"cwd":str}` with the caller's stdout/stderr passed as
@@ -217,7 +484,6 @@ mutations that must not be daemon capabilities):
 - `addAccount`/`rotateAccount`/`removeAccount` → `account add|rotate|remove … --json`
 - `settings`/`saveSettings` → `settings get|set --json`
 - `wipe` → `wipe --force --json`
-- `setMacApprovals` → `mac-approvals --enable|--phone-only --json`
 - `installShim` → `shim install --json`
 - `unpair` → `unpair --json`
 - pairing → `pair --relay <url> --json` (read the NDJSON `qr`/`sas`/`paired`/
@@ -230,10 +496,14 @@ See `JSON.md` for those mutation output shapes.
 - `account.health`/`detail`/`last_used_ms`: no token-expiry model → `healthy`/null.
 - `account.id`: equals the label (the store keys by unique label).
 - `lease.caller`: empty — a lease retains the grant key, not the provenance.
-- `pending.leasable`/`max_lease_secs`: carried through from the matched rule's
-  lease policy (`leasable=false` + omitted cap for a run-once rule). A local
-  approver must not offer "approve for N minutes" when `leasable` is false, and
-  clamps any window to `max_lease_secs`; the daemon re-checks regardless.
+- `pending.leasable`/`max_lease_secs`/`lease_covers`: carried through from the
+  matched rule's lease policy (`leasable=false` + omitted cap and label for a
+  run-once rule). A local approver must not offer "approve for N minutes" when
+  `leasable` is false, and clamps any window to `max_lease_secs`; the daemon
+  re-checks regardless. See "The lease coverage label" above for `lease_covers`.
+- `lease.covers`: empty for a grant whose rule the daemon rendered no label for;
+  a renderer then falls back to naming the rule and its breadth generically,
+  never to a guess at what the rule matches.
 - `pending.reason`/`coalesced`: null/0 — the local control-socket path sets no
   reason line and the registry does not count coalesced waiters.
 - `pair.name`: fixed `"iPhone"` — the ceremony captures no device name.

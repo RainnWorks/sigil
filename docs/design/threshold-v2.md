@@ -93,9 +93,10 @@ dependency set.
   the token-ciphertext format. This is deliberate: the at-rest token blob is
   byte-identical to v1's, which keeps migration and code blast-radius minimal.
 - **Envelope: unchanged** (`envelope.rs`): crypto_box (X25519 + XSalsa20-Poly1305)
-  seal + Ed25519 signature + uuidv7 request-id + per-pairing monotonic counter +
-  90 s window. The threshold partials ride *inside* this existing sealed, signed,
-  replay-guarded envelope. The pairing X25519 agreement key and the new P-256
+  seal + Ed25519 signature + two replay gates: a single-use uuidv7 request-id and
+  a 150 s freshness window (`REPLAY_WINDOW_MS`). The per-pairing counter is still
+  a signed wire field but gates nothing (retired; see `replay.rs`). The threshold
+  partials ride *inside* this existing sealed, signed, replay-guarded envelope. The pairing X25519 agreement key and the new P-256
   threshold key are **independent** keys with independent jobs (transport seal vs.
   token-key share).
 
@@ -385,8 +386,9 @@ this:
    Relay-blindness is inherited unchanged from v1 (`security-claims` §9).
 2. **Verify-then-act ordering (load-bearing).** On receipt the phone runs
    `Envelope::open`: Ed25519 signature check against the **pinned Mac key** first,
-   then the `ReplayGuard` (single-use uuidv7 request-id, strictly-monotonic
-   per-pairing counter, 90 s window), then decrypt. **Only after all three pass**
+   then the `ReplayGuard` (single-use uuidv7 request-id and a 150 s freshness
+   window; the counter is carried but not gated), then decrypt. **Only after all
+   of those pass**
    does the phone invoke Face ID and the SE key-agreement. So the phone contributes
    `Z_F` **only to a request provably originated by the paired Mac, fresh, and
    never seen before**. An attacker cannot forge such a request without the Mac's
@@ -550,8 +552,11 @@ self-sufficient DEK; v2's phone holds only `f`).
 **P-4 · Forgery / oracle resistance.** The phone runs the SE op only after
 verifying the Mac's Ed25519 signature and the replay guard (§8), so it is not a
 chosen-`E` decryption oracle. Forging a request needs the Mac's signing key;
-replaying one is caught by the single-use request-id + monotonic counter + 90 s
-window (`replay.rs`, already tested by the hostile-relay suite).
+replaying one is caught by the single-use request-id plus the 150 s freshness
+window (`replay.rs`, already tested by the hostile-relay suite). Both of those
+gates are RAM-only, so a restart on either end empties the seen-id set and a
+captured envelope can replay once inside its window; the counter is not a gate
+and does not help here.
 
 **P-5 · Replay / relay powerlessness.** Both the challenge and the partial ride
 inside the existing sealed, signed, replay-guarded `Envelope`; the entire
@@ -814,8 +819,10 @@ Yes. Verify-then-act (Ed25519 against the pinned Mac key, then the replay guard,
 provably originated by the paired Mac, fresh, and never seen, so it is not a
 chosen-`E` oracle to any party lacking the Mac's signing key (residual #7 is the
 sole, documented exception, mitigated by R5 + the human). Cross-request replay of
-a captured *response* is stopped by the Mac's ReplayGuard (single-use uuidv7 +
-strictly-monotonic counter + 90 s window) and the request-id correlation; the
+a captured *response* is stopped by the Mac's ReplayGuard (single-use uuidv7
+inside a 150 s freshness window; the counter is carried, not gated) and, because
+that guard is RAM-only and empty after a restart, load-bearingly by the
+request-id correlation; the
 whole `hostile_relay.rs` suite applies unchanged because v2 alters only the
 plaintext inside the seal. The one honest nuance (already in §9): because `Z_F` is
 static for a fixed `E`, "replay is prevented" is an **envelope**-level property,

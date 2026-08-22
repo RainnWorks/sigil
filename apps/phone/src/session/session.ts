@@ -15,6 +15,8 @@ import {
   type DeliveryReceiptMessage,
   type DeviceIdentity,
   type Envelope,
+  type LeaseListReplyMessage,
+  type LeaseRevokeReplyMessage,
   type PeerIdentity,
   type Sodium,
   open,
@@ -32,7 +34,20 @@ export interface SessionConfig {
   daemonPub: PeerIdentity;
   pairingId: Uint8Array;
   transport: Transport;
+  /**
+   * Where a verified answer to a lease-control question goes. Handed in rather
+   * than written straight to the store, because the caller (the session
+   * controller) is what asked the question and owns the reply timers that decide
+   * when silence becomes "cannot confirm". Absent => lease replies are dropped,
+   * which is the correct behavior for a session nobody is asking through.
+   */
+  onLeaseReply?: (reply: LeaseControlReply) => void;
 }
+
+/** A verified lease-control answer, already demuxed and shape-checked. */
+export type LeaseControlReply =
+  | { kind: "leaseList"; reply: LeaseListReplyMessage }
+  | { kind: "leaseRevoke"; reply: LeaseRevokeReplyMessage };
 
 export class SigilSession {
   private readonly inboundGuard = new ReplayGuard();
@@ -89,6 +104,15 @@ export class SigilSession {
     // Demux by the `type` tag, mirroring the daemon's ToDaemon demux.
     const msg = classifyToPhone(payload);
     if (!msg) return; // malformed: drop it (fail closed)
+    if (msg.kind === "leaseList" || msg.kind === "leaseRevoke") {
+      // An answer to a lease-control question. It rides the same sealed, signed,
+      // single-use envelope as everything else on this counter, so a hostile relay
+      // can neither forge one (to claim a window closed, or that none are open) nor
+      // replay an old one. It releases nothing and gates nothing: it is a report,
+      // and suppressing it can only ever leave the phone saying it does not know.
+      this.cfg.onLeaseReply?.(msg);
+      return;
+    }
     if (msg.kind === "resolution") {
       // #36: another paired device resolved this ring-all request (or it expired /
       // was withdrawn). Dismiss our copy. Zero-knowledge: we learn only that it is
@@ -144,12 +168,20 @@ export class SigilSession {
    * request/response flow (e.g. {@link PushRegisterMessage}). Shares the
    * outbound counter and pairing id with `respond`, so both ride the same
    * per-direction replay sequence.
+   *
+   * Returns the ENVELOPE's single-use uuidv7 request id. For a payload the
+   * daemon answers, that id is the correlation handle: the daemon echoes it as
+   * `inReplyTo`, and the caller matches the reply against the request it issued.
+   * That application-layer match is load-bearing rather than decorative, because
+   * the envelope guard's single-use id set lives in RAM and is empty again after
+   * any restart (see `LeaseRevokeReplyMessage.inReplyTo`).
    */
-  async sendToDaemon<T>(payload: T): Promise<void> {
-    await this.sealAndSend(payload);
+  async sendToDaemon<T>(payload: T): Promise<string> {
+    return this.sealAndSend(payload);
   }
 
-  private async sealAndSend<T>(payload: T): Promise<void> {
+  /** Seals, sends, and returns the envelope's single-use request id. */
+  private async sealAndSend<T>(payload: T): Promise<string> {
     const envelope = seal(this.cfg.sodium, payload, {
       pairingId: this.cfg.pairingId,
       counter: ++this.outboundCounter,
@@ -157,5 +189,6 @@ export class SigilSession {
       recipient: this.cfg.daemonPub,
     });
     await this.cfg.transport.send(envelope);
+    return envelope.requestId;
   }
 }

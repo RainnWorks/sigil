@@ -52,7 +52,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -63,9 +63,12 @@ use sigil_proto::identity::DeviceIdentity;
 use sigil_proto::ReplayGuard;
 use sigil_proto::{
     mailbox_id, now_ms, ApprovalRequest, ApprovalResponse, Decision as ProtoDecision, Direction,
-    PeerIdentity, Provenance, PushHint, PushRegister, ResolutionBroadcast, ResolutionStatus,
-    ToDaemonMessage, Transport,
+    LeaseListReply, LeaseRevoke, LeaseRevokeReply, LeaseRow, PeerIdentity, Provenance, PushHint,
+    PushRegister, ResolutionBroadcast, ResolutionStatus, ToDaemonMessage, Transport,
 };
+use uuid::Uuid;
+
+use crate::lease::LeaseControl;
 
 use crate::approve::{ApprovalContext, ApprovalOutcome, Approver, Decision, PendingRegistry};
 use crate::push_store::PushStore;
@@ -144,6 +147,37 @@ const DIRECT_VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
 /// approval.
 const DIRECT_ACCEPT_POLL: Duration = Duration::from_millis(200);
 
+/// How often the per-pairing lease-control token bucket gains a token: a
+/// sustained ceiling of one lease-control message per second.
+const LEASE_REFILL_MS: u64 = 1_000;
+
+/// How many lease-control tokens may accumulate, i.e. the burst a human is
+/// allowed on top of the sustained 1/s.
+///
+/// Not zero, and that is the whole point of using a bucket rather than a flat
+/// minimum interval. A human revoking three rows taps three times in about a
+/// second; under a flat 1/s two of those taps would be dropped in silence, which
+/// is the consent theatre this feature exists to end. Four tokens cover any burst
+/// a person can produce while reading, and still bound a looping client to 1/s.
+const LEASE_BURST: u64 = 4;
+
+/// How long the lease reply pump parks between queue polls, bounding how promptly
+/// it notices shutdown. Never gates a reply: a queued one wakes it at once.
+const LEASE_PUMP_TICK: Duration = Duration::from_millis(100);
+
+/// How many sealed lease-control replies may await the pump before new ones are
+/// dropped. Small on purpose: the queue exists to decouple the owner thread from
+/// the network, not to buffer a backlog. See
+/// [`RemoteApprover::queue_lease_reply`].
+const LEASE_REPLY_QUEUE: usize = 8;
+
+/// The per-pairing lease-control token bucket. See
+/// [`RemoteApprover::lease_budget_allows`].
+struct LeaseBudget {
+    tokens: u64,
+    refilled_at_ms: u64,
+}
+
 /// An approver backed by a paired phone reachable over a [`Transport`].
 pub struct RemoteApprover {
     transport: Arc<dyn Transport>,
@@ -201,6 +235,30 @@ pub struct RemoteApprover {
     /// The verification read window in [`verify_and_promote`](Self::verify_and_promote);
     /// a field only so tests can shrink it.
     verify_timeout: Duration,
+    /// The daemon's lease-control handle, attached by [`crate::daemon::Core`]
+    /// once it exists (the approver is built first, inside `build_gate`). `None`
+    /// until then, and in the softphone/test loop that never wires one; a
+    /// lease-control message arriving with none attached is dropped with no reply,
+    /// which is the same fail-closed shape as every other unanswerable message
+    /// here.
+    ///
+    /// **A [`LeaseControl`], not a `LeaseStore`.** The narrow trait is what makes
+    /// this path structurally unable to open or extend a window, or to read what
+    /// one holds: it has exactly two methods, list and revoke-by-id, and no code
+    /// reachable from an inbound envelope can call `grant`, `token_for`, or the
+    /// prefix-matched CLI `revoke` at all.
+    ///
+    /// Set once, never replaced: a handle that could be swapped under a running
+    /// daemon would be a way to make a revoke land somewhere it was not aimed.
+    leases: std::sync::OnceLock<Arc<dyn LeaseControl>>,
+    /// This pairing's lease-control rate budget.
+    lease_budget: Mutex<LeaseBudget>,
+    /// Sealed lease-control replies waiting for [`run_lease_reply_pump`]. Bounded
+    /// and droppable so a reply can never block the ToDaemon owner or compete with
+    /// an approval deposit.
+    ///
+    /// [`run_lease_reply_pump`]: Self::run_lease_reply_pump
+    lease_replies: (SyncSender<Envelope>, Mutex<Receiver<Envelope>>),
 }
 
 impl RemoteApprover {
@@ -243,7 +301,32 @@ impl RemoteApprover {
             direct: None,
             demote_after: DIRECT_DEMOTE_AFTER,
             verify_timeout: DIRECT_VERIFY_TIMEOUT,
+            leases: std::sync::OnceLock::new(),
+            lease_budget: Mutex::new(LeaseBudget {
+                tokens: LEASE_BURST,
+                refilled_at_ms: now_ms(),
+            }),
+            lease_replies: {
+                let (tx, rx) = std::sync::mpsc::sync_channel(LEASE_REPLY_QUEUE);
+                (tx, Mutex::new(rx))
+            },
         }
+    }
+
+    /// Attach the daemon's lease-control handle so this device can answer the
+    /// phone's [`LeaseQuery`] and [`LeaseRevoke`] messages. Called once by
+    /// [`crate::daemon::Core`] after it is built (the approvers are constructed
+    /// first, inside `build_gate`), over the SAME store `sigil lease list` and
+    /// `sigil lease revoke` read and write. A second call is a no-op.
+    ///
+    /// The parameter is deliberately the narrow [`LeaseControl`] trait, so this
+    /// path is handed the authority to see and close windows and nothing else.
+    ///
+    /// Until this is called the two lease-control messages are dropped with no
+    /// reply, so an approver that is never wired simply has no lease surface
+    /// rather than a half-working one.
+    pub fn attach_leases(&self, leases: Arc<dyn LeaseControl>) {
+        let _ = self.leases.set(leases);
     }
 
     /// Enable the direct-transport ladder for this device (#51), OFF by default.
@@ -312,7 +395,7 @@ impl RemoteApprover {
                 machine: self.machine.clone(),
                 requested_at: now,
             },
-            lease_policy: ctx.lease,
+            lease_policy: ctx.lease.clone(),
             reason: None,
             // A threshold-sealed secret (inline env, or a stored SSH key) carries
             // its threshold challenge to the phone; a plain gate leaves it absent
@@ -606,13 +689,19 @@ impl RemoteApprover {
     /// `None` when it fails any of those (fail closed). The single [`ReplayGuard`]
     /// covers responses and registrations together, matching the phone's single
     /// monotonic outbound counter.
-    fn classify(&self, env: Envelope) -> Option<ToDaemonMessage> {
+    ///
+    /// The envelope's uuidv7 request id comes back alongside the message because
+    /// the lease-control replies must name the envelope that asked for them: a
+    /// reply the phone cannot tie to an outstanding request of its own is a
+    /// captured reply, and the phone has to be able to tell.
+    fn classify(&self, env: Envelope) -> Option<(Uuid, ToDaemonMessage)> {
+        let request_id = env.request_id;
         let value: serde_json::Value = {
             let mut guard = self.guard.lock().expect("remote guard poisoned");
             env.open(&self.phone, &self.identity.agreement, &mut guard)
                 .ok()?
         };
-        ToDaemonMessage::from_value(value).ok()
+        Some((request_id, ToDaemonMessage::from_value(value).ok()?))
     }
 
     /// Turn a correlated [`ApprovalResponse`] into an [`ApprovalOutcome`], applying
@@ -745,8 +834,8 @@ impl RemoteApprover {
     fn dispatch(&self, env: Envelope) {
         // A failed verify/replay/decode classifies as `None`: fail closed by
         // dropping it (nothing to route).
-        if let Some(msg) = self.classify(env) {
-            self.route(msg);
+        if let Some((request_id, msg)) = self.classify(env) {
+            self.route(request_id, msg);
         }
     }
 
@@ -754,7 +843,7 @@ impl RemoteApprover {
     /// [`verify_and_promote`](Self::verify_and_promote) can route the verifying
     /// envelope it already opened WITHOUT a second [`classify`] (which the shared
     /// replay guard would correctly reject as a replay of the same counter).
-    fn route(&self, msg: ToDaemonMessage) {
+    fn route(&self, in_reply_to: Uuid, msg: ToDaemonMessage) {
         match msg {
             ToDaemonMessage::Push(pr) => self.record_registration(&pr),
             ToDaemonMessage::Response(resp) => self.route_response(resp),
@@ -764,6 +853,203 @@ impl RemoteApprover {
             // `mark_delivered`.
             ToDaemonMessage::Delivered(receipt) => {
                 self.mark_delivered(&receipt.request_id, now_ms())
+            }
+            // Lease control. Neither can release a secret, approve a request, or
+            // widen anything: a list reads names and clocks, and a revoke can only
+            // ever take a window away. Both name the envelope that asked, so a
+            // captured reply cannot be passed off as the answer to a later request.
+            ToDaemonMessage::LeaseList(_) => self.answer_lease_list(in_reply_to),
+            ToDaemonMessage::LeaseRevoke(revoke) => self.answer_lease_revoke(in_reply_to, &revoke),
+        }
+    }
+
+    /// Answer a phone's [`LeaseQuery`] with the daemon's live windows.
+    ///
+    /// Drops the query with NO reply when no lease-control handle is attached or
+    /// the pairing is over its rate budget. A list is idempotent, so a dropped one
+    /// costs the phone a re-ask and nothing else.
+    ///
+    /// Every row is built through [`LeaseRow::new`], which sanitizes the three
+    /// display fields to the coverage-label allowlist and validates the id. That
+    /// filter is load-bearing here and not merely defensive: `covers` is
+    /// daemon-rendered and already clean, but `scope` is the RAW rule name out of
+    /// `config.json` and `account` the raw source label, and config validation
+    /// only rejects duplicates and empty matches. A row whose id would not
+    /// validate (impossible from this store, which renders it itself) is dropped
+    /// rather than sent unusable.
+    ///
+    /// `as_of_ms` stamps when the window clocks were read, so the phone counts
+    /// down from a known instant and can show the list as stale instead of
+    /// presenting an old measurement as current.
+    fn answer_lease_list(&self, in_reply_to: Uuid) {
+        let Some(control) = self.leases.get() else {
+            return;
+        };
+        if !self.lease_budget_allows() {
+            return;
+        }
+        let rows: Vec<LeaseRow> = control
+            .list()
+            .into_iter()
+            .filter_map(|l| {
+                LeaseRow::new(
+                    &l.lease_id,
+                    &l.scope,
+                    &l.covers,
+                    &l.account,
+                    l.remaining.as_millis() as u64,
+                )
+            })
+            .collect();
+        self.queue_lease_reply(&LeaseListReply::new(
+            in_reply_to.to_string(),
+            now_ms(),
+            rows,
+        ));
+    }
+
+    /// Answer a phone's [`LeaseRevoke`] by killing exactly the named window.
+    ///
+    /// The target is an opaque [`LeaseRow::lease_id`], never a grant key: a grant
+    /// key is deterministic, shared between windows, and a durable correlator, so
+    /// it never reaches the phone at all (see [`LeaseRevoke`]). A captured revoke
+    /// re-flown after a restart therefore names an id that no longer exists.
+    ///
+    /// Always replies when the message parses, including `revoked: false`. The
+    /// three ways to reach `false` (already lapsed, already revoked, id names
+    /// nothing) are indistinguishable, so the reply is not an oracle for what this
+    /// daemon holds. A message whose target does not parse gets no reply at all,
+    /// so peer-chosen bytes are never echoed back onto a screen.
+    fn answer_lease_revoke(&self, in_reply_to: Uuid, revoke: &LeaseRevoke) {
+        let Some(control) = self.leases.get() else {
+            return;
+        };
+        let Some(lease_id) = revoke.target() else {
+            return;
+        };
+        if !self.lease_budget_allows() {
+            return;
+        }
+        let revoked = control.revoke_id(&lease_id);
+        self.queue_lease_reply(&LeaseRevokeReply::new(
+            in_reply_to.to_string(),
+            lease_id,
+            revoked,
+        ));
+    }
+
+    /// Whether this pairing's lease-control budget allows handling one more
+    /// message, spending a token if so.
+    ///
+    /// A token bucket rather than a bare minimum interval, and the shape is
+    /// deliberate. The review asked for 1/s; a flat 1/s would also drop the second
+    /// of two revokes a human taps in quick succession, which is precisely the
+    /// silent failure this feature exists to end. So the sustained rate is
+    /// [`LEASE_REFILL_MS`] (1/s) and a burst of [`LEASE_BURST`] is allowed on top,
+    /// which a human can exhaust only by tapping faster than they can read.
+    ///
+    /// Over-budget messages are dropped silently, with no reply. For a list that
+    /// costs a re-ask. For a revoke it means the phone shows the row as
+    /// unconfirmed, which is the honest state: the daemon did not act.
+    fn lease_budget_allows(&self) -> bool {
+        let now = now_ms();
+        let mut budget = self.lease_budget.lock().expect("lease budget poisoned");
+        let refilled = now.saturating_sub(budget.refilled_at_ms) / LEASE_REFILL_MS;
+        if refilled > 0 {
+            budget.tokens = (budget.tokens + refilled).min(LEASE_BURST);
+            budget.refilled_at_ms = now;
+        }
+        if budget.tokens == 0 {
+            return false;
+        }
+        budget.tokens -= 1;
+        true
+    }
+
+    /// Seal one lease-control reply and hand it to the reply pump.
+    ///
+    /// **It is queued, not deposited here.** This runs on the ToDaemon owner
+    /// thread, which is the sole reader of the channel an approval RESPONSE
+    /// arrives on. A synchronous deposit would park that reader for a network
+    /// round trip (and spend the transport's retry budget) while a human's
+    /// approval sat in the mailbox. So a lease reply never blocks, never delays,
+    /// and never competes with an approval: it goes on a small bounded queue that
+    /// a separate pump drains, and when that queue is full the reply is DROPPED.
+    ///
+    /// Dropping is the right failure. A lost list costs a re-ask; a lost revoke
+    /// reply leaves the phone showing "unconfirmed", which is exactly true. The
+    /// alternative -- an unbounded queue -- would let lease traffic grow the daemon
+    /// and still not deliver anything useful.
+    ///
+    /// The seal shares the daemon->phone [`counter`](Self::counter) with every
+    /// other deposit, and the payload was padded to
+    /// [`LEASE_PAD_BUCKET`](sigil_proto::LEASE_PAD_BUCKET) before sealing.
+    ///
+    /// **What that does and does not buy, stated exactly**, because an earlier
+    /// version of this comment claimed a relay "learns nothing about which of the
+    /// daemon's messages it is", which was false on length:
+    ///
+    /// * It buys equal lengths WITHIN a bucket. A list of zero windows and a list
+    ///   of five seal to one length, and a revoke reply is that same length, so a
+    ///   relay cannot count open windows or tell the four messages apart by size.
+    /// * It does not buy equal lengths across buckets. A reply that outgrows one
+    ///   rolls to the next, so the relay learns which BAND the open-window count
+    ///   falls in (first crossing: 8 rows with short labels, 6 with realistic
+    ///   ones, 3 with all labels at the length bound). Never the count itself, and
+    ///   never anything about which rules. Padding every list to a fixed maximum
+    ///   would close that at a real cost in bytes on every exchange, and is
+    ///   deliberately not done.
+    /// * It does not buy anything about TIMING. A lease-control exchange is
+    ///   visible as an exchange, and the relay learns that lease control was used
+    ///   and when.
+    ///
+    /// No push hint is forwarded: a lease reply answers a screen the human is
+    /// already looking at, and ringing the APNs doorbell for it would correlate
+    /// lease-control use to the relay and to Apple for no benefit.
+    fn queue_lease_reply<T: serde::Serialize>(&self, msg: &T) {
+        let counter = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let Ok(env) = Envelope::seal(
+            msg,
+            self.pairing_id,
+            counter,
+            &self.identity.signing,
+            &self.phone,
+        ) else {
+            return;
+        };
+        // try_send, never send: a full queue drops rather than blocking the owner.
+        let _ = self.lease_replies.0.try_send(env);
+    }
+
+    /// Drain queued lease-control replies to the phone until `shutdown` is set.
+    ///
+    /// Runs on its own thread so a deposit here can never park the ToDaemon owner
+    /// (see [`queue_lease_reply`](Self::queue_lease_reply)). Transport errors are
+    /// swallowed exactly as [`broadcast_resolution`](Self::broadcast_resolution)
+    /// swallows them: the phone's own re-list is the recovery, and a lease reply
+    /// must never escalate into anything that could disturb an approval.
+    ///
+    /// A no-op that returns immediately when no lease-control handle was ever
+    /// attached, so the daemon can spawn it unconditionally.
+    pub fn run_lease_reply_pump(&self, shutdown: &AtomicBool) {
+        if self.leases.get().is_none() {
+            return;
+        }
+        while !shutdown.load(Ordering::Acquire) {
+            match self
+                .lease_replies
+                .1
+                .lock()
+                .expect("lease reply queue poisoned")
+                .recv_timeout(LEASE_PUMP_TICK)
+            {
+                Ok(env) => {
+                    let _ = self.transport.deposit_to_phone(self.pairing_id, &env, None);
+                }
+                // Nothing queued this tick: loop and re-check shutdown.
+                Err(RecvTimeoutError::Timeout) => {}
+                // Every sender is gone (impossible while `self` lives): stop.
+                Err(RecvTimeoutError::Disconnected) => return,
             }
         }
     }
@@ -799,7 +1085,7 @@ impl RemoteApprover {
         // Open + replay-check + classify the opener exactly once, through the
         // shared guard, and stash the result to route after install. The predicate
         // returns true iff the envelope opened as our pinned peer.
-        let mut opener: Option<ToDaemonMessage> = None;
+        let mut opener: Option<(Uuid, ToDaemonMessage)> = None;
         let verified = discovery::verify_link(
             link.as_ref(),
             Direction::ToDaemon,
@@ -816,8 +1102,8 @@ impl RemoteApprover {
             Ok(_) => {
                 // Install BEFORE routing so the owner's next recv reads the link.
                 direct.install_primary(link);
-                if let Some(msg) = opener {
-                    self.route(msg);
+                if let Some((request_id, msg)) = opener {
+                    self.route(request_id, msg);
                 }
                 true
             }
@@ -1113,7 +1399,7 @@ mod tests {
                 label: ".env".into(),
             }],
             kind: RequestKind::SecretRead,
-            lease: LeasePolicy::Leasable { max_secs: 900 },
+            lease: LeasePolicy::leasable(900),
             ssh: None,
             threshold: None,
         };
@@ -1122,7 +1408,7 @@ mod tests {
         assert_eq!(req.kind, RequestKind::SecretRead);
         assert_eq!(
             req.lease_policy,
-            LeasePolicy::Leasable { max_secs: 900 },
+            LeasePolicy::leasable(900),
             "lease policy is threaded from the context"
         );
         assert_eq!(req.command, ctx.command);
@@ -1395,7 +1681,7 @@ mod tests {
                 assert_eq!(rb.request_id, "req-RING");
                 assert_eq!(rb.status, ResolutionStatus::Settled);
             }
-            ToPhoneMessage::Request(_) => panic!("a broadcast must classify as a Resolution"),
+            other => panic!("a broadcast must classify as a Resolution, got {other:?}"),
         }
 
         // A replay of the exact bytes is rejected by the phone's guard: a relay
@@ -2075,5 +2361,507 @@ mod tests {
         assert_eq!(direct_service_hint(&a), direct_service_hint(&a));
         assert_ne!(direct_service_hint(&a), direct_service_hint(&b));
         assert!(!direct_service_hint(&a).is_empty());
+    }
+
+    // --- phone lease control ------------------------------------------------
+
+    mod lease_control {
+        use super::*;
+        use crate::lease::{LeaseBinding, LeaseControl, LeaseStore};
+        use sigil_proto::{
+            LeaseListReply, LeaseQuery, LeaseRevoke, LeaseRevokeReply, ReplayGuard, ToPhoneMessage,
+            LABEL_REJECTED,
+        };
+        use zeroize::Zeroizing;
+
+        /// One pairing plus the store the daemon serves lease control from, with
+        /// the reply pump running exactly as the daemon runs it.
+        struct Fx {
+            relay: LocalRelay,
+            daemon: DeviceIdentity,
+            phone: DeviceIdentity,
+            mailbox: [u8; 32],
+            leases: Arc<LeaseStore>,
+            approver: Arc<RemoteApprover>,
+            counter: AtomicU64,
+            pump: Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
+        }
+
+        impl Drop for Fx {
+            fn drop(&mut self) {
+                if let Some((stop, handle)) = self.pump.take() {
+                    stop.store(true, Ordering::SeqCst);
+                    let _ = handle.join();
+                }
+            }
+        }
+
+        impl Fx {
+            fn new() -> Self {
+                Self::with_store(Arc::new(LeaseStore::new()))
+            }
+
+            fn with_store(leases: Arc<LeaseStore>) -> Self {
+                let relay = LocalRelay::new();
+                let daemon = DeviceIdentity::generate();
+                let phone = DeviceIdentity::generate();
+                let mailbox = mailbox_id(&daemon.peer_identity(), &phone.peer_identity());
+                let approver = Arc::new(RemoteApprover::new(
+                    Arc::new(relay.clone()),
+                    clone_id(&daemon),
+                    phone.peer_identity(),
+                ));
+                let control: Arc<dyn LeaseControl> = leases.clone();
+                approver.attach_leases(control);
+                // The real pump on its own thread, as `Core::serve` spawns it.
+                let stop = Arc::new(AtomicBool::new(false));
+                let pump = {
+                    let approver = approver.clone();
+                    let stop = stop.clone();
+                    std::thread::spawn(move || approver.run_lease_reply_pump(&stop))
+                };
+                Self {
+                    relay,
+                    daemon,
+                    phone,
+                    mailbox,
+                    leases,
+                    approver,
+                    counter: AtomicU64::new(0),
+                    pump: Some((stop, pump)),
+                }
+            }
+
+            /// Grant one window, returning its opaque lease id.
+            fn grant(&self, key: u8, scope: &str, covers: &str, account: &str) -> String {
+                self.leases.grant(
+                    [key; 32],
+                    &LeaseBinding::presence(account, scope, 1),
+                    covers,
+                    Zeroizing::new(Vec::new()),
+                    Duration::from_secs(300),
+                );
+                self.leases
+                    .list()
+                    .into_iter()
+                    .find(|l| l.scope == scope)
+                    .expect("the window was filed")
+                    .lease_id
+            }
+
+            /// Seal a phone -> daemon message and return it with the envelope's
+            /// uuidv7 request id, which the daemon must echo as `inReplyTo`.
+            fn seal<T: serde::Serialize>(&self, msg: &T) -> (Envelope, String) {
+                let counter = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let env = Envelope::seal(
+                    msg,
+                    self.mailbox,
+                    counter,
+                    &self.phone.signing,
+                    &self.daemon.peer_identity(),
+                )
+                .expect("seal");
+                let id = env.request_id.to_string();
+                (env, id)
+            }
+
+            /// Hand one envelope to the daemon through the real inbound path:
+            /// verify, replay-check, classify, route. Exactly what the owner loop
+            /// does with a polled envelope.
+            fn deliver(&self, env: &Envelope) {
+                self.approver.dispatch(env.clone());
+            }
+
+            /// Seal, deliver, and return the request id the reply must name.
+            fn ask<T: serde::Serialize>(&self, msg: &T) -> String {
+                let (env, id) = self.seal(msg);
+                self.deliver(&env);
+                id
+            }
+
+            /// The next daemon -> phone message, opened and classified by the
+            /// phone. `None` if the daemon sent nothing within `wait`.
+            fn reply_within(&self, wait: Duration) -> Option<ToPhoneMessage> {
+                let env = self
+                    .relay
+                    .recv(self.mailbox, Direction::ToPhone, wait)
+                    .expect("relay")?;
+                let value: serde_json::Value = env
+                    .open(
+                        &self.daemon.peer_identity(),
+                        &self.phone.agreement,
+                        &mut ReplayGuard::new(),
+                    )
+                    .expect("the phone opens the daemon-signed reply");
+                Some(ToPhoneMessage::from_value(value).expect("classifies"))
+            }
+
+            /// A reply the daemon is expected to send.
+            fn reply(&self) -> Option<ToPhoneMessage> {
+                self.reply_within(Duration::from_secs(2))
+            }
+
+            /// Assert the daemon sent nothing. The drop decision is made
+            /// synchronously in `dispatch`, before anything is queued, so a short
+            /// wait is conclusive.
+            fn expect_no_reply(&self) {
+                assert!(
+                    self.reply_within(Duration::from_millis(80)).is_none(),
+                    "the daemon must have stayed silent"
+                );
+            }
+
+            fn list_reply(&self) -> LeaseListReply {
+                match self.reply().expect("a list reply was deposited") {
+                    ToPhoneMessage::LeaseList(r) => r,
+                    other => panic!("expected a list reply, got {other:?}"),
+                }
+            }
+
+            fn revoke_reply(&self) -> LeaseRevokeReply {
+                match self.reply().expect("a revoke reply was deposited") {
+                    ToPhoneMessage::LeaseRevoke(r) => r,
+                    other => panic!("expected a revoke reply, got {other:?}"),
+                }
+            }
+
+            /// Let the token bucket refill, so a test that has spent its burst can
+            /// keep going.
+            fn refill(&self) {
+                std::thread::sleep(Duration::from_millis(1_100));
+            }
+        }
+
+        /// The happy path, end to end through the sealed envelope: the phone lists
+        /// the daemon's live windows and revokes one, the reply names the request
+        /// that asked, and the window is really gone from the same store
+        /// `sigil lease list` reads.
+        #[test]
+        fn a_sealed_list_and_revoke_round_trip_and_actually_kill_the_window() {
+            let fx = Fx::new();
+            let id = fx.grant(0x11, "op", "op read", "rowm");
+
+            let asked = fx.ask(&LeaseQuery::new());
+            let list = fx.list_reply();
+            assert_eq!(list.in_reply_to, asked, "the reply names the request");
+            assert!(list.as_of_ms > 0, "and stamps when it measured the clocks");
+            assert_eq!(list.leases.len(), 1);
+            let row = &list.leases[0];
+            assert_eq!(row.lease_id, id);
+            assert_eq!(row.scope, "op");
+            assert_eq!(row.covers, "op read");
+            assert_eq!(row.account, "rowm");
+            assert!(row.remaining_ms > 0 && row.remaining_ms <= 300_000);
+
+            let asked = fx.ask(&LeaseRevoke::new(&id));
+            let rev = fx.revoke_reply();
+            assert_eq!(rev.in_reply_to, asked);
+            assert_eq!(rev.lease_id, id);
+            assert!(rev.revoked, "the named window was live and must be killed");
+            assert_eq!(fx.leases.active(), 0, "and it is gone from the store");
+
+            // Idempotent: the same revoke again is a clean false, not an error.
+            fx.ask(&LeaseRevoke::new(&id));
+            assert!(!fx.revoke_reply().revoked);
+        }
+
+        /// **F1, the replay case this design exists for.**
+        ///
+        /// The envelope's freshness window and single-use id are RAM-only on both
+        /// ends, so a daemon restart empties the guard. A revoke captured off the
+        /// wire and re-flown inside the freshness window is then authentic, fresh,
+        /// and unseen -- it opens. What stops it is that it names an opaque lease
+        /// id, and the window it named is gone.
+        ///
+        /// Both gates are proven here: rejected outright at a live daemon, inert at
+        /// a restarted one.
+        #[test]
+        fn a_replayed_revoke_cannot_kill_a_later_window() {
+            let fx = Fx::new();
+            let id = fx.grant(0x22, "op", "op read", "rowm");
+
+            // The relay captures the revoke on its way past, and it lands.
+            let (captured, _) = fx.seal(&LeaseRevoke::new(&id));
+            fx.deliver(&captured);
+            assert!(fx.revoke_reply().revoked);
+            assert_eq!(fx.leases.active(), 0);
+
+            // The human re-approves: a NEW window, same rule, same caller, so the
+            // same deterministic grant key -- and a different lease id.
+            let id2 = fx.grant(0x22, "op", "op read", "rowm");
+            assert_ne!(id2, id, "a new window is a new id");
+            assert_eq!(
+                fx.leases.list()[0].grant_hex,
+                crate::lease::hex32(&[0x22; 32]),
+                "while the grant key really does recur"
+            );
+
+            // Gate 1: replayed at the same daemon, the guard rejects the bytes.
+            fx.deliver(&captured);
+            fx.expect_no_reply();
+            assert_eq!(fx.leases.active(), 1, "and must not touch the new window");
+
+            // Gate 2: the same message at a daemon with an EMPTY guard (a restart
+            // inside the freshness window). It opens and routes; the id binding is
+            // what makes it inert.
+            let restarted = Fx::with_store(fx.leases.clone());
+            restarted.ask(&LeaseRevoke::new(&id));
+            let rev = restarted.revoke_reply();
+            assert!(
+                !rev.revoked,
+                "a revoke naming a window that has ended must be inert"
+            );
+            assert_eq!(
+                restarted.leases.active(),
+                1,
+                "the window the human just opened survives a replayed revoke"
+            );
+        }
+
+        /// **F3: every reply names the envelope that asked.**
+        ///
+        /// Without it, a relay that captured a genuine `revoked: true` could
+        /// suppress a later revoke and deliver the capture instead, and the human
+        /// would be told a window closed while it is open. The daemon's half of the
+        /// defence is that the correlation is the ENVELOPE's uuidv7 request id,
+        /// which the phone generated and can therefore check against what it has
+        /// outstanding -- a check that survives its own restart, when the replay
+        /// guard does not.
+        #[test]
+        fn a_reply_names_the_envelope_that_asked_so_a_capture_cannot_pass_for_it() {
+            let fx = Fx::new();
+            let id = fx.grant(0x33, "op", "op read", "rowm");
+
+            // A first revoke, whose reply the relay captures.
+            let first = fx.ask(&LeaseRevoke::new(&id));
+            let captured = fx.revoke_reply();
+            assert!(captured.revoked);
+            assert_eq!(captured.in_reply_to, first);
+
+            // A second, later request gets a DIFFERENT correlation, so the capture
+            // cannot stand in for it. This is the property the phone keys on.
+            let id2 = fx.grant(0x33, "op", "op read", "rowm");
+            let second = fx.ask(&LeaseRevoke::new(&id2));
+            let fresh = fx.revoke_reply();
+            assert_ne!(second, first, "each envelope has its own uuidv7 id");
+            assert_eq!(fresh.in_reply_to, second);
+            assert_ne!(
+                captured.in_reply_to, second,
+                "the captured reply names a request that is no longer outstanding, \
+                 so the phone drops it"
+            );
+
+            // Same for a list.
+            let asked = fx.ask(&LeaseQuery::new());
+            assert_eq!(fx.list_reply().in_reply_to, asked);
+        }
+
+        /// Every way to fail is the same way: `revoked: false`, never an error and
+        /// never distinguishable. So the reply is not an oracle for what this
+        /// daemon holds.
+        #[test]
+        fn revoking_an_unknown_or_expired_window_is_one_clean_false() {
+            let fx = Fx::new();
+            fx.grant(0x44, "op", "op read", "rowm");
+
+            // An id this daemon has never minted.
+            fx.ask(&LeaseRevoke::new("a".repeat(32)));
+            let unknown = fx.revoke_reply();
+            assert!(!unknown.revoked);
+            assert_eq!(unknown.lease_id, "a".repeat(32), "echoed, normalized");
+            assert_eq!(fx.leases.active(), 1, "and nothing was killed");
+
+            // A window that lapsed on its own before the revoke arrived.
+            let lapsed = Fx::new();
+            lapsed.leases.grant(
+                [0x45; 32],
+                &LeaseBinding::presence("rowm", "op", 1),
+                "op read",
+                Zeroizing::new(Vec::new()),
+                Duration::from_millis(10),
+            );
+            let gone = lapsed.leases.list()[0].lease_id.clone();
+            std::thread::sleep(Duration::from_millis(30));
+            lapsed.ask(&LeaseRevoke::new(&gone));
+            let expired = lapsed.revoke_reply();
+            assert!(!expired.revoked);
+
+            // The two are the same shape on the wire: same keys, same length, same
+            // boolean. Nothing distinguishes "no such window" from "already gone".
+            let a = serde_json::to_vec(&unknown).unwrap();
+            let b = serde_json::to_vec(&expired).unwrap();
+            assert_eq!(a.len(), b.len());
+            assert_eq!(fx.leases.active(), 1);
+        }
+
+        /// **F2: a malformed or prefix-shaped target is dropped whole.**
+        ///
+        /// The store's other revoke entry point is prefix matched, and `""` is a
+        /// prefix of every string, so an empty identifier reaching it would be a
+        /// silent global lease wipe reported as success. This path never reaches
+        /// that API, refuses on width first, and answers nothing at all -- so
+        /// peer-chosen bytes are never echoed onto a screen either.
+        #[test]
+        fn a_malformed_or_empty_revoke_target_is_dropped_with_no_reply() {
+            let fx = Fx::new();
+            let id = fx.grant(0x55, "op", "op read", "rowm");
+            let grant_key = fx.leases.list()[0].grant_hex.clone();
+            for bad in [
+                String::new(),       // the wildcard-shaped one
+                id[..8].to_string(), // a prefix is not an id
+                format!("{id}0"),    // too long
+                "not-hex".to_string(),
+                grant_key, // a grant key is not a lease id
+            ] {
+                fx.ask(&LeaseRevoke::new(&bad));
+                fx.expect_no_reply();
+            }
+            assert_eq!(fx.leases.active(), 1, "and the store is untouched");
+        }
+
+        /// **F4: the list carries no unsanitised config text.** `scope` is the raw
+        /// rule name and `account` the raw source label, so both go through the
+        /// coverage-label allowlist. It carries no command line, secret reference,
+        /// or secret value either.
+        #[test]
+        fn the_list_never_carries_an_unsanitised_string() {
+            let fx = Fx::new();
+            fx.grant(
+                0x66,
+                "op\u{202e}prod",         // bidi override in a rule name
+                "op read\u{200b}\u{301}", // zero-width + combining mark
+                &"a".repeat(500),         // unbounded account label
+            );
+            fx.ask(&LeaseQuery::new());
+            let list = fx.list_reply();
+            let row = &list.leases[0];
+            for field in [&row.scope, &row.covers, &row.account] {
+                for ch in field.chars() {
+                    assert!(
+                        ch.is_ascii_graphic()
+                            || ch == ' '
+                            || ch == '\u{2026}'
+                            || ch == LABEL_REJECTED,
+                        "{ch:?} reached the phone's lease list"
+                    );
+                }
+                assert!(field.chars().count() <= sigil_proto::LEASE_LABEL_MAX_CHARS);
+            }
+            assert!(
+                row.scope.contains(LABEL_REJECTED),
+                "the override was marked"
+            );
+
+            // And the payload holds no grant key, no argv, no secret reference.
+            let json = serde_json::to_string(&list).unwrap();
+            assert!(!json.contains(&fx.leases.list()[0].grant_hex));
+            assert!(!json.contains("op://"));
+            assert!(!json.contains("command"));
+        }
+
+        /// **F7: the relay cannot count the windows.** Zero rows and several rows
+        /// seal to one ciphertext length, and a revoke reply is that same length,
+        /// so an observer cannot tell a list from a revoke or read the row count
+        /// off the wire.
+        #[test]
+        fn lease_control_ciphertexts_are_one_length_whatever_they_say() {
+            let mut lengths = Vec::new();
+            for rows in [0usize, 1, 3] {
+                let fx = Fx::new();
+                for i in 0..rows {
+                    fx.grant(
+                        0x70 + i as u8,
+                        &format!("rule-{i}"),
+                        "op with --account \"rowmhq.1password.eu\"",
+                        "Rowm work",
+                    );
+                }
+                fx.ask(&LeaseQuery::new());
+                let env = fx
+                    .relay
+                    .recv(fx.mailbox, Direction::ToPhone, Duration::from_secs(2))
+                    .expect("relay")
+                    .expect("a list reply");
+                lengths.push(env.ciphertext.len());
+            }
+            assert_eq!(
+                lengths
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                1,
+                "row count leaked through ciphertext length: {lengths:?}"
+            );
+
+            // A revoke reply is indistinguishable from a list reply by length.
+            let fx = Fx::new();
+            let id = fx.grant(0x7f, "op", "op read", "rowm");
+            fx.ask(&LeaseRevoke::new(&id));
+            let env = fx
+                .relay
+                .recv(fx.mailbox, Direction::ToPhone, Duration::from_secs(2))
+                .expect("relay")
+                .expect("a revoke reply");
+            assert_eq!(env.ciphertext.len(), lengths[0]);
+        }
+
+        /// With no lease-control handle attached (the softphone/test loop, or an
+        /// approver built before the core exists) a lease message is dropped with
+        /// no reply, rather than answered with a half-truth like an empty list --
+        /// which the human would read as "no windows are open".
+        #[test]
+        fn lease_control_with_no_handle_attached_is_dropped() {
+            let relay = LocalRelay::new();
+            let daemon = DeviceIdentity::generate();
+            let phone = DeviceIdentity::generate();
+            let mailbox = mailbox_id(&daemon.peer_identity(), &phone.peer_identity());
+            let approver = RemoteApprover::new(
+                Arc::new(relay.clone()),
+                clone_id(&daemon),
+                phone.peer_identity(),
+            );
+            let env = Envelope::seal(
+                &LeaseQuery::new(),
+                mailbox,
+                1,
+                &phone.signing,
+                &daemon.peer_identity(),
+            )
+            .expect("seal");
+            approver.dispatch(env);
+            assert!(relay
+                .recv(mailbox, Direction::ToPhone, Duration::from_millis(50))
+                .expect("relay")
+                .is_none());
+        }
+
+        /// **F8: the rate budget bounds a looping client without costing a human a
+        /// revoke.** A burst is served, a sustained flood is not, and the budget
+        /// refills.
+        #[test]
+        fn the_rate_budget_serves_a_human_burst_and_bounds_a_flood() {
+            let fx = Fx::new();
+            // A human revoking several rows in a second: every tap is answered.
+            let ids: Vec<String> = (0..LEASE_BURST)
+                .map(|i| fx.grant(0x80 + i as u8, &format!("rule-{i}"), "op read", "rowm"))
+                .collect();
+            for id in &ids {
+                fx.ask(&LeaseRevoke::new(id));
+                assert!(
+                    fx.revoke_reply().revoked,
+                    "a human's burst must never be silently dropped"
+                );
+            }
+            assert_eq!(fx.leases.active(), 0, "all of them really closed");
+
+            // The budget is now spent, so a flood past it is dropped in silence.
+            fx.ask(&LeaseQuery::new());
+            fx.expect_no_reply();
+
+            // And it refills, so the phone is served again shortly after.
+            fx.refill();
+            let asked = fx.ask(&LeaseQuery::new());
+            assert_eq!(fx.list_reply().in_reply_to, asked);
+        }
     }
 }

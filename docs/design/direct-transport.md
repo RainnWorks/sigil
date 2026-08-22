@@ -33,8 +33,10 @@ security argument for it, and the design for the parts deliberately deferred.
 
 **A direct transport is a pipe, never a trust boundary.** The security layer is,
 and remains, the envelope: crypto_box-sealed to the pinned recipient,
-Ed25519-signed by the pinned sender, single-use uuidv7 request id, per-pairing
-monotonic counter, 150s timestamp window (`sigil_proto`). A direct transport
+Ed25519-signed by the pinned sender, and two replay gates: a single-use uuidv7
+request id and a 150s freshness window (`sigil_proto`). The per-pairing counter
+rides the wire under the signature but gates nothing (retired; `replay.rs`), and
+both surviving gates are RAM-only. A direct transport
 changes only *which bytes carry the envelope*; it introduces no plaintext and no
 new trust in the network.
 

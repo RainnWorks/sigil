@@ -27,6 +27,12 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo fmt --check
+      # The citation gate already ran above (sigil-doccheck's tests are part of
+      # the workspace). This prints its full report, including the citations
+      # that were already dead when the gate landed, so the backlog stays
+      # visible in every CI log instead of only when someone runs it locally.
+      - name: security-claims citations (report)
+        run: cargo run -q -p sigil-doccheck
 
   house-rules-lint:
     name: house-rules (zero em-dash, zero emoji)

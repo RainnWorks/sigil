@@ -108,14 +108,103 @@ struct Lease: Identifiable, Equatable, Sendable {
     let grantHex: String
     var caller: String
     var account: String
-    /// The matched RULE's name, not a command line. The lease covers any command
+    /// The matched RULE's name, not a command line. The lease covers everything
     /// that rule matches for the caller chain that opened it, so every renderer
     /// has to show that breadth alongside the name.
+    ///
+    /// Held verbatim, because it names a rule and callers may need to match on
+    /// it. It is user-authored config that no surface sanitizes, so anything
+    /// rendering it runs it through `sanitized(_:)` at the render site.
     var scope: String
+    /// The daemon's coverage label for that rule: `op read`, or
+    /// `op with --account "rowmhq.1password.eu"` (Match::coverage quotes a flag's
+    /// value). The same words the approver consented to, so this screen states
+    /// the breadth exactly instead of gesturing at it. Nil when the
+    /// daemon sent none, and the row then falls back to the generic breadth
+    /// rather than guessing what the rule matches. Display only: nothing branches
+    /// on it, and it never defines the window (the daemon's binding does).
+    var covers: String? = nil
     var grantedAt: Date
     var expiresAt: Date
 
     func remaining(now: Date) -> TimeInterval { max(0, expiresAt.timeIntervalSince(now)) }
+
+    /// A port of `sigil_proto::sanitize_label` at the coverage bound, character
+    /// for character. That function is authoritative and runs first; this is
+    /// defence in depth at the render boundary, and it has to agree with it
+    /// exactly, or the same lease reads differently on two surfaces.
+    ///
+    /// An allowlist, deliberately, not a list of known-bad characters: a line may
+    /// hold printable ASCII (U+0021...U+007E), runs of whitespace collapsed to one
+    /// space, and the ellipsis. Everything else becomes one rejection marker per
+    /// run. A blocklist of control characters and combining marks would still pass
+    /// U+3164 HANGUL FILLER and U+2800 BRAILLE PATTERN BLANK, which are a letter
+    /// and a symbol that render as nothing, along with whatever a later Unicode
+    /// revision adds. Unknown input is rejected rather than passed, which is the
+    /// direction a consent surface has to fail in.
+    ///
+    /// Both free-text fields on the lease row need it. The daemon sanitizes the
+    /// coverage label, so re-running is belt and braces; the rule NAME is
+    /// user-authored config that no surface sanitizes, so here the pass is the
+    /// only one. Nothing parses or branches on the result.
+    ///
+    /// Idempotent, which is what lets it sit downstream of the daemon: a rejected
+    /// scalar becomes the marker, and the marker is itself rejected, so it maps to
+    /// itself. An already-sanitised label survives a second pass unchanged.
+    static func sanitized(_ raw: String) -> String {
+        var out = String.UnicodeScalarView()
+        var pendingSpace = false
+        var prevRejected = false
+        // Scalars, not Characters: "e" plus a combining acute is one Character but
+        // two scalars, and only the mark should be rejected. It matches how the
+        // daemon walks the same string.
+        for scalar in raw.unicodeScalars {
+            if scalar.properties.generalCategory == .control || scalar.properties.isWhitespace {
+                // Leading whitespace never opens a line, and a pending space at the
+                // end is simply never flushed, so both ends come out trimmed.
+                pendingSpace = !out.isEmpty
+                continue
+            }
+            let permitted = (0x21...0x7e).contains(scalar.value) || scalar == labelEllipsis
+            // A run of rejected scalars collapses to one marker, the way a run of
+            // whitespace collapses to one space: forty combining marks are one
+            // piece of information, and forty markers would deform the line the
+            // same way the marks would.
+            if !permitted, prevRejected, !pendingSpace { continue }
+            if pendingSpace {
+                out.append(" ")
+                pendingSpace = false
+            }
+            out.append(permitted ? scalar : labelRejected)
+            prevRejected = !permitted
+        }
+        guard out.count > coversMaxChars else { return String(out) }
+        var clipped = String.UnicodeScalarView(out.prefix(coversMaxChars - 1))
+        // Trimmed before the mark, so a line never elides to "op read …".
+        while let last = clipped.last, last.properties.isWhitespace { clipped.removeLast() }
+        clipped.append(labelEllipsis)
+        return String(clipped)
+    }
+
+    /// U+2026: the one non-ASCII scalar the allowlist admits, because eliding with
+    /// one character rather than three dots keeps the bound exact.
+    static let labelEllipsis: Unicode.Scalar = "\u{2026}"
+
+    /// U+FFFD, what a run of rejected scalars becomes. Not "?", which is ordinary
+    /// label content: a rule holding a literal question mark would be
+    /// indistinguishable from one that had been degraded.
+    static let labelRejected: Unicode.Scalar = "\u{fffd}"
+
+    /// A coverage label as the row should show it. Blank in, nil out: the caller
+    /// then states the generic breadth rather than an empty clause.
+    static func coverage(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let label = sanitized(raw)
+        return label.isEmpty ? nil : label
+    }
+
+    /// The daemon's bound on a coverage label (sigil_proto::COVERS_MAX_CHARS).
+    static let coversMaxChars = 72
 }
 
 // MARK: - History (audit)

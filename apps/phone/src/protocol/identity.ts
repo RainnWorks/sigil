@@ -1,10 +1,36 @@
 /**
  * Device identities, mirroring crates/sigil-proto/src/identity.rs.
  *
- * A device holds an Ed25519 signing key and an X25519 agreement key. On a real
- * phone the private halves live in the Secure Enclave and never surface here;
- * this module models the shapes and the in-memory operations used by the mock
- * transport, dev builds, and the shared test vectors.
+ * A device holds an Ed25519 signing key and an X25519 agreement key.
+ *
+ * **BOTH PRIVATE HALVES ARE HANDLED HERE, IN JS, ON EVERY USE, AND NEITHER IS IN
+ * THE SECURE ENCLAVE.** This comment used to say the opposite, and the correction
+ * matters more than a comment usually would, so be exact about what is where:
+ *
+ *   - The Ed25519 signing seed and the X25519 agreement seed are persisted
+ *     base64 in `expo-secure-store` (`src/session/keystore.ts`), which is an iOS
+ *     keychain item. `signingSecretKey` and `agreementSecretKey` below expand
+ *     them into raw private keys in JS memory on every outbound seal and every
+ *     inbound open (`src/session/session.ts`). No biometric gates either.
+ *   - Only the P-256 threshold share `f` is enclave-resident and non-exportable
+ *     (`modules/sigil-se`). That key is what a secret release depends on, and it
+ *     is the one thing on this phone that genuinely never surfaces in JS.
+ *
+ * The consequence is the reason to state it plainly: FORGING AN APPROVAL AS THIS
+ * PHONE DOES NOT REQUIRE ENCLAVE EXTRACTION. It requires reading one keychain
+ * item. The old wording invited a reviewer to conclude the opposite and stop
+ * looking, which is the expensive kind of wrong comment. What the enclave share
+ * does buy is separate and real: holding these seeds is not enough to open a
+ * threshold-sealed secret, because `Z_F` still has to come from the enclave under
+ * biometry.
+ *
+ * NEEDS VERIFICATION (behaviour, not documentation): the keystore writes with no
+ * `keychainAccessible` option, so it takes expo-secure-store's default, which
+ * reads as `kSecAttrAccessibleWhenUnlocked` in the vendored source. That is not a
+ * `ThisDeviceOnly` class, so the item can migrate to new hardware through an
+ * encrypted backup restore. Whether that is the intended custody for the key that
+ * authorizes approvals is a decision nobody has recorded making; it should be
+ * pinned deliberately rather than inherited from a default.
  *
  * `PeerIdentity` is the public half exchanged at pairing and pinned forever.
  */

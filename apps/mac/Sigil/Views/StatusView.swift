@@ -161,7 +161,7 @@ private struct KeystoreCard: View {
     private var tone: StateTone {
         switch state {
         case .sealed: return .armed
-        case .sealedUnprovisioned, .failed, .downgraded: return .denied
+        case .sealedUnprovisioned, .failed, .downgraded, .downgradeUnverified: return .denied
         case .plaintext, .checking, .absent: return .neutral
         }
     }
@@ -174,6 +174,9 @@ private struct KeystoreCard: View {
         case .sealedUnprovisioned: return "Sealed, not open"
         case .plaintext: return "Plaintext"
         case .downgraded: return "Downgraded"
+        // Not "Unknown": what is unknown is the wrapping key, and the file being
+        // plaintext is already established. The pill names the thing to act on.
+        case .downgradeUnverified: return "Downgrade, unconfirmed"
         case .failed: return "Failed"
         }
     }
@@ -195,6 +198,8 @@ private struct KeystoreCard: View {
             return sentence(reason)
         case .downgraded:
             return "The wrapping key is still on this Mac, but the file has gone back to plaintext. No sanctioned unwrap does that: an unwrap destroys the key. Either the file was replaced, or an unwrap stopped halfway. Check where this file came from before wrapping it again."
+        case .downgradeUnverified(_, let reason):
+            return "The file is plaintext and this Mac would not say whether the wrapping key survived (\(clause(reason))). Until it answers, this counts as a downgrade: wrapping the file again now would overwrite the only evidence of one. Check where this file came from first."
         case .failed(_, let reason):
             return sentence(reason)
         }
@@ -208,12 +213,23 @@ private struct KeystoreCard: View {
         return first.uppercased() + text.dropFirst()
     }
 
+    /// The same strings set inside a sentence rather than as one: keep the
+    /// lowercase start, drop a trailing stop that would land next to a bracket.
+    private func clause(_ text: String) -> String {
+        text.hasSuffix(".") ? String(text.dropLast()) : text
+    }
+
     /// Retry is offered only where the app can actually change the outcome by
     /// trying again. A Mac with no Enclave gets no button to press.
     private var retryable: Bool {
         switch state {
         case .sealedUnprovisioned, .failed: return true
-        case .checking, .absent, .sealed, .plaintext, .downgraded: return false
+        // No Retry on either downgrade state: re-reading the file cannot change
+        // what happened to it, and the deliberate control is "Wrap again". The
+        // unconfirmed one does re-evaluate on the next daemon reconnect, and it
+        // should: a keychain that answers is strictly better information than one
+        // that would not, whichever way it answers.
+        case .checking, .absent, .sealed, .plaintext, .downgraded, .downgradeUnverified: return false
         }
     }
 }
@@ -264,6 +280,20 @@ private struct KeystoreCard: View {
             daemon: MockDaemonClient(scenario: .armedIdle),
             keystore: KeystoreCoordinator(
                 previewState: .downgraded(path: "/Users/you/.sigil/keystore.json"))))
+        .frame(width: 640, height: 700)
+}
+
+#Preview("Status · keystore downgrade unconfirmed") {
+    // The same alarm, one certainty short: the file is plaintext and the keychain
+    // would not say whether the wrapping key is still there. Rendered as an alarm
+    // rather than as the calm plaintext line, because adopting to clear it is
+    // exactly what would destroy the evidence.
+    NavigationStack { StatusView() }
+        .environment(AppModel(
+            daemon: MockDaemonClient(scenario: .armedIdle),
+            keystore: KeystoreCoordinator(previewState: .downgradeUnverified(
+                path: "/Users/you/.sigil/keystore.json",
+                reason: "keychain lookup failed: User interaction is not allowed."))))
         .frame(width: 640, height: 700)
 }
 

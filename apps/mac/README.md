@@ -41,7 +41,9 @@ Sigil/
   Security/       LocalApprovalService protocol, SecureEnclaveApprover (real), MockApprover
   Views/          RootWindow + 6 tabs (Status/Accounts/Pairing/Leases/History/Settings), MenubarContent, components
 Tools/
-  se-selftest.swift   on-device Secure Enclave round-trip (the NEEDS VERIFICATION command)
+  keystore-alarm-check.swift  headless check on the two keystore decisions that
+                              must not fail open. Outside `Sigil/`, so it joins
+                              no build; run it by hand, command in the file.
 ```
 
 ## The two seams (mirroring the phone app's mock transport)
@@ -70,6 +72,14 @@ de-adopt. De-adoption is the one path gated on Touch ID, because it is the one
 path that lowers protection; it also destroys the wrapping key, and that absence
 is the record that the unwrap was sanctioned. A plaintext file next to a
 surviving wrapping key is a downgrade and is alarmed as one.
+
+Two rules keep that from being decorative, and `Tools/keystore-alarm-check.swift`
+holds both to it. "Is the wrapping key still here" has three answers, and only an
+answered *no* licenses an adopt: a keychain that will not say is alarmed, because
+adopting is what overwrites the evidence. And the Touch ID on de-adoption accepts
+the login password in exactly one situation, a Mac with no usable biometry
+hardware; a sensor that is merely locked out refuses, or failing Touch ID five
+times becomes the cheap way to unwrap the keystore.
 
 A write-back ("commit") flow is deferred, not missing: the production daemon
 never writes the keystore, since every mutation is CLI-side and those are refused

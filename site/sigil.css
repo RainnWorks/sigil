@@ -319,14 +319,16 @@ tr td:last-child, tr th:last-child { padding-right: 0; }
 .prov div { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-top: 1px solid oklch(0.27 0.014 245); }
 .prov .k { color: oklch(0.58 0.012 240); }
 .prov .v { color: oklch(0.88 0.008 238); text-align: right; }
-.risk-line { display: flex; gap: 8px; align-items: center; margin: 14px 2px 18px; font-size: 0.78rem; color: var(--term-brass); }
-.risk-line::before { content: ""; width: 7px; height: 7px; border-radius: 99px; background: var(--term-brass); flex: none; }
-.slide {
+.covers-line { display: flex; gap: 8px; align-items: baseline; margin: 14px 2px 18px; font-size: 0.78rem; line-height: 1.45; color: var(--term-brass); }
+.covers-line::before { content: ""; width: 7px; height: 7px; border-radius: 99px; background: var(--term-brass); flex: none; transform: translateY(-1px); }
+/* The sheet is a device mockup and keeps its own dark surface in both themes,
+   so the page's code chip must not paint a light background inside it. */
+.covers-line code { background: none; border: 0; padding: 0; color: inherit; }
+.approvebtn {
   background: oklch(0.42 0.1 231); border-radius: 999px; height: 56px;
-  display: flex; align-items: center; padding: 5px; position: relative; overflow: hidden;
+  display: grid; place-items: center;
+  color: oklch(0.97 0.004 235); font-size: 0.95rem; font-weight: 500;
 }
-.slide .knob { width: 46px; height: 46px; border-radius: 99px; background: oklch(0.97 0.004 235); color: oklch(0.42 0.1 231); display: grid; place-items: center; font-size: 1.1rem; flex: none; font-family: var(--mono); }
-.slide .lbl { flex: 1; text-align: center; color: oklch(0.97 0.004 235); font-size: 0.95rem; font-weight: 500; padding-right: 46px; }
 .denybtn { margin-top: 12px; text-align: center; padding: 13px; border-radius: 999px; border: 1px solid oklch(0.5 0.12 25 / 0.65); color: oklch(0.74 0.13 25); font-size: 0.95rem; }
 .mock-cap { font-size: 0.8rem; color: var(--muted); margin-top: 16px; max-width: 42ch; }
 

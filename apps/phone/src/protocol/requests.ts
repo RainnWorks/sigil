@@ -61,7 +61,34 @@ export interface LeasePolicy {
   kind: "leasable";
   /** The longest lease window the daemon will honor for this grant, in seconds. */
   maxSecs: number;
+  /**
+   * The daemon's own one-line description of how wide the window is, e.g.
+   * `op read`, `op with --account "rowmhq.1password.eu"`, or
+   * `any command with the subcommand read`. Rendered by the daemon from the
+   * user's rule match conditions, so the phone can state the breadth exactly
+   * instead of guessing it from argv.
+   *
+   * DISPLAY ONLY, and strictly so: render it, never parse it, never branch
+   * behavior on it. It is never an argv, never a secret reference, and never
+   * client-supplied; it arrives inside the sealed, signed request like every
+   * other display field.
+   *
+   * Absent on run-once and omitted when empty. Absent/empty means the sheet has
+   * no daemon-stated breadth to show (an older daemon), never that the window is
+   * narrow. The daemon guarantees at most `COVERS_MAX_CHARS` characters, no
+   * control characters or newlines, whitespace already collapsed, and a single
+   * "…" for any elision; `coverageLabel` (src/lib/format.ts) re-applies that
+   * bound for layout rather than trusting it.
+   */
+  covers?: string;
 }
+
+/**
+ * The longest coverage label the daemon will send, mirroring proto
+ * `COVERS_MAX_CHARS`. The phone treats it as a layout bound it re-applies, not
+ * as a promise it depends on.
+ */
+export const COVERS_MAX_CHARS = 72;
 
 /**
  * The trust level of an SSH challenge's `host`, mirroring proto `HostBinding`
@@ -286,26 +313,325 @@ export interface ResolutionBroadcastMessage {
 }
 
 /**
- * An opened daemon -> phone payload: either a fresh {@link ApprovalRequest} to
- * display (untagged, legacy) or a tagged {@link ResolutionBroadcastMessage} to
- * dismiss one. Mirrors proto `ToPhoneMessage`. {@link classifyToPhone} is the
- * single place the phone decides which one an opened envelope is.
+ * The exact width of a lease id rendered as lowercase hex: 128 opaque random
+ * bits, mirroring the daemon's own constant.
+ *
+ * A lease id and NOT a grant key, deliberately, and this is the one thing about
+ * lease control the phone must never get wrong. A grant key is a hash of the
+ * caller chain plus the rule: it is not unique to a window, it is a stable
+ * correlator that would outlive the window in anything the phone kept and would
+ * survive a re-pair, and the daemon's CLI revoke is PREFIX matched, so a
+ * truncated or empty one would silently revoke every window while reporting
+ * success. The phone therefore never handles, stores, renders or logs a grant
+ * key; it echoes back the opaque per-window id it was handed and nothing else.
+ */
+export const LEASE_ID_CHARS = 32;
+
+/**
+ * The bound every human-readable field of a {@link LeaseRow} is sanitized to,
+ * mirroring the daemon's `LEASE_LABEL_MAX_CHARS`. The same number as
+ * {@link COVERS_MAX_CHARS}, because it is the same allowlist doing the same job
+ * on the same kind of surface.
+ */
+export const LEASE_LABEL_MAX_CHARS = COVERS_MAX_CHARS;
+
+/**
+ * Every lease-control plaintext is padded to a multiple of this before sealing,
+ * mirroring the daemon's `LEASE_PAD_BUCKET`.
+ *
+ * Ciphertext length would otherwise carry the row count straight to the relay: a
+ * realistic row is around 169 bytes, so an unpadded reply says how many windows
+ * are open, and a revoke is trivially shorter than a list. 1024 rather than 512
+ * because 512 holds only two realistic rows and rolls at three, leaking the count
+ * in exactly the range that matters.
+ *
+ * Padding is a SENDER obligation and is deliberately not verified on receipt. A
+ * peer that does not pad leaks its own lengths and nobody else's, whereas
+ * rejecting an unpadded message would make a version skew between the two halves
+ * fail silently and closed, and a revoke that vanishes is the failure this whole
+ * feature exists to end.
+ */
+export const LEASE_PAD_BUCKET = 1024;
+
+/** The inert filler. ASCII, so one character is one byte and needs no escaping. */
+const LEASE_PAD_FILL = ".";
+
+/** A lease-control payload, which always carries its own padding field. */
+interface Padded {
+  pad: string;
+}
+
+/**
+ * Size `pad` so the serialized JSON is exactly a multiple of
+ * {@link LEASE_PAD_BUCKET} bytes. Mirrors the daemon's
+ * `LeaseControlMessage::padded`.
+ *
+ * Exact rather than approximate because `pad` always serializes, even when empty,
+ * so measuring with it empty already accounts for the field's own overhead and
+ * the filler can never spill into a further bucket. Measured in BYTES, matching
+ * `serde_json::to_vec().len()` on the daemon and the `TextEncoder` in `seal`.
+ *
+ * Key order differs from the daemon's struct order and that is fine: only the
+ * length is load-bearing, and nothing on either side parses the padding.
+ */
+export function padLeaseControl<T extends Padded>(payload: T): T {
+  const encoder = new TextEncoder();
+  const bare = { ...payload, pad: "" };
+  const len = encoder.encode(JSON.stringify(bare)).length;
+  const target = Math.ceil(len / LEASE_PAD_BUCKET) * LEASE_PAD_BUCKET;
+  return { ...bare, pad: LEASE_PAD_FILL.repeat(target - len) };
+}
+
+/**
+ * Phone -> daemon: list the daemon's live lease windows (PHONE LEASE CONTROL).
+ *
+ * Sealed over the live session like {@link PushRegisterMessage}, outside the
+ * request/response flow, and carrying no body: the correlation id is the
+ * ENVELOPE's single-use uuidv7 request id, which the daemon echoes as
+ * {@link LeaseListReplyMessage.inReplyTo}.
+ *
+ * Unlike the rest of the read path this one IS gated on a local biometric before
+ * it is issued (design review F5). Listing releases nothing, but it changes what
+ * a stolen or coerced phone can produce on demand: a complete schedule of which
+ * auto-approve windows are live, on which rules, and how many seconds each has
+ * left, which is a map of what will release with no human tap. Revoking stays
+ * completely ungated, because a revoke is a deny and a deny is never made heavier
+ * than an approve.
+ */
+export interface LeaseListMessage {
+  type: "leaseList";
+  /** Length-hiding filler; see {@link padLeaseControl}. Never read by anyone. */
+  pad: string;
+}
+
+/**
+ * Phone -> daemon: end ONE live lease window, named by its opaque id.
+ *
+ * `leaseId` comes verbatim from a {@link LeaseRow} the daemon itself sent. The
+ * phone cannot compute one and never invents one. See {@link LEASE_ID_CHARS} for
+ * why this is not a grant key.
+ *
+ * Revoking only ever NARROWS authority, so like a deny it needs no biometric and
+ * no confirmation.
+ */
+export interface LeaseRevokeMessage {
+  type: "leaseRevoke";
+  leaseId: string;
+  /** Length-hiding filler; see {@link padLeaseControl}. Never read by anyone. */
+  pad: string;
+}
+
+/**
+ * One live lease window as the daemon reports it. Display only, in every field:
+ * nothing here is parsed, matched on, or branched upon, and `leaseId` is an
+ * opaque handle to hand back on a revoke.
+ *
+ * The daemon sanitizes `scope`, `covers`, and `account` through its own label
+ * allowlist before sending, because all three are raw config text the user wrote.
+ * The phone re-runs that allowlist anyway (`safeLabel` in src/lib/format.ts),
+ * exactly as the approval sheet's coverage caption does: this type describes what
+ * the daemon promises, not what a screen may assume it received.
+ *
+ * There is no age field. It was dropped from the wire because it lies across a
+ * refresh: a window extended by a later approval is one window, and an age
+ * measured from the first approval would describe something the human never
+ * agreed to as a single span.
+ */
+export interface LeaseRow {
+  /** The opaque per-window id, lowercase hex, {@link LEASE_ID_CHARS} wide. The
+   *  row's identity, and the only thing a revoke names. */
+  leaseId: string;
+  /**
+   * The matched RULE's name. One window covers ANY command that rule matches for
+   * the caller chain that opened it, so no renderer may let this read as a
+   * single command line.
+   */
+  scope: string;
+  /**
+   * The daemon's one-line description of the rule's breadth, the same string the
+   * approval sheet's caption consented to. **Empty means no label was
+   * rendered**: show no coverage clause rather than inventing one, and never read
+   * empty as "narrow".
+   */
+  covers: string;
+  /** The source label the window injects from. Empty for a plain gate, which
+   *  injects nothing. */
+  account: string;
+  /** Milliseconds left when the daemon took the snapshot. */
+  remainingMs: number;
+}
+
+/**
+ * Daemon -> phone: the answer to a {@link LeaseListMessage}.
+ *
+ * A SNAPSHOT, and the type says so: `asOfMs` is when the daemon measured it, and
+ * the screen renders that timestamp and goes visibly stale rather than sitting
+ * there looking like a live view of the Mac.
+ *
+ * An empty `leases` array is a POSITIVE statement that nothing is open, and it
+ * is the only thing that entitles the phone to say so. The absence of a reply is
+ * not an empty list, and the settings screen must never render one as the other.
+ */
+export interface LeaseListReplyMessage {
+  type: "leaseListReply";
+  /** The envelope request id of the {@link LeaseListMessage} this answers. */
+  inReplyTo: string;
+  /** When the daemon took this snapshot, unix ms on the daemon's clock. */
+  asOfMs: number;
+  leases: LeaseRow[];
+}
+
+/**
+ * Daemon -> phone: the answer to a {@link LeaseRevokeMessage}.
+ *
+ * `revoked: true` means a live window with that id was found and zeroized;
+ * `false` means there was none, and the daemon deliberately does not distinguish
+ * already-lapsed from already-revoked from never-held. Every `false` is a
+ * SUCCESS: the window is closed either way, and the UI says so plainly rather
+ * than dressing it as a failure.
+ *
+ * The only real failure is no reply at all, and that one is never reported as a
+ * success: see {@link inReplyTo}.
+ */
+export interface LeaseRevokeReplyMessage {
+  type: "leaseRevokeReply";
+  /**
+   * The envelope request id of the {@link LeaseRevokeMessage} this answers, and
+   * the whole defence against the attack that made this feature worse than the
+   * badge it replaced (design review F3).
+   *
+   * The envelope layer's replay guard is a 150 second freshness window
+   * (`REPLAY_WINDOW_MS`) plus a single-use id set held in RAM, and that set is
+   * empty again after any restart.
+   * The phone being killed or backgrounded is routine. So a relay can capture a
+   * genuine `revoked: true`, wait for a restart, suppress the human's next
+   * outgoing revoke, and deliver the captured reply into a fresh guard: unseen
+   * id, valid signature, inside the freshness window, because the message really
+   * is genuine. The phone would tell the human a window closed while it is open.
+   *
+   * The correlation is what closes it. The phone applies a reply ONLY if this
+   * matches a request it issued in THIS session and has not yet answered, and it
+   * consumes that entry on the match. A captured reply replayed after a restart
+   * matches nothing, because the outstanding set died with the process, and is
+   * dropped. This is single-use at the application layer and is load-bearing on
+   * its own, not belt-and-braces over the envelope guard.
+   */
+  inReplyTo: string;
+  /** Echoes the revoked lease id. */
+  leaseId: string;
+  revoked: boolean;
+}
+
+/** Exactly-width lowercase hex, normalized. Anything else is not an identifier. */
+function hexField(v: unknown, chars: number): string | null {
+  if (typeof v !== "string" || v.length !== chars) return null;
+  return /^[0-9a-fA-F]+$/.test(v) ? v.toLowerCase() : null;
+}
+
+/** A uuid correlation id: the shape `seal` mints for an envelope request id. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function uuidField(v: unknown): string | null {
+  return typeof v === "string" && UUID.test(v) ? v.toLowerCase() : null;
+}
+
+function isMs(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0;
+}
+
+/**
+ * Validate one wire lease row. Shape only: the display hygiene (the daemon's
+ * label allowlist, re-applied here as defence in depth) happens where the row is
+ * turned into something renderable, in src/domain/leases.ts.
+ */
+function parseLeaseRow(v: unknown): LeaseRow | null {
+  if (typeof v !== "object" || v === null) return null;
+  const r = v as Record<string, unknown>;
+  const leaseId = hexField(r.leaseId, LEASE_ID_CHARS);
+  if (!leaseId) return null;
+  if (typeof r.scope !== "string" || typeof r.covers !== "string") return null;
+  if (typeof r.account !== "string") return null;
+  if (!isMs(r.remainingMs)) return null;
+  return {
+    leaseId,
+    scope: r.scope,
+    covers: r.covers,
+    account: r.account,
+    remainingMs: r.remainingMs,
+  };
+}
+
+/**
+ * Validate a lease-list reply, returning null for anything malformed.
+ *
+ * **One bad row voids the whole answer, deliberately.** Skipping the bad row and
+ * keeping the rest would under-report open windows, and under-reporting is the
+ * one direction this surface must never fail in: the human would read a shorter
+ * list as "that is everything". Voiding the answer lands the screen in "cannot
+ * check right now", which is a true statement about what the phone knows.
+ */
+export function parseLeaseListReply(payload: unknown): LeaseListReplyMessage | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const p = payload as Record<string, unknown>;
+  const inReplyTo = uuidField(p.inReplyTo);
+  if (!inReplyTo || !isMs(p.asOfMs)) return null;
+  if (!Array.isArray(p.leases)) return null;
+  const leases: LeaseRow[] = [];
+  for (const raw of p.leases) {
+    const row = parseLeaseRow(raw);
+    if (!row) return null;
+    leases.push(row);
+  }
+  // `pad` is deliberately not read, not copied, and not sanitized: it is inert
+  // filler, and letting its size or content reach anything would hand a relay a
+  // lever it does not otherwise have.
+  return { type: "leaseListReply", inReplyTo, asOfMs: p.asOfMs, leases };
+}
+
+/** Validate a revoke reply. Fails closed: a malformed one confirms nothing. */
+export function parseLeaseRevokeReply(payload: unknown): LeaseRevokeReplyMessage | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const p = payload as Record<string, unknown>;
+  const inReplyTo = uuidField(p.inReplyTo);
+  const leaseId = hexField(p.leaseId, LEASE_ID_CHARS);
+  if (!inReplyTo || !leaseId) return null;
+  if (typeof p.revoked !== "boolean") return null;
+  return { type: "leaseRevokeReply", inReplyTo, leaseId, revoked: p.revoked };
+}
+
+/**
+ * An opened daemon -> phone payload: a fresh {@link ApprovalRequest} to display
+ * (untagged, legacy), a tagged {@link ResolutionBroadcastMessage} to dismiss one,
+ * or a tagged answer to a lease-control question. Mirrors proto `ToPhoneMessage`.
+ * {@link classifyToPhone} is the single place the phone decides which one an
+ * opened envelope is.
  */
 export type ToPhoneMessage =
   | { kind: "request"; request: ApprovalRequest }
-  | { kind: "resolution"; resolution: ResolutionBroadcastMessage };
+  | { kind: "resolution"; resolution: ResolutionBroadcastMessage }
+  | { kind: "leaseList"; reply: LeaseListReplyMessage }
+  | { kind: "leaseRevoke"; reply: LeaseRevokeReplyMessage };
 
 /**
  * Classify an opened (decrypted, verified) ToPhone payload by its `type` tag,
  * mirroring proto `ToPhoneMessage::from_value`. `"resolution"` selects a
- * dismissal; its absence is an approval request. Fails closed: a `"resolution"`
- * tag with a missing/blank `requestId` returns `null` so the caller drops it
- * rather than dismissing an unknown request. Kept a pure function so it is unit
+ * dismissal, `"leaseListReply"` / `"leaseRevokeReply"` select a lease-control
+ * answer; the absence of a tag is an approval request. Fails closed: a tagged
+ * payload that does not validate returns `null` so the caller drops it rather
+ * than acting on a half-read message. Kept a pure function so it is unit
  * testable without a live session.
  */
 export function classifyToPhone(payload: unknown): ToPhoneMessage | null {
   if (typeof payload !== "object" || payload === null) return null;
   const tag = (payload as { type?: unknown }).type;
+  if (tag === "leaseListReply") {
+    const reply = parseLeaseListReply(payload);
+    return reply ? { kind: "leaseList", reply } : null;
+  }
+  if (tag === "leaseRevokeReply") {
+    const reply = parseLeaseRevokeReply(payload);
+    return reply ? { kind: "leaseRevoke", reply } : null;
+  }
   if (tag === "resolution") {
     const p = payload as Partial<ResolutionBroadcastMessage>;
     if (typeof p.requestId !== "string" || p.requestId.length === 0) return null;

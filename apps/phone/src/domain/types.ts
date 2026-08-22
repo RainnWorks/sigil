@@ -87,19 +87,176 @@ export interface HistoryEntry {
   via: string;
 }
 
-export interface Lease {
-  id: string;
-  /** e.g. "rowm launcher". */
-  caller: string;
+/**
+ * One live lease window, as this phone last heard it and stamped it against its
+ * own clock. Built from a wire {@link LeaseRow} by `toActiveLeases`
+ * (src/domain/leases.ts); every display string has already been through the
+ * daemon's label allowlist a second time there.
+ *
+ * A SNAPSHOT ROW, never a source of truth: the daemon is the only lease
+ * authority, and every field here describes what it said at {@link LeaseView.asOfMs}.
+ * The phone holds no lease state of its own, which is why removing a row locally
+ * can never stand in for revoking one. Rows are rendered and dropped; nothing
+ * here is persisted, because a stored list of live auto-approve windows is a map
+ * of what will release without a tap.
+ */
+export interface ActiveLease {
+  /** The opaque per-window id: the row's identity, and the only thing a revoke
+   *  names. Never a grant key; see `LEASE_ID_CHARS` for why that distinction is
+   *  load-bearing rather than cosmetic. */
+  leaseId: string;
   /**
-   * The matched RULE's name, mirroring the daemon's `LeaseJson.scope`, e.g.
-   * "op-eu". NOT the command line that opened the lease: one lease covers any
-   * command that rule matches, run by the caller chain that opened it, until it
-   * expires. Anything rendering this must not imply it covers a single command.
+   * The matched RULE's name, e.g. "op-eu". NOT the command line that opened the
+   * window: one window covers any command that rule matches, run by the caller
+   * chain that opened it, until it expires. Anything rendering this must not
+   * imply it covers a single command. Null when nothing usable survived the
+   * allowlist.
    */
-  scope: string;
-  grantedAt: number;
+  scope: string | null;
+  /** The daemon's own description of the rule's breadth; null when it sent none,
+   *  which never means the window is narrow. */
+  covers: string | null;
+  /** The source the window injects from; null for a plain gate, which injects
+   *  nothing. */
+  account: string | null;
+  /** Absolute local expiry, unix ms: arrival time plus the daemon's `remainingMs`. */
   expiresAt: number;
+  /** The span the countdown depletes over: `remainingMs` as measured on arrival.
+   *  Not the window's original length, which the wire no longer states because a
+   *  refreshed window has no single honest start. */
+  windowMs: number;
+}
+
+/**
+ * A revoke this phone has sent and not yet had confirmed.
+ *
+ * `requestId` is the whole of the correlation defence (design review F3). The
+ * envelope layer's replay protection is a freshness window plus a single-use id
+ * set held in RAM, and that set is empty again after any restart, which for a
+ * phone is routine. Matching a reply against a request THIS session issued, and
+ * consuming the entry on the match, is what stops a captured genuine
+ * `revoked: true` from being replayed into a fresh process to tell the human a
+ * window closed while it is open.
+ */
+export interface PendingRevoke {
+  /** The envelope request id this phone sent, echoed back as `inReplyTo`. */
+  requestId: string;
+  /** The window it names. */
+  leaseId: string;
+  /** The rule name as it was on screen, so a standing warning can name what it
+   *  is about after the snapshot behind it has been dropped. */
+  scope: string | null;
+  /**
+   * When the FIRST attempt left this device, unix ms. Deliberately not re-stamped
+   * by a retry: it dates how long this window has been unresolved, which is what
+   * the reader needs, and holding it still keeps `revokeResolution`'s renewal
+   * check looking back over the whole unresolved span rather than only the latest
+   * attempt, which is the conservative direction.
+   */
+  sentAt: number;
+  /**
+   * The window's own expiry as the snapshot reported it, unix ms. A lease is
+   * TTL-bounded, so once this has passed the window is closed whether or not the
+   * revoke ever landed, and the warning can retire itself instead of standing
+   * forever. Arrival-stamped like the row it came from, so it errs late, which is
+   * the right way for a warning to err.
+   */
+  windowExpiresAt: number;
+  /**
+   * A request for this window is outstanding right now. Separate from
+   * {@link unconfirmed} because a RETRY is both at once, and the two must not be
+   * collapsed: the row shows work in progress while the warning goes on standing.
+   */
+  inFlight: boolean;
+  /**
+   * True once a reply window has passed with no answer, and STICKY thereafter: a
+   * retry does not clear it, and only a confirmed reply does. The window's own
+   * expiry does NOT clear this flag; it makes `revokeResolution` return "lapsed",
+   * which retires the DISPLAY and lets `clearLeaseSnapshot` drop the entry on
+   * blur. The distinction matters in this file: the flag records that a reply
+   * never came, which stays true forever, while the resolution records whether
+   * there is still anything to do about it.
+   *
+   * The warning outlives the snapshot it came from, because a suppressed reply
+   * must never leave the human believing a window closed, and it must not blink
+   * out for the twenty seconds a retry is in flight either.
+   */
+  unconfirmed: boolean;
+}
+
+/**
+ * How the last confirmed revoke ended. Held until the next revoke starts, so the
+ * one line of feedback does not blink out from under someone mid-read; it names
+ * no rule, so it cannot be misread as describing a row that arrived after it.
+ */
+export interface RevokeNote {
+  leaseId: string;
+  /**
+   * `closed`: the daemon ended a live window. `alreadyGone`: it had no such
+   * window (already lapsed, already revoked, or never held, and the daemon
+   * deliberately does not distinguish them), which is equally a success.
+   */
+  outcome: "closed" | "alreadyGone";
+  at: number;
+}
+
+/**
+ * What this phone knows about the daemon's live windows, and when it knew it.
+ *
+ * The freshness fields are load-bearing, not decoration. The phone may state that
+ * nothing is open ONLY from a fresh successful snapshot; a phone that cannot
+ * reach the daemon saying "no active leases" is a false statement of fact about a
+ * containment surface. `askedAt === 0` means never answered, and that is a
+ * different sentence from "asked and got none".
+ *
+ * Everything here is RAM only and is cleared when the screen goes away. What
+ * survives that clearing is {@link revokes} entries still flagged unconfirmed,
+ * because those are warnings rather than an enumeration, and the reason to keep
+ * them is the same reason not to keep the rest.
+ */
+export interface LeaseView {
+  /** The rows from the last successful snapshot. Empty is meaningful only when
+   *  {@link askedAt} is non-zero. */
+  rows: ActiveLease[];
+  /**
+   * When the QUERY behind the current snapshot was sent, unix ms, local clock.
+   * 0 = never answered. This is the freshness base, and it is deliberately not
+   * the arrival time: a relay chooses how long to stall a reply, so arrival is a
+   * number the adversary controls, while send time is an upper bound on the
+   * answer's age that only this phone can set. Nor is it {@link asOfMs}, which a
+   * daemon clock running fast could use to make an old snapshot look current.
+   */
+  askedAt: number;
+  /** When the DAEMON measured it, unix ms on its clock. Displayed, never used to
+   *  decide freshness. 0 = never answered. */
+  asOfMs: number;
+  /**
+   * When the snapshot ARRIVED here, unix ms, local clock. 0 = never answered.
+   *
+   * DISPLAY REASONING ONLY, and this restriction is the whole reason the field is
+   * documented rather than merely declared. It exists for exactly one question:
+   * was the round trip itself longer than the freshness budget, so this snapshot
+   * was never current on the screen at all? It is NEVER read by
+   * {@link snapshotFresh}, which ages from {@link askedAt} because a relay picks
+   * how long to stall a reply and must not be able to buy currency by doing so.
+   * A third timestamp in a type whose comments work this hard to police which one
+   * decides what is how that regression gets reintroduced; if you are reaching for
+   * this in a freshness decision, you want askedAt.
+   */
+  arrivedAt: number;
+  /** A list query is in flight right now. */
+  asking: boolean;
+  /** The last query did not come back. Cleared by the next successful snapshot. */
+  unreachable: boolean;
+  /** This device has no enrolled biometric, so it cannot ask at all. Listing is
+   *  gated on one, so this is a dead end the screen names rather than a failure
+   *  it retries. */
+  noBiometric: boolean;
+  /** Revokes sent and not yet confirmed, keyed off {@link ActiveLease.leaseId}. */
+  revokes: PendingRevoke[];
+  /** The outcome of the last confirmed revoke, for one line of plain feedback.
+   *  Both outcomes are successes; see {@link RevokeNote}. */
+  note: RevokeNote | null;
 }
 
 export interface Settings {
@@ -135,7 +292,8 @@ export interface AppState {
   pairedAt: number;
   pending: PendingRequest[];
   history: HistoryEntry[];
-  leases: Lease[];
+  /** What the daemon last said is open, and how recently it said it. */
+  leases: LeaseView;
   settings: Settings;
   /** The six pairing words, held only during the ceremony. */
   pairingWords: string[] | null;

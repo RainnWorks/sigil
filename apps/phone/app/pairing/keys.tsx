@@ -65,9 +65,10 @@ export default function KeysScreen() {
           This phone is the key
         </Sans>
         <Sans size={16} tone="muted" style={{ lineHeight: 24 }}>
-          Sigil just generated this phone&apos;s own keys inside its secure hardware. The private
-          halves never leave it. Your Mac keeps only ciphertext; your approval supplies the missing
-          half of the cryptography, not a permission flag.
+          Sigil just generated this phone&apos;s own keys, here on this device. Your Mac never
+          gets the private half of any of them, so it cannot grant itself anything: every gated
+          command runs on a decision you made. The piece that opens a sealed secret is held in
+          this phone&apos;s secure hardware, where nothing can export it, not even Sigil.
         </Sans>
       </View>
 

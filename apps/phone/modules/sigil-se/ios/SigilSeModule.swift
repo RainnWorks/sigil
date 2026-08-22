@@ -85,6 +85,13 @@ public final class SigilSeModule: Module {
     // return F = f.publicKey in ANSI X9.63 uncompressed form (65 bytes), base64.
     // The Mac pins F and seals account tokens to it. Minting itself does not
     // prompt Face ID; the biometric is required on every later key-agreement.
+    //
+    // The access control below is the WHOLE of that enforcement, and the only
+    // place in this file that has any. Nothing at a later call site can add to it
+    // or take it away, so read it here and not from the LAContext in
+    // `computePartial`. `.biometryCurrentSet` rather than `.biometryAny` also
+    // means enrolling a new face invalidates `f`, which is deliberate: adding a
+    // face is otherwise a way to inherit someone else's approvals.
     AsyncFunction("generateShareKey") { (keyId: String) -> String in
       guard SecureEnclave.isAvailable else { throw SecureEnclaveUnavailableException() }
 
@@ -135,13 +142,26 @@ public final class SigilSeModule: Module {
 
       guard let blob = loadBlob(keyId) else { throw MissingKeyException() }
 
-      // `reason` is the generic Face-ID prompt string ("Approve request"); the
-      // provider-blind phone no longer names an account here (R5 removed). Passcode
-      // fallback is disabled so key release is strictly biometric.
+      // `reason` is the generic prompt string the JS layer passes ("Approve
+      // request", the only value any caller sends); the provider-blind phone no
+      // longer names an account here (R5 removed). Stated because it is not
+      // obvious from the signature: it currently reaches NOTHING. Setting it on
+      // the sheet would mean assigning `context.localizedReason`, which this does
+      // not do, so Face ID shows the system default wording. Left alone rather
+      // than quietly changed, since what that sheet says is a design decision.
+      //
+      // Clearing the fallback title only HIDES the "Enter Passcode" button. It
+      // enforces nothing, and nothing here rests on it: key release is strictly
+      // biometric because the enclave key was minted under `.biometryCurrentSet`
+      // (see `generateShareKey` above), so the enclave refuses to release `f` for
+      // anything but a live face from the currently enrolled set, whatever any
+      // LAContext at this call site says. The button is suppressed regardless,
+      // because offering a passcode that cannot work is a worse prompt than
+      // offering nothing. Unconditional: it used to hang off `!reason.isEmpty`,
+      // which coupled a cosmetic line to an unrelated value and read like the
+      // suppression was somehow load-bearing.
       let context = LAContext()
-      if !reason.isEmpty {
-        context.localizedFallbackTitle = ""
-      }
+      context.localizedFallbackTitle = ""
 
       let shared: SharedSecret
       do {

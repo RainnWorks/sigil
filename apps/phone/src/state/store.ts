@@ -5,12 +5,20 @@
  */
 import { useSyncExternalStore } from "react";
 
-import { type ApprovalRequest, type Decision, type ResolutionStatus } from "@/src/protocol";
+import {
+  type ApprovalRequest,
+  type Decision,
+  type LeaseRow,
+  type ResolutionStatus,
+} from "@/src/protocol";
 import { secretRefLabel, sshLabel } from "@/src/lib/format";
+import { mergeRevoke, revokeResolution, settledByAbsence, toActiveLeases } from "@/src/domain/leases";
 import {
   type AppState,
   type HistoryEntry,
+  type LeaseView,
   type PendingRequest,
+  type PendingRevoke,
   type RelayOrigin,
   type RequestState,
 } from "@/src/domain/types";
@@ -138,16 +146,189 @@ class Store {
     this.remove(requestId);
   }
 
+  // ---- lease control -------------------------------------------------------
+  //
+  // Every writer below records only what the DAEMON said, and when. Nothing here
+  // removes a row on the phone's own initiative, because the phone holds no lease
+  // state: the daemon's `LeaseStore` is the only authority, and a local edit that
+  // looked like a revoke would be exactly the consent theatre this replaced. The
+  // one local removal is expiry, which is arithmetic on the daemon's own number,
+  // and it is never reported as a revoke.
+  //
+  // A reply reaches these writers only after the session controller has matched
+  // it to a request THIS session issued and consumed that entry (design review
+  // F3). Nothing here confirms anything on a reply's say-so alone.
+
+  /** A list query has left this phone. */
+  leaseQueryStarted(): void {
+    this.patchLeases({ asking: true, noBiometric: false });
+  }
+
   /**
-   * PHONE-LOCAL ONLY, and deliberately not called by any screen (security review
-   * F7). This drops a row from this phone's array; it sends no envelope, so the
-   * daemon's `LeaseStore` keeps honoring the window for the rest of its TTL. Do
-   * NOT put a "Revoke" control behind this: a control that says a window closed
-   * when it did not is worse than no control. Wire a real revoke message first,
-   * then restore the affordance in the settings screen.
+   * The list query could not be sent, or nothing came back in time. Records
+   * inability, never emptiness: `rows`, `askedAt` and `asOfMs` are left exactly
+   * as they were, so the screen goes on describing the last real snapshot (and
+   * says it has aged) instead of inventing a fresh one.
    */
-  revokeLease(id: string): void {
-    this.patch({ leases: this.state.leases.filter((l) => l.id !== id) });
+  leaseQueryFailed(): void {
+    this.patchLeases({ asking: false, unreachable: true });
+  }
+
+  /**
+   * The biometric did not pass, so no question was asked. Distinct from
+   * {@link leaseQueryFailed} on purpose: nothing failed and nothing is unknown
+   * that was not already unknown, so a declined check must not raise "cannot
+   * check right now", which would read as a fault in the link.
+   *
+   * `noBiometric` separates "you cancelled" from "this device has nothing to
+   * cancel with". The first needs no explanation; the second is a dead end the
+   * screen has to name, because the list is gated on a biometric and this device
+   * cannot produce one.
+   */
+  leaseQueryCancelled(noBiometric = false): void {
+    this.patchLeases({ asking: false, noBiometric });
+  }
+
+  /**
+   * A fresh, correlated snapshot from the daemon. This is the ONLY writer of
+   * `rows`, `askedAt` and `asOfMs`, and therefore the only thing that can
+   * entitle the screen to say the list is complete.
+   *
+   * It also settles pending revokes: a window missing from a snapshot is
+   * confirmed closed by the daemon's own account of itself, which is stronger
+   * evidence than the revoke reply. A window still present stays pending, warning
+   * and all, because it really is still open. Note "a snapshot", with no
+   * requirement that it was taken after the revoke was sent: see
+   * {@link settledByAbsence} for why ordering does not enter into it.
+   *
+   * THAT INFERENCE BORROWS AN INVARIANT FROM THE DAEMON, so say where it is
+   * pinned. It is sound only because a lease id goes live to dead and never back:
+   * a refresh keeps the id (it extends one window rather than starting another),
+   * and no id is ever handed to a second window. So an omission proves the window
+   * was dead when the snapshot was computed, and dead is permanent, whatever a
+   * relay does to ordering. The daemon pins that from this consumer's side in
+   * `a_live_window_keeps_its_id_and_a_dead_one_never_lends_it_out`
+   * (crates/sigil/src/lease.rs). If anyone ever reuses an id across re-grants for
+   * continuity, that test fails first and this code starts lying second; the two
+   * must be revisited together.
+   *
+   * It also depends on there being ONE list question in flight, which the session
+   * controller enforces: two could interleave and let an older snapshot arrive
+   * last, and an omission from a snapshot taken before the window existed proves
+   * nothing about now.
+   */
+  leaseListReceived(rows: LeaseRow[], asOfMs: number, sentAt: number, receivedAt: number): void {
+    const live = toActiveLeases(rows, receivedAt);
+    const settled = settledByAbsence(this.state.leases.revokes, live);
+    const note =
+      settled.length > 0
+        ? { leaseId: settled[0]!.leaseId, outcome: "closed" as const, at: receivedAt }
+        : this.state.leases.note;
+    this.patchLeases({
+      rows: live,
+      // Aged from when the QUESTION went out, never from when the answer turned
+      // up: the relay picks the delay, so arrival is a number it controls. See
+      // the two-timestamp note in the session controller.
+      askedAt: sentAt,
+      asOfMs,
+      // Display reasoning only, never freshness: it answers "was the round trip
+      // itself longer than the budget", so the copy can say a snapshot arrived
+      // too late to count rather than implying it was once current on screen.
+      arrivedAt: receivedAt,
+      asking: false,
+      unreachable: false,
+      noBiometric: false,
+      revokes: this.state.leases.revokes.filter((r) => !settled.includes(r)),
+      note,
+    });
+  }
+
+  /**
+   * A revoke has left this phone. The row deliberately STAYS: clearing it here
+   * would be an optimistic claim that a window closed, and a relay suppressing
+   * the reply must never be able to buy that claim by dropping one message.
+   */
+  leaseRevokeStarted(revoke: PendingRevoke): void {
+    const prior = this.state.leases.revokes.find((r) => r.leaseId === revoke.leaseId);
+    const merged = mergeRevoke(prior, revoke);
+    const others = this.state.leases.revokes.filter((r) => r.leaseId !== revoke.leaseId);
+    this.patchLeases({ revokes: [...others, merged], note: null });
+  }
+
+  /**
+   * The daemon answered a revoke, and the controller matched that answer to a
+   * request this session issued. Both verdicts are successes: `revoked` true
+   * means it ended a live window, false means it had none to end. Either way that
+   * window is closed, so the row goes, and the note says which it was rather than
+   * letting the second case read as a failure.
+   */
+  leaseRevokeConfirmed(requestId: string, revoked: boolean, at: number): void {
+    const p = this.state.leases.revokes.find((r) => r.requestId === requestId);
+    if (!p) return;
+    this.patchLeases({
+      rows: this.state.leases.rows.filter((l) => l.leaseId !== p.leaseId),
+      revokes: this.state.leases.revokes.filter((r) => r.requestId !== requestId),
+      note: { leaseId: p.leaseId, outcome: revoked ? "closed" : "alreadyGone", at },
+    });
+  }
+
+  /**
+   * The revoke went out and nothing came back. The warning stays, and outlives
+   * the snapshot it came from: the honest reading is that the window may still be
+   * open, and saying anything else here would be the failure mode this whole
+   * feature exists to avoid.
+   */
+  leaseRevokeUnconfirmed(requestId: string): void {
+    this.patchLeases({
+      revokes: this.state.leases.revokes.map((r) =>
+        r.requestId === requestId ? { ...r, inFlight: false, unconfirmed: true } : r,
+      ),
+    });
+  }
+
+  /**
+   * Drop rows whose window has run out. Arithmetic on the daemon's own
+   * `remainingMs`, so it claims nothing the daemon did not already say; a row
+   * that lapses is never recorded as a revoke.
+   */
+  expireLeases(nowMs: number): void {
+    const rows = this.state.leases.rows.filter((l) => l.expiresAt > nowMs);
+    if (rows.length === this.state.leases.rows.length) return;
+    this.patchLeases({ rows });
+  }
+
+  /**
+   * Throw the snapshot away when the screen goes away: render and drop, never
+   * persist. A held list of live auto-approve windows is a schedule of what will
+   * release with no human tap, and it should not outlive the moment someone chose
+   * to look at it. It returns the section to "not checked yet", which is a true
+   * description of what this phone then knows.
+   *
+   * Unconfirmed revokes SURVIVE this, but only while they are still an open
+   * question. They are warnings rather than an enumeration, and the whole point
+   * of one is that it outlasts the screen that produced it; once the window has
+   * run out on its own there is nothing left to warn about, and a warning that
+   * never resolves is one people stop reading.
+   */
+  clearLeaseSnapshot(): void {
+    const now = Date.now();
+    this.patchLeases({
+      rows: [],
+      askedAt: 0,
+      asOfMs: 0,
+      arrivedAt: 0,
+      asking: false,
+      unreachable: false,
+      noBiometric: false,
+      revokes: this.state.leases.revokes.filter(
+        (r) => r.unconfirmed && revokeResolution(r, this.state.history, now) === "standing",
+      ),
+      note: null,
+    });
+  }
+
+  private patchLeases(p: Partial<LeaseView>): void {
+    this.patch({ leases: { ...this.state.leases, ...p } });
   }
 
   setSetting<K extends keyof AppState["settings"]>(key: K, value: AppState["settings"][K]): void {

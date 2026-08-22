@@ -36,11 +36,11 @@ with zero duplication. Two thin `[[bin]]` targets in `src/bin/`:
   everything else is the `sigil <cmd>` primitive.
 - **`sigil-config`**: the configuration-management CLI the desktop shells out
   to under the hood: `source`/`rule`/`list`/`export`/`import`, plus the
-  config-ish mutations (`account`, `settings`, `mac-approvals`, `wipe`).
+  config-ish mutations (`account`, `settings`, `wipe`).
 
 The split moves the desktop's invocation from `sigil config …`/`sigil account …`
-to `sigil-config …` (source/rule/list/export/import + account/settings/
-mac-approvals/wipe are now `sigil-config` verbs, no `config` prefix). That is an
+to `sigil-config …` (source/rule/list/export/import + account/settings/wipe are
+now `sigil-config` verbs, no `config` prefix). That is an
 outward-facing contract the Mac app (`apps/mac`) depends on; updating it is a
 separate task. Because `config`/`account`/`settings`/`wipe` are no longer
 reserved in the lean `sigil` binary, a program literally named any of those is
@@ -276,7 +276,6 @@ exact moves, so retargeting the Mac app (#42) is mechanical:
 | `sigil config add <cmd> …`        | `sigil-config add <cmd> …`             |
 | `sigil account <verb>`            | `sigil-config account <verb>`          |
 | `sigil settings <verb>`           | `sigil-config settings <verb>`         |
-| `sigil mac-approvals …`           | `sigil-config mac-approvals …`         |
 | `sigil wipe [--force]`            | `sigil-config wipe [--force]`          |
 | `sigil <anything-else>`           | unchanged (lean `sigil`)               |
 

@@ -30,7 +30,7 @@ name = "sigil"
 path = "src/bin/sigil.rs"
 
 # The configuration-management CLI the desktop shells out to: the rule/source
-# config engine plus account/settings/mac-approvals/wipe. Genuinely separate
+# config engine plus account/settings/wipe. Genuinely separate
 # artifact, same shared core.
 [[bin]]
 name = "sigil-config"
