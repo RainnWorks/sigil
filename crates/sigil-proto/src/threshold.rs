@@ -155,6 +155,13 @@ impl P256Point {
         &self.x963
     }
 
+    /// The validated point as an affine curve point, for the ECDH primitive.
+    /// Crate-internal: every caller must come through [`P256Point::from_x963`], so
+    /// no unvalidated point can reach a scalar multiplication.
+    pub(crate) fn as_affine(&self) -> &p256::AffinePoint {
+        self.key.as_affine()
+    }
+
     fn public(&self) -> &PublicKey {
         &self.key
     }
@@ -220,7 +227,11 @@ impl MacShare {
 /// [`EcdhAlgo::RawX`] this is the identity; for [`EcdhAlgo::X963Sha256`] it is
 /// Apple's ANSI-X9.63 SHA-256 KDF with `sharedInfo = E` (NV-7: pin to the SE's
 /// actual bare-key-agreement parameters on device).
-fn shape(raw_x: &[u8; XCOORD_LEN], algo: EcdhAlgo, e_x963: &[u8]) -> Zeroizing<[u8; XCOORD_LEN]> {
+pub(crate) fn shape(
+    raw_x: &[u8; XCOORD_LEN],
+    algo: EcdhAlgo,
+    e_x963: &[u8],
+) -> Zeroizing<[u8; XCOORD_LEN]> {
     match algo {
         EcdhAlgo::RawX => Zeroizing::new(*raw_x),
         EcdhAlgo::X963Sha256 => x963_kdf_sha256_32(raw_x, e_x963),

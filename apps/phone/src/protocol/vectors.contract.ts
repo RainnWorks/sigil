@@ -163,6 +163,47 @@ export interface CombinerVector {
 }
 
 /**
+ * approveProof: the per-request approve proof (crates/sigil-proto/src/proof.rs),
+ * which the phone's TS must mirror byte-for-byte. This is what makes invariant 4
+ * structural on the plain-gate path, so a mismatch here is not a test failure, it
+ * is every approval being denied.
+ *
+ * The phone is given `challengePubB64` on the request. It hands the decoded 65
+ * bytes to the enclave, which returns `seRawX` (the raw x-coordinate, base64 in
+ * the native module). It then applies the pairing's `ecdhAlgo` shaping with
+ * `sharedInfo = challengePub` to get `shared`, and computes
+ * `BLAKE2b("sigil.approve-proof.v1" ‖ len·shared ‖ len·requestId ‖ len·decision
+ * ‖ len·lease)` (32-byte digest; libsodium `crypto_generichash(32, …)`, u64-BE
+ * length prefixes, the 22-byte domain as a raw leading constant), which must equal
+ * `expectedProof`. `expectedProofB64` is what goes on the wire.
+ *
+ * The `lease` field is the one easy thing to get wrong: an ABSENT lease absorbs a
+ * zero-LENGTH field, a lease of `0` absorbs eight zero bytes. The
+ * `raw-x/zero-lease` and `raw-x/no-lease` cases exist to separate them, and a
+ * mirror that conflates the two produces proofs the daemon denies.
+ */
+export interface ApproveProofVector {
+  name: string;
+  ecdhAlgo: "raw-x" | "x963-sha256";
+  /** The daemon challenge C = c·G, ANSI X9.63 uncompressed (65 bytes). hex. */
+  challengePub: string;
+  /** The same C exactly as it rides on the wire. Standard base64. */
+  challengePubB64: string;
+  /** What the Secure Enclave returns for x(f·C): the RAW x-coordinate. 32-byte hex. */
+  seRawX: string;
+  /** `seRawX` after the ecdhAlgo shaping, i.e. what is folded into the proof. 32-byte hex. */
+  shared: string;
+  requestId: string;
+  decision: "approved" | "denied";
+  /** The requested lease window, or `null` for run-once. Not interchangeable with `0`. */
+  leaseTtlMs: number | null;
+  /** Expected proof. 32-byte hex. */
+  expectedProof: string;
+  /** Expected proof exactly as it rides on the wire. Standard base64. */
+  expectedProofB64: string;
+}
+
+/**
  * pairingTranscript: locks the phone's `pairingTranscript` builder and the
  * final confirmation `tag` against crates/sigil-proto's `pairing_transcript` +
  * `pairing_confirmation_vector` (#34) - the exact cross-language check that
@@ -204,6 +245,7 @@ export interface SigilVectors {
   open: OpenVector[];
   replay: ReplayVector[];
   combiner: CombinerVector[];
+  approveProof?: ApproveProofVector[];
   pairingTranscript?: PairingTranscriptVector[];
 }
 

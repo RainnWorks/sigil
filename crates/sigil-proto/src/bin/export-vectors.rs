@@ -29,6 +29,11 @@
 //!     base `E` in, the derived token key `K` and AES-256-GCM `token_ct` out, for
 //!     both `ecdh_algo` shapes, so the phone's TS combiner is locked to this Rust
 //!     one (`threshold.rs`).
+//!   * `approveProof` — the per-request approve proof (`proof.rs`): a fixed phone
+//!     key `f` and a fixed daemon challenge `C` in, the shaped ECDH output and the
+//!     BLAKE2b proof out, for both `ecdh_algo` shapes and for the absent /
+//!     zero / non-zero lease cases. This is what makes invariant 4 structural on
+//!     the plain-gate path, so the phone's TS must reproduce it byte-for-byte.
 //!   * `pairingTranscript` — the v2 pairing confirmation transcript and MAC
 //!     (`pairing.rs`'s `pairing_transcript`/`confirmation_tag`): fixed daemon/
 //!     phone identities, endpoints, timestamp, and nonce in (a v1 case with no
@@ -45,10 +50,20 @@ use uuid::Uuid;
 use sigil_proto::envelope::Envelope;
 use sigil_proto::identity::DeviceIdentity;
 use sigil_proto::pairing::{PairingPayload, PairingSecret};
-use sigil_proto::threshold::{aead_seal, combine, EcdhAlgo, MacShare};
+use sigil_proto::proof::approve_proof;
+use sigil_proto::threshold::{aead_seal, combine, EcdhAlgo, MacShare, P256Point};
 use sigil_proto::{
     fingerprint_words, mailbox_id, PeerIdentity, ReplayError, ReplayGuard, REPLAY_WINDOW_MS,
 };
+
+/// Standard base64, the exact encoding these values take on the wire. The
+/// vectors carry both this and hex: hex is what a TS mirror compares bytes with,
+/// base64 is what it must actually put in the envelope.
+fn b64(bytes: &[u8]) -> String {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    STANDARD.encode(bytes)
+}
 
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -478,6 +493,80 @@ fn combiner_vectors() -> Vec<Value> {
     .collect()
 }
 
+/// approveProof: the per-request approve proof (`proof.rs`), locked to the phone's
+/// TS mirror. A fixed phone key `f` (standing in for the Secure Enclave) and a
+/// fixed daemon challenge scalar `c` give a deterministic `C = c·G`; `seRawX` is
+/// what the enclave returns for `x(f·C)`, `shared` is that after the record's
+/// ECDH shaping, and `expectedProof` is the BLAKE2b over the bound preimage.
+///
+/// The `leaseTtlMs: null` and `leaseTtlMs: 0` cases are both present on purpose:
+/// an absent lease absorbs a zero-LENGTH field and a zero lease absorbs eight
+/// zero bytes, so a TS mirror that conflates them produces a proof the daemon
+/// denies. That is the single easiest thing to get wrong here.
+fn approve_proof_vectors() -> Vec<Value> {
+    // Distinct seeds from `combiner_vectors`, so a mirror that crosses the two
+    // categories' fixtures fails rather than accidentally agreeing.
+    let f = fixed_share(0x44);
+    let c = fixed_share(0x55);
+    let c_point = c.public_point();
+    let c_x963 = *c_point.as_x963();
+    let request_id = "01920000-0000-7000-8000-0000000000aa";
+
+    let cases: [(&str, EcdhAlgo, &str, Option<u64>); 4] = [
+        ("raw-x/no-lease", EcdhAlgo::RawX, "approved", None),
+        ("raw-x/lease", EcdhAlgo::RawX, "approved", Some(900_000)),
+        ("raw-x/zero-lease", EcdhAlgo::RawX, "approved", Some(0)),
+        (
+            "x963-sha256/no-lease",
+            EcdhAlgo::X963Sha256,
+            "approved",
+            None,
+        ),
+    ];
+
+    cases
+        .into_iter()
+        .map(|(name, algo, decision, lease_ttl_ms)| {
+            // What the Secure Enclave hands back: the RAW x-coordinate, unshaped.
+            // `RawX` shaping is the identity, so this is the bare agreement.
+            let raw_x = f.partial(&c_point, EcdhAlgo::RawX, &[]);
+            // What both sides fold into the proof, after the record's shaping.
+            let shared = f.partial(&c_point, algo, &c_x963);
+            let proof = approve_proof(&shared, request_id, decision, lease_ttl_ms);
+
+            // The daemon reaches the same value from the other side (x(c·F)).
+            // Asserted here so a broken vector cannot ship silently.
+            let f_pub = f.public_point();
+            let daemon_side = c.partial(&f_pub, algo, &c_x963);
+            assert_eq!(*shared, *daemon_side, "ECDH must commute for {name}");
+            // And the challenge must survive the validating decoder the phone uses.
+            assert_eq!(
+                P256Point::from_x963(&c_x963)
+                    .expect("challenge on-curve")
+                    .as_x963(),
+                &c_x963
+            );
+
+            json!({
+                "name": name,
+                "ecdhAlgo": match algo {
+                    EcdhAlgo::RawX => "raw-x",
+                    EcdhAlgo::X963Sha256 => "x963-sha256",
+                },
+                "challengePub": hex(&c_x963),
+                "challengePubB64": b64(&c_x963),
+                "seRawX": hex(&*raw_x),
+                "shared": hex(&*shared),
+                "requestId": request_id,
+                "decision": decision,
+                "leaseTtlMs": lease_ttl_ms,
+                "expectedProof": hex(&proof),
+                "expectedProofB64": b64(&proof),
+            })
+        })
+        .collect()
+}
+
 fn main() {
     let doc = json!({
         "version": 2,
@@ -487,6 +576,7 @@ fn main() {
         "open": open_vectors(),
         "replay": replay_vectors(),
         "combiner": combiner_vectors(),
+        "approveProof": approve_proof_vectors(),
         "pairingTranscript": pairing_transcript_vectors(),
     });
 

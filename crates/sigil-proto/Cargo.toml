@@ -20,6 +20,10 @@ base64.workspace = true
 # can hold ONLY P-256 keys (never X25519), so the SE second-recipient wrap must
 # be P-256 ECIES; this is the sole curve the SE seam interoperates with.
 p256 = { version = "0.13", default-features = false, features = ["ecdh", "std"] }
+# subtle: constant-time equality for the approve proof. Already in the tree via
+# p256/ed25519-dalek; named directly so the comparison cannot silently regress to
+# a short-circuiting `==` on a byte array.
+subtle = { version = "2", default-features = false }
 # sha2: SHA-256 for the ANSI-X9.63 KDF inside Apple's ECIES construction. Must be
 # SHA-256 (not the crate's blake2) to interoperate with SecKeyCreateDecryptedData.
 sha2 = "0.10"

@@ -199,6 +199,10 @@ fn cmd_demo(args: &[String]) -> anyhow::Result<()> {
         threshold: None,
         expires_at: now + 90_000,
         timeout_ms: 90_000,
+        // The demo daemon mints no challenge, so this request predates the
+        // approve-proof requirement and the softphone answers without one. A
+        // real daemon mints one for every request; see `sigil_proto::proof`.
+        proof_challenge: None,
     };
     let req_env = Envelope::seal(
         &request,
