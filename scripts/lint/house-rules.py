@@ -59,7 +59,13 @@ EXCLUDE_SUBSTRINGS = [
     "/test/",
     "/tests/",
 ]
-EXCLUDE_SUFFIXES = (".test.ts", ".test.tsx", ".spec.ts", "_test.rs")
+# ".selftest.ts" is this repo's convention for a standalone test entry point, run
+# by `bun run <name>:selftest` (see apps/phone/package.json) and never imported by
+# app code. It is test material exactly like the suffixes beside it, but it needs
+# naming explicitly because ".test.ts" does not match it. Without it,
+# apps/phone/src/domain/leases.selftest.ts is reported for the dash character
+# class inside the assertion that enforces this very rule on lease copy.
+EXCLUDE_SUFFIXES = (".test.ts", ".test.tsx", ".spec.ts", ".selftest.ts", "_test.rs")
 
 EM_DASH = "—"
 
