@@ -44,6 +44,7 @@ use crate::approve::{
 };
 use crate::config::Config;
 use crate::factor::{self, Factor};
+use crate::instance;
 use crate::keystore::{self, Keystore};
 use crate::lease::{self, LeaseStore, ProcessTable, SysProcessTable};
 use crate::local::{self, Frame, Reply};
@@ -1234,6 +1235,24 @@ async fn serve(
     if let Err(e) = service::socket_path_fits() {
         eprintln!("sigil daemon: {e}");
     }
+
+    // One daemon per runtime dir, taken BEFORE prepare_socket, because
+    // prepare_socket unlinks whatever socket file it finds. Without this, a
+    // second `sigil daemon` does not refuse: it removes the running daemon's
+    // socket, binds the name itself, and leaves daemon one alive holding
+    // listeners no client can reach. Held for the whole life of `serve`; the
+    // kernel releases it however this process exits.
+    let lock_path = local::runtime_dir().join(instance::LOCK_FILE);
+    let _instance = match instance::acquire(&lock_path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            // Refuse loudly and leave the incumbent untouched. Exiting here is
+            // the correct end state, not a failure to recover from: the daemon
+            // the caller wanted is already running.
+            anyhow::bail!("{e}; not starting a second one");
+        }
+    };
+
     prepare_socket(&sock)?;
     let listener =
         UnixListener::bind(&sock).with_context(|| format!("binding {}", sock.display()))?;

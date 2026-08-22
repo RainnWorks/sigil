@@ -17,6 +17,7 @@ pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod factor;
+pub mod instance;
 pub mod json;
 pub mod keystore;
 #[cfg(target_os = "macos")]
