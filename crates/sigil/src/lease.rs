@@ -936,6 +936,12 @@ impl UnmeasuredNote {
 /// session; this exists only so a process churning through unmeasurable
 /// executables cannot grow the daemon. The oldest is evicted, which at worst
 /// costs a repeated log line later.
+///
+/// Only the macOS `ProcessTable` records notes today, so outside macOS this is
+/// reached from the registry's tests and from nowhere else. It stays compiled on
+/// every platform because the registry logic is platform-independent and those
+/// tests are what keep it honest.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const UNMEASURED_NOTES_MAX: usize = 64;
 
 fn unmeasured_registry() -> &'static Mutex<Vec<UnmeasuredNote>> {
@@ -989,6 +995,9 @@ fn still_running(_note: &UnmeasuredNote) -> bool {
 /// is REFRESHED to the newest instance so the row keeps naming a process that is
 /// actually running. Nothing is lost: the actionable content of the line is the
 /// path and the reason, and the pid is only there to find it with.
+///
+/// See [`UNMEASURED_NOTES_MAX`] for why this is compiled but uncalled off macOS.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn note_unmeasured(note: UnmeasuredNote) {
     let mut notes = unmeasured_registry()
         .lock()
@@ -1026,6 +1035,9 @@ fn note_unmeasured(note: UnmeasuredNote) {
 /// the human in RIGHT NOW" (`sigil doctor` reads only the live notes). A note
 /// about a process that has exited is history and costs nothing to drop; dropping
 /// a live one loses the row that was going to explain why approvals came back.
+///
+/// See [`UNMEASURED_NOTES_MAX`] for why this is compiled but uncalled off macOS.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn doomed_index(notes: &[UnmeasuredNote], live: impl Fn(&UnmeasuredNote) -> bool) -> usize {
     notes.iter().position(|n| !live(n)).unwrap_or_default()
 }
@@ -1342,6 +1354,10 @@ mod tests {
     // ---- Ancestor code identity: the platform measure and its fallback ----
 
     /// A scratch dir for the measurement tests, unique per test and per process.
+    ///
+    /// Every caller is a macOS-only measurement test, so off macOS there is
+    /// nothing to give it a directory for.
+    #[cfg(target_os = "macos")]
     fn scratch(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("sigil-measure-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);

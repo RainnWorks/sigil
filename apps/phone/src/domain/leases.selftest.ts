@@ -652,7 +652,10 @@ function main(): void {
         revokeNoteLine("alreadyGone"),
       );
     for (const s of strings) {
-      ok(!/[—–]/.test(s), `no dash rule: ${JSON.stringify(s)}`);
+      // Escaped rather than literal so this assertion does not itself trip
+      // the house-rules lint, which scans this tree for em-dash codepoints.
+      // Same two characters: U+2014 em-dash, U+2013 en-dash.
+      ok(!/[\u2014\u2013]/.test(s), `no dash rule: ${JSON.stringify(s)}`);
       ok(!/\p{Extended_Pictographic}/u.test(s), `no emoji: ${JSON.stringify(s)}`);
     }
   }
