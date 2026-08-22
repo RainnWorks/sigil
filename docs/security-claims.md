@@ -159,6 +159,14 @@ Residuals for the security-reviewer to weigh:
 | ~~Only the macOS Secure Enclave keystore reports biometric, and its unwrap refuses until verified on hardware~~ | ~~`keystore_macos.rs::unwrap_dek`~~ | **STALE, 2026-08-08**: `unwrap_dek`/`has_dek` and the test `se_paths_refuse_until_verified` no longer exist; there is no DEK. The Mac presence gate is now `presence.m` (`LAContext`, biometrics-only policy). Needs re-mapping by whoever owns that surface |
 | ~~The Secure Enclave DEK unwrap fires Touch ID on real hardware~~ | ~~`keystore_macos.rs::unwrap_dek`~~ | **STALE, 2026-08-08**: same retirement. The live hardware question is now the phone SE row above and the Mac keystore-wrap key |
 
+> **CORRECTION 2026-08-22, security-reviewer (independent).** The row above
+> reading "a threshold approve does not rely on the app-level gate at all; the
+> Secure Enclave key-agreement is its own gate" is TRUE about the enclave call
+> and MISLEADING about the approval. The value that call returns is a CONSTANT
+> for the life of a sealed record, so the enclave gate is a one-time toll on the
+> account, not a per-request gate on the approval. Invariant #4 was unmet on the
+> threshold path as well as the plain-gate path. See §22, finding R9-F1.
+
 ## 7. Caller identity is daemon-verified (invariant #6)
 
 | Claim | Enforcing code | Proving test |
@@ -1660,6 +1668,216 @@ migration (not the wire), so nothing dead needed removing daemon-side.
 `apps/phone/src/protocol/requests.ts` still carries a residual `risk: RiskLevel`
 on `ApprovalRequest` (and the `RiskLevel` type). It is now dead on the wire (the
 daemon never sends it); drop both there to match.
+
+## 22. The approve proof (`6b3a1a4`) + R9: invariant #4 was unmet on BOTH approve paths
+
+*Independent security-reviewer verdict, 2026-08-22, on `feat/config-rule-engine`
+tip `6b3a1a4`. The construction under review was written by another agent; this
+reviewer did not author it. R9-F1 below was found by that agent while designing
+the fix, not by a review round, and it is confirmed here independently.*
+
+### R9-F1, HIGH: the threshold approve was a one-time biometric, not a per-request one
+
+**Claim, confirmed.** `E` is minted once per sealed record, at seal time
+(`threshold.rs::ThresholdRecord::seal`), and copied verbatim into every challenge
+the daemon sends (`daemon.rs` at both `ThresholdChallenge` construction sites:
+the ssh-signer path and the inline-`env` path, each `ephemeral_pub:
+record.ephemeral_pub.clone()`). The challenge point is therefore CONSTANT for the
+life of the record, so `Z_F = shape(x(f·E), algo, E)` is constant too, and the
+daemon accepts it on every approve: `threshold.rs::decrypt` feeds whatever `Z_F`
+arrives into `combine`, and the only check is the AEAD tag, which succeeds for
+exactly one value and always for that value. Nothing anywhere records that a
+`Z_F` was used before.
+
+**Consequence.** Anything that learns `Z_F` once, after one legitimate Face ID,
+can approve that account forever with no biometric and no enclave. The enclave
+key proves it was used at SOME point in the past, not that it authorized THIS
+request. Invariant #4 was therefore unmet on BOTH paths, not only on the plain
+gate: the plain gate had no cryptographic authorization at all, and the threshold
+path had one that did not refresh.
+
+**Attack, concretely.** The holder set for `Z_F` is the phone's JS layer (the
+enclave hands the raw x-coordinate out to JS by design:
+`SigilSeModule.swift::computePartial` returns it base64) and the daemon's own
+RAM. Compromised JS in the phone app already holds the identity signing key and
+the agreement key, which are passcode-tier and deliberately not enclave-bound
+(`keystore.ts`, and see the "no identity key is hardware-bound" note in §6). So:
+
+1. The human approves once, legitimately. Face ID fires, the enclave returns
+   `Z_F`, the app caches it instead of wiping it.
+2. On every later request for that account, the JS seals and signs an approve
+   carrying the cached `Z_F`. No Face ID, no enclave call.
+3. The daemon combines, opens the token, and releases the secret. Every other
+   guard holds and none of them looks at this: the envelope is fresh, the
+   request id is single-use, the ephemeral agreement key is per-request, and the
+   correlation check passes because the request really is outstanding.
+
+**Severity, HIGH and argued.** Not CRITICAL: exploitation needs code execution
+inside the phone app or possession of its software keys, which is an adversary
+that already defeats every plain gate outright, and it releases only what that
+one account's token unlocks. HIGH rather than MEDIUM because the threshold path
+was the one path this document described as hardware-gated per request (§6),
+and it was not, so the system had no per-request hardware gate anywhere.
+
+**Reproduction, run at `6b3a1a4`.** A scratch test (not committed; it asserts the
+defect rather than the fix) sealed a record, took one partial, and opened the
+record five times with that same partial: all five succeeded, and a second
+enclave use produced the byte-identical value. The regression test the design
+specifies, "a constant `Z_F` replayed with no fresh proof is rejected", cannot be
+written against today's tree in that form: no code path anywhere in `crates/sigil`
+reads `ApprovalResponse::proof`, so there is nothing to be absent and nothing to
+reject on. Stated exactly: the property FAILS today, and it fails by absence
+rather than by a failing assertion. It becomes a real failing-then-passing test
+only with the daemon half.
+
+**What the approve proof does and does not fix.** It restores a per-request
+hardware gate on the daemon's release path, once the daemon half lands AND
+requires a proof on the threshold path too, not only on the plain gate. It does
+NOT make `Z_F` non-durable: `Z_F` remains a permanent half of that account's
+at-rest key, so an attacker holding `Z_F` plus the Mac share `m` plus the record
+opens the token offline, with no daemon and no proof involved. The only
+construction that would retire a used `Z_F` is re-sealing the account under a
+fresh `E` after each open (rekey-on-use); nothing does that today, and
+`threshold.rs::all_ephemerals_unique` guards uniqueness ACROSS accounts, never
+freshness across uses.
+
+### R9-F2, MEDIUM: the enclave answers whatever point it is handed, and nothing binds that point to what the human sees
+
+`computePartial(keyId, ephemeralPubBase64, reason)` takes the point straight from
+JS, and `reason` reaches nothing (the file says so): the Face ID sheet shows the
+system default wording and names no account, no command, and no point. The
+`ThresholdChallenge`'s `label`/`account_id` are display context that the phone
+cannot check against `ephemeral_pub`, because the phone stores no account-to-`E`
+mapping. Two consequences worth stating separately from R9-F1:
+
+- A holder of the daemon identity key (in practice, a compromised Mac) can put
+  any point it likes in `ephemeral_pub` behind any label it likes, and the honest
+  phone answers with `x(f·P)` in the clear. The threshold field IS the
+  chosen-point ECDH oracle that `proof.rs` is careful not to become. Hashing the
+  proof does not remove that oracle; it declines to add a second one.
+- Compromised JS can call the enclave with a point of its own choosing at any
+  prompt the human is willing to approve, since the sheet says nothing about
+  which point is being signed.
+
+Marginal impact over what those adversaries already hold is real but bounded:
+`Z_F` alone opens nothing without `m` and the ciphertext. The fix, if it is ever
+worth building, is trust-on-first-use pinning of `account_id -> E` on the phone,
+plus refusing a changed `E` without a re-pair.
+
+### The construction itself: SOUND, with the limits below
+
+| Claim | Enforcing code | Proving test |
+|-------|----------------|--------------|
+| Both sides reach the same proof from opposite halves of the ECDH, for both output shapes | `proof.rs::{approve_proof,ApproveChallenge::shared_with}` (`shape(x(c·F))` = `shape(x(f·C))`) | `proof.rs::the_two_sides_agree_because_ecdh_commutes` |
+| The preimage framing is injective: a fixed 22-byte domain absorbed raw, then four u64-BE length-prefixed fields, the first of them a fixed 32 bytes | `proof.rs::{approve_proof,absorb,APPROVE_PROOF_DOMAIN}` | Reviewed by inspection, and it holds. Injective by the standard argument (fixed-length constant prefix, then length-prefixed fields, fixed field count), so two distinct (shared, request, decision, lease) tuples collide only on a BLAKE2b collision. **UNPROVEN**: no test asserts the framing, only its consequences |
+| No cross-domain collision with the combiner, whose domain is also absorbed raw | `proof.rs::APPROVE_PROOF_DOMAIN` vs `threshold.rs::THRESHOLD_DOMAIN` | Reviewed by inspection: the two constants differ at byte 6 (`sigil.a` vs `sigil.t`), so neither is a prefix of the other and no suffix can reconcile them. **UNPROVEN** as a general property; the pair-inequality is asserted by `proof.rs::the_proof_domain_is_distinct_from_the_threshold_domain`, which is weaker than its name (see R9-F4) |
+| A proof authorizes one request, one decision, one lease window, and nothing else | `proof.rs::approve_proof`, `request.rs::{ApprovalResponse::proof_binding,Decision::wire_tag}` | `proof.rs::a_proof_for_one_request_does_not_verify_for_another`, `a_proof_from_a_different_challenge_does_not_verify`, `the_decision_is_bound_so_a_deny_proof_cannot_approve`, `the_lease_window_is_bound_in_both_directions` (widened, stripped, and unchanged) |
+| An absent lease and a zero-millisecond lease are different proofs on both sides | `proof.rs::approve_proof` (absent absorbs a zero-LENGTH field; present absorbs eight bytes) | `proof.rs::an_absent_lease_is_not_a_zero_lease`, plus the `raw-x/no-lease` and `raw-x/zero-lease` vectors in the `approveProof` category of `crates/sigil-proto/src/bin/export-vectors.rs` |
+| The whole lease is bound, not part of it | `request.rs::InstallLease` (one field, `ttl_ms`), `ApprovalResponse::proof_binding` | Reviewed by inspection: `InstallLease` carries `ttl_ms` and nothing else, so there is no unbound lease field to widen. This claim decays the moment a second field is added |
+| The wire value can never be substituted into the combiner | `proof.rs::approve_proof` (a hash under a distinct domain crosses the wire; the raw x-coordinate never does) | `proof.rs::a_proof_is_never_usable_as_a_threshold_partial` — **weaker than its name, see R9-F3.** The property that actually holds, and its scope: this defends an HONEST phone against a MALICIOUS daemon that sets the challenge to a sealed record's `E`. It does not defend against a compromised phone, which holds the raw enclave output on both paths regardless |
+| A malformed, short, or wrong proof denies, and the comparison leaks nothing by timing | `proof.rs::ApproveChallenge::verify` (`subtle::ConstantTimeEq`; every arm is an `Err`) | `proof.rs::a_malformed_proof_fails_closed_rather_than_matching` (bad base64, 16 bytes, 32 wrong bytes) |
+| The challenge is fresh per request, RAM-only, and from the platform CSPRNG | `proof.rs::ApproveChallenge::generate` (`SecretKey::random(OsRng)`; `SecretKey` zeroizes on drop; no `Debug`, no serde, no persistence) | `proof.rs::every_challenge_is_fresh`. **UNPROVEN** that it is dropped at the terminal state of a request: there is no daemon half yet to hold it |
+| The challenge survives the validating decoder the phone must use | `proof.rs::ApproveChallenge::to_wire`, `threshold.rs::P256Point::from_x963` (rejects off-curve, twist, identity, wrong length) | `proof.rs::the_wire_form_round_trips_through_the_validating_decoder`; the phone-side decoder is `SigilSeModule.swift::computePartial`'s `P256.KeyAgreement.PublicKey(x963Representation:)`, unchanged by this work |
+| The daemon never multiplies an unvalidated point | `proof.rs::ApproveChallenge::shared_with` takes `&P256Point`, whose only constructor validates; `threshold.rs::P256Point::as_affine` is `pub(crate)` | Reviewed by inspection, and the visibility makes it structural rather than conventional |
+| No secret outlives its request | `proof.rs::{shared_with,expected_proof}` (the shaped ECDH output is `Zeroizing`; the proof itself is a public wire value) | Reviewed by inspection. **UNPROVEN**: zeroization has no automated test here, as elsewhere in this tree |
+
+**Rulings on the specific questions asked.**
+
+- *Is the raw leading domain constant safe here?* Yes. Everything after it is
+  length-prefixed and the field count is fixed, so the only hazard the pattern
+  invites is one domain being a prefix of another. `sigil.approve-proof.v1` is
+  not. Worth recording as a near-miss elsewhere in the tree: `sigil.pairing.v1`
+  IS a prefix of `sigil.pairing.rendezvous.v1` (`pairing.rs`). That is not
+  exploitable, because reconciling them would need a u64-BE length field reading
+  `.rendezv`, i.e. a field of about 3.3e18 bytes. It is the exact structural
+  hazard the raw-constant pattern invites, and a third pairing domain could
+  land on the wrong side of it.
+- *Is `sharedInfo = C` in the X9.63 shaping load-bearing or decorative?* Neither,
+  and the premise needs correcting: the challenge is NOT otherwise absorbed into
+  the preimage. `approve_proof` covers the shared secret, the request id, the
+  decision, and the lease, and never `C` itself. The binding to `C` is carried
+  entirely by the ECDH output, which is sufficient (a proof from another
+  challenge yields a different shared secret and fails). `sharedInfo = C` is
+  therefore required for the phone-Mac byte parity it exists for, and neither
+  adds nor removes a security property. It does mean the proof path mirrors the
+  threshold path exactly, `shape(x(f·P), algo, P)`, which is precisely why a
+  challenge set to `E` would reproduce `Z_F` if the raw value crossed the wire.
+  The hash is what stops that, so the "do not simplify this" comment in
+  `proof.rs` is correct and must survive.
+- *Can `with_lease` / `with_proof` be misused?* Yes, and it is a defect, but a
+  benign one: applying the lease after the proof yields a response the daemon
+  DENIES, so the failure mode is a lost approval, never a released secret. See
+  R9-F5 for the structural fix. Ruled: fix it, do not ship an API whose
+  correctness rests on a doc comment, but it does not block.
+
+### Findings, ranked
+
+- **R9-F1, HIGH** — the constant `Z_F`. Above. Open until the daemon half lands
+  and requires a proof on the threshold path as well as the plain gate.
+- **R9-F2, MEDIUM** — the enclave answers any point, and the biometric sheet
+  names nothing. Above. Open; a fix is optional and scoped.
+- **R9-F3, LOW (test quality, and it matters because this document cites it)** —
+  `proof.rs::a_proof_is_never_usable_as_a_threshold_partial` asserts
+  `proof != zf` for one random instance. That is true of any function that is
+  not the identity, including a badly broken one (`zf` with a flipped bit would
+  pass). It does not prove the property in its name. Strengthen it to the
+  end-to-end statement: seal a record, set the challenge point to that record's
+  `E`, take the proof, substitute it into `combine` as `Z_F`, and assert the AEAD
+  refuses to open. That test fails against a construction that puts the raw value
+  on the wire and passes against this one, which is what the name promises.
+- **R9-F4, LOW** — `proof.rs::the_proof_domain_is_distinct_from_the_threshold_domain`
+  asserts two constants are unequal. Its comment says it stops a later reader
+  folding the two hashes into one helper; it does not, since a folded helper
+  taking a domain parameter passes it. Keep it (a constant-inequality guard is
+  cheap) but do not let the document rest the domain-separation claim on it.
+- **R9-F5, LOW** — `with_lease` must precede `with_proof`. Correctness by call
+  order is a defect. Structural fix: have `with_proof` take a closure over
+  `self.proof_binding()` and compute the proof at attach time, so a later
+  `with_lease` cannot invalidate it. Fails closed as built.
+- **R9-F6, LOW** — `approve_proof` and `verify` take `decision: &str`. A
+  stringly-typed security parameter next to a `Decision::wire_tag` that exists
+  precisely to avoid spelling it out. Take `Decision` and call `wire_tag`
+  internally; the phone mirror is unaffected, since it hashes the wire tag either
+  way.
+- **R9-F7, LOW (doc)** — `proof.rs`'s module doc cites
+  `docs/security-claims.md §20` for the invariant-4 gap. §20 is the single
+  ToDaemon owner. The correct citation is this section, §22.
+- **R9-F8, LOW now, and a merge gate for the phone half** — the `approveProof`
+  vectors are exported and generate correctly, but `approveProof?` is optional
+  in `apps/phone/src/protocol/vectors.contract.ts` and
+  `apps/phone/src/protocol/verify-vectors.ts` has no loop for the category, so
+  nothing checks a phone mirror today. Make the field required and add the loop
+  in the same change that adds the TS mirror. A mirror bug is fail-closed (every
+  approval denied), so this is a release-quality gate rather than a security
+  hole. Note for whoever writes the mirror: the request field is
+  `proofChallenge`, while the vector calls the same bytes `challengePubB64`.
+
+### What is inert today, stated so a later reader does not over-read this section
+
+No daemon mints a challenge (`remote.rs::build_request` sets
+`proof_challenge: None`), and no code outside `sigil-proto` reads
+`ApprovalResponse::proof`. The slice is additive and changes no behaviour. When
+the daemon half lands, the hostile-relay suite must gain these attacks BEFORE it
+merges, per this reviewer's standing rule: an approve with no proof; an approve
+carrying a proof minted against a previous request's challenge; an approve whose
+lease was widened after the proof was taken; a proof lifted from a deny and
+replayed on an approve; a proof from a different pairing's `f`; and a replayed
+constant `Z_F` presented with no proof, which is R9-F1's regression test and the
+whole reason this exists. The challenge must also be dropped at the terminal
+state of its request, and a daemon restart mid-request must deny.
+
+### Residual, restated at its real strength
+
+The daemon cannot distinguish an enclave-held `f` from a software-held one.
+There is no key attestation anywhere in this construction, and `sigil-softphone`
+demonstrates the limit by satisfying every check with a software scalar. The
+honest claim is that the phone app contains no code path that approves without a
+biometrically-gated hardware key operation. It is NOT that the daemon verifies an
+enclave was used, and no wording anywhere should imply otherwise. Closing it
+needs pairing-time `SecKeyCreateAttestation` against Apple's attestation root,
+which is filed and not built. Read together with R9-F1: until the daemon half
+lands, even the narrower claim is false, because the phone can approve from a
+cached partial with no key operation at all.
 
 ## Independent review verdict: hot-reload + pairing biometric + delivery receipt + relay #53 (75932b0..518d28f)
 

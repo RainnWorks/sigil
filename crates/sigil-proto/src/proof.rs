@@ -229,7 +229,7 @@ impl ApproveChallenge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::threshold::MacShare;
+    use crate::threshold::{MacShare, ThresholdRecord};
 
     /// Stand in for the Secure Enclave: a software scalar `f` whose public point is
     /// the `F` a pairing pins. This is exactly the substitution `sigil-softphone`
@@ -381,15 +381,37 @@ mod tests {
     /// record's base `E` must not yield anything a combiner would accept as `Z_F`.
     #[test]
     fn a_proof_is_never_usable_as_a_threshold_partial() {
-        let (f, _f_pub) = phone_key();
-        // `E` here stands in for a sealed account's base point, which an attacker
-        // would want the plain-gate path to answer for.
-        let e = MacShare::generate().public_point();
+        // The attack this pins: a daemon asks the plain-gate path to prove
+        // against a challenge it has set to a SEALED ACCOUNT'S base point `E`,
+        // hoping the answer is the combiner share for that account. Asserting
+        // `proof != zf` would not prove anything (any non-identity function
+        // passes that, a flipped bit included), so feed the proof to the
+        // combiner as if it were the partial and require the AEAD to refuse.
+        let (f, f_pub) = phone_key();
+        let m = MacShare::generate();
+        let record = ThresholdRecord::seal(
+            "acct",
+            &m,
+            &f_pub,
+            EcdhAlgo::RawX,
+            "phone-se.v2",
+            b"the-secret",
+        )
+        .expect("seal");
+
+        let e = record.ephemeral_point().expect("record E is on-curve");
         let zf = f.partial(&e, EcdhAlgo::RawX, e.as_x963());
+        // The real partial opens it, so the fixture is genuinely the live path.
+        assert_eq!(
+            &*record.decrypt(&m, &zf).expect("the real partial opens it"),
+            b"the-secret"
+        );
+
+        // The proof over that same point does not, which is what the hash buys.
         let proof = approve_proof(&zf, "req-1", "approved", None);
-        assert_ne!(
-            proof, *zf,
-            "the wire value must not equal the combiner share for the same point"
+        assert!(
+            record.decrypt(&m, &proof).is_err(),
+            "a proof substituted for the partial must not open the record"
         );
     }
 
@@ -397,7 +419,38 @@ mod tests {
     /// hashes into one helper.
     #[test]
     fn the_proof_domain_is_distinct_from_the_threshold_domain() {
+        // Distinct constants are necessary and nowhere near sufficient: what
+        // must hold is that the two derivations cannot be folded together, so
+        // check the OUTPUTS over one shared secret rather than the labels.
         assert_ne!(APPROVE_PROOF_DOMAIN, crate::threshold::THRESHOLD_DOMAIN);
+        assert!(
+            !APPROVE_PROOF_DOMAIN.starts_with(crate::threshold::THRESHOLD_DOMAIN)
+                && !crate::threshold::THRESHOLD_DOMAIN.starts_with(APPROVE_PROOF_DOMAIN),
+            "neither domain may prefix the other: the constants are raw, not length-prefixed"
+        );
+
+        let (f, f_pub) = phone_key();
+        let m = MacShare::generate();
+        let record = ThresholdRecord::seal(
+            "acct",
+            &m,
+            &f_pub,
+            EcdhAlgo::RawX,
+            "phone-se.v2",
+            b"the-secret",
+        )
+        .expect("seal");
+        let e = record.ephemeral_point().expect("record E is on-curve");
+        let zf = f.partial(&e, EcdhAlgo::RawX, e.as_x963());
+
+        // One shared secret, two derivations, and the proof must not land on the
+        // combiner's key material for it.
+        let proof = approve_proof(&zf, "req-1", "approved", None);
+        assert_ne!(proof, *zf, "the proof must not be the partial itself");
+        assert!(
+            record.decrypt(&m, &proof).is_err(),
+            "the proof must not open what the partial opens"
+        );
     }
 
     #[test]
