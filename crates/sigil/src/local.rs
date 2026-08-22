@@ -54,53 +54,46 @@ fn platform_runtime_dir() -> PathBuf {
         .join("sigil")
 }
 
-/// Non-macOS (Linux): `/run/user/<uid>/sigil` when `/run/user/<uid>` is a
-/// directory this uid owns, else `/tmp/sigil-<uid>`.
+/// Non-macOS (Linux): always `/tmp/sigil-<uid>`, derived from `getuid()` alone.
 ///
-/// This deliberately no longer reads `$TMPDIR`, and the reason is not
-/// theoretical. `$TMPDIR` breaks the zero-environment promise this function's
-/// whole existence rests on: the same binary talking to the same live daemon
-/// resolved different socket paths depending on who exported what. Worse for a
-/// container deployment, an agent runner commonly points `$TMPDIR` at a per-run
-/// scratch directory that it DELETES when the run ends, so a daemon meant to
-/// outlive a run would put its control socket somewhere the next run cannot find
-/// and the runner then removes underneath it.
+/// This deliberately does not read `$TMPDIR`, and the reason is not theoretical.
+/// `$TMPDIR` breaks the zero-environment promise this function's whole existence
+/// rests on: the same binary talking to the same live daemon resolved different
+/// socket paths depending on who exported what. Worse for a container
+/// deployment, an agent runner commonly points `$TMPDIR` at a per-run scratch
+/// directory that it DELETES when the run ends, so a daemon meant to outlive a
+/// run would put its control socket somewhere the next run cannot find and the
+/// runner then removes underneath it.
 ///
-/// `/run/user/<uid>` is the Linux analogue of the Darwin per-user temp dir:
-/// logind creates it 0700 owned by the user, it is a tmpfs (so it clears on
-/// boot, which is what we want for a socket), and it is short. It is derived
-/// from `getuid()` alone, so it is the same answer from a login shell, a
-/// container entrypoint, and a supervised daemon.
+/// It also deliberately does not prefer `/run/user/<uid>`, which is the obvious
+/// Linux analogue of the Darwin per-user temp dir and is the wrong choice here.
+/// That directory is owned by the login-session manager: logind (or elogind)
+/// creates it when a session opens and REMOVES it when the user's last session
+/// closes, unless lingering is enabled for that user. Sigil's daemon is
+/// specifically the thing that must outlive logins, so anchoring it there gives
+/// a socket path that changes depending on whether a human happens to be logged
+/// in, which is the precise failure this function exists to prevent. Preferring
+/// it "when present" is worse than not using it at all: it makes the path depend
+/// on session state, so a daemon started while a session was open keeps a socket
+/// at a path its own clients stop resolving to.
 ///
-/// The `/tmp` fallback carries the uid IN THE NAME rather than nesting under a
-/// shared `sigil/`. `/tmp` is world-writable, so a bare `/tmp/sigil` is a name
-/// any other uid can win the race to create. Suffixing is not itself a defence;
-/// it makes "this is not mine" detectable, and [`ensure_private_runtime_dir`] is
-/// what detects it.
+/// (Measured on the deployment target, a 7.2 Unraid host: `/run/user` exists and
+/// is EMPTY after 20 hours of uptime, no `systemctl` is installed at all, and
+/// `elogind` manages sessions. So the preference would have bought nothing there
+/// and cost determinism everywhere.)
+///
+/// `/tmp` is world-writable, so the uid goes IN THE NAME rather than nesting
+/// under a shared `sigil/`, which any other uid could win the race to create.
+/// Suffixing is not itself a defence; it makes "this is not mine" detectable,
+/// and [`ensure_private_runtime_dir`] is what detects it and refuses. `/tmp` is
+/// sticky, so another uid cannot remove the directory once it is ours, and on
+/// both the container and the host it is a tmpfs cleared on boot, which is the
+/// right lifetime for a socket.
 #[cfg(not(target_os = "macos"))]
 fn platform_runtime_dir() -> PathBuf {
     // SAFETY: getuid is a pure query with no failure mode.
     let uid = unsafe { libc::getuid() };
-    let run_user = PathBuf::from(format!("/run/user/{uid}"));
-    if own_private_dir(&run_user) {
-        return run_user.join("sigil");
-    }
     PathBuf::from(format!("/tmp/sigil-{uid}"))
-}
-
-/// Whether `path` is an existing directory (not a symlink to one) owned by this
-/// uid. Used to decide whether `/run/user/<uid>` is really ours before anchoring
-/// the daemon's sockets under it.
-#[cfg(not(target_os = "macos"))]
-fn own_private_dir(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    // symlink_metadata, not metadata: a symlink planted at this name must read
-    // as "not a directory we own", never be followed to something that is.
-    match std::fs::symlink_metadata(path) {
-        // SAFETY: getuid is a pure query with no failure mode.
-        Ok(md) => md.is_dir() && md.uid() == unsafe { libc::getuid() },
-        Err(_) => false,
-    }
 }
 
 /// Create `dir` 0700 and prove it is ours before anything binds inside it.
@@ -669,17 +662,37 @@ mod tests {
             with_none, with_var_tmp,
             "TMPDIR must not move the runtime dir"
         );
-        // And it must be one of the two uid-derived answers, never a $TMPDIR one.
+        // And it must be THE uid-derived answer, never a $TMPDIR one and never a
+        // session-manager-owned one. There is exactly one acceptable value: the
+        // path must not depend on env, on login state, or on anything else a
+        // second Sigil process could disagree about.
         // SAFETY: getuid is a pure query with no failure mode.
         let uid = unsafe { libc::getuid() };
-        let acceptable = [
-            PathBuf::from(format!("/run/user/{uid}/sigil")),
+        assert_eq!(
+            with_none,
             PathBuf::from(format!("/tmp/sigil-{uid}")),
-        ];
+            "the Linux runtime dir must be exactly /tmp/sigil-<uid>"
+        );
+    }
+
+    /// The runtime dir must not be anchored under `/run/user/<uid>`, even when
+    /// that directory exists.
+    ///
+    /// It is owned by the login-session manager: logind or elogind creates it on
+    /// login and removes it when the user's last session closes unless lingering
+    /// is on. The Sigil daemon is precisely the thing meant to outlive logins, so
+    /// a socket path that appears and disappears with sessions reintroduces the
+    /// disagreement this whole module exists to prevent, in a form that is harder
+    /// to see than `$TMPDIR` was.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_runtime_dir_is_not_owned_by_the_login_session_manager() {
+        let dir = runtime_dir();
         assert!(
-            acceptable.contains(&with_none),
-            "runtime dir must be uid-derived, got {}",
-            with_none.display()
+            !dir.starts_with("/run/user"),
+            "the daemon's sockets must not live under the session manager's \
+             runtime dir, which is torn down on logout; got {}",
+            dir.display()
         );
     }
 
