@@ -2321,9 +2321,11 @@ fn split_shadowed_plain(
 /// The command's config selects the provider; the provider decides the injection
 /// shape. `op` is a plain gated command: Sigil injects no credential and op does
 /// its own auth. An inline-`env` rule opens its threshold-sealed values with the
-/// phone's partial and injects them, gated on every run (no leasing, so resolved
-/// values never sit in RAM across a TTL). An *unconfigured* command is refused
-/// with a pointer to `sigil-config add`, never run ungated.
+/// phone's partial and injects them; whether that run also opens a lease is the
+/// matched rule's `LeasePolicy` alone, and a leasable one caches the values it
+/// just opened so later matching runs inject them from RAM until the window
+/// lapses. An *unconfigured* command is refused with a pointer to
+/// `sigil-config add`, never run ungated.
 #[allow(clippy::too_many_arguments)]
 fn fulfill(
     core: &Core,
@@ -4377,8 +4379,9 @@ mod tests {
 
         assert_eq!(code, 0);
         assert_eq!(read_all(read_end), "tok=abc123 region=eu");
-        // A direct-injection provider is never leased (no credential to hold in
-        // RAM across a TTL), even though the decision would allow it.
+        // The rule is `RunOnce`, so no lease opens even though the decision would
+        // allow one. The provider does not enter into it: under a leasable rule
+        // this same sealed source would cache its opened values for the window.
         assert_eq!(core.leases.active(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -7527,7 +7530,7 @@ mod tests {
         assert_eq!(
             core.leases.active(),
             0,
-            "env-file must never lease, even on a lease decision"
+            "a RunOnce rule must not lease, even on a lease decision"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

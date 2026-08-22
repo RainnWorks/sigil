@@ -30,13 +30,22 @@ independent adversarial pass, never self-certification.
 
 ## Non-negotiable invariants (see .claude/agents/security-reviewer.md for the full list)
 
-1. Daemon at rest is inert: tokens are ciphertext; the DEK arrives per-approval
-   from the phone (or a live lease) and is zeroized after use.
+1. Daemon at rest is inert: secrets are threshold-sealed ciphertext. Opening one
+   needs the phone's per-approval partial combined with the Mac share (or a live
+   lease); both are zeroized after use. There is no DEK; that was the retired v1
+   model.
 2. Secret bytes never enter daemon memory: op child stdout splices to the
    client fd.
 3. The relay is powerless and anonymous: opaque envelopes, key-hash mailboxes,
    no accounts, no key-distribution role.
-4. Approve requires hardware-gated biometrics; deny requires nothing.
+4. Approve requires hardware-gated biometrics; deny and revoke require nothing.
+   A biometric binds to a DEVICE, not a human, so anything that lets the
+   approving identity leave the device defeats this entirely. No gate may accept
+   a device passcode. KNOWN OPEN GAP, being closed, do not reword this invariant
+   to match it: a plain-gate approve is today authorized by a biometric check
+   alone with no enclave key use, and every `op` rule is a plain gate. Treat a
+   plain-gate approve path that unlocks nothing cryptographic as the gap this
+   invariant exists to close, not as compliant.
 5. Everything fails closed.
 6. Zero em-dashes and zero emoji in any user-facing string.
 
