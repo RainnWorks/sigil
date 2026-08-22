@@ -34,15 +34,28 @@ pub fn push_path() -> Option<PathBuf> {
     sigil_home().map(|h| h.join("push.json"))
 }
 
-/// `<sigil_home>/logs`, where the launchd agent's stdout/stderr are rotated.
+/// `<sigil_home>/logs`, where the supervised daemon's stdout/stderr are
+/// rotated (launchd writes them on macOS, the Sigil supervisor elsewhere).
 pub fn logs_dir() -> Option<PathBuf> {
     sigil_home().map(|h| h.join("logs"))
 }
 
-/// The launchd LaunchAgent plist for the daemon.
+/// The launchd LaunchAgent plist for the daemon: the macOS supervision
+/// definition. See [`supervisor_definition`] for the one used off Darwin.
 pub fn launch_agent_plist() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(|h| PathBuf::from(h).join("Library/LaunchAgents/works.rainn.sigil.plist"))
+}
+
+/// `~/.sigil/supervisor.conf`: the non-Darwin supervision definition, and the
+/// LaunchAgent plist's exact counterpart. `sigil up` renders it; `sigil daemon
+/// --supervise` reads it.
+///
+/// Anchored to `HOME` rather than to [`sigil_home`] for the same reason as
+/// [`shim_bin_dir`]: a `SIGIL_HOME` override must never move the path a
+/// supervisor that is already running was told to read.
+pub fn supervisor_definition() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".sigil").join("supervisor.conf"))
 }
 
 /// True if `p` is a regular file with any execute bit set.
