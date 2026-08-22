@@ -1,7 +1,7 @@
 # Linux lifecycle: how the daemon gets installed, supervised and updated
 
-Status: decision record. Parts 1 and 2 below are implemented; part 3, the
-supervisor backend behind `sigil up`, is specified here and not yet written.
+Status: decision record. All four decisions below are implemented, decision 4
+(the supervisor backend behind `sigil up`) included.
 
 `sigil up` is the keystone verb. `docs/design/agent-operated-sigil.md` section 2
 states its contract: the daemon "is not 'started'; it is *ensured*". This note
@@ -10,20 +10,20 @@ wrong ones here.
 
 ## The gap
 
-`up.rs` and `service.rs` contain no `cfg(target_os)` split at all. The same
+`up.rs` and `service.rs` contained no `cfg(target_os)` split at all. The same
 crate splits on platform in six other files (`local.rs`, `peercode.rs`,
-`lease.rs`, `lib.rs`, `keystore.rs`, `daemon.rs`), so this is one subsystem that
-never learned about Linux rather than a codebase that never did.
+`lease.rs`, `lib.rs`, `keystore.rs`, `daemon.rs`), so this was one subsystem
+that never learned about Linux rather than a codebase that never did.
 
-What that means concretely: `service.rs` renders a `<!DOCTYPE plist>`
-LaunchAgent, writes `~/Library/LaunchAgents/works.rainn.sigil.plist`, and drives
-`launchctl bootout` / `bootstrap` / `kickstart`. On Linux it compiles, then
-fabricates an Apple directory under `$HOME` and shells out to a binary that is
-not there. So a Linux host has no supervision, no restart-on-crash, and no
+What that meant concretely: `service.rs` rendered a `<!DOCTYPE plist>`
+LaunchAgent, wrote `~/Library/LaunchAgents/works.rainn.sigil.plist`, and drove
+`launchctl bootout` / `bootstrap` / `kickstart`. On Linux it compiled, then
+fabricated an Apple directory under `$HOME` and shelled out to a binary that is
+not there. So a Linux host had no supervision, no restart-on-crash, and no
 update path.
 
-Six of `ensure_up()`'s seven steps already work unmodified on Linux. The gap is
-one step, and it is the one that makes the daemon stay running.
+Six of `ensure_up()`'s seven steps already worked unmodified on Linux. The gap
+was one step, and it was the one that makes the daemon stay running.
 
 ## What the target actually is
 
@@ -126,14 +126,11 @@ silent.
 
 ## Decision 4: the supervisor is a Sigil process, behind the existing `up` verb
 
-Not yet implemented. Specified here so the implementation is not a fresh
-argument.
-
 `up` stays the single idempotent entry point; the platform split goes behind it.
-No second verb, per `agent-operated-sigil.md` section 2. `service.rs` grows a
-platform-agnostic surface (ensure the definition, is it loaded, start, stop,
-restart) with the launchd implementation moved behind `cfg(target_os = "macos")`
-and a Linux implementation beside it.
+No second verb, per `agent-operated-sigil.md` section 2. `service.rs` is now a
+platform-agnostic surface (ensure the definition, is it loaded, bootstrap,
+bootout, kickstart) over two backends: `service/launchd.rs` and
+`service/supervisor.rs`.
 
 The Linux implementation is a small supervisor process that Sigil ships and
 `up` ensures: it takes its own lock, spawns `sigil daemon`, waits, and respawns
@@ -150,16 +147,94 @@ deliberate. The reasons for this over the alternatives:
 - **It matches the verb's semantics.** `up` ensures a process; it does not
   register a unit and hope.
 
-### The contract the backend must satisfy
+### How it maps onto launchd
 
-1. Ensure a process, not register a unit.
-2. Enforce single-instance (decision 3, already in place).
-3. Restart after an unexpected exit, but **not** after a deliberate stop.
-4. Use a socket path independent of `$TMPDIR` (decision 2, already in place).
-5. `stop` must actually stop, and stay stopped.
-6. Exit 0 when healthy. `cmd_up` returning 1 permanently on Linux means anything
-   gating on `sigil up &&` fails closed forever, which defeats the pipeline this
-   is all for.
+The two backends answer the same five questions, so `up.rs` drives one seam
+rather than carrying two code paths:
+
+| launchd | supervisor |
+|---|---|
+| `~/Library/LaunchAgents/works.rainn.sigil.plist` | `~/.sigil/supervisor.conf` |
+| `launchctl bootstrap` | spawn `sigil daemon --supervise`, detached |
+| `launchctl bootout` | `SIGTERM` the supervisor, then any daemon still running |
+| `launchctl kickstart -k` | `SIGHUP` the supervisor |
+| `launchctl print` succeeds | the supervisor holds `supervisor.lock` |
+| unconditional `KeepAlive` | the respawn loop, with backoff |
+
+The definition is a file rather than arguments for the same two reasons the
+plist is one: `up` compares it byte for byte to decide whether anything changed,
+and a human with no `launchctl print` to run can read what the supervisor was
+told. It pins the same shim-first `PATH` and, like the plist, pins no keystore
+and no `SIGIL_HOME`.
+
+**`--supervise` is a flag on `daemon`, not a new verb.** `sigil daemon` is
+already the process launchd invokes and no human types; the supervisor sits at
+exactly that level. Making it `sigil supervise` would have grown the
+reserved-verb surface, which the CLI keeps deliberately small so that a program
+actually named `supervise` stays gateable.
+
+The one thing launchd gives for free and this has to earn is telling a
+deliberate stop from a crash. launchd knows because a bootout unloads the job.
+Here the supervisor itself is the unit: `SIGTERM` means stop (terminate the
+daemon, exit, so nothing respawns it), `SIGHUP` means cycle. A daemon that exits
+without either was not asked to, and comes back.
+
+### The one place the backends genuinely differ
+
+`service::RELOAD_ON_BINARY_REFRESH`. When `up` copies new bytes into
+`~/.sigil/bin/sigil`, macOS only needs the daemon kickstarted: launchd is the
+operating system's, not one of the bytes that just changed. Off macOS the
+supervisor **is** one of those bytes, so cycling only the daemon would update the
+daemon and leave the supervisor running the previous build indefinitely. That is
+a silently half-applied update, which is precisely what this chain exists to make
+impossible, so a refreshed binary forces a full reload there.
+
+### The contract the backend must satisfy, and where each item is met
+
+1. **Ensure a process, not register a unit.** `supervisor::bootstrap` spawns and
+   waits for the lock, so a success means supervising, not that `fork` returned.
+2. **Enforce single-instance** (decision 3). The supervisor takes its own
+   `supervisor.lock` beside the daemon's, by the same mechanism.
+3. **Restart after an unexpected exit, but not after a deliberate stop.** The
+   signal split above, plus a 1s-to-30s doubling backoff that resets once a
+   daemon has stayed up for a minute.
+4. **A socket path independent of `$TMPDIR`** (decision 2).
+5. **`stop` must actually stop, and stay stopped.** `bootout` signals, then
+   escalates to `SIGKILL`, and confirms by watching the lock be *released*
+   rather than by probing a pid, which cannot be fooled by pid reuse. It then
+   stops any daemon still holding its own lock, because a daemon started outside
+   this supervisor (by hand, by a container restart policy, by a systemd unit a
+   site added) is still a daemon that was asked to stop.
+6. **Exit 0 when healthy.** `up::exit_code` is now a separate, tested function
+   rather than a counter inside the renderer, because it is a contract:
+   `sigil up && <work>` is how the pipeline gates itself. Until this split
+   existed, every launchd step failed off Darwin, so `up` could not report
+   success on Linux however healthy the daemon was.
+
+### What was verified by running it
+
+On Linux, 2026-08-22, against the built binary. Recorded because a supervisor
+that has never been signalled is a belief, not a supervisor.
+
+- A second supervisor is refused and names the holder; the first survives.
+- `SIGKILL` to the daemon: respawned with a new pid after the backoff.
+- `SIGHUP`: the daemon is cycled immediately, logged as asked-for, no backoff.
+- `SIGTERM`: daemon terminated, supervisor exited, lock released, and nothing
+  respawned. Confirmed by exe rather than by a name match.
+- A daemon that exits instantly forever backs off 1s, 2s, 4s, 8s, 16s: five
+  attempts in 25 seconds rather than a busy loop. A stop during a backoff sleep
+  breaks out of it instead of waiting the sleep out.
+- `sigil up` end to end: definition written to `~/.sigil/supervisor.conf`, no
+  `~/Library` fabricated anywhere, daemon answering a real control round trip.
+  A second run changes nothing and both pids are unchanged.
+- The supervisor is reparented to init with its own session id, so the terminal
+  that ran `sigil up` closing (or a Ctrl-C in it) cannot take it down.
+- A genuinely different build: **both** the supervisor and the daemon are
+  replaced, and the installed copy is the new bytes.
+
+The step that cannot be verified here is pairing, which needs the phone. That is
+the one step `up` reports as action-needed on any platform, and it is why a
+freshly installed, perfectly healthy Sigil still exits 1 until the human pairs.
 
 ### Open question, carried from the lease work
 
