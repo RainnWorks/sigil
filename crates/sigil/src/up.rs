@@ -10,23 +10,29 @@
 //! The chain, in order (each step idempotent):
 //!
 //! 1. **binary**: the running binary is copied to the install-stable
-//!    `~/.sigil/bin/sigil` when the bytes differ, so launchd never depends on
-//!    a build checkout path surviving.
-//! 2. **plist**: the LaunchAgent plist is re-rendered against the stable
-//!    binary (unconditional KeepAlive, shim-first PATH, and no keystore pin:
+//!    `~/.sigil/bin/sigil` when the bytes differ, so the supervision layer
+//!    never depends on a build checkout path surviving.
+//! 2. **definition**: the supervision definition is re-rendered against the
+//!    stable binary (always-on restart, shim-first PATH, and no keystore pin:
 //!    daemon and CLI share one default) and rewritten only when it differs.
-//! 3. **loaded**: the agent is bootstrapped into the GUI domain; a changed
-//!    plist is re-bootstrapped (bootout + bootstrap) so launchd reads it.
+//! 3. **loaded**: the definition is bootstrapped; a changed one is reloaded
+//!    (bootout + bootstrap) so the supervisor reads the new definition.
 //! 4. **daemon**: a real `Status` control round trip must answer, bounded by
 //!    socket timeouts. This catches the zombie mode (process alive, listeners
-//!    gone) that a bare liveness probe or launchd's own view calls healthy.
-//!    An unhealthy or restart-needing daemon is kickstarted and re-probed.
+//!    gone) that a bare liveness probe or the supervisor's own view calls
+//!    healthy. An unhealthy or restart-needing daemon is kickstarted and
+//!    re-probed.
 //! 5. **ssh agent**: the agent socket accepts a connection (same process;
 //!    the kickstart above is the heal).
 //! 6. **shim**: `~/.sigil/bin/op` points at the installed runtime and
 //!    `~/.sigil/bin` is on PATH in the shell profile.
 //! 7. **paired**: a phone pairing exists, else the one thing `up` cannot do
 //!    alone is reported as action needed (the ceremony requires the human).
+//!
+//! Steps 2 and 3 are the only platform-specific ones, and they go through the
+//! [`crate::service`] seam rather than being written twice here: launchd on
+//! macOS, a Sigil supervisor process elsewhere. See
+//! `docs/design/linux-lifecycle.md`.
 
 use std::io::Write as _;
 use std::time::Duration;
@@ -164,8 +170,10 @@ pub fn ensure_up() -> Vec<Step> {
     let mut steps = Vec::new();
 
     // 1. The install-stable binary.
+    let mut binary_refreshed = false;
     let installed = match service::ensure_installed_binary() {
         Ok((path, true)) => {
+            binary_refreshed = true;
             steps.push(Step::fixed(
                 "binary",
                 format!("installed to {}", path.display()),
@@ -182,54 +190,68 @@ pub fn ensure_up() -> Vec<Step> {
         }
     };
 
-    // 2 + 3. The plist and its bootstrap. A changed plist is re-bootstrapped
-    // so launchd actually reads the new definition; an unchanged one is
-    // bootstrapped only if not loaded.
+    // 2 + 3. The supervision definition and its bootstrap. A changed definition
+    // is reloaded so the supervision layer actually reads it; an unchanged one
+    // is bootstrapped only if not loaded.
+    //
+    // A refreshed binary also forces a reload where the supervisor is one of the
+    // bytes that was just replaced (see `service::RELOAD_ON_BINARY_REFRESH`).
+    // Restarting only the daemon there would update the daemon and leave the
+    // supervisor running the previous build indefinitely, which is a silent
+    // half-applied update: exactly the failure this whole chain exists to make
+    // impossible.
+    let supervisor_is_stale = binary_refreshed && service::RELOAD_ON_BINARY_REFRESH;
     let mut restarted_via_bootstrap = false;
-    let mut plist_changed = false;
-    match installed.as_deref().map(service::install_plist_for) {
-        Some(Ok((plist, changed))) => {
-            plist_changed = changed;
+    let mut definition_changed = false;
+    match installed.as_deref().map(service::install_definition_for) {
+        Some(Ok((definition, changed))) => {
+            definition_changed = changed;
             let loaded = service::is_loaded();
-            if changed && loaded {
-                // Reload the definition. bootout also stops the daemon; the
-                // bootstrap (RunAtLoad) starts the new one.
-                let result = service::bootout().and_then(|()| service::bootstrap(&plist));
+            let reload = changed || supervisor_is_stale;
+            if reload && loaded {
+                // Reload. The bootout also stops the daemon; the bootstrap
+                // starts a new one from the new definition.
+                let result = service::bootout().and_then(|()| service::bootstrap(&definition));
+                let note = if changed {
+                    "definition updated and reloaded"
+                } else {
+                    "reloaded to run the refreshed binary"
+                };
                 match result {
                     Ok(()) => {
                         restarted_via_bootstrap = true;
-                        steps.push(Step::fixed("launchd", "plist updated and reloaded"));
+                        steps.push(Step::fixed(service::SUPERVISION, note));
                     }
-                    Err(e) => steps.push(Step::failed("launchd", format!("reload failed: {e:#}"))),
+                    Err(e) => steps.push(Step::failed(
+                        service::SUPERVISION,
+                        format!("reload failed: {e:#}"),
+                    )),
                 }
             } else if !loaded {
-                match service::bootstrap(&plist) {
+                match service::bootstrap(&definition) {
                     Ok(()) => {
                         restarted_via_bootstrap = true;
-                        steps.push(Step::fixed("launchd", "agent bootstrapped"));
+                        steps.push(Step::fixed(service::SUPERVISION, "loaded"));
                     }
-                    Err(e) => {
-                        steps.push(Step::failed("launchd", format!("bootstrap failed: {e:#}")))
-                    }
+                    Err(e) => steps.push(Step::failed(
+                        service::SUPERVISION,
+                        format!("bootstrap failed: {e:#}"),
+                    )),
                 }
-            } else if changed {
-                // Written but was not loaded to begin with and bootstrap above
-                // covers it; unreachable, kept for exhaustiveness.
-                steps.push(Step::fixed("launchd", "plist updated"));
             } else {
-                steps.push(Step::ok("launchd", "agent loaded, plist current"));
+                steps.push(Step::ok(service::SUPERVISION, "loaded, definition current"));
             }
         }
-        Some(Err(e)) => steps.push(Step::failed("launchd", format!("{e:#}"))),
-        None => steps.push(Step::failed("launchd", "skipped: no installed binary")),
+        Some(Err(e)) => steps.push(Step::failed(service::SUPERVISION, format!("{e:#}"))),
+        None => steps.push(Step::failed(
+            service::SUPERVISION,
+            "skipped: no installed binary",
+        )),
     }
 
     // 4. The daemon answers. A refreshed binary needs a restart to run the new
-    // bytes unless the re-bootstrap above already restarted it.
-    let binary_refreshed = steps
-        .iter()
-        .any(|s| s.name == "binary" && s.state == StepState::Fixed);
-    let force_restart = (binary_refreshed || plist_changed) && !restarted_via_bootstrap;
+    // bytes unless the reload above already restarted it.
+    let force_restart = (binary_refreshed || definition_changed) && !restarted_via_bootstrap;
     if restarted_via_bootstrap {
         // Give the fresh daemon its probe window without forcing a second
         // restart on top of the bootstrap's.
@@ -297,8 +319,9 @@ pub fn ensure_up() -> Vec<Step> {
     if let Some(note) = keystore::legacy_keychain_notice(ks.as_ref()) {
         steps.push(Step::action("keystore (legacy)", note));
     }
-    // An older plist pinned the store into launchd. `up` has just rewritten it
-    // without the pin; say so rather than leaving a mystery entry behind.
+    // An older macOS plist pinned the store into launchd. `up` has just
+    // rewritten it without the pin; say so rather than leaving a mystery entry
+    // behind. Never fires off Darwin, where no build ever wrote such a pin.
     if service::installed_dev_keystore_pin().is_some() {
         steps.push(Step::ok(
             "keystore (plist)",
@@ -307,6 +330,26 @@ pub fn ensure_up() -> Vec<Step> {
     }
 
     steps
+}
+
+/// The exit code for a finished chain: 0 when every step is ok or fixed, 1 when
+/// any needs the human or failed.
+///
+/// Pure, and separate from the rendering, because it is a CONTRACT rather than a
+/// detail of the report. `sigil up && <do the work>` is how the pipeline gates
+/// itself, so anything that makes this return 1 unconditionally on a platform
+/// fails that gate closed forever on that platform. It did, until the
+/// supervision seam above existed: every launchd step failed on Linux, so `up`
+/// could never report success there no matter how healthy the daemon was.
+pub fn exit_code(steps: &[Step]) -> i32 {
+    if steps
+        .iter()
+        .all(|s| matches!(s.state, StepState::Ok | StepState::Fixed))
+    {
+        0
+    } else {
+        1
+    }
 }
 
 /// Ensure the `op` shim alias and the profile PATH entry. Fixed-vs-ok keys
@@ -346,7 +389,7 @@ pub fn cmd_up() -> i32 {
     println!("{}", s.cobalt("sigil up"));
     println!();
     let steps = ensure_up();
-    let mut code = 0;
+    let code = exit_code(&steps);
     for step in &steps {
         let (glyph, word) = match step.state {
             StepState::Ok => (s.ok("\u{2713}"), "ok"),
@@ -354,9 +397,6 @@ pub fn cmd_up() -> i32 {
             StepState::ActionNeeded => (s.brass("\u{2717}"), "action needed"),
             StepState::Failed => (s.deny("\u{2717}"), "failed"),
         };
-        if !matches!(step.state, StepState::Ok | StepState::Fixed) {
-            code = 1;
-        }
         // Pad the plain text, then color it: ANSI escapes inside a width spec
         // would break the column alignment.
         println!(
@@ -430,12 +470,44 @@ mod tests {
     #[test]
     fn step_states_map_to_exit_semantics() {
         // fixed is success (up made it true); action/failed are attention.
-        assert_eq!(StepState::Ok, StepState::Ok);
-        let fixed = Step::fixed("x", "y");
-        assert_eq!(fixed.state, StepState::Fixed);
-        let action = Step::action("x", "y");
-        assert_eq!(action.state, StepState::ActionNeeded);
-        let failed = Step::failed("x", "y");
-        assert_eq!(failed.state, StepState::Failed);
+        // Asserted through `exit_code`, the function `cmd_up` actually returns,
+        // so this tests the contract rather than restating the enum.
+        assert_eq!(exit_code(&[]), 0);
+        assert_eq!(
+            exit_code(&[Step::ok("a", ""), Step::fixed("b", "")]),
+            0,
+            "`up` having FIXED something is success: that is the whole point of the verb"
+        );
+        assert_eq!(
+            exit_code(&[Step::ok("a", ""), Step::action("b", "")]),
+            1,
+            "something only the human can do is not success"
+        );
+        assert_eq!(exit_code(&[Step::ok("a", ""), Step::failed("b", "")]), 1);
+    }
+
+    #[test]
+    fn a_healthy_chain_exits_zero_on_every_platform() {
+        // The regression this guards is platform-shaped, so state it as such: a
+        // chain whose supervision step is named for THIS build's backend and is
+        // ok must exit 0. Before the service seam split, the launchd steps could
+        // only fail off Darwin, so `sigil up && ...` gated closed forever on
+        // Linux however healthy the daemon was.
+        let healthy = [
+            Step::ok("binary", "/home/x/.sigil/bin/sigil"),
+            Step::ok(crate::service::SUPERVISION, "loaded, definition current"),
+            Step::ok("daemon", "answering on the control socket"),
+            Step::ok("ssh-agent", "/tmp/sigil-1000/agent.sock"),
+            Step::ok("shim", "/home/x/.sigil/bin/op"),
+            Step::ok("pairing", "phone paired"),
+            Step::ok("keystore", "portable on-disk store"),
+        ];
+        assert_eq!(exit_code(&healthy), 0);
+
+        // And the same chain with the supervision step failing must not: a
+        // daemon nobody is keeping alive is not "up".
+        let mut unsupervised = healthy.to_vec();
+        unsupervised[1] = Step::failed(crate::service::SUPERVISION, "bootstrap failed");
+        assert_eq!(exit_code(&unsupervised), 1);
     }
 }

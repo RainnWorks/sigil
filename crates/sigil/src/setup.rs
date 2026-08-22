@@ -108,13 +108,14 @@ fn ensure_profile_path_at(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Install the launchd plist and load the agent into the user's GUI domain.
-/// Returns the plist path. The `launchctl bootstrap` is Mac-runtime; on failure
-/// the plist is still written so a manual load is possible.
+/// Install the supervision definition and load it. Returns the definition path:
+/// the launchd plist on macOS, `~/.sigil/supervisor.conf` elsewhere. On a
+/// bootstrap failure the definition is still written, so a manual load and a
+/// later `sigil up` both still have something to work from.
 pub fn install_and_load_agent() -> Result<PathBuf> {
-    let plist = service::install_plist()?;
-    service::bootstrap(&plist)?;
-    Ok(plist)
+    let definition = service::install_definition()?;
+    service::bootstrap(&definition)?;
+    Ok(definition)
 }
 
 #[cfg(test)]

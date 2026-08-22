@@ -209,10 +209,10 @@ usage: sigil <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
                     command is refused; configure one with: sigil-config add <cmd>
   run -- <cmd>      escape hatch: run <cmd> even if it collides with a verb
   status            instrument panel: daemon, shim, op, factor
-  up                ensure everything: install the binary and launchd agent,
+  up                ensure everything: install the binary and its supervision,
                     heal a dead or wedged daemon, wire the shim, check pairing.
                     Idempotent; run it any time something looks off
-  setup             guided first run: shim, PATH, launchd, then pair
+  setup             guided first run: shim, PATH, supervision, then pair
   daemon [--dev-insecure]  run the approval daemon (foreground). Without a
                     paired phone or a hardware biometric it fails closed;
                     --dev-insecure enables local self-approval for dev only.
@@ -227,7 +227,7 @@ usage: sigil <cmd> [args...]   the primitive: gate <cmd>, inject its env, run it
   qr <data>         render <data> as a QR in the terminal; --stdin reads it from
                     stdin, --png <path> also writes a PNG, --out svg emits SVG,
                     --scale <n> sets pixels per module (PNG/SVG, default 8)
-  start|stop|restart   control the launchd daemon agent
+  start|stop|restart   control the supervised daemon (prefer: sigil up)
   lease list        list active session leases with countdowns
   lease revoke <p>  revoke leases whose grant-key hex starts with <p>
   keystore status   whether the on-disk keystore is sealed to the Sigil app
@@ -928,6 +928,20 @@ fn cmd_pending() -> i32 {
 }
 
 fn cmd_daemon(args: &[String]) -> i32 {
+    // `--supervise` runs the supervisor (the process `sigil up` ensures off
+    // macOS), not the daemon itself. It is a FLAG on `daemon` rather than a new
+    // verb on purpose: the reserved-verb surface is kept small so a program
+    // literally named `supervise` stays gateable as `sigil supervise ...`, and
+    // `up` stays the one lifecycle entry point either way.
+    if args.iter().any(|a| a == "--supervise") {
+        return match crate::service::supervise(args) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("sigil daemon --supervise: {e:#}");
+                1
+            }
+        };
+    }
     match daemon::run(args) {
         Ok(()) => 0,
         Err(e) => {
@@ -1597,18 +1611,20 @@ fn cmd_setup(args: &[String]) -> i32 {
         ),
     }
 
-    // 4. launchd agent (RunAtLoad + KeepAlive) with a shim-first PATH for GUI
-    //    tools. Mac-runtime; a bootstrap failure still leaves the plist written.
+    // 4. Supervision (always-on restart) with a shim-first PATH for the daemon
+    //    and anything it spawns. A bootstrap failure still leaves the definition
+    //    written, so a later `sigil up` has something to load.
+    let supervision = crate::service::SUPERVISION;
     match crate::setup::install_and_load_agent() {
-        Ok(plist) => {
-            println!("  {} launchd agent loaded", s.ok("\u{2713}"));
-            println!("    {} {}", s.dim("plist"), plist.display());
+        Ok(definition) => {
+            println!("  {} {supervision} loaded", s.ok("\u{2713}"));
+            println!("    {} {}", s.dim("definition"), definition.display());
         }
         Err(e) => println!(
-            "  {} launchd: {} {}",
+            "  {} {supervision}: {} {}",
             s.brass("\u{2717}"),
             s.dim(&e.to_string()),
-            s.faint("(you can load it later with: sigil start)")
+            s.faint("(you can load it later with: sigil up)")
         ),
     }
 
@@ -1622,7 +1638,7 @@ fn cmd_setup(args: &[String]) -> i32 {
 fn cmd_service(verb: &str) -> i32 {
     let s = Style::stdout();
     let result = match verb {
-        "start" => crate::service::install_plist()
+        "start" => crate::service::install_definition()
             .and_then(|p| crate::service::bootstrap(&p).map(|_| "started")),
         "stop" => crate::service::bootout().map(|_| "stopped"),
         "restart" => crate::service::kickstart().map(|_| "restarted"),
