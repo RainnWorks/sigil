@@ -19,7 +19,7 @@ use std::io::{self, Read, Write};
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -29,37 +29,129 @@ use serde::{Deserialize, Serialize};
 /// per-context `$TMPDIR` used to force: the GUI (launched by launchd), a login
 /// shell, and a subprocess can each see a *different* `$TMPDIR` (or none at all,
 /// falling back to `/tmp`), so deriving the socket from `$TMPDIR` made them bind
-/// and connect to different names. We instead anchor on the stable per-user temp
-/// dir (`confstr(_CS_DARWIN_USER_TEMP_DIR)` on macOS), which is identical across
-/// all of those contexts for one user, then append `sigil/`.
+/// and connect to different names. We instead anchor on the stable per-user
+/// runtime dir the OS itself defines (`confstr(_CS_DARWIN_USER_TEMP_DIR)` on
+/// macOS, `/run/user/<uid>` on Linux), which is identical across all of those
+/// contexts for one user, then append `sigil/`.
 ///
 /// Callers that want to override (tests, or a bespoke deployment) do so at the
 /// socket level via `SIGIL_SOCK` / `SIGIL_SSH_SOCK`, not here, so a single
 /// authoritative default stands unless a full path is deliberately supplied.
 pub fn runtime_dir() -> PathBuf {
-    stable_temp_base().join("sigil")
+    platform_runtime_dir()
 }
 
-/// The stable per-user temporary directory the [`runtime_dir`] anchors on.
-///
-/// On macOS this is `confstr(_CS_DARWIN_USER_TEMP_DIR)` (e.g.
-/// `/var/folders/xx/…/T/`), which the OS guarantees is the same for a given user
-/// whether the process was started by launchd, a GUI app, or a login shell, and
-/// which is short enough to keep the socket well under `sun_path`'s limit. It is
-/// deliberately NOT the `$TMPDIR` env var, which any of those contexts may strip
-/// or override. If the lookup ever fails we fall back to `/tmp` (shared, but at
-/// least consistent). On other platforms we keep the historical `$TMPDIR` (then
-/// `/tmp`) behavior.
+/// macOS: `confstr(_CS_DARWIN_USER_TEMP_DIR)` (e.g. `/var/folders/xx/…/T/`),
+/// which the OS guarantees is the same for a given user whether the process was
+/// started by launchd, a GUI app, or a login shell, and which is short enough to
+/// keep the socket well under `sun_path`'s limit. It is deliberately NOT the
+/// `$TMPDIR` env var, which any of those contexts may strip or override. If the
+/// lookup ever fails we fall back to `/tmp` (shared, but at least consistent).
 #[cfg(target_os = "macos")]
-fn stable_temp_base() -> PathBuf {
-    darwin_user_temp_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
+fn platform_runtime_dir() -> PathBuf {
+    darwin_user_temp_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("sigil")
 }
 
+/// Non-macOS (Linux): `/run/user/<uid>/sigil` when `/run/user/<uid>` is a
+/// directory this uid owns, else `/tmp/sigil-<uid>`.
+///
+/// This deliberately no longer reads `$TMPDIR`, and the reason is not
+/// theoretical. `$TMPDIR` breaks the zero-environment promise this function's
+/// whole existence rests on: the same binary talking to the same live daemon
+/// resolved different socket paths depending on who exported what. Worse for a
+/// container deployment, an agent runner commonly points `$TMPDIR` at a per-run
+/// scratch directory that it DELETES when the run ends, so a daemon meant to
+/// outlive a run would put its control socket somewhere the next run cannot find
+/// and the runner then removes underneath it.
+///
+/// `/run/user/<uid>` is the Linux analogue of the Darwin per-user temp dir:
+/// logind creates it 0700 owned by the user, it is a tmpfs (so it clears on
+/// boot, which is what we want for a socket), and it is short. It is derived
+/// from `getuid()` alone, so it is the same answer from a login shell, a
+/// container entrypoint, and a supervised daemon.
+///
+/// The `/tmp` fallback carries the uid IN THE NAME rather than nesting under a
+/// shared `sigil/`. `/tmp` is world-writable, so a bare `/tmp/sigil` is a name
+/// any other uid can win the race to create. Suffixing is not itself a defence;
+/// it makes "this is not mine" detectable, and [`ensure_private_runtime_dir`] is
+/// what detects it.
 #[cfg(not(target_os = "macos"))]
-fn stable_temp_base() -> PathBuf {
-    std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+fn platform_runtime_dir() -> PathBuf {
+    // SAFETY: getuid is a pure query with no failure mode.
+    let uid = unsafe { libc::getuid() };
+    let run_user = PathBuf::from(format!("/run/user/{uid}"));
+    if own_private_dir(&run_user) {
+        return run_user.join("sigil");
+    }
+    PathBuf::from(format!("/tmp/sigil-{uid}"))
+}
+
+/// Whether `path` is an existing directory (not a symlink to one) owned by this
+/// uid. Used to decide whether `/run/user/<uid>` is really ours before anchoring
+/// the daemon's sockets under it.
+#[cfg(not(target_os = "macos"))]
+fn own_private_dir(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    // symlink_metadata, not metadata: a symlink planted at this name must read
+    // as "not a directory we own", never be followed to something that is.
+    match std::fs::symlink_metadata(path) {
+        // SAFETY: getuid is a pure query with no failure mode.
+        Ok(md) => md.is_dir() && md.uid() == unsafe { libc::getuid() },
+        Err(_) => false,
+    }
+}
+
+/// Create `dir` 0700 and prove it is ours before anything binds inside it.
+///
+/// The daemon's sockets are chmod 0600 after bind, but a socket is only as
+/// private as the directory holding it: on the `/tmp/sigil-<uid>` fallback path
+/// another uid can create the directory first and then watch, move, or replace
+/// what lands in it. So this refuses rather than proceeds when the directory it
+/// finds is a symlink, is not a directory, or is owned by someone else, and it
+/// corrects group/world access rather than binding under it.
+///
+/// Idempotent: the common case is "already exists, ours, 0700" and does nothing.
+/// `Err` is a human-readable reason and every caller treats it as fatal, because
+/// binding anyway is the exact failure this exists to prevent.
+pub fn ensure_private_runtime_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+
+    if !dir.exists() {
+        // mode() on the builder, not create-then-chmod: the latter leaves a
+        // window in which the directory exists at the ambient umask.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    }
+
+    let md = std::fs::symlink_metadata(dir).map_err(|e| format!("stat {}: {e}", dir.display()))?;
+    if md.file_type().is_symlink() {
+        return Err(format!(
+            "{} is a symlink; refusing to bind the daemon's sockets through it",
+            dir.display()
+        ));
+    }
+    if !md.is_dir() {
+        return Err(format!("{} is not a directory", dir.display()));
+    }
+    // SAFETY: getuid is a pure query with no failure mode.
+    let me = unsafe { libc::getuid() };
+    if md.uid() != me {
+        return Err(format!(
+            "{} is owned by uid {}, not uid {me}; refusing to use another user's runtime directory",
+            dir.display(),
+            md.uid()
+        ));
+    }
+    if md.permissions().mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("chmod 0700 {}: {e}", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// Query `confstr(_CS_DARWIN_USER_TEMP_DIR)` for the stable per-user temp dir.
@@ -538,6 +630,99 @@ mod tests {
                 body: "{\"k\":1}".into()
             }
         );
+    }
+
+    /// The `$TMPDIR` regression this file's whole zero-environment contract
+    /// exists to prevent, asserted on Linux where it was live.
+    ///
+    /// Before this, `runtime_dir()` off macOS was `$TMPDIR/sigil`, so the same
+    /// binary talking to the same live daemon resolved a different socket for
+    /// every value of `$TMPDIR`. In an agent container that variable points at a
+    /// per-run scratch directory the runner deletes when the run ends, so the
+    /// socket of a daemon meant to outlive runs was placed somewhere that gets
+    /// removed underneath it.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_runtime_dir_does_not_move_when_tmpdir_does() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("TMPDIR");
+
+        std::env::remove_var("TMPDIR");
+        let with_none = runtime_dir();
+        std::env::set_var("TMPDIR", "/tmp/some-per-run-scratch-dir");
+        let with_scratch = runtime_dir();
+        std::env::set_var("TMPDIR", "/var/tmp");
+        let with_var_tmp = runtime_dir();
+
+        match prev {
+            Some(v) => std::env::set_var("TMPDIR", v),
+            None => std::env::remove_var("TMPDIR"),
+        }
+
+        assert_eq!(
+            with_none, with_scratch,
+            "TMPDIR must not move the runtime dir"
+        );
+        assert_eq!(
+            with_none, with_var_tmp,
+            "TMPDIR must not move the runtime dir"
+        );
+        // And it must be one of the two uid-derived answers, never a $TMPDIR one.
+        // SAFETY: getuid is a pure query with no failure mode.
+        let uid = unsafe { libc::getuid() };
+        let acceptable = [
+            PathBuf::from(format!("/run/user/{uid}/sigil")),
+            PathBuf::from(format!("/tmp/sigil-{uid}")),
+        ];
+        assert!(
+            acceptable.contains(&with_none),
+            "runtime dir must be uid-derived, got {}",
+            with_none.display()
+        );
+    }
+
+    /// A runtime dir owned by another uid is refused, not used. The sockets are
+    /// chmod 0600 after bind, which is worth nothing if somebody else owns the
+    /// directory they sit in, and the `/tmp/sigil-<uid>` fallback path is
+    /// reachable by any uid on the box.
+    #[test]
+    fn a_runtime_dir_owned_by_someone_else_is_refused() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        // Root can chown, so it can build the real case. Everyone else can still
+        // check the honest one: a directory we DO own is accepted.
+        let base = std::env::temp_dir().join(format!("sigil-rtdir-{}", std::process::id()));
+        let mine = base.join("mine");
+        ensure_private_runtime_dir(&mine).expect("a directory we create is ours");
+        assert_eq!(
+            std::fs::metadata(&mine).unwrap().mode() & 0o777,
+            0o700,
+            "the runtime dir must be 0700"
+        );
+        // Re-running is a no-op, not an error: `up` calls this on every run.
+        ensure_private_runtime_dir(&mine).expect("idempotent");
+
+        // Group/world bits that appear later are corrected rather than tolerated.
+        std::fs::set_permissions(&mine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_runtime_dir(&mine).expect("a loosened dir is tightened, not refused");
+        assert_eq!(
+            std::fs::metadata(&mine).unwrap().mode() & 0o777,
+            0o700,
+            "0755 must be corrected back to 0700"
+        );
+
+        // A symlink at the name is refused outright, never followed. This is the
+        // shape that would otherwise plant our sockets in an attacker's dir.
+        let target = base.join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err =
+            ensure_private_runtime_dir(&link).expect_err("a symlinked runtime dir must be refused");
+        assert!(err.contains("symlink"), "honest reason: {err}");
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

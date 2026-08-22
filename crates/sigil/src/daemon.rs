@@ -1560,12 +1560,17 @@ fn spawn_config_watcher(
     Some(handle)
 }
 
-/// Create the socket directory 0700 and clear any stale socket file.
+/// Create the socket directory 0700, prove it is ours, and clear any stale
+/// socket file.
+///
+/// The directory check is not decoration. The socket is chmod 0600 after bind,
+/// but that is worth nothing if the directory holding it belongs to somebody
+/// else, and the Linux fallback runtime dir lives under world-writable `/tmp`.
+/// `ensure_private_runtime_dir` refuses in that case, and the `?` makes the
+/// refusal fatal, which is the point: binding anyway is the failure mode.
 fn prepare_socket(sock: &Path) -> anyhow::Result<()> {
     if let Some(dir) = sock.parent() {
-        fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("chmod {}", dir.display()))?;
+        local::ensure_private_runtime_dir(dir).map_err(|e| anyhow::anyhow!(e))?;
     }
     if sock.exists() {
         fs::remove_file(sock).with_context(|| format!("removing stale {}", sock.display()))?;
