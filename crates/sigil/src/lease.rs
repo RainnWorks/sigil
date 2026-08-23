@@ -1972,10 +1972,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn linux_scratch(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "sigil-linux-measure-{tag}-{}",
-            std::process::id()
-        ));
+        let d =
+            std::env::temp_dir().join(format!("sigil-linux-measure-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).expect("scratch dir");
         d
@@ -1989,10 +1987,14 @@ mod tests {
         // including parens and spaces. The parser must split on the LAST `)`
         // or a hostile comm can shift every field that follows, including
         // ppid.
-        let raw = "4242 (evil) proc) S 4241 4242 4242 0 -1 4194560 100 0 0 0 0 0 0 0 20 0 1 0 12345 0 0";
+        let raw =
+            "4242 (evil) proc) S 4241 4242 4242 0 -1 4194560 100 0 0 0 0 0 0 0 20 0 1 0 12345 0 0";
         let fields = parse_stat_fields(raw).expect("parses");
         assert_eq!(fields[0], "S", "field 3, state");
-        assert_eq!(fields[1], "4241", "field 4, ppid -- not shifted by the fake `)` in comm");
+        assert_eq!(
+            fields[1], "4241",
+            "field 4, ppid -- not shifted by the fake `)` in comm"
+        );
     }
 
     #[cfg(target_os = "linux")]
