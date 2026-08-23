@@ -592,6 +592,41 @@ pub struct Config {
     pub sources: Vec<Source>,
     #[serde(default)]
     pub rules: Vec<Rule>,
+    /// **Where the real executable of a gated command lives**, keyed by the
+    /// command name as it appears in `argv[0]` — `{"op": "/opt/1p/bin/op"}`.
+    ///
+    /// The daemon does not trust the caller's `PATH` (see
+    /// [`crate::paths::resolve_command`]); it walks its own, pinned by the
+    /// supervision definition to the handful of system directories a tool is
+    /// normally installed into. A site whose tool lives somewhere else — a
+    /// NAS share, `/opt`, a Nix profile — is not reachable from that list, and
+    /// the daemon reports the tool as missing however correctly everything else
+    /// is configured. This map is the escape hatch for exactly that, and it is
+    /// the one the security note in
+    /// [`service::supervisor`](crate::service::supervisor) has always pointed
+    /// at.
+    ///
+    /// **A pin, not a widening**, and the difference is the whole point. Adding
+    /// a directory to the daemon's `PATH` makes every present and future file in
+    /// it spawnable with an approved credential; naming a file makes exactly one
+    /// file spawnable. So this is keyed by command and valued by an absolute
+    /// path to a regular executable, and it is validated at authoring time
+    /// ([`validate_binary_pin`]) and again at spawn time.
+    ///
+    /// **A pin that no longer resolves fails closed** rather than falling back
+    /// to the `PATH` walk. Silently spawning a different binary than the one the
+    /// operator named is the substitution this whole resolver exists to prevent;
+    /// "your pin is broken" is a worse morning and a better one than "something
+    /// else ran with your token".
+    ///
+    /// It lives in `config.json` rather than `settings.json` because it decides
+    /// what the daemon executes. `config.json` is already the store the daemon
+    /// only ever *reads*, at arm time, precisely so an always-on daemon cannot
+    /// rewrite what is gated; `settings.json` is a preference file the GUI
+    /// writes. A path that selects an executable belongs on the first side of
+    /// that line.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub binaries: BTreeMap<String, String>,
 }
 
 fn default_version() -> u32 {
@@ -604,14 +639,89 @@ impl Default for Config {
             version: VERSION,
             sources: Vec::new(),
             rules: Vec::new(),
+            binaries: BTreeMap::new(),
         }
     }
+}
+
+/// Why a binary pin was refused at authoring time. Rendered by `sigil-config`;
+/// the same conditions are re-checked at spawn time by
+/// [`crate::paths::resolve_command`], which fails closed on all of them.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BinaryPinError {
+    #[error("a binary pin must be an absolute path, and {0:?} is not")]
+    NotAbsolute(String),
+    #[error("the command name must not be empty")]
+    EmptyCommand,
+    #[error("a command name is a bare argv[0], not a path, and {0:?} contains a separator")]
+    CommandIsPath(String),
+    #[error("nothing exists at {0:?}")]
+    Missing(String),
+    #[error("{0:?} is not a regular file")]
+    NotAFile(String),
+    #[error("{0:?} is not executable")]
+    NotExecutable(String),
+}
+
+/// Whether `command` -> `path` is a usable pin, checked against the filesystem.
+///
+/// Called by `sigil-config` before writing, so a typo is refused where a human
+/// is standing rather than at 3am inside a daemon. It deliberately does **not**
+/// check the Sigil-alias exclusions (that a pin does not point back at our own
+/// shim): those need the running binary's identity, so they live in
+/// [`crate::paths::resolve_command_in`] where the spawn happens and where the
+/// existing rules already are. Both checks run; neither is the only one.
+pub fn validate_binary_pin(command: &str, path: &str) -> Result<(), BinaryPinError> {
+    use std::os::unix::fs::PermissionsExt;
+    if command.is_empty() {
+        return Err(BinaryPinError::EmptyCommand);
+    }
+    if command.contains('/') {
+        return Err(BinaryPinError::CommandIsPath(command.to_string()));
+    }
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        return Err(BinaryPinError::NotAbsolute(path.to_string()));
+    }
+    let meta = std::fs::metadata(p).map_err(|_| BinaryPinError::Missing(path.to_string()))?;
+    if !meta.is_file() {
+        return Err(BinaryPinError::NotAFile(path.to_string()));
+    }
+    if meta.permissions().mode() & 0o111 == 0 {
+        return Err(BinaryPinError::NotExecutable(path.to_string()));
+    }
+    Ok(())
 }
 
 impl Config {
     /// `~/.sigil/config.json`, or `$SIGIL_HOME/config.json` (tests).
     pub fn path() -> Option<PathBuf> {
         crate::paths::sigil_home().map(|h| h.join("config.json"))
+    }
+
+    /// The pinned executable for `command`, if the operator named one.
+    ///
+    /// `None` means "resolve on the daemon's own `PATH`", which is the default
+    /// and is what every site whose tools live in the usual places gets. See
+    /// [`binaries`](Self::binaries) for why a pin, once present, is never
+    /// downgraded back to a `PATH` walk.
+    pub fn binary_for(&self, command: &str) -> Option<&str> {
+        self.binaries.get(command).map(String::as_str)
+    }
+
+    /// Pin `command` to `path`, replacing any existing pin. Validated against
+    /// the filesystem first, so the store never holds a pin that was already
+    /// unusable when it was written.
+    pub fn set_binary(&mut self, command: &str, path: &str) -> Result<(), BinaryPinError> {
+        validate_binary_pin(command, path)?;
+        self.binaries.insert(command.to_string(), path.to_string());
+        Ok(())
+    }
+
+    /// Remove `command`'s pin, returning the path that was there. The command
+    /// goes back to being resolved on the daemon's own `PATH`.
+    pub fn unset_binary(&mut self, command: &str) -> Option<String> {
+        self.binaries.remove(command)
     }
 
     /// The legacy per-command store path (`commands.json`), migrated on load.
@@ -1786,6 +1896,7 @@ mod tests {
         // later catch-all-ish rule would otherwise capture the same command.
         let cfg = Config {
             version: VERSION,
+            binaries: BTreeMap::new(),
             sources: vec![Source {
                 name: "real".into(),
                 provider: "env-file".into(),
@@ -1943,6 +2054,103 @@ mod tests {
         let op = gate(cfg.resolve(&argv(&["op", "read"])).unwrap());
         assert_eq!(op.account.as_deref(), Some("Rowm"));
         assert_eq!(op.lease, LeasePolicy::RunOnce);
+    }
+
+    // --- binary pins --------------------------------------------------------
+
+    /// An executable stub at `dir/name`.
+    fn stub_exe(dir: &std::path::Path, name: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, "#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p.display().to_string()
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "sigil-cfgbin-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_binary_pin_round_trips_and_is_absent_from_json_when_unset() {
+        let root = tmpdir("roundtrip");
+        let op = stub_exe(&root.join("mnt/user/HQ/tools"), "op");
+
+        // Unset is the default and must not appear on disk at all: every existing
+        // config.json stays byte-identical after an upgrade that adds this field.
+        let empty = serde_json::to_string(&Config::default()).unwrap();
+        assert!(
+            !empty.contains("binaries"),
+            "an empty map must be skipped, got {empty}"
+        );
+
+        let mut cfg = Config::default();
+        cfg.set_binary("op", &op).unwrap();
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.binary_for("op"), Some(op.as_str()));
+        assert_eq!(back.binary_for("curl"), None);
+
+        // And an older config.json, written before the field existed, still loads.
+        let old: Config = serde_json::from_str(r#"{"version":1,"sources":[],"rules":[]}"#).unwrap();
+        assert!(old.binaries.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_pin_is_validated_against_the_filesystem_before_it_is_stored() {
+        // Refused at authoring time, where a human is standing, rather than
+        // stored and then failing closed inside a daemon at 3am.
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmpdir("validate");
+        let good = stub_exe(&root.join("bin"), "op");
+        let notexec = root.join("bin/notexec");
+        std::fs::write(&notexec, "x").unwrap();
+        std::fs::set_permissions(&notexec, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut cfg = Config::default();
+        assert!(cfg.set_binary("op", &good).is_ok());
+
+        for (cmd, path, want) in [
+            (
+                "op",
+                "tools/op",
+                BinaryPinError::NotAbsolute("tools/op".into()),
+            ),
+            (
+                "op",
+                "/nope/nothing/here",
+                BinaryPinError::Missing("/nope/nothing/here".into()),
+            ),
+            (
+                "op",
+                notexec.to_str().unwrap(),
+                BinaryPinError::NotExecutable(notexec.display().to_string()),
+            ),
+            ("", &good, BinaryPinError::EmptyCommand),
+            (
+                "/usr/bin/op",
+                &good,
+                BinaryPinError::CommandIsPath("/usr/bin/op".into()),
+            ),
+        ] {
+            assert_eq!(cfg.set_binary(cmd, path), Err(want));
+        }
+
+        // Every refusal left the good pin exactly as it was.
+        assert_eq!(cfg.binary_for("op"), Some(good.as_str()));
+        assert_eq!(cfg.binaries.len(), 1);
+
+        assert_eq!(cfg.unset_binary("op").as_deref(), Some(good.as_str()));
+        assert_eq!(cfg.binary_for("op"), None);
+        assert_eq!(cfg.unset_binary("op"), None);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -2440,6 +2440,11 @@ fn fulfill(
                 // to inject: a passthrough runs the command as the user's shell
                 // would have.
                 plain: &[],
+                // A pin is about WHERE the command lives, not about whether it
+                // is gated, so an allow rule honours it too. Without this an
+                // ungated tool outside the daemon's PATH would be unreachable
+                // in the one mode that injects nothing at all.
+                binary: config.binary_for(cmd),
             });
         }
         Some(crate::config::Resolution::Gate(mut action)) => {
@@ -2648,6 +2653,7 @@ fn fulfill(
                         proxy_depth: child_depth,
                         env: leased.as_ref(),
                         plain: &plain_env,
+                        binary: config.binary_for(cmd),
                     },
                 );
                 drop(leased); // zeroized here (EnvVars is Zeroizing)
@@ -2841,6 +2847,7 @@ fn fulfill(
             proxy_depth: child_depth,
             env: sealed_env.as_ref(),
             plain: &plain_env,
+            binary: config.binary_for(cmd),
         },
     );
     drop(sealed_env); // zeroized here (EnvVars is Zeroizing) when present

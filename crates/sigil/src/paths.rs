@@ -172,6 +172,109 @@ pub fn find_real_op() -> Option<PathBuf> {
     find_real("op")
 }
 
+/// Why the executable for a gated command could not be resolved. Every variant
+/// is a refusal: the daemon spawns nothing and the caller gets a non-zero exit.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ResolveError {
+    /// No pin, and nothing named `cmd` on the daemon's own `PATH`.
+    #[error("no `{0}` found on the daemon's PATH")]
+    NotOnPath(String),
+    /// A pin that is not an absolute path. Relative to *what* has no answer
+    /// inside a daemon, so it is refused rather than guessed at.
+    #[error("the configured path for `{cmd}` is not absolute: {path}")]
+    PinNotAbsolute { cmd: String, path: String },
+    /// A pin naming something absent, a directory, or not executable.
+    #[error("the configured path for `{cmd}` is not an executable file: {path}")]
+    PinNotExecutable { cmd: String, path: String },
+    /// A pin that resolves back to Sigil itself — the shim alias, the running
+    /// binary, or anything inside `~/.sigil/bin`. Spawning it would re-enter the
+    /// gate and loop until the depth fuse blows; refusing here says why.
+    #[error("the configured path for `{cmd}` points back at Sigil's own shim: {path}")]
+    PinIsShim { cmd: String, path: String },
+}
+
+/// **The one resolver that decides what a gated run executes.**
+///
+/// `pin` is the operator's [`binary_for`](crate::config::Config::binary_for)
+/// entry for this command, if any. The two arms differ in kind, not just in
+/// where the answer comes from:
+///
+/// * **No pin** — walk the daemon's own `PATH` via [`find_real`], with the two
+///   Sigil-alias exclusions that resolver already applies. Unchanged behaviour,
+///   and still the default.
+/// * **A pin** — use exactly that file, or refuse. There is **no fallback to the
+///   `PATH` walk**, and that is the security-relevant half of this function. A
+///   pin exists because the operator does not want the daemon choosing, so
+///   quietly choosing when the pin breaks would reintroduce the substitution the
+///   pin was written to prevent. A broken pin is an outage; a silent
+///   substitution is an incident.
+///
+/// A pin is re-validated here even though `sigil-config` validated it at
+/// authoring time, because the file can be removed, replaced by a directory, or
+/// have its execute bit cleared in between — and because `config.json` is a file
+/// a human may edit by hand.
+pub fn resolve_command(cmd: &str, pin: Option<&str>) -> Result<PathBuf, ResolveError> {
+    resolve_command_in(
+        cmd,
+        pin,
+        std::env::var_os("PATH").as_deref(),
+        own_binary(),
+        crate::proxy::alias_target(),
+        shim_bin_dir().and_then(|d| d.canonicalize().ok()),
+    )
+}
+
+/// The pure core of [`resolve_command`], taking the same explicit inputs as
+/// [`find_real_in`] so tests drive it with synthetic dirs and no process-global
+/// env mutation.
+fn resolve_command_in(
+    cmd: &str,
+    pin: Option<&str>,
+    path: Option<&std::ffi::OsStr>,
+    own: Option<PathBuf>,
+    alias_target: Option<PathBuf>,
+    proxy_dir: Option<PathBuf>,
+) -> Result<PathBuf, ResolveError> {
+    let Some(pin) = pin else {
+        return find_real_in(cmd, path, own, alias_target, proxy_dir)
+            .ok_or_else(|| ResolveError::NotOnPath(cmd.to_string()));
+    };
+    let p = PathBuf::from(pin);
+    if !p.is_absolute() {
+        return Err(ResolveError::PinNotAbsolute {
+            cmd: cmd.to_string(),
+            path: pin.to_string(),
+        });
+    }
+    if !is_executable(&p) {
+        return Err(ResolveError::PinNotExecutable {
+            cmd: cmd.to_string(),
+            path: pin.to_string(),
+        });
+    }
+    // The same two exclusions `find_real_in` applies, for the same reason: a pin
+    // is a way to name a file the PATH walk cannot reach, not a way to opt out of
+    // the alias checks. Rule 2 (resident in the proxy dir) first, since it also
+    // catches a hard copy that canonicalisation cannot see.
+    if let (Some(pd), Some(parent)) = (&proxy_dir, p.parent().and_then(|d| d.canonicalize().ok())) {
+        if &parent == pd {
+            return Err(ResolveError::PinIsShim {
+                cmd: cmd.to_string(),
+                path: pin.to_string(),
+            });
+        }
+    }
+    if let Ok(canon) = p.canonicalize() {
+        if own.as_ref() == Some(&canon) || alias_target.as_ref() == Some(&canon) {
+            return Err(ResolveError::PinIsShim {
+                cmd: cmd.to_string(),
+                path: pin.to_string(),
+            });
+        }
+    }
+    Ok(p)
+}
+
 /// The health of the `op` shim install, as seen from the running binary.
 ///
 /// The daemon and `sigil doctor` read this to catch **shim drift**: the shim
@@ -550,6 +653,175 @@ mod tests {
         assert!(!s.dir_on_path);
         assert!(!s.first_on_path);
         assert!(s.issue().unwrap().contains("not on PATH"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- resolve_command: the config pin -----------------------------------
+    //
+    // The defect these cover: the daemon walks a PINNED PATH of five system
+    // directories, so a site whose tool lives anywhere else (Tower's `op` is on
+    // a NAS share at /mnt/user/HQ/tools/op) could not run a single gated call,
+    // however correctly everything else was configured. The escape hatch the
+    // code's own comment recommended did not exist.
+
+    #[test]
+    fn a_pin_reaches_a_binary_the_daemon_path_cannot_see() {
+        // The whole point: the pinned dir is NOT on the PATH being walked.
+        let root = tmp("resolve-pin-offpath");
+        let unreachable = exe_in(&root.join("mnt/user/HQ/tools"), "op");
+        let path = path_of(&[&root.join("usr/bin")]);
+
+        let got = resolve_command_in(
+            "op",
+            Some(unreachable.to_str().unwrap()),
+            Some(path.as_os_str()),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(got.as_deref(), Ok(unreachable.as_path()));
+
+        // Control: the same call with no pin cannot find it, which is the bug.
+        let none = resolve_command_in("op", None, Some(path.as_os_str()), None, None, None);
+        assert_eq!(none, Err(ResolveError::NotOnPath("op".into())));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_broken_pin_refuses_and_never_falls_back_to_the_path_walk() {
+        // The security-relevant half. A pin names the file the operator trusts;
+        // if it stops resolving, spawning whatever the PATH turns up instead is
+        // exactly the substitution the pin was written to prevent. There IS a
+        // resolvable `op` on the PATH here, and it must NOT win.
+        let root = tmp("resolve-pin-broken");
+        let on_path = exe_in(&root.join("usr/bin"), "op");
+        let path = path_of(&[&root.join("usr/bin")]);
+        let gone = root.join("opt/1p/bin/op");
+
+        let got = resolve_command_in(
+            "op",
+            Some(gone.to_str().unwrap()),
+            Some(path.as_os_str()),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            got,
+            Err(ResolveError::PinNotExecutable {
+                cmd: "op".into(),
+                path: gone.display().to_string(),
+            }),
+            "a broken pin must refuse, not silently resolve to {}",
+            on_path.display()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_pin_at_a_non_executable_or_a_directory_refuses() {
+        let root = tmp("resolve-pin-notexec");
+        let plain = root.join("notexec");
+        std::fs::write(&plain, "#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let dir = root.join("adir");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for target in [&plain, &dir] {
+            assert_eq!(
+                resolve_command_in("op", Some(target.to_str().unwrap()), None, None, None, None),
+                Err(ResolveError::PinNotExecutable {
+                    cmd: "op".into(),
+                    path: target.display().to_string(),
+                }),
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_relative_pin_refuses_rather_than_resolving_against_the_daemons_cwd() {
+        // "relative to what" has no answer inside a long-running daemon, and the
+        // plausible answers (the caller's cwd, the daemon's) are both steerable.
+        assert_eq!(
+            resolve_command_in("op", Some("tools/op"), None, None, None, None),
+            Err(ResolveError::PinNotAbsolute {
+                cmd: "op".into(),
+                path: "tools/op".into(),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_pin_cannot_be_used_to_bypass_the_shim_exclusions() {
+        // A pin names a file the PATH walk cannot reach; it is not an opt-out of
+        // rules 1 and 2. Pinning `op` at our own shim would re-enter the gate and
+        // loop until the depth fuse blows, so it is refused with the reason.
+        //
+        // Rule 2: resident in the proxy dir (a hard copy, not a symlink, so
+        // canonicalisation cannot see it).
+        let root = tmp("resolve-pin-shim");
+        let proxy_dir = root.join("bin");
+        let planted = exe_in(&proxy_dir, "op");
+        assert_eq!(
+            resolve_command_in(
+                "op",
+                Some(planted.to_str().unwrap()),
+                None,
+                None,
+                None,
+                proxy_dir.canonicalize().ok(),
+            ),
+            Err(ResolveError::PinIsShim {
+                cmd: "op".into(),
+                path: planted.display().to_string(),
+            }),
+        );
+
+        // Rule 1: an alias symlink OUTSIDE the proxy dir that canonicalises to a
+        // Sigil binary.
+        let own = exe_in(&root.join("libexec"), "sigil");
+        let alias = root.join("elsewhere/op");
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(own.canonicalize().unwrap(), &alias).unwrap();
+        assert_eq!(
+            resolve_command_in(
+                "op",
+                Some(alias.to_str().unwrap()),
+                None,
+                own.canonicalize().ok(),
+                None,
+                None,
+            ),
+            Err(ResolveError::PinIsShim {
+                cmd: "op".into(),
+                path: alias.display().to_string(),
+            }),
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn no_pin_is_the_unchanged_path_walk_including_its_exclusions() {
+        // The default must not have moved: with `pin: None`, `resolve_command_in`
+        // is `find_real_in` plus an error type. Same fixture as
+        // `find_real_skips_a_non_symlink_planted_in_the_proxy_dir`.
+        let root = tmp("resolve-nopin");
+        let proxy_dir = root.join("bin");
+        exe_in(&proxy_dir, "op");
+        let real_dir = root.join("real");
+        let real = exe_in(&real_dir, "op");
+        let path = path_of(&[&proxy_dir, &real_dir]);
+
+        let got = resolve_command_in(
+            "op",
+            None,
+            Some(path.as_os_str()),
+            None,
+            None,
+            proxy_dir.canonicalize().ok(),
+        );
+        assert_eq!(got.as_deref(), Ok(real.as_path()));
         std::fs::remove_dir_all(&root).ok();
     }
 }
