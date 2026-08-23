@@ -57,18 +57,33 @@ pub fn install_shim_for(cmd: &str) -> Result<(PathBuf, PathBuf)> {
     Ok((link, target))
 }
 
-/// The shell profile to edit, chosen from `$SHELL`. zsh (the macOS default) uses
-/// `~/.zshrc`; bash uses `~/.bash_profile` (macOS login shells read it).
+/// The shell profile to edit, chosen from `$SHELL` **and** from which candidate
+/// files the home directory already has. `None` only if `$HOME` is unset.
 pub fn shell_profile() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let shell = std::env::var("SHELL").unwrap_or_default();
-    let file = if shell.ends_with("bash") {
-        ".bash_profile"
+    Some(shell_profile_in(&shell, &home))
+}
+
+/// [`shell_profile`] against an explicit shell and home (tests).
+///
+/// zsh (the macOS default) uses `~/.zshrc`, which shadows nothing: zsh does not
+/// read `~/.profile` of its own accord. bash is the case that has to be
+/// resolved against the filesystem, because the file bash reads at login
+/// depends on which of `~/.bash_profile`, `~/.bash_login` and `~/.profile`
+/// already exist. See [`paths::bash_login_profile`]; picking the name blind is
+/// how `sigil up` created a `~/.bash_profile` on a Linux box and took that
+/// box's `~/.profile` out of service without saying so.
+///
+/// `$SHELL` alone is not a reliable platform signal and is not used as one
+/// here: it picks the *chain*, and the filesystem picks the *file*.
+fn shell_profile_in(shell: &str, home: &Path) -> PathBuf {
+    if shell.ends_with("bash") {
+        paths::bash_login_profile(home)
     } else {
         // zsh and anything else: ~/.zshrc is the macOS default.
-        ".zshrc"
-    };
-    Some(home.join(file))
+        home.join(".zshrc")
+    }
 }
 
 /// True if `contents` already puts the shim dir on `PATH` (our managed block, or
@@ -185,5 +200,114 @@ mod tests {
         if std::env::var_os("HOME").is_some() {
             assert!(shell_profile().is_some());
         }
+    }
+
+    /// The box measured on RAI-49: a `~/.profile` from 2019 and a `~/.bashrc`,
+    /// no `~/.bash_profile`. The chooser used to name `.bash_profile` blind,
+    /// which created it and so stopped bash login shells reading `.profile` at
+    /// all. The user's login environment disappeared with no message.
+    #[test]
+    fn bash_edits_the_existing_profile_instead_of_shadowing_it() {
+        let home = tmp("bash-has-profile");
+        std::fs::write(home.join(".bashrc"), "alias ll='ls -l'\n").unwrap();
+        std::fs::write(home.join(".profile"), "export EDITOR=vim\n").unwrap();
+
+        let chosen = shell_profile_in("/bin/bash", &home);
+        assert_eq!(chosen, home.join(".profile"), "the file bash reads");
+
+        assert!(ensure_profile_path_at(&chosen).unwrap());
+        assert!(
+            !home.join(".bash_profile").exists(),
+            "creating ~/.bash_profile here would demote the existing ~/.profile"
+        );
+        let after = std::fs::read_to_string(home.join(".profile")).unwrap();
+        assert!(after.contains("export EDITOR=vim"), "existing content kept");
+        assert!(after.contains(".sigil/bin"));
+        assert_eq!(
+            std::fs::read_to_string(home.join(".bashrc")).unwrap(),
+            "alias ll='ls -l'\n",
+            "~/.bashrc is not the login file and is left alone"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The macOS-shaped case the old code assumed: `~/.bash_profile` is already
+    /// there, so it is what bash reads and what we edit. `~/.profile` is not
+    /// touched, because bash stops before reaching it.
+    #[test]
+    fn bash_prefers_an_existing_bash_profile() {
+        let home = tmp("bash-has-bash-profile");
+        std::fs::write(home.join(".bash_profile"), "export A=1\n").unwrap();
+        std::fs::write(home.join(".profile"), "export EDITOR=vim\n").unwrap();
+
+        let chosen = shell_profile_in("/bin/bash", &home);
+        assert_eq!(chosen, home.join(".bash_profile"));
+
+        assert!(ensure_profile_path_at(&chosen).unwrap());
+        assert!(std::fs::read_to_string(&chosen)
+            .unwrap()
+            .contains("export A=1"));
+        assert_eq!(
+            std::fs::read_to_string(home.join(".profile")).unwrap(),
+            "export EDITOR=vim\n",
+            "bash never reads ~/.profile when ~/.bash_profile exists"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `~/.bash_login` is the middle of bash's chain and beats `~/.profile`.
+    #[test]
+    fn bash_login_beats_profile() {
+        let home = tmp("bash-login");
+        std::fs::write(home.join(".bash_login"), "export A=1\n").unwrap();
+        std::fs::write(home.join(".profile"), "export EDITOR=vim\n").unwrap();
+        assert_eq!(
+            shell_profile_in("/bin/bash", &home),
+            home.join(".bash_login")
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// With no login file at all, creating `~/.bash_profile` is correct: there
+    /// is nothing left for it to shadow. `~/.bashrc` is not in the login chain,
+    /// so it keeps working exactly as before.
+    #[test]
+    fn bash_creates_bash_profile_only_when_there_is_nothing_to_shadow() {
+        let home = tmp("bash-bare");
+        std::fs::write(home.join(".bashrc"), "alias ll='ls -l'\n").unwrap();
+
+        let chosen = shell_profile_in("/bin/bash", &home);
+        assert_eq!(chosen, home.join(".bash_profile"));
+
+        assert!(ensure_profile_path_at(&chosen).unwrap());
+        assert!(chosen.exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join(".bashrc")).unwrap(),
+            "alias ll='ls -l'\n",
+            "a login shell did not read ~/.bashrc before this and still does not"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// bash tests readability, so a dangling `~/.bash_profile` symlink is not a
+    /// file bash reads, and it must not be one we edit either.
+    #[test]
+    fn a_dangling_bash_profile_symlink_does_not_count_as_present() {
+        let home = tmp("bash-dangling");
+        std::os::unix::fs::symlink(home.join(".nowhere"), home.join(".bash_profile")).unwrap();
+        std::fs::write(home.join(".profile"), "export EDITOR=vim\n").unwrap();
+        assert_eq!(shell_profile_in("/bin/bash", &home), home.join(".profile"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// zsh is unchanged by any of this: it does not read `~/.profile` of its
+    /// own accord, so `~/.zshrc` shadows nothing.
+    #[test]
+    fn zsh_and_the_default_still_pick_zshrc() {
+        let home = tmp("zsh-profile");
+        std::fs::write(home.join(".profile"), "export EDITOR=vim\n").unwrap();
+        assert_eq!(shell_profile_in("/bin/zsh", &home), home.join(".zshrc"));
+        assert_eq!(shell_profile_in("", &home), home.join(".zshrc"));
+        std::fs::remove_dir_all(&home).ok();
     }
 }

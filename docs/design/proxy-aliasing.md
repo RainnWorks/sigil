@@ -41,9 +41,16 @@ The current tree already has most of the primitive:
 - **Drift detection** (`paths::ShimStatus`, `path_order`): today hardwired to
   `op`; this design generalises it to an arbitrary command for `proxy doctor`.
 - **PATH durability** (`setup::ensure_profile_path`): edits one shell profile
-  (zsh `~/.zshrc` or bash `~/.bash_profile`) with an idempotent managed block.
-  This design widens it to bash-login + `.profile` + fish and adds the agent
-  story.
+  (zsh `~/.zshrc`, or for bash the login file that already exists, resolved by
+  `paths::bash_login_profile`) with an idempotent managed block. This design
+  widens it to bash-login + `.profile` + fish and adds the agent story.
+
+  The bash arm is resolved rather than named, and RAI-49 is why. bash reads the
+  first of `~/.bash_profile`, `~/.bash_login`, `~/.profile` and then stops, so
+  naming `.bash_profile` unconditionally does not add a file bash reads on a
+  Linux box, it stops `~/.profile` being read. Any widening here inherits that
+  constraint: the union of files to edit may only contain one member of bash's
+  login chain, and it has to be the member bash is already reading.
 - **launchd PATH** (`service.rs`): the daemon plist pins `PATH` with
   `~/.sigil/bin` first, so GUI-launched / launchd-descended tools resolve the
   alias ahead of the real binary without sourcing an rc file. This is the macOS

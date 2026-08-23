@@ -58,6 +58,36 @@ pub fn supervisor_definition() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".sigil").join("supervisor.conf"))
 }
 
+/// The file a bash **login** shell under `home` will actually read, so an edit
+/// meant for login shells lands where bash looks instead of somewhere it has
+/// stopped looking.
+///
+/// bash reads the first of `~/.bash_profile`, `~/.bash_login`, `~/.profile`
+/// that it can read, and then stops. That "and then stops" is the whole point
+/// of resolving against the filesystem rather than hardcoding a name: on a box
+/// that has only `~/.profile` (the Debian and Ubuntu default), creating a
+/// `~/.bash_profile` does not add a file bash reads, it demotes `~/.profile`
+/// from the file that configures login shells to a file nothing reads, and the
+/// user's login environment silently stops applying.
+///
+/// Falls back to `~/.bash_profile` when none of the three exist, which is safe
+/// precisely because none of them exist: there is nothing left to shadow.
+/// `~/.bashrc` is deliberately not in the chain and is never shadowed by this,
+/// because a bash login shell does not read `~/.bashrc` either way.
+///
+/// Existence is tested with `is_file`, which follows symlinks, matching what
+/// bash does: a dangling `~/.bash_profile` symlink is not readable, so bash
+/// moves on to the next candidate and so do we.
+pub fn bash_login_profile(home: &Path) -> PathBuf {
+    for candidate in [".bash_profile", ".bash_login", ".profile"] {
+        let path = home.join(candidate);
+        if path.is_file() {
+            return path;
+        }
+    }
+    home.join(".bash_profile")
+}
+
 /// True if `p` is a regular file with any execute bit set.
 fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
