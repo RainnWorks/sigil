@@ -161,16 +161,23 @@
 //!
 //! macOS ancestors are measured through the live guest code object, the same
 //! machinery [`crate::peercode`] uses for the keystore gate, with the validity
-//! check gating the answer. Nothing is measured from a path, and nothing is
-//! cached: a stale or forgeable cache key is a way to be told an ancestor is
-//! code it is no longer running, so every request measures afresh (a few
-//! fractions of a millisecond per ancestor, well under the cost of the `op` child
-//! the request goes on to spawn).
+//! check gating the answer. Linux has no such object to ask, so ancestors are
+//! measured by hashing the executable through the fd `/proc/<pid>/exe` opens,
+//! which the kernel resolves to the RUNNING image regardless of what the path
+//! now names on disk, the same property the macOS path buys by a different
+//! mechanism (see `docs/design/linux-code-identity.md` for the verification and
+//! the daemon-uid precondition it depends on). Nothing is measured from a path
+//! on either platform, and nothing is cached: a stale or forgeable cache key is
+//! a way to be told an ancestor is code it is no longer running, so every
+//! request measures afresh (a few fractions of a millisecond per ancestor on
+//! macOS, well under the cost of the `op` child the request goes on to spawn;
+//! the Linux cost is higher for a large ancestor and is stated honestly in the
+//! design note rather than assumed away).
 //!
 //! Residuals that remain (for the reviewer, not a verdict): the caller-chain
 //! imitation class above; the process-instance branch, which asserts continuity
 //! of a process rather than identity of code and is stated in full in its own
-//! section; the measure is macOS-only, so a future Linux/Windows process table
+//! section; the measure is macOS/Linux-only, so a future Windows process table
 //! has to fill the seam or every ancestor there is unmeasured; and the walk
 //! resolves ancestors by pid, so a pid recycled between the parent lookup and
 //! the measurement pairs one process's chain position with another's identity.
@@ -937,11 +944,11 @@ impl UnmeasuredNote {
 /// executables cannot grow the daemon. The oldest is evicted, which at worst
 /// costs a repeated log line later.
 ///
-/// Only the macOS `ProcessTable` records notes today, so outside macOS this is
-/// reached from the registry's tests and from nowhere else. It stays compiled on
-/// every platform because the registry logic is platform-independent and those
-/// tests are what keep it honest.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// Only the macOS and Linux `ProcessTable`s record notes today, so elsewhere
+/// this is reached from the registry's tests and from nowhere else. It stays
+/// compiled on every platform because the registry logic is
+/// platform-independent and those tests are what keep it honest.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 const UNMEASURED_NOTES_MAX: usize = 64;
 
 fn unmeasured_registry() -> &'static Mutex<Vec<UnmeasuredNote>> {
@@ -973,7 +980,12 @@ fn still_running(note: &UnmeasuredNote) -> bool {
     start_time(note.pid) == Some(note.started)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn still_running(note: &UnmeasuredNote) -> bool {
+    start_time(note.pid) == Some(note.started)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn still_running(_note: &UnmeasuredNote) -> bool {
     false
 }
@@ -996,8 +1008,9 @@ fn still_running(_note: &UnmeasuredNote) -> bool {
 /// actually running. Nothing is lost: the actionable content of the line is the
 /// path and the reason, and the pid is only there to find it with.
 ///
-/// See [`UNMEASURED_NOTES_MAX`] for why this is compiled but uncalled off macOS.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// See [`UNMEASURED_NOTES_MAX`] for why this is compiled but uncalled off
+/// macOS and Linux.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn note_unmeasured(note: UnmeasuredNote) {
     let mut notes = unmeasured_registry()
         .lock()
@@ -1036,8 +1049,9 @@ fn note_unmeasured(note: UnmeasuredNote) {
 /// about a process that has exited is history and costs nothing to drop; dropping
 /// a live one loses the row that was going to explain why approvals came back.
 ///
-/// See [`UNMEASURED_NOTES_MAX`] for why this is compiled but uncalled off macOS.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// See [`UNMEASURED_NOTES_MAX`] for why this is compiled but uncalled off
+/// macOS and Linux.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn doomed_index(notes: &[UnmeasuredNote], live: impl Fn(&UnmeasuredNote) -> bool) -> usize {
     notes.iter().position(|n| !live(n)).unwrap_or_default()
 }
@@ -1124,7 +1138,163 @@ fn start_time(pid: i32) -> Option<ProcessStart> {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+// ---- Linux: ancestry from /proc, code identity from a hashed fd ----
+//
+// There is no guest-code-object machinery to ask here (no cdhash), so
+// `resolve()` measures by hashing the executable's bytes through the fd
+// `/proc/<pid>/exe` opens rather than by reading it from a path. See
+// `docs/design/linux-code-identity.md` for the verification this rests on
+// (a rename over the path does not move the hash; an in-place rewrite is
+// refused outright) and for the daemon-uid precondition the whole fill
+// depends on.
+
+/// `/proc/<pid>/stat`, split after the `pid (comm) ` prefix. `comm` is the
+/// only field that can itself contain spaces or a `)` (it is user/attacker
+/// settable via `exec`/`prctl(PR_SET_NAME)`), which is why this splits on the
+/// LAST `)` rather than counting fields from the start. What remains begins at
+/// field 3 (`state`) in `proc(5)`'s 1-indexed numbering, so field `k` (k >= 3)
+/// sits at index `k - 3` of the returned vector.
+#[cfg(target_os = "linux")]
+fn parse_stat_fields(raw: &str) -> Option<Vec<String>> {
+    let close = raw.rfind(')')?;
+    Some(
+        raw.get(close + 1..)?
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// Read and parse `/proc/<pid>/stat` for `pid`. `None` for any pid that does
+/// not currently name a process, which is the common case this walk needs to
+/// truncate on rather than fail on.
+#[cfg(target_os = "linux")]
+fn proc_stat_fields(pid: i32) -> Option<Vec<String>> {
+    parse_stat_fields(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Ticks per second `/proc/<pid>/stat`'s start-time field is counted in.
+/// POSIX requires this fixed for the life of the process, so one `sysconf`
+/// call serves every pid. Tower measures 100 (`getconf CLK_TCK`), which gives
+/// 10ms resolution on the start time -- coarser than macOS's kernel-supplied
+/// microseconds. See `docs/design/linux-code-identity.md` for what that costs.
+#[cfg(target_os = "linux")]
+fn clock_ticks_per_sec() -> Option<u64> {
+    // SAFETY: sysconf reads a fixed kernel constant; no pointer arguments and
+    // no memory it writes through.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    (hz > 0).then_some(hz as u64)
+}
+
+/// The kernel's boot time (seconds since the epoch), read fresh on every call
+/// rather than cached once: caching it would silently mis-date every start
+/// time this process computes for the rest of its life across a real reboot,
+/// and the file is a handful of bytes.
+#[cfg(target_os = "linux")]
+fn boot_time_secs() -> Option<u64> {
+    std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// The kernel's start time for `pid`, folded to the same (seconds,
+/// microseconds) shape [`ProcessStart`] uses on macOS. `/proc/<pid>/stat`
+/// field 22 is ticks since boot; `/proc/stat`'s `btime` anchors it to the
+/// epoch. Both are kernel-supplied and neither is settable by the process
+/// itself, which is what makes the pair usable as a process-instance identity.
+#[cfg(target_os = "linux")]
+fn start_time(pid: i32) -> Option<ProcessStart> {
+    let fields = proc_stat_fields(pid)?;
+    let ticks: u64 = fields.get(19)?.parse().ok()?; // field 22, index 22-3
+    let hz = clock_ticks_per_sec()?;
+    let btime = boot_time_secs()?;
+    Some(ProcessStart {
+        sec: btime + ticks / hz,
+        usec: ((ticks % hz) * 1_000_000 / hz) as u32,
+    })
+}
+
+/// Measure the image running as `pid`: hash its bytes through the fd
+/// `/proc/<pid>/exe` opens, and read the path off that SAME fd via
+/// `/proc/self/fd/<n>` rather than a second `/proc/<pid>/exe` lookup, so a pid
+/// recycled between the two cannot pair one process's path with a different
+/// process's digest.
+///
+/// `/proc/<pid>/exe` is not a path lookup: it is a kernel-held reference to
+/// the inode the process was exec'd from, so opening it measures the RUNNING
+/// image even after the file at that path is replaced (verified: a
+/// rename-over the path leaves the hash unchanged) or unlinked (the kernel
+/// keeps a live process's inode around; the link just gains a ` (deleted)`
+/// suffix). The one thing it cannot survive is an in-place rewrite, and the
+/// kernel refuses that outright (`ETXTBSY`) against any executable with a
+/// running instance -- so unlike macOS there is no state here where the path
+/// resolves but the content does not, and no platform-refusal branch is
+/// needed for this attack. Full verification, with the commands run, is in
+/// `docs/design/linux-code-identity.md`.
+///
+/// Opening (not just reading) `/proc/<pid>/exe` is gated by
+/// `PTRACE_MODE_READ`: the same uid as `pid`, or `CAP_SYS_PTRACE`. A daemon
+/// running as a third uid gets `Err(NoLiveImage)` for every ancestor it does
+/// not share a uid with, which truncates the chain -- see the daemon-uid
+/// section of the design note; this is a deployment decision, not a bug here.
+#[cfg(target_os = "linux")]
+fn measure_running_image(
+    pid: i32,
+) -> Result<(PathBuf, CodeIdentity), crate::peercode::GuestFailure> {
+    use crate::peercode::GuestFailure;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    let mut f =
+        std::fs::File::open(format!("/proc/{pid}/exe")).map_err(|_| GuestFailure::NoLiveImage)?;
+    let path = std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd()))
+        .map_err(|_| GuestFailure::NoLiveImage)?;
+    let mut hasher = Blake2b256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(GuestFailure::NoLiveImage),
+        }
+    }
+    Ok((path, CodeIdentity::content(hasher.finalize().into())))
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessTable for SysProcessTable {
+    fn parent(&self, pid: i32) -> Option<i32> {
+        let ppid: i32 = proc_stat_fields(pid)?.get(1)?.parse().ok()?; // field 4
+        (ppid > 0).then_some(ppid)
+    }
+
+    fn resolve(&self, pid: i32) -> Option<(PathBuf, CodeIdentity)> {
+        let failure = match measure_running_image(pid) {
+            Ok(resolved) => return Some(resolved),
+            Err(failure) => failure,
+        };
+        // Reachable only if the open above succeeded and a later read failed
+        // (the permission gate already passed), or the process exited between
+        // the open and here -- in which case this readlink fails too and the
+        // walk truncates, same as macOS's "no live image" case. Keep the
+        // ancestor named rather than dropping the whole chain over a read
+        // failure that says nothing about who the caller is.
+        let started = start_time(pid)?;
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        note_unmeasured(UnmeasuredNote {
+            pid,
+            started,
+            exe: exe.clone(),
+            reason: failure,
+        });
+        Some((exe, CodeIdentity::unmeasured(pid, started)))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 impl ProcessTable for SysProcessTable {
     fn parent(&self, _pid: i32) -> Option<i32> {
         None
@@ -1796,6 +1966,255 @@ mod tests {
         // Every note live: the cap still has to give, and it gives up the oldest.
         assert_eq!(doomed_index(&notes, |_| true), 0);
         assert_eq!(doomed_index(&[], |_| true), 0);
+    }
+
+    // ---- Linux: ancestry via /proc, code identity via a hashed fd ----
+
+    #[cfg(target_os = "linux")]
+    fn linux_scratch(tag: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("sigil-linux-measure-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("scratch dir");
+        d
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_fields_survive_a_comm_containing_parens_and_spaces() {
+        // comm is set by the process itself (exec's argv[0] basename, or
+        // prctl(PR_SET_NAME)) and can contain anything but NUL or `/`,
+        // including parens and spaces. The parser must split on the LAST `)`
+        // or a hostile comm can shift every field that follows, including
+        // ppid.
+        let raw =
+            "4242 (evil) proc) S 4241 4242 4242 0 -1 4194560 100 0 0 0 0 0 0 0 20 0 1 0 12345 0 0";
+        let fields = parse_stat_fields(raw).expect("parses");
+        assert_eq!(fields[0], "S", "field 3, state");
+        assert_eq!(
+            fields[1], "4241",
+            "field 4, ppid -- not shifted by the fake `)` in comm"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sys_process_table_parent_reads_the_real_ppid_from_proc() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            SysProcessTable.parent(child.id() as i32),
+            Some(std::process::id() as i32),
+            "the test process is the child's real parent"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_running_binary_measures_as_a_hash_of_its_own_bytes() {
+        let mut sleeper = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn");
+        std::thread::sleep(Duration::from_millis(100));
+        let pid = sleeper.id() as i32;
+
+        let (exe, id) = measure_running_image(pid).expect("a live binary measures");
+        assert_eq!(
+            id.measure,
+            IdentityMeasure::Content,
+            "Linux has no signer to ask, so this is always Content"
+        );
+        // /proc/<pid>/exe resolves to the canonical inode path, which on a
+        // usr-merged system is /usr/bin/sleep even when invoked as /bin/sleep.
+        assert_eq!(
+            exe,
+            std::fs::canonicalize("/bin/sleep").expect("canonicalize the invoked path")
+        );
+        let expected: [u8; 32] =
+            Blake2b256::digest(std::fs::read("/bin/sleep").expect("read it directly")).into();
+        assert_eq!(
+            id.digest, expected,
+            "must be the same hash a direct read of the binary gives, while nothing has changed"
+        );
+
+        // Stable across repeat measurement.
+        assert_eq!(
+            measure_running_image(pid).map(|(_, i)| i),
+            Ok(id),
+            "the same process measures the same way twice"
+        );
+
+        // Two different binaries never collide. `cat` with its stdin held open
+        // blocks on read() forever, so it stays alive without a fixed sleep.
+        let mut other = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a second, different binary");
+        std::thread::sleep(Duration::from_millis(100));
+        let (_, id2) = measure_running_image(other.id() as i32).expect("also measures");
+        assert_ne!(id.digest, id2.digest, "two binaries, two identities");
+
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        let _ = other.kill();
+        let _ = other.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pid_that_names_no_process_yields_no_identity_at_all() {
+        // pid 0 names no process on Linux; /proc/0 does not exist.
+        assert_eq!(
+            measure_running_image(0),
+            Err(crate::peercode::GuestFailure::NoLiveImage)
+        );
+        assert_eq!(SysProcessTable.resolve(0), None);
+        assert!(
+            !walk_ancestry(&SysProcessTable, 0).may_lease(),
+            "a caller with no identity at all gets no window"
+        );
+
+        // The daemon's own chain, the shape a real gated command arrives in:
+        // this test binary and every ancestor above it share this process's
+        // uid, so the whole chain measures end to end.
+        let me = walk_ancestry(&SysProcessTable, std::process::id() as i32);
+        assert!(!me.chain.is_empty(), "this process has ancestors");
+        assert!(me.may_lease());
+        assert!(
+            me.unmeasured().is_empty(),
+            "a normal same-uid chain measures end to end: {}",
+            me.provenance()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn renaming_over_the_exe_path_does_not_change_what_a_running_process_measures_as() {
+        // The core of the R3-F1-class attack, replayed on Linux: a caller who
+        // can write an ancestor's executable path used to be able to choose
+        // that ancestor's identity by replacing the file after exec. Verified
+        // by hand first (see docs/design/linux-code-identity.md); this is the
+        // same finding as a real test.
+        let dir = linux_scratch("swap");
+        let victim = dir.join("victim");
+        // Stage under a different name and rename into place rather than
+        // executing straight after `copy`: on some container storage drivers
+        // (overlay2) a fresh copy can transiently answer ETXTBSY to an exec
+        // that follows immediately, because the writeback that closed it has
+        // not settled. A rename has no such window -- by the time it returns
+        // the target is fully written and has no writer fd.
+        std::fs::copy("/bin/sleep", dir.join("victim.tmp")).expect("stage the victim binary");
+        std::fs::rename(dir.join("victim.tmp"), &victim).expect("place it before executing");
+        let mut running = std::process::Command::new(&victim)
+            .arg("30")
+            .spawn()
+            .expect("run the victim");
+        std::thread::sleep(Duration::from_millis(100));
+        let pid = running.id() as i32;
+
+        let (_, before) = measure_running_image(pid).expect("measures while honest");
+        assert_eq!(before.measure, IdentityMeasure::Content);
+
+        // The attack: put a different binary at the same path while the
+        // process is still running the original.
+        let decoy = dir.join("decoy");
+        std::fs::copy("/bin/ls", &decoy).expect("stage the substitute");
+        std::fs::rename(&decoy, &victim).expect("rename the substitute over the exec path");
+
+        let (_, after) = measure_running_image(pid)
+            .expect("still measures: /proc/<pid>/exe outlives a rename at its old path");
+        assert_eq!(
+            after.digest, before.digest,
+            "the running image is unchanged by a rename at its old path"
+        );
+
+        let substitute_digest: [u8; 32] =
+            Blake2b256::digest(std::fs::read(&victim).expect("read what is now at the path"))
+                .into();
+        assert_ne!(
+            after.digest, substitute_digest,
+            "and it must differ from the substitute now sitting at that path -- proving this \
+             measured the running image, never a fresh read by path"
+        );
+
+        let _ = running.kill();
+        let _ = running.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_kernel_refuses_to_overwrite_a_running_executable_in_place() {
+        // The other half of the finding: an in-place rewrite (no rename) is
+        // refused outright, so there is no window where a byte-patched image
+        // is served either.
+        let dir = linux_scratch("etxtbsy");
+        let victim = dir.join("victim");
+        // See the rename-into-place comment in the swap test above.
+        std::fs::copy("/bin/sleep", dir.join("victim.tmp")).expect("stage the victim binary");
+        std::fs::rename(dir.join("victim.tmp"), &victim).expect("place it before executing");
+        let mut running = std::process::Command::new(&victim)
+            .arg("30")
+            .spawn()
+            .expect("run the victim");
+        std::thread::sleep(Duration::from_millis(100));
+
+        match std::fs::OpenOptions::new().write(true).open(&victim) {
+            Err(e) => assert_eq!(
+                e.raw_os_error(),
+                Some(libc::ETXTBSY),
+                "must be refused as text-file-busy, not some other error"
+            ),
+            Ok(_) => panic!("kernel allowed opening its own running executable for writing"),
+        }
+
+        let _ = running.kill();
+        let _ = running.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn still_running_tracks_the_kernels_start_time_not_just_the_pid() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn");
+        std::thread::sleep(Duration::from_millis(100));
+        let pid = child.id() as i32;
+        let started = start_time(pid).expect("a live process has a start time");
+        let note = UnmeasuredNote {
+            pid,
+            started,
+            exe: PathBuf::from("/bin/sleep"),
+            reason: crate::peercode::GuestFailure::NoIdentity,
+        };
+        assert!(still_running(&note), "the process is alive and unmoved");
+
+        // A stale start time for the SAME live pid must not read as current --
+        // this is what stops a recycled pid inheriting its predecessor's note.
+        let stale = UnmeasuredNote {
+            started: ProcessStart {
+                usec: started.usec.wrapping_add(1),
+                ..started
+            },
+            ..note.clone()
+        };
+        assert!(!still_running(&stale));
+
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            !still_running(&note),
+            "a reaped pid must not read as still running"
+        );
     }
 
     #[cfg(target_os = "macos")]
