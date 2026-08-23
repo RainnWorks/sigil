@@ -358,8 +358,8 @@ pub fn primary_rc_file() -> Option<(PathBuf, Shell)> {
 }
 
 /// The startup files a given shell reads, under `home`, that should carry the
-/// PATH prepend. bash gets both `.bashrc` (interactive non-login) and
-/// `.bash_profile` (login), which is why interactive-only edits miss agents.
+/// PATH prepend. bash gets both `.bashrc` (interactive non-login) and its login
+/// file, which is why interactive-only edits miss agents.
 pub fn rc_files_for(shell: Shell, home: &Path) -> Vec<PathBuf> {
     match shell {
         Shell::Posix => {
@@ -367,12 +367,21 @@ pub fn rc_files_for(shell: Shell, home: &Path) -> Vec<PathBuf> {
             // union that a POSIX login/interactive shell might read. Each edit is
             // idempotent and guarded, so touching a file an unused shell reads is
             // harmless.
-            vec![
-                home.join(".zshrc"),
-                home.join(".bashrc"),
-                home.join(".bash_profile"),
-                home.join(".profile"),
-            ]
+            //
+            // The login half is ONE resolved file, not the `.bash_profile` and
+            // `.profile` pair this used to list. bash reads the first of
+            // `.bash_profile`, `.bash_login`, `.profile` and stops, so listing
+            // both meant creating a `.bash_profile` that stops an existing
+            // `.profile` being read: the exact harm `setup::shell_profile`
+            // caused on Linux. Resolving picks whichever of them bash is
+            // actually reading, and only invents `.bash_profile` when there is
+            // no login file at all to shadow.
+            let mut files = vec![home.join(".zshrc"), home.join(".bashrc")];
+            let login = paths::bash_login_profile(home);
+            if !files.contains(&login) {
+                files.push(login);
+            }
+            files
         }
         Shell::Fish => vec![home.join(".config/fish/config.fish")],
         Shell::Nushell => vec![home.join(".config/nushell/config.nu")],
@@ -698,11 +707,39 @@ mod tests {
 
     #[test]
     fn rc_files_cover_bash_login_and_interactive() {
+        // A home with no login file at all: `.bash_profile` is the one to make.
         let home = Path::new("/home/tom");
         let posix = rc_files_for(Shell::Posix, home);
         assert!(posix.contains(&home.join(".bashrc")));
         assert!(posix.contains(&home.join(".bash_profile")));
         assert!(posix.contains(&home.join(".zshrc")));
+    }
+
+    /// The RAI-49 hazard, from this side: on a home that already has
+    /// `~/.profile` and no `~/.bash_profile`, the login file to edit is
+    /// `~/.profile`. Listing `.bash_profile` as well would have `ensure_path_in`
+    /// create it, and bash would stop reading `~/.profile` from then on.
+    #[test]
+    fn rc_files_pick_the_login_file_that_exists_and_do_not_shadow_it() {
+        let home = tmp("rcfiles-profile");
+        std::fs::write(home.join(".profile"), "export EDITOR=vim\n").unwrap();
+
+        let posix = rc_files_for(Shell::Posix, &home);
+        assert!(posix.contains(&home.join(".profile")), "{posix:?}");
+        assert!(
+            !posix.contains(&home.join(".bash_profile")),
+            "creating it would demote the ~/.profile beside it: {posix:?}"
+        );
+        assert!(posix.contains(&home.join(".bashrc")), "{posix:?}");
+        assert!(posix.contains(&home.join(".zshrc")), "{posix:?}");
+
+        // And with `.bash_profile` present it is the login file, so `.profile`
+        // drops out: bash stops before reaching it, so an edit there is dead.
+        std::fs::write(home.join(".bash_profile"), "export A=1\n").unwrap();
+        let posix = rc_files_for(Shell::Posix, &home);
+        assert!(posix.contains(&home.join(".bash_profile")), "{posix:?}");
+        assert!(!posix.contains(&home.join(".profile")), "{posix:?}");
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
