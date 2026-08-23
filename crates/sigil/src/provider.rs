@@ -100,6 +100,16 @@ pub struct ProviderRun<'a> {
     /// sealed value of the same name wins; the daemon has already dropped the
     /// shadowed entries and logged them, so a collision cannot reach here silently.
     pub plain: &'a [(String, String)],
+    /// The operator's explicit path to this command's real executable
+    /// ([`Config::binaries`](crate::config::Config::binaries)), or `None` to
+    /// resolve it on the daemon's own `PATH`.
+    ///
+    /// It rides on the run rather than on the provider because the registry is
+    /// built once and shared: which file a given invocation resolves to is a
+    /// property of the config in force for that invocation, not of the provider
+    /// type. See [`paths::resolve_command`] for why a present-but-broken pin
+    /// refuses rather than falling back to the `PATH` walk.
+    pub binary: Option<&'a str>,
 }
 
 /// The provider-specific slice of a source's config passed to
@@ -229,8 +239,14 @@ impl OpProvider {
         }
     }
 
-    fn resolve(&self) -> Option<PathBuf> {
-        self.op_path.clone().or_else(paths::find_real_op)
+    /// Where this run's `op` lives. Three inputs, most specific first: the
+    /// test-injected binary, the operator's config pin, then the daemon's own
+    /// `PATH`. The first two are exact files; only the last one searches.
+    fn resolve(&self, pin: Option<&str>) -> Result<PathBuf, paths::ResolveError> {
+        if let Some(p) = &self.op_path {
+            return Ok(p.clone());
+        }
+        paths::resolve_command("op", pin)
     }
 }
 
@@ -254,9 +270,12 @@ impl SecretProvider for OpProvider {
         // caller's fds spliced straight to it. Sigil injects NOTHING; `op` does its
         // own auth (the caller supplies OP_SERVICE_ACCOUNT_TOKEN or an interactive
         // session). The daemon never holds op's credential.
-        let Some(real) = self.resolve() else {
-            eprintln!("sigil daemon: no real `op` found on PATH");
-            return 127;
+        let real = match self.resolve(run.binary) {
+            Ok(real) => real,
+            Err(e) => {
+                eprintln!("sigil daemon: {e}");
+                return 127;
+            }
         };
         let mut cmd = Command::new(&real);
         cmd.args(run.command.iter().skip(1));
@@ -474,10 +493,15 @@ pub fn run_passthrough(run: ProviderRun) -> i32 {
 /// security-claims residual #3/#9), bounded to the spawn.
 fn spawn_with_env(run: ProviderRun, vars: &[(String, Zeroizing<String>)]) -> i32 {
     // Resolve the real underlying binary (skipping our own shim alias) so a
-    // command named like a shimmed tool still runs the true executable.
-    let Some(real) = paths::find_real(&run.command[0]) else {
-        eprintln!("sigil daemon: no `{}` found on PATH to run", run.command[0]);
-        return 127;
+    // command named like a shimmed tool still runs the true executable. A
+    // configured pin wins over the PATH walk and refuses rather than falling
+    // back to it; see `paths::resolve_command`.
+    let real = match paths::resolve_command(&run.command[0], run.binary) {
+        Ok(real) => real,
+        Err(e) => {
+            eprintln!("sigil daemon: {e}");
+            return 127;
+        }
     };
 
     let mut cmd = Command::new(&real);
@@ -760,6 +784,7 @@ mod tests {
             source: "",
             env: None,
             plain: &[],
+            binary: None,
             proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
@@ -768,6 +793,98 @@ mod tests {
         assert_eq!(code, 0);
         // The gated op ran (prefix present) and Sigil injected no marker var.
         assert_eq!(read_all(read_end), "ran:");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_config_pin_runs_a_binary_the_path_could_never_resolve() {
+        // The RAI-48 defect, end to end through the provider: the daemon walks a
+        // pinned PATH of system directories, so a tool installed anywhere else was
+        // unreachable and every gated call failed with "no real `op` found".
+        //
+        // The pinned file is deliberately NOT named `op` and NOT in any directory
+        // on any PATH, so no PATH walk for the command `op` could ever produce it.
+        // If the child runs, the pin is what resolved it. No process env is
+        // mutated: a pin short-circuits before the PATH walk is consulted at all.
+        let dir = std::env::temp_dir().join(format!("sigil-prov-pin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let elsewhere = dir.join("op-1.2.3-nas-build");
+        std::fs::write(&elsewhere, "#!/bin/sh\nprintf 'pinned'\n").unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (read_end, write_end) = pipe();
+        let code = OpProvider::new().run(ProviderRun {
+            command: &["op".into(), "read".into()],
+            cwd: "",
+            source: "",
+            env: None,
+            plain: &[],
+            binary: elsewhere.to_str(),
+            proxy_depth: 1,
+            stdin: None,
+            stdout: Some(write_end),
+            stderr: None,
+        });
+        assert_eq!(code, 0);
+        assert_eq!(read_all(read_end), "pinned");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_broken_pin_refuses_the_run_rather_than_spawning_something_else() {
+        // Fail closed, and the direction matters: a pin exists because the
+        // operator does not want the daemon choosing. 127 (no such command) with
+        // nothing spawned, not a substitute resolved off the PATH.
+        let dir = std::env::temp_dir().join(format!("sigil-prov-pinbad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gone = dir.join("was-uninstalled-last-tuesday");
+
+        let (read_end, write_end) = pipe();
+        let code = OpProvider::new().run(ProviderRun {
+            command: &["op".into(), "read".into()],
+            cwd: "",
+            source: "",
+            env: None,
+            plain: &[],
+            binary: gone.to_str(),
+            proxy_depth: 1,
+            stdin: None,
+            stdout: Some(write_end),
+            stderr: None,
+        });
+        assert_eq!(code, 127);
+        assert_eq!(read_all(read_end), "", "nothing was spawned");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_pin_also_reaches_the_direct_injection_and_passthrough_shapes() {
+        // The pin is honoured by `spawn_with_env`, which backs the env-file and
+        // inline-env providers AND `run_passthrough` (an `allow` rule). A tool
+        // outside the daemon's PATH must be reachable in every shape, not just
+        // when it happens to be `op` — the resolver is shared, so this is the
+        // test that says so rather than three copies of it.
+        let dir = std::env::temp_dir().join(format!("sigil-prov-pinpt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let elsewhere = dir.join("tool-on-the-nas");
+        std::fs::write(&elsewhere, "#!/bin/sh\nprintf 'pt:%s' \"$FROM_FILE\"\n").unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (read_end, write_end) = pipe();
+        let code = run_passthrough(ProviderRun {
+            command: &["faketool".into()],
+            cwd: "",
+            source: "",
+            env: None,
+            plain: &[],
+            binary: elsewhere.to_str(),
+            proxy_depth: 1,
+            stdin: None,
+            stdout: Some(write_end),
+            stderr: None,
+        });
+        assert_eq!(code, 0);
+        assert_eq!(read_all(read_end), "pt:");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -794,6 +911,7 @@ mod tests {
             source: "",
             env: None,
             plain: &vars,
+            binary: None,
             proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
@@ -848,6 +966,7 @@ mod tests {
             source: env_path.to_str().unwrap(),
             env: None,
             plain: &[],
+            binary: None,
             proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
@@ -899,6 +1018,7 @@ mod tests {
             source: env_path.to_str().unwrap(),
             env: None,
             plain: &[],
+            binary: None,
             proxy_depth: 1,
             stdin: None,
             stdout: Some(write_end),
@@ -1021,6 +1141,7 @@ mod tests {
             stderr: None,
             env: Some(&vars),
             plain: &[],
+            binary: None,
         });
 
         match prev {
@@ -1070,6 +1191,7 @@ mod tests {
             stderr: None,
             env: sealed,
             plain,
+            binary: None,
         };
         let code = match sealed {
             Some(_) => EnvProvider.run(run),
@@ -1151,6 +1273,7 @@ mod tests {
             stderr: None,
             env: None,
             plain: &[],
+            binary: None,
         });
         assert_eq!(code, 1, "no sealed values must fail closed");
     }

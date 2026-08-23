@@ -87,6 +87,7 @@ pub fn run_config() -> i32 {
         "" | "list" => config_list(json),
         "source" => cmd_config_source(&args[1..], json),
         "rule" => cmd_config_rule(&args[1..], json),
+        "binary" => cmd_config_binary(&args[1..], json),
         "export" => config_export(),
         "import" => config_import(json),
         // The one-command convenience desugar (source + rule in one step).
@@ -286,6 +287,14 @@ usage: sigil-config <cmd> [args...]   author rules/sources, manage accounts
                     [--leasable [--lease-max <secs>]] [--timeout <sec>]
                     a match -> gate + inject rule (default run-once; --leasable
                     allows a session lease up to the cap). also: rule list|remove
+  binary set <cmd> <abs path>
+                    pin where a gated command's real executable lives, for a
+                    tool outside the daemon's own PATH (/usr/local/bin, /usr/bin,
+                    /bin, /usr/sbin, /sbin, + Homebrew on macOS). The daemon does
+                    not inherit the caller's PATH, so this is how to reach an
+                    `op` in /opt, on a NAS share, or in a Nix profile. A pin that
+                    stops resolving refuses the run; it never falls back to PATH.
+                    also: binary list|unset <cmd>
   list              summarize sources and rules (--json = the whole config)
   export            print the whole config as JSON (for the desktop to load)
   import            replace the whole config from JSON on stdin
@@ -382,7 +391,17 @@ fn cmd_status() -> i32 {
             s.dim(st.op.path.as_deref().unwrap_or("")),
         )
     } else {
-        (s.deny("\u{2717}"), "missing", s.dim("no `op` on PATH"))
+        // Not "no `op` on PATH": with a config pin there are four distinct ways
+        // this row goes red (absent, not executable, relative, points at our own
+        // shim) and only one of them is about a PATH. `StatusJson.op` carries no
+        // reason field and widening the wire type would touch the Mac app, so
+        // this points at the surface that does carry it rather than naming the
+        // wrong cause.
+        (
+            s.deny("\u{2717}"),
+            "missing",
+            s.dim("not resolved; run: sigil doctor"),
+        )
     };
     println!(
         "  {} {glyph} {}  {note}",
@@ -2712,6 +2731,110 @@ fn cmd_config_source(args: &[String], json: bool) -> i32 {
             2
         }
     }
+}
+
+/// `sigil-config binary <set|list|unset>`: where a gated command's real
+/// executable lives, for the sites the daemon's pinned `PATH` cannot reach.
+///
+/// A separate verb rather than a flag on `source` or `rule` because it answers a
+/// different question. A source says what to inject and a rule says what to
+/// gate; this says which file on this box is the tool. One `op` install serves
+/// every rule that gates `op`, so it is keyed by command and stored once.
+fn cmd_config_binary(args: &[String], json: bool) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("set") => config_binary_set(&args[1..], json),
+        Some("list") | None => config_binary_list(json),
+        Some("unset") | Some("remove") | Some("rm") => {
+            config_binary_unset(args.get(1).map(String::as_str), json)
+        }
+        _ => {
+            eprintln!(
+                "usage: sigil-config binary <set <cmd> <absolute path> | list | unset <cmd>>"
+            );
+            2
+        }
+    }
+}
+
+fn config_binary_set(args: &[String], json: bool) -> i32 {
+    let (Some(cmd), Some(path)) = (args.first(), args.get(1)) else {
+        eprintln!("usage: sigil-config binary set <cmd> <absolute path>");
+        eprintln!("  e.g. sigil-config binary set op /opt/1Password/bin/op");
+        return 2;
+    };
+    let mut cfg = match load_config() {
+        Some(c) => c,
+        None => return 1,
+    };
+    // Validated against the filesystem before it is written, so a typo is caught
+    // here rather than at 3am inside a daemon that can only fail closed.
+    let result = match cfg.set_binary(cmd, path) {
+        Ok(()) => {
+            if !save_config(&cfg) {
+                return 1;
+            }
+            // The daemon reads config at arm time and reloads on change, but
+            // the sentence a human needs here is what the pin MEANS, not that
+            // the file saved.
+            ControlResult::ok(vec![
+                format!("{cmd} pinned to {path}"),
+                format!(
+                    "gated `{cmd}` runs will use exactly this file; if it stops being an \
+                     executable they refuse rather than fall back to PATH"
+                ),
+            ])
+        }
+        Err(e) => ControlResult::line(false, e.to_string()),
+    };
+    print_config_result(&result, json)
+}
+
+fn config_binary_list(json: bool) -> i32 {
+    let Some(cfg) = load_config() else {
+        return 1;
+    };
+    let mut lines = vec![format!("{} pinned binar(ies)", cfg.binaries.len())];
+    let mut all_ok = true;
+    for (cmd, path) in cfg.binaries.iter() {
+        // Re-resolve rather than echoing the file back, so `list` reports the
+        // state the daemon would find and not the state the operator intended.
+        match crate::paths::resolve_command(cmd, Some(path.as_str())) {
+            Ok(_) => lines.push(format!("  {cmd}  {path}")),
+            Err(e) => {
+                all_ok = false;
+                lines.push(format!("  {cmd}  {path}  [BROKEN: {e}]"));
+            }
+        }
+    }
+    if cfg.binaries.is_empty() {
+        lines.push("  every gated command resolves on the daemon's own PATH".to_string());
+    }
+    let result = ControlResult { ok: all_ok, lines };
+    print_config_result(&result, json)
+}
+
+fn config_binary_unset(cmd: Option<&str>, json: bool) -> i32 {
+    let Some(cmd) = cmd else {
+        eprintln!("usage: sigil-config binary unset <cmd>");
+        return 2;
+    };
+    let mut cfg = match load_config() {
+        Some(c) => c,
+        None => return 1,
+    };
+    let result = match cfg.unset_binary(cmd) {
+        Some(path) => {
+            if !save_config(&cfg) {
+                return 1;
+            }
+            ControlResult::line(
+                true,
+                format!("{cmd} unpinned (was {path}); it resolves on the daemon's PATH again"),
+            )
+        }
+        None => ControlResult::line(false, format!("no pinned binary for {cmd}")),
+    };
+    print_config_result(&result, json)
 }
 
 /// Validate a provider id against the shipping registry, so a typo is caught at

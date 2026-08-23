@@ -12,11 +12,27 @@
 use crate::json::{CheckJson, FactorJson, OpJson, ShimJson, StatusJson};
 use crate::{keystore, paths};
 
+/// How `op` resolves for a gated run, as the reports must state it: the
+/// operator's config pin when there is one, the `PATH` walk otherwise.
+///
+/// This exists so `status` and `doctor` answer the question the daemon actually
+/// asks at spawn time ([`paths::resolve_command`]) rather than a different one
+/// that usually agrees. Reporting `op` as missing while a pinned `op` runs fine
+/// — or the reverse — is worse than not reporting it, because both rows are read
+/// as a verdict on whether Sigil will work.
+///
+/// A missing/unreadable config is treated as "no pin", not as an error: these
+/// builders are diagnostics and must produce a report on a half-installed box.
+fn resolve_op() -> Result<std::path::PathBuf, paths::ResolveError> {
+    let cfg = crate::config::Config::load().ok();
+    paths::resolve_command("op", cfg.as_ref().and_then(|c| c.binary_for("op")))
+}
+
 /// Build the full status report. `daemon_up` is whether the control socket is
 /// listening (always true when the daemon answers its own `Frame::Status`).
 pub fn status(daemon_up: bool) -> StatusJson {
     let shim = paths::ShimStatus::detect();
-    let real_op = paths::find_real_op();
+    let real_op = resolve_op().ok();
     let accounts = crate::threshold::ThresholdStore::load()
         .map(|s| s.secrets.len())
         .unwrap_or(0);
@@ -83,7 +99,7 @@ pub fn status(daemon_up: bool) -> StatusJson {
 /// check. The final ssh-agent row is informational (always `ok`).
 pub fn doctor(daemon_up: bool) -> Vec<CheckJson> {
     let shim = paths::ShimStatus::detect();
-    let real_op = paths::find_real_op();
+    let real_op = resolve_op();
     let mut checks = Vec::new();
     let mut push = |label: &str, ok: bool, hint: &str| {
         checks.push(CheckJson {
@@ -144,14 +160,22 @@ pub fn doctor(daemon_up: bool) -> Vec<CheckJson> {
         );
     }
 
-    // 6. a real op to run.
+    // 6. a real op to run. The hint carries the resolver's own words, because
+    // "no `op` on PATH" was wrong for every failure a pin can produce and, on a
+    // box whose `op` simply lives somewhere unusual, told the operator to fix
+    // their `PATH` — which is the one thing that cannot work, since the daemon
+    // does not use theirs. `sigil-config binary set op <path>` is the fix, so
+    // the hint says so.
     push(
         "real op found",
-        real_op.is_some(),
-        if real_op.is_some() {
-            ""
-        } else {
-            "no `op` on PATH"
+        real_op.is_ok(),
+        &match &real_op {
+            Ok(_) => String::new(),
+            Err(paths::ResolveError::NotOnPath(_)) => "no `op` in the daemon's own PATH \
+                 (/usr/local/bin, /usr/bin, /bin, /usr/sbin, /sbin, plus Homebrew on macOS). \
+                 If `op` lives elsewhere, pin it: sigil-config binary set op <absolute path>"
+                .to_string(),
+            Err(e) => format!("{e}. Fix or clear it: sigil-config binary set|unset op"),
         },
     );
 

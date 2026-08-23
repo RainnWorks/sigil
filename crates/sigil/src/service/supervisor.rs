@@ -60,8 +60,17 @@ const DEFINITION_VERSION: u32 = 1;
 /// tidiness: `docs/security-claims.md` states that the daemon resolves the real
 /// binary in its own trusted `PATH`, so a caller cannot steer what the daemon
 /// spawns. Inheriting the `PATH` of whichever shell ran `sigil up` would hand
-/// that back. A site whose `op` lives outside these directories sets an explicit
-/// `op_path` in config rather than widening this.
+/// that back. A site whose `op` lives outside these directories names the file
+/// itself — `sigil-config binary set op <absolute path>`, stored in
+/// [`Config::binaries`](crate::config::Config::binaries) and honoured by
+/// [`resolve_command`](crate::paths::resolve_command) — rather than widening
+/// this list. Naming one file is narrower than adding a directory, which would
+/// make everything later planted in that directory spawnable too.
+///
+/// This paragraph used to point at an `op_path` config setting that had never
+/// been built, so the documented escape hatch did not exist and a site in
+/// exactly this position — Tower, whose `op` lives on a NAS share — had no way
+/// out at all. `binary set` is that setting, built.
 const BASE_PATH_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
 /// Respawn backoff bounds. A daemon that dies instantly and repeatedly (a bad
