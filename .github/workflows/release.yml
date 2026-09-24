@@ -70,15 +70,17 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------
-  # iOS: Sigil -> TestFlight. Needs the Rainnworks App Store Connect API key.
+  # iOS: Sigil -> TestFlight. Needs the RW_* signing secrets from
+  # RainnWorks/apple-signing.
   # ---------------------------------------------------------------------
   ios:
     name: ios (TestFlight)
     runs-on: macos-latest
     env:
-      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
-      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
-      ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+      RW_ASC_KEY_ID: ${{ secrets.RW_ASC_KEY_ID }}
+      RW_ASC_ISSUER_ID: ${{ secrets.RW_ASC_ISSUER_ID }}
+      RW_ASC_KEY_P8: ${{ secrets.RW_ASC_KEY_P8 }}
+      RW_SIGNING_PASSWORD: ${{ secrets.RW_SIGNING_PASSWORD }}
       IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
     steps:
       # Step (not job) `if:` cannot read the `secrets` context directly (a
@@ -86,36 +88,48 @@ jobs:
       # `env:` block above mirrors each secret so steps gate on `env.*`
       # instead.
       - name: skip if secrets are not configured yet
-        if: ${{ env.ASC_API_KEY_P8 == '' }}
+        if: ${{ env.RW_ASC_KEY_P8 == '' }}
         run: |
-          echo "::warning::ASC_API_KEY_P8 not set - skipping the iOS TestFlight upload. See docs/RELEASE.md."
+          echo "::warning::RW_ASC_KEY_P8 not set - skipping the iOS TestFlight upload. See RainnWorks/apple-signing."
           exit 0
       - uses: actions/checkout@v4
-        if: ${{ env.ASC_API_KEY_P8 != '' }}
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
       - uses: ruby/setup-ruby@v1
-        if: ${{ env.ASC_API_KEY_P8 != '' }}
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
         with:
           ruby-version: "3.3"
           bundler-cache: true
           working-directory: fastlane
       - uses: oven-sh/setup-bun@v2
-        if: ${{ env.ASC_API_KEY_P8 != '' }}
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
       - name: bun install
-        if: ${{ env.ASC_API_KEY_P8 != '' }}
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
         working-directory: apps/phone
         run: bun install --frozen-lockfile
       # apps/phone/ios is gitignored (Expo CNG, see apps/phone/.gitignore) -
       # regenerate the native project fresh from app.json for every release.
       - name: expo prebuild
-        if: ${{ env.ASC_API_KEY_P8 != '' }}
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
         working-directory: apps/phone
         run: bunx expo prebuild -p ios
       - name: pod install
-        if: ${{ env.ASC_API_KEY_P8 != '' }}
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
         working-directory: apps/phone/ios
         run: pod install
+      - name: check out apple-signing
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: RainnWorks/apple-signing
+          ssh-key: ${{ secrets.RW_SIGNING_DEPLOY_KEY }}
+          path: .apple-signing
+      - name: install signing certificate + profile
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
+        run: bun .apple-signing/src/cli.ts sync sigil --ci
+        env:
+          RW_SIGNING_ROOT: .apple-signing
       - name: fastlane ios beta
-        if: ${{ env.ASC_API_KEY_P8 != '' }}
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
         run: bundle exec fastlane ios beta
         working-directory: fastlane
 
