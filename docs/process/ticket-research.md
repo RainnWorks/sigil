@@ -1,6 +1,6 @@
 # Ticket skill: research
 
-Input for the talk about `.claude/skills/ticket/SKILL.md`. Read only. No Linear data was read or
+Input for the talk about the ticket flow. The rules live in `~/.claude/skills/ticket`, shared by every RainnWorks product; what is specific to Sigil lives in [ticket.md](ticket.md). Read only. No Linear data was read or
 changed: the `linear-server` MCP is not connected in this project yet, so every statement below
 about Linear comes from the Attention work, not from Sigil's own workspace.
 
