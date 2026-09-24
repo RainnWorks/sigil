@@ -13,7 +13,7 @@ creating a million tasks", none of them thought through.
 
 1. Nothing is written to Linear until Tom has seen the final draft in chat and said yes. His yes
    covers that one ticket only.
-2. At most five tickets not yet started in the Sigil team at any time. When there are five, say so
+2. At most five tickets not yet started in the Sigil project at any time. When there are five, say so
    and do not draft a sixth; ask Tom which to drop or finish first.
 3. An idea that is not worked out goes to Triage as one line with where it came from. Only Tom
    accepts from Triage.
@@ -28,9 +28,11 @@ creating a million tasks", none of them thought through.
 
 ## Where things live
 
-- Linear: the **Sigil** team (key `SIG`), project **Sigil**. Keep projects simple; do not propose
-  new ones unless Tom asks.
+- Linear: the **Rainnworks** team (key `RAI`), project **Sigil** (`P-RAI-6`). Work is split by
+  project, not by team. Do not propose a new team or project unless Tom asks.
 - Labels: one from the workspace **Kind** group: `build`, `fix`, `spec`, `design`, `research`.
+  Ignore the `area/*`, `role/*`, `Feature`, `Bug`, `Improvement` and `tonight` labels; they belong
+  to the OSRS work.
 - The constitution: `docs/design/sigil-design-brief.html`. When the code and the brief disagree,
   the ticket fixes one of them in the same change. Its Build state table says what is not built.
 - The security record: `docs/security-claims.md`. A ticket that changes what the product claims
@@ -54,7 +56,7 @@ creating a million tasks", none of them thought through.
 
 ### 1. Intake
 
-Before drafting, read the Sigil team's open tickets with the Linear tools, so you do not duplicate
+Before drafting, read the Sigil project's open tickets with the Linear tools, so you do not duplicate
 one. Then write back, in two or three lines:
 
 - the problem in Tom's words, quoted where you can
@@ -89,7 +91,7 @@ go to Triage if Tom wants them kept.
 
 Only after Tom's yes on the final text:
 
-- create the issue in the Sigil team and project, status Backlog, with one Kind label
+- create the issue in the Rainnworks team, project Sigil, status Backlog, with one Kind label
 - set the size as the estimate
 - link blockers with Linear relations, not in prose
 - post the issue link in chat, and nothing else

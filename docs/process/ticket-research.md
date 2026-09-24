@@ -4,14 +4,18 @@ Input for the talk about `.claude/skills/ticket/SKILL.md`. Read only. No Linear 
 changed: the `linear-server` MCP is not connected in this project yet, so every statement below
 about Linear comes from the Attention work, not from Sigil's own workspace.
 
-## What still has to be checked in Linear
+## What Linear holds now
 
-| To check | Why it matters |
+Checked with the Linear tools, read only apart from the labels Tom asked for.
+
+| Fact | Effect on the skill |
 |---|---|
-| The Sigil team exists, with Triage on | Rule 3 sends raw ideas to Triage. Without it they have nowhere to go. |
-| The team key | The skill says `SIG`. If Tom picks another, the skill changes. |
-| A `Sigil` project exists | Tickets are filed into it. |
-| The workspace `Kind` labels are visible to the team | The skill uses `build`, `fix`, `spec`, `design`, `research` and creates nothing. |
+| One team, `Rainnworks` (key `RAI`). Teams cannot be added, so work is split by project. | The skill names the team `RAI` and the project `Sigil`. |
+| Project `Sigil` is `P-RAI-6`. `Attention` is `P-RAI-5`. | Two products, one team, one board each. |
+| Triage is on. | Rule 3 has somewhere to send a raw idea. |
+| The `Kind` group was a team label on a team that was later deleted, which deleted the labels with it. | Recreated at workspace level, on Tom's yes. A team deletion cannot take them again, and Attention shares them. |
+| `Kind` holds `build`, `fix`, `spec`, `design`, `research`, one per issue. | The only labels a ticket uses. |
+| The team also carries `area/*`, `role/*`, `Feature`, `Bug`, `Improvement`, `tonight` from the OSRS work. | The skill says to ignore them, so a ticket cannot pick from two sets. |
 
 ## What Sigil adds over the Attention version
 
