@@ -2,42 +2,29 @@
 require "tempfile"
 require "shellwords"
 require "fileutils"
-require "tmpdir"
+require "base64"
 
 default_platform(:ios)
 
-# App Store Connect API key, used both for auto-provisioning at archive time and
-# for the TestFlight upload. Resolution order mirrors the TileCam/GlassView
-# setup so local runs need zero config:
-#   1. CI env: ASC_KEY_ID, ASC_ISSUER_ID, and either ASC_KEY_CONTENT (base64 .p8,
-#      with ASC_KEY_CONTENT_BASE64=true) or ASC_API_KEY_P8 (raw PEM).
-#   2. The .p8 already at ~/.appstoreconnect/private_keys/ (no 1Password prompt).
-#   3. Pulled once from 1Password (my.1password.com -> Private ->
-#      "ASC API Key - Sigil Build Upload (RainnWorks)"); op must be signed in.
-# Key ID and Issuer ID are identifiers, not secrets.
-def asc_api_key
-  key_id = ENV["ASC_KEY_ID"] || "454G953UNX"
-  issuer = ENV["ASC_ISSUER_ID"] || "c73bbb08-c295-4f05-8941-061c35640941"
-  key_content = ENV["ASC_KEY_CONTENT"] || ENV["ASC_API_KEY_P8"]
-  if key_content
-    return app_store_connect_api_key(
-      key_id: key_id,
-      issuer_id: issuer,
-      key_content: key_content,
-      is_key_content_base64: ENV["ASC_KEY_CONTENT_BASE64"] == "true",
-      in_house: false
-    )
-  end
+RW_ASC_ENV = %w[RW_ASC_KEY_ID RW_ASC_ISSUER_ID RW_ASC_KEY_P8].freeze
 
-  standard = File.expand_path("~/.appstoreconnect/private_keys/AuthKey_#{key_id}.p8")
-  key_path = File.exist?(standard) ? standard : File.join(Dir.tmpdir, "asc_sigil_#{key_id}.p8")
-  unless File.exist?(key_path)
-    UI.message("Fetching App Store Connect API key from 1Password...")
-    sh("env -u OP_SERVICE_ACCOUNT_TOKEN op --account my.1password.com document get " \
-       "'ASC API Key - Sigil Build Upload (RainnWorks)' --vault Private " \
-       "--out-file #{key_path.shellescape}")
-  end
-  app_store_connect_api_key(key_id: key_id, issuer_id: issuer, key_filepath: key_path, in_house: false)
+def require_rw_asc_env!
+  missing = RW_ASC_ENV.reject { |name| ENV[name].to_s.strip != "" }
+  return if missing.empty?
+  UI.user_error!("Missing #{missing.join(', ')}. On a Mac run lanes as " \
+                 "`rw-apple exec -- bundle exec fastlane <platform> <lane>`. " \
+                 "In CI set the RW_* secrets. See RainnWorks/apple-signing.")
+end
+
+def asc_api_key
+  require_rw_asc_env!
+  app_store_connect_api_key(
+    key_id: ENV.fetch("RW_ASC_KEY_ID"),
+    issuer_id: ENV.fetch("RW_ASC_ISSUER_ID"),
+    key_content: ENV.fetch("RW_ASC_KEY_P8"),
+    is_key_content_base64: true,
+    in_house: false
+  )
 end
 
 # fastlane's own Dir.pwd is fastlane/ itself (confirmed empirically - it does
@@ -49,15 +36,12 @@ ROOT = File.expand_path("..", __dir__)
 # iOS: Sigil (apps/phone)
 # ---------------------------------------------------------------------------
 platform :ios do
-  desc "Build and sign the Sigil app via match, upload to TestFlight"
+  desc "Build and sign the Sigil app, upload to TestFlight"
   desc ""
-  desc "Signing uses fastlane match: the App Store distribution cert + profile"
-  desc "stored AES-encrypted in the ios-certificates repo (mirrors TileCam), so"
-  desc "codesign runs in a dedicated prompt-free keychain and never blocks."
-  desc "Requires (see docs/RELEASE.md):"
-  desc "  MATCH_GIT_URL, MATCH_PASSWORD  - from ~/tilecam-build/ci.env or GHA secrets"
-  desc "  ASC_* or the .p8 under ~/.appstoreconnect (see asc_api_key above)"
-  desc "  IOS_TEAM_ID                    - Apple team id (defaults to 53W966FBFP)"
+  desc "Signing comes from RainnWorks/apple-signing. On a Mac the lane runs"
+  desc "`rw-apple sync sigil` itself; in CI the workflow runs the sync step first."
+  desc "Run it as `rw-apple exec -- bundle exec fastlane ios beta` so the RW_* secrets are set."
+  desc "  IOS_TEAM_ID  - Apple team id (defaults to 53W966FBFP)"
   desc ""
   desc "Set SIGIL_ARCHIVE_PATH=<path.xcarchive> to re-export an existing archive"
   desc "and skip the full rebuild."
@@ -65,7 +49,7 @@ platform :ios do
     api_key = asc_api_key
     team_id = ENV["IOS_TEAM_ID"] || "53W966FBFP"
     app_id  = "works.rainn.sigil"
-    profile = "match AppStore #{app_id}"
+    profile = "RW AppStore #{app_id}"
 
     # apps/phone/ios/ is generated (gitignored) - Expo continuous native
     # generation. Locally, run `bunx expo prebuild -p ios` in apps/phone/ first
@@ -73,20 +57,7 @@ platform :ios do
     ios_dir = File.join(ROOT, "apps/phone/ios")
     UI.user_error!("apps/phone/ios is missing - run `bunx expo prebuild -p ios` in apps/phone/ first") unless Dir.exist?(ios_dir)
 
-    # A dedicated, unlocked, prompt-free keychain (the same one CI would use).
-    # Without it, codesign is denied the login keychain from a non-interactive
-    # shell (errSecInternalComponent). Runs locally too, not just in CI.
-    setup_ci(force: true)
-
-    # Fetch, or on first run for this app id create, the App Store distribution
-    # cert + provisioning profile from the ios-certificates repo and install
-    # them into that keychain.
-    match(
-      type: "appstore",
-      app_identifier: app_id,
-      api_key: api_key,
-      readonly: false
-    )
+    sh("rw-apple", "sync", "sigil") unless is_ci
 
     export_opts = {
       workspace: File.join(ios_dir, "Sigil.xcworkspace"),
@@ -103,7 +74,7 @@ platform :ios do
 
     reuse = ENV["SIGIL_ARCHIVE_PATH"]
     if reuse && Dir.exist?(reuse)
-      # Re-export an already-built archive with the match profile (skips ~40 min).
+      # Re-export an already-built archive with the RW AppStore profile (skips ~40 min).
       UI.message("Reusing archive: #{reuse}")
       gym(**export_opts, skip_build_archive: true, archive_path: reuse)
     else
@@ -136,28 +107,27 @@ end
 platform :mac do
   desc "Generate, build, sign, and notarize the Sigil macOS app; package a DMG"
   desc ""
-  desc "Requires (see docs/RELEASE.md):"
-  desc "  MAC_ASC_KEY_ID, MAC_ASC_ISSUER_ID, MAC_ASC_API_KEY_P8  - ASC API key for notarization"
+  desc "Signing comes from RainnWorks/apple-signing. On a Mac the lane runs"
+  desc "`rw-apple sync sigil-mac` itself; in CI the workflow runs the sync step first."
+  desc "Run it as `rw-apple exec -- bundle exec fastlane mac release` so the RW_* secrets are set."
+  desc "The same RW_ASC_* key notarizes the app."
   desc ""
   desc "Apple identity (mirrors apps/phone/app.config.js), both default to Rainnworks:"
   desc "  SIGIL_MAC_TEAM_ID     - Apple team id signing the app (default 53W966FBFP)"
   desc "  SIGIL_MAC_BUNDLE_ID   - app bundle id (default works.rainn.sigil.mac)"
-  desc ""
-  desc "As of #52 the Mac app is on the Rainnworks team (53W966FBFP), same as the iOS"
-  desc "app. The MAC_ASC_* notarization credentials are still named separately from the"
-  desc "iOS ASC_* ones only because notarization uses a Developer-ID API key distinct"
-  desc "from the App Store one; both now live under the same Rainnworks account."
+  desc "A self-hoster also needs a Developer ID profile named \"RW DeveloperID <bundle id>\"."
   lane :release do
-    ensure_env_vars(
-      env_vars: ["MAC_ASC_KEY_ID", "MAC_ASC_ISSUER_ID", "MAC_ASC_API_KEY_P8"]
-    )
+    require_rw_asc_env!
 
     team_id   = ENV["SIGIL_MAC_TEAM_ID"] || "53W966FBFP"
     bundle_id = ENV["SIGIL_MAC_BUNDLE_ID"] || "works.rainn.sigil.mac"
+    profile   = "RW DeveloperID #{bundle_id}"
 
     mac_dir = File.join(ROOT, "apps/mac")
     build_dir = File.join(ROOT, "build/mac")
     FileUtils.mkdir_p(build_dir)
+
+    sh("rw-apple", "sync", "sigil-mac") unless is_ci
 
     # Sigil.xcodeproj is generated (see apps/mac/project.yml's own header) -
     # never hand-edited, never assumed fresh in CI.
@@ -171,14 +141,21 @@ platform :mac do
       scheme: "Sigil",
       configuration: "Release",
       export_method: "developer-id",
+      export_options: {
+        signingStyle: "manual",
+        teamID: team_id,
+        provisioningProfiles: { bundle_id => profile }
+      },
       output_directory: build_dir,
       output_name: "Sigil.app",
       skip_package_ipa: true,
       clean: true,
-      xcargs: "-allowProvisioningUpdates " \
-              "SIGIL_MAC_TEAM_ID=#{team_id.shellescape} " \
+      xcargs: "SIGIL_MAC_TEAM_ID=#{team_id.shellescape} " \
               "SIGIL_MAC_BUNDLE_ID=#{bundle_id.shellescape} " \
-              "DEVELOPMENT_TEAM=#{team_id.shellescape}"
+              "DEVELOPMENT_TEAM=#{team_id.shellescape} " \
+              "CODE_SIGN_STYLE=Manual " \
+              "CODE_SIGN_IDENTITY=#{'Developer ID Application'.shellescape} " \
+              "PROVISIONING_PROFILE_SPECIFIER=#{profile.shellescape}"
     )
 
     app_path = File.join(build_dir, "Sigil.app")
@@ -193,14 +170,14 @@ platform :mac do
     # nothing logged).
     key_file = Tempfile.new(["asc_notarize_key", ".p8"])
     begin
-      key_file.write(ENV["MAC_ASC_API_KEY_P8"])
+      key_file.write(Base64.decode64(ENV.fetch("RW_ASC_KEY_P8")))
       key_file.close
 
       sh(
         "xcrun notarytool submit #{zip_path.shellescape} " \
         "--key #{key_file.path.shellescape} " \
-        "--key-id #{ENV['MAC_ASC_KEY_ID'].shellescape} " \
-        "--issuer #{ENV['MAC_ASC_ISSUER_ID'].shellescape} " \
+        "--key-id #{ENV.fetch('RW_ASC_KEY_ID').shellescape} " \
+        "--issuer #{ENV.fetch('RW_ASC_ISSUER_ID').shellescape} " \
         "--wait"
       )
     ensure
