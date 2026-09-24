@@ -134,43 +134,56 @@ jobs:
         working-directory: fastlane
 
   # ---------------------------------------------------------------------
-  # macOS: Latch configurator -> notarized, stapled DMG. Needs its own ASC
-  # API key (see fastlane/Fastfile's comment: separate team from iOS until
-  # #35 migrates the Mac identity to Rainnworks).
+  # macOS: Sigil configurator -> notarized, stapled DMG. Needs the RW_*
+  # signing secrets from RainnWorks/apple-signing.
   # ---------------------------------------------------------------------
   mac:
     name: mac (notarized DMG)
     runs-on: macos-latest
     env:
-      MAC_ASC_KEY_ID: ${{ secrets.MAC_ASC_KEY_ID }}
-      MAC_ASC_ISSUER_ID: ${{ secrets.MAC_ASC_ISSUER_ID }}
-      MAC_ASC_API_KEY_P8: ${{ secrets.MAC_ASC_API_KEY_P8 }}
-      MAC_TEAM_ID: ${{ secrets.MAC_TEAM_ID }}
+      RW_ASC_KEY_ID: ${{ secrets.RW_ASC_KEY_ID }}
+      RW_ASC_ISSUER_ID: ${{ secrets.RW_ASC_ISSUER_ID }}
+      RW_ASC_KEY_P8: ${{ secrets.RW_ASC_KEY_P8 }}
+      RW_SIGNING_PASSWORD: ${{ secrets.RW_SIGNING_PASSWORD }}
     steps:
       - name: skip if secrets are not configured yet
-        if: ${{ env.MAC_ASC_API_KEY_P8 == '' }}
+        if: ${{ env.RW_ASC_KEY_P8 == '' }}
         run: |
-          echo "::warning::MAC_ASC_API_KEY_P8 not set - skipping the macOS build/notarize. See docs/RELEASE.md."
+          echo "::warning::RW_ASC_KEY_P8 not set - skipping the macOS build/notarize. See RainnWorks/apple-signing."
           exit 0
       - uses: actions/checkout@v4
-        if: ${{ env.MAC_ASC_API_KEY_P8 != '' }}
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
       - uses: dtolnay/rust-toolchain@stable
-        if: ${{ env.MAC_ASC_API_KEY_P8 != '' }}
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
       - uses: ruby/setup-ruby@v1
-        if: ${{ env.MAC_ASC_API_KEY_P8 != '' }}
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
         with:
           ruby-version: "3.3"
           bundler-cache: true
           working-directory: fastlane
       - name: brew install xcodegen
-        if: ${{ env.MAC_ASC_API_KEY_P8 != '' }}
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
         run: brew install xcodegen
+      - name: check out apple-signing
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: RainnWorks/apple-signing
+          ssh-key: ${{ secrets.RW_SIGNING_DEPLOY_KEY }}
+          path: .apple-signing
+      - uses: oven-sh/setup-bun@v2
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
+      - name: install signing certificate + profile
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
+        run: bun .apple-signing/src/cli.ts sync sigil-mac --ci
+        env:
+          RW_SIGNING_ROOT: .apple-signing
       - name: fastlane mac release
-        if: ${{ env.MAC_ASC_API_KEY_P8 != '' }}
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
         run: bundle exec fastlane mac release
         working-directory: fastlane
       - uses: actions/upload-artifact@v4
-        if: ${{ env.MAC_ASC_API_KEY_P8 != '' }}
+        if: ${{ env.RW_ASC_KEY_P8 != '' }}
         with:
           name: mac-dmg
           path: build/mac/Sigil.dmg

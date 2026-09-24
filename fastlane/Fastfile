@@ -2,18 +2,22 @@
 require "tempfile"
 require "shellwords"
 require "fileutils"
+require "base64"
 
 default_platform(:ios)
 
 RW_ASC_ENV = %w[RW_ASC_KEY_ID RW_ASC_ISSUER_ID RW_ASC_KEY_P8].freeze
 
-def asc_api_key
+def require_rw_asc_env!
   missing = RW_ASC_ENV.reject { |name| ENV[name].to_s.strip != "" }
-  unless missing.empty?
-    UI.user_error!("Missing #{missing.join(', ')}. On a Mac run lanes as " \
-                   "`rw-apple exec -- bundle exec fastlane ios <lane>`. " \
-                   "In CI set the RW_* secrets. See RainnWorks/apple-signing.")
-  end
+  return if missing.empty?
+  UI.user_error!("Missing #{missing.join(', ')}. On a Mac run lanes as " \
+                 "`rw-apple exec -- bundle exec fastlane <platform> <lane>`. " \
+                 "In CI set the RW_* secrets. See RainnWorks/apple-signing.")
+end
+
+def asc_api_key
+  require_rw_asc_env!
   app_store_connect_api_key(
     key_id: ENV.fetch("RW_ASC_KEY_ID"),
     issuer_id: ENV.fetch("RW_ASC_ISSUER_ID"),
@@ -103,28 +107,27 @@ end
 platform :mac do
   desc "Generate, build, sign, and notarize the Sigil macOS app; package a DMG"
   desc ""
-  desc "Requires (see docs/RELEASE.md):"
-  desc "  MAC_ASC_KEY_ID, MAC_ASC_ISSUER_ID, MAC_ASC_API_KEY_P8  - ASC API key for notarization"
+  desc "Signing comes from RainnWorks/apple-signing. On a Mac the lane runs"
+  desc "`rw-apple sync sigil-mac` itself; in CI the workflow runs the sync step first."
+  desc "Run it as `rw-apple exec -- bundle exec fastlane mac release` so the RW_* secrets are set."
+  desc "The same RW_ASC_* key notarizes the app."
   desc ""
   desc "Apple identity (mirrors apps/phone/app.config.js), both default to Rainnworks:"
   desc "  SIGIL_MAC_TEAM_ID     - Apple team id signing the app (default 53W966FBFP)"
   desc "  SIGIL_MAC_BUNDLE_ID   - app bundle id (default works.rainn.sigil.mac)"
-  desc ""
-  desc "As of #52 the Mac app is on the Rainnworks team (53W966FBFP), same as the iOS"
-  desc "app. The MAC_ASC_* notarization credentials are separate from the iOS RW_ASC_*"
-  desc "ones because notarization uses a Developer-ID API key distinct from the App"
-  desc "Store one; both live under the same Rainnworks account."
+  desc "A self-hoster also needs a Developer ID profile named \"RW DeveloperID <bundle id>\"."
   lane :release do
-    ensure_env_vars(
-      env_vars: ["MAC_ASC_KEY_ID", "MAC_ASC_ISSUER_ID", "MAC_ASC_API_KEY_P8"]
-    )
+    require_rw_asc_env!
 
     team_id   = ENV["SIGIL_MAC_TEAM_ID"] || "53W966FBFP"
     bundle_id = ENV["SIGIL_MAC_BUNDLE_ID"] || "works.rainn.sigil.mac"
+    profile   = "RW DeveloperID #{bundle_id}"
 
     mac_dir = File.join(ROOT, "apps/mac")
     build_dir = File.join(ROOT, "build/mac")
     FileUtils.mkdir_p(build_dir)
+
+    sh("rw-apple", "sync", "sigil-mac") unless is_ci
 
     # Sigil.xcodeproj is generated (see apps/mac/project.yml's own header) -
     # never hand-edited, never assumed fresh in CI.
@@ -138,14 +141,21 @@ platform :mac do
       scheme: "Sigil",
       configuration: "Release",
       export_method: "developer-id",
+      export_options: {
+        signingStyle: "manual",
+        teamID: team_id,
+        provisioningProfiles: { bundle_id => profile }
+      },
       output_directory: build_dir,
       output_name: "Sigil.app",
       skip_package_ipa: true,
       clean: true,
-      xcargs: "-allowProvisioningUpdates " \
-              "SIGIL_MAC_TEAM_ID=#{team_id.shellescape} " \
+      xcargs: "SIGIL_MAC_TEAM_ID=#{team_id.shellescape} " \
               "SIGIL_MAC_BUNDLE_ID=#{bundle_id.shellescape} " \
-              "DEVELOPMENT_TEAM=#{team_id.shellescape}"
+              "DEVELOPMENT_TEAM=#{team_id.shellescape} " \
+              "CODE_SIGN_STYLE=Manual " \
+              "CODE_SIGN_IDENTITY=#{'Developer ID Application'.shellescape} " \
+              "PROVISIONING_PROFILE_SPECIFIER=#{profile.shellescape}"
     )
 
     app_path = File.join(build_dir, "Sigil.app")
@@ -160,14 +170,14 @@ platform :mac do
     # nothing logged).
     key_file = Tempfile.new(["asc_notarize_key", ".p8"])
     begin
-      key_file.write(ENV["MAC_ASC_API_KEY_P8"])
+      key_file.write(Base64.decode64(ENV.fetch("RW_ASC_KEY_P8")))
       key_file.close
 
       sh(
         "xcrun notarytool submit #{zip_path.shellescape} " \
         "--key #{key_file.path.shellescape} " \
-        "--key-id #{ENV['MAC_ASC_KEY_ID'].shellescape} " \
-        "--issuer #{ENV['MAC_ASC_ISSUER_ID'].shellescape} " \
+        "--key-id #{ENV.fetch('RW_ASC_KEY_ID').shellescape} " \
+        "--issuer #{ENV.fetch('RW_ASC_ISSUER_ID').shellescape} " \
         "--wait"
       )
     ensure
