@@ -45,6 +45,8 @@ targets:
       - path: Sigil
         excludes:
           - "**/*.md"
+      - path: Sigil/App/Sigil.icns
+        buildPhase: resources
     settings:
       base:
         INFOPLIST_FILE: Sigil/App/Info.plist

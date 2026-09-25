@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="684" viewBox="0 0 1600 684" font-family="Helvetica Neue, Helvetica, Arial, sans-serif">
+<rect width="1600" height="684" fill="#000000"/>
+<rect x="72" y="124" width="322" height="240" rx="26" fill="none" stroke="#FFFFFF" stroke-width="2"/>
+<text x="102" y="92" fill="#8A8A8E" font-size="20" letter-spacing="2">YOUR MAC</text>
+<text x="102" y="218" fill="#FFFFFF" font-size="28">A command asks</text>
+<text x="102" y="258" fill="#FFFFFF" font-size="28">your vault for</text>
+<text x="102" y="298" fill="#FFFFFF" font-size="28">a secret.</text>
+<path d="M 406 244 L 430 244" stroke="#FFFFFF" stroke-width="2"/>
+<path d="M 428 237 L 440 244 L 428 251 Z" fill="#FFFFFF"/>
+<rect x="450" y="124" width="322" height="240" rx="26" fill="none" stroke="#FFFFFF" stroke-width="2"/>
+<text x="480" y="92" fill="#8A8A8E" font-size="20" letter-spacing="2">SIGIL</text>
+<text x="480" y="218" fill="#FFFFFF" font-size="28">The daemon holds</text>
+<text x="480" y="258" fill="#FFFFFF" font-size="28">it back and asks</text>
+<text x="480" y="298" fill="#FFFFFF" font-size="28">you to approve.</text>
+<path d="M 784 244 L 808 244" stroke="#FFFFFF" stroke-width="2"/>
+<path d="M 806 237 L 818 244 L 806 251 Z" fill="#FFFFFF"/>
+<rect x="828" y="124" width="322" height="240" rx="26" fill="none" stroke="#FFFFFF" stroke-width="2"/>
+<text x="858" y="92" fill="#8A8A8E" font-size="20" letter-spacing="2">YOUR PHONE</text>
+<text x="858" y="218" fill="#FFFFFF" font-size="28">You approve with</text>
+<text x="858" y="258" fill="#FFFFFF" font-size="28">Face ID. Denying</text>
+<text x="858" y="298" fill="#FFFFFF" font-size="28">costs one tap.</text>
+<path d="M 1162 244 L 1186 244" stroke="#FFFFFF" stroke-width="2"/>
+<path d="M 1184 237 L 1196 244 L 1184 251 Z" fill="#FFFFFF"/>
+<rect x="1206" y="124" width="322" height="240" rx="26" fill="none" stroke="#FFFFFF" stroke-width="2"/>
+<text x="1236" y="92" fill="#8A8A8E" font-size="20" letter-spacing="2">RESULT</text>
+<text x="1236" y="218" fill="#FFFFFF" font-size="28">The secret is</text>
+<text x="1236" y="258" fill="#FFFFFF" font-size="28">released, once,</text>
+<text x="1236" y="298" fill="#FFFFFF" font-size="28">to that command.</text>
+<rect x="72" y="436" width="1456" height="176" rx="26" fill="none" stroke="#2C2C2E" stroke-width="2"/>
+<rect x="199" y="490" width="68" height="68" rx="7" fill="#FFFFFF" transform="rotate(45 233 524)"/>
+<text x="450" y="510" fill="#FFFFFF" font-size="28">The key that opens a sealed secret is split in two.</text>
+<text x="450" y="552" fill="#8A8A8E" font-size="26">Your Mac holds one half. The other never leaves your phone.</text>
+</svg>
