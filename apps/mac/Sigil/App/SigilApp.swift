@@ -8,6 +8,7 @@ import SwiftUI
 @main
 struct SigilApp: App {
     @State private var model = SigilApp.makeModel()
+    @State private var updater = SigilApp.makeUpdater()
     @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
@@ -34,6 +35,7 @@ struct SigilApp: App {
         Settings {
             SettingsView()
                 .environment(model)
+                .environment(updater)
                 .frame(width: 460)
         }
     }
@@ -56,6 +58,16 @@ struct SigilApp: App {
             return AppModel(daemon: MockDaemonClient(scenario: .pendingRequests))
         }
         return AppModel(daemon: SocketDaemonClient())
+    }
+
+    /// Sparkle starts only in a real run. A preview and the SIGIL_MOCK fixture run
+    /// both render every screen without a daemon, and neither should reach the
+    /// network or offer to replace the bundle it is running from.
+    @MainActor
+    private static func makeUpdater() -> Updater {
+        let env = ProcessInfo.processInfo.environment
+        let fixture = env["SIGIL_MOCK"] == "1" || env["XCODE_RUNNING_FOR_PREVIEWS"] == "1"
+        return Updater(enabled: !fixture)
     }
 }
 

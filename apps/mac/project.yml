@@ -21,14 +21,24 @@ options:
     macOS: "26.0"
   createIntermediateGroups: true
   defaultConfig: Debug
+# Sparkle ships the in-app updater. The app is not sandboxed, so it needs no
+# XPC services; Xcode embeds and signs the framework with the app's own identity,
+# which is what keeps the Release library-validation flag below satisfied.
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: "2.10.0"
 settings:
   base:
     SWIFT_VERSION: "6.0"
     SWIFT_STRICT_CONCURRENCY: complete
     MACOSX_DEPLOYMENT_TARGET: "26.0"
     PRODUCT_NAME: Sigil
+    # One version, bumped in one place. Sparkle compares CFBundleVersion between
+    # the running app and the appcast, so a constant build number here would
+    # make every update invisible to the updater.
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "1"
+    CURRENT_PROJECT_VERSION: $(MARKETING_VERSION)
     ENABLE_HARDENED_RUNTIME: YES
     GENERATE_INFOPLIST_FILE: NO
     SWIFT_TREAT_WARNINGS_AS_ERRORS: YES
@@ -47,6 +57,9 @@ targets:
           - "**/*.md"
       - path: Sigil/App/Sigil.icns
         buildPhase: resources
+    dependencies:
+      - package: Sparkle
+        product: Sparkle
     settings:
       base:
         INFOPLIST_FILE: Sigil/App/Info.plist

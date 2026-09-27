@@ -27,5 +27,20 @@
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>Personal instrument. Single user.</string>
+	<!--
+	  Sparkle. The feed is the appcast the release workflow attaches to every
+	  GitHub Release; /latest/download/ always resolves to the newest one.
+	  SUPublicEDKey is the public half of the one RainnWorks Sparkle key (the
+	  private half is the RW_SPARKLE_PRIVATE_KEY organization secret). The
+	  release workflow re-derives the public key from that secret and refuses to
+	  publish if it does not match this string, so a key swap cannot ship an
+	  update this app would reject.
+	-->
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/RainnWorks/sigil/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>u3ZheIeb81NurueqlFoFV2mfOMqXaHVVTC0iLdDt75Y=</string>
 </dict>
 </plist>

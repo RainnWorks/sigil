@@ -7,12 +7,14 @@ import SwiftUI
 
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
+    @Environment(Updater.self) private var updater
     @State private var draft = AppSettings()
     @State private var loaded = false
     @State private var confirmingWipe = false
 
     var body: some View {
-        Form {
+        @Bindable var updater = updater
+        return Form {
             if let error = model.lastError {
                 ErrorStrip(message: error)
                     .listRowInsets(EdgeInsets())
@@ -34,6 +36,19 @@ struct SettingsView: View {
                     LabeledContent("Keep history") {
                         MonoText("\(draft.historyRetentionDays)d", size: 11, color: .secondary)
                     }
+                }
+            }
+
+            SwiftUI.Section("Updates") {
+                LabeledContent("Version") {
+                    MonoText(updater.version, size: 11, color: .secondary)
+                }
+                if updater.isRunning {
+                    Toggle("Check for updates automatically", isOn: $updater.checksAutomatically)
+                    Button("Check now") { updater.checkNow() }
+                } else {
+                    Text("This build does not check for updates.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             }
 
@@ -62,5 +77,6 @@ struct SettingsView: View {
 #Preview {
     NavigationStack { SettingsView() }
         .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle)))
+        .environment(Updater(enabled: false))
         .frame(width: 460, height: 520)
 }
