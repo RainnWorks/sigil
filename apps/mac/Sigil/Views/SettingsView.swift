@@ -40,14 +40,19 @@ struct SettingsView: View {
             }
 
             SwiftUI.Section("Updates") {
-                LabeledContent("Version") {
+                LabeledContent("Installed version") {
                     MonoText(updater.version, size: 11, color: .secondary)
                 }
-                if updater.isRunning {
-                    Toggle("Check for updates automatically", isOn: $updater.checksAutomatically)
-                    Button("Check now") { updater.checkNow() }
+                if let inert = updater.inert {
+                    Text("Updates are off in this build. \(inert.rawValue)")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
                 } else {
-                    Text("This build does not check for updates.")
+                    LabeledContent("Last checked") {
+                        MonoText(lastCheckedLabel, size: 11, color: .secondary)
+                    }
+                    Toggle("Check automatically", isOn: $updater.checksAutomatically)
+                    Button("Check now") { updater.checkNow() }
+                    Text("Signed releases from github.com/RainnWorks/sigil.")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             }
@@ -62,6 +67,7 @@ struct SettingsView: View {
         .navigationTitle("Settings")
         .task {
             await model.loadSecondaryScreens()
+            updater.refresh()
             if !loaded { draft = model.settings; loaded = true }
         }
         .onChange(of: draft) { _, new in Task { await model.saveSettings(new) } }
@@ -72,11 +78,24 @@ struct SettingsView: View {
             Text("This cannot be undone.")
         }
     }
+
+    /// Sparkle has never asked until it has, and saying so beats an empty value.
+    private var lastCheckedLabel: String {
+        guard let date = updater.lastChecked else { return "Never" }
+        return date.formatted(.relative(presentation: .named))
+    }
 }
 
-#Preview {
+#Preview("Updates running") {
     NavigationStack { SettingsView() }
         .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle)))
-        .environment(Updater(enabled: false))
-        .frame(width: 460, height: 520)
+        .environment(Updater.preview(lastChecked: .now.addingTimeInterval(-3600)))
+        .frame(width: 460, height: 560)
+}
+
+#Preview("Updates off") {
+    NavigationStack { SettingsView() }
+        .environment(AppModel(daemon: MockDaemonClient(scenario: .armedIdle)))
+        .environment(Updater(inert: .fixture))
+        .frame(width: 460, height: 560)
 }

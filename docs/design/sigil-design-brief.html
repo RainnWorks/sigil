@@ -621,7 +621,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
   </div>
   <div>
     <h3>Mac <span class="badge progress">builds; socket client pending</span></h3>
-    <p style="max-width:48ch">Native SwiftUI with Liquid Glass throughout (the material is GA in the macOS 26.2 SDK), built clean on Xcode 26.3 and Swift 6.2.4 against the macOS 26 SDK. Six sidebar sections plus a menubar item: the configurator is the setup-and-admin surface, the menubar is the pulse. It compiles and runs today against a mock; wiring its <code>DaemonClient</code> to the real control protocol is the pending step, blocked on that protocol landing.</p>
+    <p style="max-width:48ch">Native SwiftUI with Liquid Glass throughout (the material is GA in the macOS 26.2 SDK), built clean on Xcode 26.3 and Swift 6.2.4 against the macOS 26 SDK. Seven sidebar sections plus a menubar item: the configurator is the setup-and-admin surface, the menubar is the pulse. The app updates itself through Sparkle, from the signed GitHub release its appcast names; the control is a section in the Settings tab, never the menubar, and no update check starts while a request is waiting for a decision. It compiles and runs today against a mock; wiring its <code>DaemonClient</code> to the real control protocol is the pending step, blocked on that protocol landing.</p>
     <div class="mb-states">
       <div class="mb"><span class="glyph" style="color:var(--faint)">&#9676;</span><div class="nm">Idle</div><div class="ds">daemon down or unpaired, dotted outline</div></div>
       <div class="mb"><span class="glyph" style="color:var(--cobalt)">&#9670;</span><div class="nm">Armed</div><div class="ds">solid latch, requests will route</div></div>
@@ -662,7 +662,7 @@ postgres://<span class="t-faint">&hellip;</span></pre></div>
   <tr><td>SSH agent</td><td>RFC 9987, phone-gated, ed25519, default 1Password-fetch signer; real <code>ssh-add -l</code> against the running daemon works</td></tr>
   <tr><td>Blind relay</td><td>Cloudflare Worker plus Bun variant; opaque key-hash mailboxes held in memory only (180s TTL, drain-on-read, zero at-rest storage); never parses an envelope; the hostile-relay suite of fourteen attacks all rejected; the relay also rings the publisher APNs doorbell</td></tr>
   <tr><td>iOS approver</td><td>Expo 57 / RN 0.86: approval sheet, real pairing rendezvous, real relay transport, byte-parity-locked to Rust, verified against the live daemon</td></tr>
-  <tr><td>Mac configurator</td><td>SwiftUI plus Liquid Glass, six tabs and a menubar; builds clean on Xcode 26.3 / Swift 6.2.4 / macOS 26 SDK; runs on a mock</td></tr>
+  <tr><td>Mac configurator</td><td>SwiftUI plus Liquid Glass, seven tabs and a menubar; builds clean on Xcode 26.3 / Swift 6.2.4 / macOS 26 SDK; runs on a mock</td></tr>
 </table></div>
 
 <h3>Planned and in progress <span class="badge progress">next</span></h3>
