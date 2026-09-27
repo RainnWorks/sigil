@@ -160,7 +160,14 @@ platform :mac do
 
     app_path = File.join(build_dir, "Sigil.app")
     zip_path = File.join(build_dir, "Sigil.zip")
-    dmg_path = File.join(build_dir, "Sigil.dmg")
+
+    # The DMG carries the version in its name because that is what the Homebrew
+    # cask and the Sparkle appcast both point at, and both are written from the
+    # app that was actually built rather than from a number typed twice.
+    version = sh("/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' " \
+                 "#{File.join(app_path, 'Contents/Info.plist').shellescape}", log: false).strip
+    UI.user_error!("the built app has no CFBundleShortVersionString") if version.empty?
+    dmg_path = File.join(build_dir, "Sigil-#{version}.dmg")
 
     # notarytool wants a zip/dmg/pkg, not a raw .app bundle, for submission.
     sh("ditto -c -k --keepParent #{app_path.shellescape} #{zip_path.shellescape}")
@@ -195,5 +202,6 @@ platform :mac do
     )
 
     UI.success("Notarized DMG ready at #{dmg_path}")
+    dmg_path
   end
 end

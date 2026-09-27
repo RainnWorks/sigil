@@ -14,8 +14,11 @@
 
    ```sh
    brew tap rainnworks/tap && brew trust rainnworks/tap
-   brew install sigil
+   brew install rainnworks/tap/sigil
    ```
+
+   Name the tap. An unrelated app already holds `sigil` in Homebrew's own cask
+   list, so a bare `brew install sigil` reaches that one instead.
 
    Or download `sigil-x.y.z-aarch64-apple-darwin.tar.gz` from
    [Releases](https://github.com/RainnWorks/sigil/releases) and put `sigil` and
@@ -102,6 +105,12 @@ The default approval timeout is 120 seconds. History keeps 30 days. The relay is
 
 Sigil also has a Mac app: a menubar item and a window that do the same things.
 Everything it does, the CLI does headless.
+
+```sh
+brew install --cask rainnworks/tap/sigil-app
+```
+
+The app updates itself, so `brew upgrade` leaves it alone.
 
 ## How it works
 
@@ -198,12 +207,13 @@ Pushing a tag runs the release workflow:
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-It cross-compiles `sigil` and `sigil-config` for Apple silicon and Intel,
-attaches the tarballs and their checksums to a GitHub Release, renders the
-Homebrew formula, builds the relay binary and its container image, and publishes
-the release. Putting the rendered formula into
-[`RainnWorks/homebrew-tap`](https://github.com/RainnWorks/homebrew-tap) is still
-a manual step.
+It builds the CLI for Apple silicon and Intel, builds and notarizes the Mac app,
+builds the relay binary and its container image, publishes the GitHub Release
+with everything attached, and points
+[`RainnWorks/homebrew-tap`](https://github.com/RainnWorks/homebrew-tap) at it.
+
+`docs/RELEASE.md` has the full table, including which jobs need which secret and
+how the Mac app's own updates are signed.
 
 ## Security
 

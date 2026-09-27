@@ -7,14 +7,26 @@ import SwiftUI
 
 @main
 struct SigilApp: App {
-    @State private var model = SigilApp.makeModel()
+    @State private var model: AppModel
+    @State private var updater: Updater
     @Environment(\.openWindow) private var openWindow
+
+    /// Both seams are built here rather than as default values, because the
+    /// updater has to be able to ask the model whether a request is waiting.
+    init() {
+        let model = SigilApp.makeModel()
+        _model = State(initialValue: model)
+        _updater = State(initialValue: Updater(
+            inert: SigilApp.inertReason(),
+            requestsPending: { !model.pending.isEmpty }))
+    }
 
     var body: some Scene {
         // The configurator: one window, source-list sidebar + detail.
         Window("Sigil", id: WindowID.configurator) {
             RootWindow()
                 .environment(model)
+                .environment(updater)
                 .frame(minWidth: 720, minHeight: 480)
                 .task { model.start(); await model.loadSecondaryScreens() }
         }
@@ -34,6 +46,7 @@ struct SigilApp: App {
         Settings {
             SettingsView()
                 .environment(model)
+                .environment(updater)
                 .frame(width: 460)
         }
     }
@@ -56,6 +69,16 @@ struct SigilApp: App {
             return AppModel(daemon: MockDaemonClient(scenario: .pendingRequests))
         }
         return AppModel(daemon: SocketDaemonClient())
+    }
+
+    /// Sparkle starts only in a real run. A preview and the SIGIL_MOCK fixture run
+    /// both render every screen without a daemon, and neither should reach the
+    /// network or offer to replace the bundle it is running from.
+    private static func inertReason() -> Updater.Inert? {
+        let env = ProcessInfo.processInfo.environment
+        if env["XCODE_RUNNING_FOR_PREVIEWS"] == "1" { return .preview }
+        if env["SIGIL_MOCK"] == "1" { return .fixture }
+        return nil
     }
 }
 
